@@ -118,8 +118,14 @@ describe("the model key", () => {
     expect((await withTools([{ type: "mcp", server_url: "https://attacker.example/mcp" }])).status).toBe(403);
     expect((await withTools([{ type: "function", name: "bash" }, { type: "web_search" }])).status).toBe(403);
     expect((await withTools("not a list")).status).toBe(403);
+    // Hosted tools can also be smuggled in as conversation items.
+    const withInput = (input: unknown) => send("https://model.test/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input }) });
+    expect((await withInput([{ role: "user", content: "hi" }, { type: "function_call", call_id: "c", name: "bash", arguments: "{}" }, { type: "function_call_output", call_id: "c", output: "ok" }, { type: "reasoning", summary: [] }])).status).toBe(200);
+    expect((await withInput([{ type: "mcp_approval_response", approve: true, approval_request_id: "x" }])).status).toBe(403);
+    expect((await withInput([{ type: "mcp_list_tools", server_label: "x", tools: [] }])).status).toBe(403);
+    expect((await withInput(["a string item"])).status).toBe(403);
     expect((await send("https://model.test/v1/responses/compact", { method: "POST", body: JSON.stringify({ model: "test-model" }) })).status).toBe(403);
-    expect(forwarded).toHaveLength(1);
+    expect(forwarded).toHaveLength(2);
   });
 
   it("pays only for the configured model, on the model endpoint, within the task's allowance", async () => {

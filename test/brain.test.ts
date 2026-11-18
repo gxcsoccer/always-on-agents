@@ -269,7 +269,14 @@ describe("tasks and approvals", () => {
     expect(readDecision("批准：AB12", "AB12")).toBe("allow");
     expect(readDecision("deny AB12", "AB12")).toBe("deny");
     expect(readDecision("不同意 AB12", "AB12")).toBe("deny");
+    expect(readDecision("approve AB12.", "AB12")).toBe("allow");
+    // An approval is the whole message. Anything more could be saying the opposite.
+    expect(readDecision("do not approve AB12", "AB12")).toBe("deny");
+    expect(readDecision("Don't approve AB12!", "AB12")).toBe("deny");
+    expect(readDecision("不要批准 AB12", "AB12")).toBe("deny");
+    expect(readDecision("approve AB12? no, wait", "AB12")).toBe("deny");
     expect(readDecision("I disapprove AB12", "AB12")).toBeUndefined();
+    expect(readDecision("approve AB12 and also the next one", "AB12")).toBeUndefined();
     expect(readDecision("approve AB123", "AB12")).toBeUndefined();
     expect(readDecision("the code is AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve ZZ99", "AB12")).toBeUndefined();
@@ -281,6 +288,27 @@ describe("tasks and approvals", () => {
     expect((await reply(stub, id, "bob", `@agent deny ${code}`, "allow")).error).toMatch(/refuses this/);
     expect((await reply(stub, id, "bob", `@agent 不同意 ${code}`, "allow")).error).toMatch(/refuses this/);
     expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("lets a refusal win over an approval sent in the same batch", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`@agent approve ${code}`, { user: "bob", session_key: "chat" }));
+    expect((await reply(stub, id, "bob", `@agent wait, deny ${code}`, "allow")).error).toMatch(/refuses this/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("delivers the recorded decision again rather than making a new one for the same question", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // The approval is recorded and sent, but the task row still shows the question as open,
+    // as it would if the worker's acknowledgement had been lost.
+    await reply(stub, id, "bob", `@agent approve ${code}`);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE tasks SET status = 'needs_input', pending = json_object('id', 'q-1', 'code', ?) WHERE id = ?", code, id);
+    });
+    // A later run tries to decide differently.
+    const output = await reply(stub, id, "carol", "@agent no", "deny");
+    expect(output).toMatchObject({ ok: true, decision: "allow", decided_by: "bob" });
+    expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow", "allow"]);
   });
 
   it("does not let one reply approve two questions", async () => {
@@ -332,7 +360,7 @@ describe("tasks and approvals", () => {
 
   it("does not approve on a yes that does not quote the code", async () => {
     const { stub, id } = await taskAwaitingApproval();
-    expect((await reply(stub, id, "bob", "@agent yes, go ahead")).error).toMatch(/must say "approve/);
+    expect((await reply(stub, id, "bob", "@agent yes, go ahead")).error).toMatch(/says just "approve/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
@@ -347,7 +375,7 @@ describe("tasks and approvals", () => {
     await scope.stub.taskEvent(id, 1, "needs_input", ask);
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "bob said yes" })], [say("")], [say("")]);
     await wake(scope.stub);
-    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/has not been delivered|nobody here has answered|must say/);
+    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/has not been delivered|nobody here has answered|says just/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
@@ -392,7 +420,7 @@ describe("tasks and approvals", () => {
     await stub.taskEvent(id, 2, "needs_input", { source: "gate", id: "q-2", command: "rm -rf /" });
     model.replies([say("")]);
     await wake(stub);
-    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/must say "approve/);
+    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/says just "approve/);
     expect(await answersSent(id)).toHaveLength(1);
   });
 

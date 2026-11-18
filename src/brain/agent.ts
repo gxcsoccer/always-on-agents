@@ -647,7 +647,12 @@ export class BrainAgent extends DurableObject<Env> {
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be answered there");
 
     let intent = task.answering ? (JSON.parse(task.answering) as { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number }) : undefined;
-    if (!intent || intent.call_id !== callId) {
+    // A question gets one decision. If one is already on record for the question still shown as
+    // pending (its delivery to the worker was not confirmed), this call delivers that same decision
+    // again; it does not get to make a new one.
+    const open = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { id: string }).id : undefined;
+    if (intent && intent.pending_id !== open && intent.call_id !== callId) intent = undefined;
+    if (!intent) {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
       const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
       // "Asked" means the message actually went out, not merely that it was queued.
@@ -655,7 +660,7 @@ export class BrainAgent extends DurableObject<Env> {
       if (asked?.status !== "sent") throw new Error("the question has not been delivered to anyone in this conversation yet, so it cannot be answered");
 
       // Messages from members, sent after the question was put to them.
-      const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at >= ? ORDER BY id", run.id, asked.sent_at)
+      const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at > ? ORDER BY id", run.id, asked.sent_at)
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
         .filter(({ principal }) => this.#isDecider(principal));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
@@ -666,11 +671,10 @@ export class BrainAgent extends DurableObject<Env> {
         if (pending.truncated) throw new Error("the action is too long to be shown in full, so it cannot be approved; it can only be refused");
         // What the person wrote decides, not what the model made of it. Only "approve <code>" (or
         // its Chinese equivalents) is an approval; "deny <code>" carries the same code and is not.
+        // A refusal from any member wins over an approval in the same batch, whichever came first.
+        if (replies.some(({ event }) => readDecision(event.text ?? "", pending.code) === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         const withCode = replies.filter(({ event }) => readDecision(event.text ?? "", pending.code) === "allow");
-        if (withCode.length === 0) {
-          if (replies.some(({ event }) => readDecision(event.text ?? "", pending.code) === "deny")) throw new Error("the reply refuses this; pass on a denial, not an approval");
-          throw new Error(`an approval must say "approve ${pending.code}"; nobody has`);
-        }
+        if (withCode.length === 0) throw new Error(`an approval must be a message that says just "approve ${pending.code}"; nobody has sent one`);
         // One message approves one question.
         const used = new Set(this.#rows<{ event: number | null }>("SELECT json_extract(answering, '$.deciding_event') AS event FROM tasks WHERE answering IS NOT NULL").map((r) => r.event));
         const unused = withCode.filter(({ event }) => !used.has(event.id));
@@ -942,9 +946,13 @@ function describeRequest(body: Record<string, unknown>): string {
  * A refusal is checked first because "不同意 X" contains "同意 X".
  */
 export function readDecision(text: string, code: string): "allow" | "deny" | undefined {
-  const quoted = (verbs: string) => new RegExp(`(?:${verbs})[\\s:：]*${code}(?![A-Za-z0-9])`, "i").test(text);
-  if (quoted("deny|refuse|reject|拒绝|不同意|不批准|否决")) return "deny";
-  if (quoted("(?<![A-Za-z])approve|同意|批准")) return "allow";
+  if (!new RegExp(`(?<![A-Za-z0-9])${code}(?![A-Za-z0-9])`, "i").test(text)) return undefined;
+  // An approval is the whole message and nothing else (apart from @-mentions and punctuation):
+  // "approve CODE". Anything longer could be saying the opposite ("do not approve CODE").
+  const bare = text.replace(/@[^\s@]+/g, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
+  if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
+  // A message that mentions the code together with a refusing or negating word is a refusal.
+  if (/deny|denied|refuse|reject|don'?t|do not|not|never|no\b|stop|cancel|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
   return undefined;
 }
 

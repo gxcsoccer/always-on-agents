@@ -18,6 +18,8 @@ const HOLD_POLL_MS = 2_000;
 const MAX_MODEL_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_PUSH_BYTES = 64 * 1024 * 1024;
 const ZERO = /^0+$/;
+/** Input items a coding agent produces by itself: its messages, its reasoning, calls to its own tools. */
+const LOCAL_ITEM_TYPES = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"]);
 
 /** One ref a push would move. `old` or `new` being all zeros means create or delete. */
 export interface RefUpdate {
@@ -68,7 +70,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const bytes = await readBounded(request, MAX_MODEL_REQUEST_BYTES);
     if (!bytes) return this.#refuse(request, url, "model request is too large");
     const body = new TextDecoder().decode(bytes);
-    let parsed: { model?: unknown; tools?: unknown };
+    let parsed: { model?: unknown; tools?: unknown; input?: unknown };
     try {
       parsed = JSON.parse(body);
     } catch {
@@ -82,6 +84,12 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const tools = parsed.tools ?? [];
     if (!Array.isArray(tools) || tools.some((tool) => tool?.type !== "function" && tool?.type !== "custom")) {
       return this.#refuse(request, url, "only function tools may be declared from this sandbox");
+    }
+    // The same goes for the conversation itself: only the kinds of item a local agent produces.
+    // Items that stand for hosted tools (MCP, web search, code interpreter…) are not among them.
+    const input = (parsed as { input?: unknown }).input;
+    if (Array.isArray(input) && input.some((item) => item === null || typeof item !== "object" || !LOCAL_ITEM_TYPES.has(item.type ?? "message"))) {
+      return this.#refuse(request, url, "the request contains an item type that is not allowed from this sandbox");
     }
     if (!(await this.#task.countModelCall())) return new Response("this task has used its model call allowance\n", { status: 429 });
     return fetch(url, { method: "POST", headers, body, redirect: "manual" });

@@ -238,7 +238,20 @@ export class TaskSandbox extends DurableObject<Env> {
   // ---------- state ----------
 
   #state(): TaskState | undefined {
-    return this.ctx.storage.kv.get<TaskState>("state");
+    const state = this.ctx.storage.kv.get<TaskState>("state");
+    if (!state) return undefined;
+    // Fields added after a task was created are filled in, so a task from an older deploy still loads.
+    state.gate_questions ??= {};
+    state.decisions ??= {};
+    state.grants ??= {};
+    state.out ??= [];
+    state.out_seq ??= 0;
+    state.asks ??= 0;
+    state.model_calls ??= 0;
+    for (const [callId, question] of Object.entries(state.gate_questions)) {
+      if (typeof question === "string") state.gate_questions[callId] = { id: question, command: "" };
+    }
+    return state;
   }
 
   #save(state: TaskState) {
@@ -489,7 +502,13 @@ export class TaskSandbox extends DurableObject<Env> {
       return { state: "deny", reason: "the approval expired before it was used" };
     }
     if (state.pending?.source === "proxy" && state.pending.key === requestId) {
-      // Seen again: the request is still being held.
+      this.#expireHold(state);
+      if (!state.pending) {
+        this.#save(state);
+        this.ctx.waitUntil(this.#flush());
+        return { state: "deny", reason: "the request waited too long for an answer" };
+      }
+      // Seen again in time: the request is still being held.
       state.pending.polled_at = Date.now();
       this.#save(state);
       return { state: "pending", reason: "" };
@@ -708,7 +727,10 @@ export class TaskSandbox extends DurableObject<Env> {
     if (!before?.checkpoint) return;
     const started = Date.now();
     before.recoveries += 1;
+    // Whatever was being held died with the container; its question no longer stands.
+    if (before.pending) this.#emit(before, "withdrawn", { id: before.pending.id });
     before.pending = undefined;
+    before.grants = {};
     before.phase = "starting";
     before.starting_since = started;
     before.inbox.push({ at: started, kind: "recovering", body: { message: `from checkpoint taken ${Math.round((started - before.checkpoint.at) / 1000)}s ago` } });
@@ -752,7 +774,8 @@ export class TaskSandbox extends DurableObject<Env> {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    if (ACTIVE.has(before.phase)) {
+    const overdue = Date.now() - before.created_at > MAX_LIFETIME_MS;
+    if (ACTIVE.has(before.phase) && !overdue) {
       try {
         await this.#settle("alarm");
       } catch (err) {
