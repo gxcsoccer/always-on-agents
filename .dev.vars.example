@@ -1,0 +1,5 @@
+OPENAI_API_KEY=sk-xxx
+ADMIN_KEY=pick-a-long-random-string
+# Optional
+# GITHUB_WEBHOOK_SECRET=the-secret-configured-on-the-github-app
+# GITHUB_TOKEN=ghp_xxx

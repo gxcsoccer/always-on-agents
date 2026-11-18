@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "always-on-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  // Files resolves native Linux errno names through node:os.
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host only.
+    "OPENAI_BASE_URL": "https://api.openai.com/v1",
+    "BRAIN_MODEL": "gpt-6-sol",
+    // Must be in pi's openai catalog (`pi --list-models`).
+    "WORKER_MODEL": "gpt-6-sol"
+  },
+  // Secrets (wrangler secret put / .dev.vars): OPENAI_API_KEY, ADMIN_KEY,
+  // optional GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN
+  "r2_buckets": [{ "binding": "CHECKPOINTS", "bucket_name": "always-on-agent-checkpoints" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "BRAIN", "class_name": "BrainAgent" },
+      { "name": "TASKS", "class_name": "TaskSandbox" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "TaskSandbox",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "sandbox": { "dockerfile": "./Dockerfile" }
+      }
+    }
+  ],
+  "exports": {
+    "BrainAgent": { "type": "durable-object", "storage": "sqlite" },
+    "TaskSandbox": { "type": "durable-object", "storage": "sqlite" },
+    "Registry": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "observability": { "enabled": true }
+}

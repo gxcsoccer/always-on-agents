@@ -1,0 +1,144 @@
+/**
+ * The tools the Brain's model can call. Each one is a thin, validated wrapper over something the
+ * Brain's Durable Object does; all state changes go through `ToolHost`.
+ *
+ * Every tool must be safe to execute twice with the same call id: after a crash the Brain re-runs
+ * any tool call that has no recorded output.
+ */
+import type { ToolDefinition } from "../model/openai";
+
+export interface ToolCall {
+  call_id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface ToolHost {
+  sendMessage(callId: string, text: string): unknown;
+  memoryList(): unknown;
+  memoryRead(path: string): unknown;
+  memoryWrite(path: string, content: string): unknown;
+  memoryDelete(path: string): unknown;
+  setTimer(callId: string, delaySeconds: number, note: string, repeatEverySeconds: number | null): unknown;
+  listTimers(): unknown;
+  cancelTimer(id: string): unknown;
+  dispatchTask(callId: string, title: string, brief: string, repository: string | null): Promise<unknown>;
+  taskStatus(taskId: string): Promise<unknown>;
+  answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
+  cancelTask(taskId: string): Promise<unknown>;
+}
+
+const string = { type: "string" } as const;
+const nullable = (type: string) => ({ type: [type, "null"] });
+
+function tool(name: string, description: string, properties: Record<string, unknown>): ToolDefinition {
+  return {
+    type: "function",
+    name,
+    description,
+    strict: true,
+    parameters: { type: "object", properties, required: Object.keys(properties), additionalProperties: false },
+  };
+}
+
+export const TOOLS: ToolDefinition[] = [
+  tool(
+    "send_message",
+    "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
+    { text: string },
+  ),
+  tool("memory_list", "List the files in your long-term memory.", {}),
+  tool("memory_read", "Read one memory file.", { path: string }),
+  tool(
+    "memory_write",
+    "Create or replace a memory file. Keep only what you could not look up again. Paths look like notes/preferences.md; index.md and instructions.md are loaded at the start of every run.",
+    { path: string, content: string },
+  ),
+  tool("memory_delete", "Delete a memory file that is no longer true or useful.", { path: string }),
+  tool(
+    "set_timer",
+    "Wake yourself up later. When the timer fires you get an event containing the note, in this same conversation. Use it for follow-ups and recurring work.",
+    {
+      delay_seconds: { type: "integer", description: "Seconds from now until it first fires." },
+      note: { type: "string", description: "What you should do when it fires. Write it for a future you with no other context." },
+      repeat_every_seconds: { ...nullable("integer"), description: "Null for a one-off; otherwise the interval, at least 60." },
+    },
+  ),
+  tool("list_timers", "List your active timers.", {}),
+  tool("cancel_timer", "Cancel a timer.", { id: string }),
+  tool(
+    "dispatch_task",
+    "Hand a piece of work to a coding agent that runs in its own sandbox: it can run shell commands, write code and use git. Use it for anything that takes more than a moment. You are told when it finishes, fails or needs approval; do not wait for it.",
+    {
+      title: { type: "string", description: "A few words, shown to people." },
+      brief: { type: "string", description: "Everything the worker needs. It knows nothing about this conversation." },
+      repository: { ...nullable("string"), description: "An https://github.com/... URL to clone first, or null." },
+    },
+  ),
+  tool("task_status", "Look up a task's current state and latest progress.", { task_id: string }),
+  tool(
+    "answer_task",
+    "Answer a task that is waiting for approval. Only pass on a decision a person just gave you in this conversation; you may not approve on your own.",
+    { task_id: string, decision: { type: "string", enum: ["allow", "deny"] }, reason: string },
+  ),
+  tool("cancel_task", "Stop a task and discard its sandbox.", { task_id: string }),
+];
+
+/** Runs one tool call and returns the JSON string the model will see. Never throws. */
+export async function executeTool(host: ToolHost, call: ToolCall): Promise<string> {
+  let args: Record<string, any>;
+  try {
+    args = JSON.parse(call.arguments || "{}");
+  } catch {
+    return JSON.stringify({ error: "arguments were not valid JSON" });
+  }
+  try {
+    return JSON.stringify((await route(host, call, args)) ?? { ok: true });
+  } catch (err) {
+    return JSON.stringify({ error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
+  switch (call.name) {
+    case "send_message":
+      return host.sendMessage(call.call_id, text(a.text, "text", 8_000));
+    case "memory_list":
+      return host.memoryList();
+    case "memory_read":
+      return host.memoryRead(text(a.path, "path", 200));
+    case "memory_write":
+      return host.memoryWrite(text(a.path, "path", 200), text(a.content, "content", 64_000, true));
+    case "memory_delete":
+      return host.memoryDelete(text(a.path, "path", 200));
+    case "set_timer":
+      return host.setTimer(call.call_id, integer(a.delay_seconds, "delay_seconds"), text(a.note, "note", 2_000), a.repeat_every_seconds == null ? null : integer(a.repeat_every_seconds, "repeat_every_seconds"));
+    case "list_timers":
+      return host.listTimers();
+    case "cancel_timer":
+      return host.cancelTimer(text(a.id, "id", 200));
+    case "dispatch_task":
+      return host.dispatchTask(call.call_id, text(a.title, "title", 120), text(a.brief, "brief", 20_000), a.repository == null ? null : text(a.repository, "repository", 300));
+    case "task_status":
+      return host.taskStatus(text(a.task_id, "task_id", 64));
+    case "answer_task":
+      if (a.decision !== "allow" && a.decision !== "deny") throw new Error("decision must be allow or deny");
+      return host.answerTask(call.call_id, text(a.task_id, "task_id", 64), a.decision, text(a.reason, "reason", 1_000, true));
+    case "cancel_task":
+      return host.cancelTask(text(a.task_id, "task_id", 64));
+    default:
+      throw new Error(`unknown tool: ${call.name}`);
+  }
+}
+
+function text(value: unknown, name: string, max: number, allowEmpty = false): string {
+  if (typeof value !== "string") throw new Error(`${name} must be a string`);
+  if (!allowEmpty && value.trim() === "") throw new Error(`${name} must not be empty`);
+  if (value.length > max) throw new Error(`${name} is longer than ${max} characters`);
+  return value;
+}
+
+function integer(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${name} must be an integer`);
+  return value;
+}
