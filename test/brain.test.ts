@@ -1,4 +1,5 @@
 import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { readDecision } from "../src/brain/agent";
@@ -560,6 +561,34 @@ describe("records and limits", () => {
     const replay = await stub.ingest({ source: "t", source_id: "old-done", kind: "message", session_key: "old", principal: { kind: "human", id: "alice", explicit: true }, text: "replayed" });
     expect(replay.duplicate).toBe(true);
     expect(JSON.stringify(state.recent_events)).not.toContain("an old secret");
+  });
+
+  it("pauses a scope when its tenant has used up the tenant's daily budget", async () => {
+    const { stub, name } = brain();
+    const tenant = name.split(":")[0];
+    const usage = await (env as any).REGISTRY.getByName("global").recordUsage(tenant, 25_000_000);
+    expect(usage.allowed).toBe(false);
+    // Another tenant is not affected by it.
+    expect((await (env as any).REGISTRY.getByName("global").recordUsage("someone-else", 0)).allowed).toBe(true);
+
+    await stub.ingest(message("hi"));
+    await wake(stub);
+    const state = await stub.inspect();
+    expect(modelCalls).toHaveLength(0);
+    expect(state.inbox).toMatchObject({ claimed: 1, done: 0 });
+    expect(state.active_run.retry_at).toBeGreaterThan(Date.now());
+  });
+
+  it("adds what the Brain and its workers spend to the tenant's total", async () => {
+    const { stub, name } = brain();
+    const registry = (env as any).REGISTRY.getByName("global");
+    model.replies([call("dispatch_task", { title: "t", brief: "b", repository: null })], [say("")]);
+    await stub.ingest(message("do it"));
+    await wake(stub);
+    const afterRun = (await registry.recordUsage(name.split(":")[0], 0)).used;
+    expect(afterRun).toBe(30); // two model calls of 15 tokens each
+    await stub.taskEvent((await stub.inspect()).tasks[0].id, 1, "result", { text: "done", usage: { total_tokens: 1_000 } });
+    expect((await registry.recordUsage(name.split(":")[0], 0)).used).toBe(afterRun + 1_000);
   });
 
   it("reports the figures an operator would watch", async () => {

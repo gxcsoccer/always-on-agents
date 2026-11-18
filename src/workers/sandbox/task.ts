@@ -17,7 +17,6 @@ import {
   type DirectoryBackupGatewayBinding,
   type DirectoryBackupRecord,
   Files,
-  SandboxFileError,
 } from "@cloudflare/sandbox";
 import { DurableObject } from "cloudflare:workers";
 
@@ -162,6 +161,9 @@ const STARTUP_DEADLINE_MS = 5 * 60 * 1_000;
 const MAX_MODEL_CALLS_PER_TASK = 400;
 /** How long a finished task's record, container and checkpoint are kept for inspection. */
 const PURGE_AFTER_MS = 24 * 60 * 60 * 1_000;
+/** How much of the end of the agent's event log is read to work out how it ended. */
+const MAX_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024;
+const ADMIN_READ_BYTES = 2 * 1024 * 1024;
 const MAX_IDLE_MS = 15 * 60 * 1_000;
 const MAX_LIFETIME_MS = 2 * 60 * 60 * 1_000;
 // Checkpoints: at most this often, and a task is restored at most this many times.
@@ -646,11 +648,11 @@ export class TaskSandbox extends DurableObject<Env> {
   async readFiles(which: "events" | "hooks" | "stderr"): Promise<string> {
     const state = this.#state();
     if (!state || !this.#container.running) return "";
-    if (which === "hooks") return (await this.#readOptional(HOOK_LOG_PATH)) ?? "";
+    if (which === "hooks") return (await this.#readTail(HOOK_LOG_PATH, ADMIN_READ_BYTES)) ?? "";
     if (which === "stderr") {
-      return `${(await this.#readOptional(STDERR_PATH)) ?? ""}\n--- report.log ---\n${(await this.#readOptional(REPORT_LOG_PATH)) ?? ""}`;
+      return `${(await this.#readTail(STDERR_PATH, ADMIN_READ_BYTES)) ?? ""}\n--- report.log ---\n${(await this.#readTail(REPORT_LOG_PATH, ADMIN_READ_BYTES)) ?? ""}`;
     }
-    return (await this.#readOptional(EVENTS_PATH)) ?? "";
+    return (await this.#readTail(EVENTS_PATH, ADMIN_READ_BYTES)) ?? "";
   }
 
   async diff(): Promise<CommandResult | { error: string }> {
@@ -785,7 +787,7 @@ export class TaskSandbox extends DurableObject<Env> {
     }
     const running = this.#container.running;
     // Touch the container: a request to it is what counts as activity.
-    if (running) await this.#readOptional(PID_PATH).catch(() => undefined);
+    if (running) await this.#readTail(PID_PATH, 32).catch(() => undefined);
 
     // Every await is done. From here to #save nothing can interleave, so this cannot overwrite
     // a state that a callback settled in the meantime.
@@ -924,22 +926,24 @@ export class TaskSandbox extends DurableObject<Env> {
     // A missing container is the alarm's business: it decides between restoring and giving up.
     if (!this.#container.running) return;
     {
-      let raw = await this.#readOptional(EXIT_CODE_PATH);
+      let raw = await this.#readTail(EXIT_CODE_PATH, 32);
       if (raw === undefined) {
-        const pid = (await this.#readOptional(PID_PATH))?.trim();
+        const pid = (await this.#readTail(PID_PATH, 32))?.trim();
         // The wrapper has not written its pid yet: it only just started.
         if (!pid && Date.now() - (before.runs.at(-1)?.started_at ?? 0) < 15_000) return;
         // kill is a shell builtin; slim images have no kill binary.
         const alive = pid ? (await this.#run(["/bin/sh", "-c", 'kill -0 "$1"', "probe", pid], "/", {})).exitCode === 0 : false;
         if (alive) return;
         // The process can finish between the two reads; its wrapper writes the code before exiting.
-        raw = await this.#readOptional(EXIT_CODE_PATH);
+        raw = await this.#readTail(EXIT_CODE_PATH, 32);
         if (raw === undefined) lost = "agent process ended without recording an exit code";
       }
       if (raw !== undefined) {
         exitCode = Number.parseInt(raw, 10);
-        events = (await this.#readOptional(EVENTS_PATH)) ?? "";
-        stderr = ((await this.#readOptional(STDERR_PATH)) ?? "").slice(-2_000);
+        // These files are written by the guest and can be any size. Only their ends are read: the
+        // outcome is in the last events, and a bounded read cannot exhaust this object's memory.
+        events = (await this.#readTail(EVENTS_PATH, MAX_TRANSCRIPT_TAIL_BYTES)) ?? "";
+        stderr = ((await this.#readTail(STDERR_PATH, 4_000)) ?? "").slice(-2_000);
       }
     }
 
@@ -994,13 +998,10 @@ export class TaskSandbox extends DurableObject<Env> {
 
   // ---------- container helpers ----------
 
-  async #readOptional(path: string): Promise<string | undefined> {
-    try {
-      return await (await this.#files.readFile(path)).text();
-    } catch (cause) {
-      if (SandboxFileError.is(cause) && cause.code === "ENOENT") return undefined;
-      throw cause;
-    }
+  /** The last `bytes` of a file in the container, or undefined if it does not exist. */
+  async #readTail(path: string, bytes: number): Promise<string | undefined> {
+    const result = await this.#run(["tail", "-c", String(bytes), "--", path], "/", {});
+    return result.exitCode === 0 ? result.stdout : undefined;
   }
 
   async #run(command: string[], cwd: string, env: Record<string, string>): Promise<CommandResult> {

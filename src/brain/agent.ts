@@ -314,7 +314,10 @@ export class BrainAgent extends DurableObject<Env> {
       const awaitingModel = last && (last.role === "user" || last.type === "function_call_output");
       if (!awaitingModel || run.steps >= MAX_STEPS_PER_RUN) break;
 
-      if (this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
+      // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
+      const tenant = await registry(this.env).recordUsage(this.#scope().tenant, 0);
+      if (!this.#stillActive(runId)) return;
+      if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
         this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, "I have reached today's usage limit here and will pick this up tomorrow.");
@@ -349,6 +352,8 @@ export class BrainAgent extends DurableObject<Env> {
         );
         this.#setMeta(`tokens:${today()}`, String(this.#tokensToday() + response.usage.total_tokens));
       });
+      // After the commit: if this is lost the tenant is under-counted by one call, never blocked.
+      await registry(this.env).recordUsage(this.#scope().tenant, response.usage.total_tokens).catch(() => undefined);
     }
     this.#finish(runId, "done");
   }
@@ -743,7 +748,7 @@ export class BrainAgent extends DurableObject<Env> {
    */
   async taskEvent(taskId: string, seq: number, kind: WorkerEventKind, report: Record<string, unknown>): Promise<{ ok: boolean }> {
     let body = report;
-    const outcome = this.ctx.storage.transactionSync(() => {
+    const outcome: { known: boolean; wake: boolean; terminal: boolean; spent?: number } = this.ctx.storage.transactionSync(() => {
       const task = this.#rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
       if (!task) return { known: false, wake: false, terminal: false };
       // A repeat means the worker never saw our acknowledgement. The work after the commit (waking
@@ -806,8 +811,9 @@ export class BrainAgent extends DurableObject<Env> {
         text: renderWorkerEvent(task, kind, body),
         data: { task_id: taskId, ...body },
       });
-      return { known: true, wake: true, terminal: kind !== "needs_input" };
+      return { known: true, wake: true, terminal: kind !== "needs_input", spent };
     });
+    if (outcome.spent) await registry(this.env).recordUsage(this.#scope().tenant, outcome.spent).catch(() => undefined);
     if (outcome.terminal) await registry(this.env).releaseTaskSlot(taskId);
     if (outcome.wake) await this.#wakeBy(Date.now() + 300);
     return { ok: outcome.known };

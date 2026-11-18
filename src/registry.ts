@@ -25,6 +25,8 @@ export interface Tenant {
   created_at: number;
 }
 
+/** What one tenant may spend on models per UTC day, across all of its scopes and sandboxes. */
+const TENANT_DAILY_TOKEN_BUDGET = 20_000_000;
 /** How many sandbox containers one tenant may run at once. */
 const MAX_TASKS_PER_TENANT = 5;
 /** A slot nobody released is reclaimed after this long. */
@@ -47,6 +49,7 @@ export class Registry extends DurableObject<Env> {
         bot_open_id TEXT, token TEXT, token_expires_at INTEGER
       );
       DROP TABLE IF EXISTS github_tokens;
+      CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
   }
 
@@ -134,6 +137,22 @@ export class Registry extends DurableObject<Env> {
       .exec<{ user_id: string }>("SELECT user_id FROM identities WHERE tenant = ? AND provider = ? AND external_id = ?", tenant, provider, externalId)
       .toArray();
     return rows[0]?.user_id ?? null;
+  }
+
+  /**
+   * Records model tokens a tenant used and says whether it may keep spending today. All tenants
+   * share one provider key, so this is what stops one tenant from using up everyone's allowance.
+   */
+  async recordUsage(tenant: string, tokens: number): Promise<{ allowed: boolean; used: number; budget: number }> {
+    const day = new Date().toISOString().slice(0, 10);
+    const sql = this.ctx.storage.sql;
+    const add = Number.isFinite(tokens) && tokens > 0 ? Math.min(Math.floor(tokens), 1_000_000_000) : 0;
+    if (add > 0) {
+      sql.exec("INSERT INTO tenant_usage (tenant, day, tokens) VALUES (?, ?, ?) ON CONFLICT(tenant, day) DO UPDATE SET tokens = tokens + excluded.tokens", tenant, day, add);
+      sql.exec("DELETE FROM tenant_usage WHERE day < ?", new Date(Date.now() - 40 * 86_400_000).toISOString().slice(0, 10));
+    }
+    const used = sql.exec<{ tokens: number }>("SELECT tokens FROM tenant_usage WHERE tenant = ? AND day = ?", tenant, day).toArray()[0]?.tokens ?? 0;
+    return { allowed: used < TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET };
   }
 
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */
