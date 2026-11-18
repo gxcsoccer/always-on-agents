@@ -41,6 +41,8 @@ const MAX_ACTIVE_TASKS = 3;
 const MAX_ACTIVE_TIMERS = 50;
 const MAX_MEMORY_FILES = 200;
 const DAILY_TOKEN_BUDGET = 2_000_000;
+/** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
+const MODEL_CALL_RESERVE = 20_000;
 const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How long finished records are kept before housekeeping removes them. */
@@ -315,9 +317,13 @@ export class BrainAgent extends DurableObject<Env> {
       if (!awaitingModel || run.steps >= MAX_STEPS_PER_RUN) break;
 
       // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
-      const tenant = await registry(this.env).recordUsage(this.#scope().tenant, 0);
+      // The tenant's share is reserved before the call and trued up after it, so several scopes
+      // admitted at the same moment cannot all slip under the limit together.
+      const tenant = await registry(this.env).recordUsage(this.#scope().tenant, MODEL_CALL_RESERVE);
       if (!this.#stillActive(runId)) return;
       if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
+        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE).catch(() => undefined);
+        if (!this.#stillActive(runId)) return;
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
         this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, "I have reached today's usage limit here and will pick this up tomorrow.");
@@ -339,6 +345,7 @@ export class BrainAgent extends DurableObject<Env> {
           tools: TOOLS,
         });
       } catch (err) {
+        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE).catch(() => undefined);
         return this.#retryLater(runId, err);
       }
       if (!this.#stillActive(runId)) return;
@@ -353,7 +360,7 @@ export class BrainAgent extends DurableObject<Env> {
         this.#setMeta(`tokens:${today()}`, String(this.#tokensToday() + response.usage.total_tokens));
       });
       // After the commit: if this is lost the tenant is under-counted by one call, never blocked.
-      await registry(this.env).recordUsage(this.#scope().tenant, response.usage.total_tokens).catch(() => undefined);
+      await registry(this.env).adjustUsage(this.#scope().tenant, response.usage.total_tokens - MODEL_CALL_RESERVE).catch(() => undefined);
     }
     this.#finish(runId, "done");
   }
@@ -602,12 +609,17 @@ export class BrainAgent extends DurableObject<Env> {
       this.#setTask(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
       throw new Error("too many sandboxes are running for this tenant right now; try again later");
     }
-    const started = await this.env.TASKS.getByName(task.id).start({
-      id: task.id,
-      prompt: brief,
-      repository: repository ?? undefined,
-      brain: this.#scopeName(),
-    });
+    let started: { phase: string; error?: string };
+    try {
+      started = await this.env.TASKS.getByName(task.id).start({ id: task.id, prompt: brief, repository: repository ?? undefined, brain: this.#scopeName() });
+    } catch (err) {
+      // Whether the worker heard us is unknown. Stop it if it did, and free the slot either way, so
+      // a start that failed in transit does not hold one of this scope's task slots for good.
+      await this.env.TASKS.getByName(task.id).cancel().catch(() => undefined);
+      this.#setTask(task.id, "failed", { result: JSON.stringify({ error: `the sandbox could not be reached: ${String(err).slice(0, 300)}` }) });
+      await registry(this.env).releaseTaskSlot(task.id).catch(() => undefined);
+      throw new Error("the sandbox could not be started; try again");
+    }
     if (started.phase === "failed" || started.phase === "lost") {
       this.#setTask(task.id, "failed", { result: JSON.stringify({ error: started.error ?? "the sandbox did not start" }) });
       await registry(this.env).releaseTaskSlot(task.id);
@@ -670,29 +682,36 @@ export class BrainAgent extends DurableObject<Env> {
         .filter(({ principal }) => this.#isDecider(principal));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
 
+      // What each reply says about this question, read from its own words. The model proposes a
+      // decision; it only goes through if a person's message actually says it.
+      const read = replies.map((reply) => ({ ...reply, says: readDecision(reply.event.text ?? "", pending.code) }));
       const shared = this.#scope().kind !== "user";
-      let deciding = replies.at(-1)!;
-      if (decision === "allow") {
+      let deciding: (typeof read)[number];
+      if (decision === "deny") {
+        // A refusal has to be said too: "deny <code>". An unrelated message is not one.
+        const refusals = read.filter(({ says }) => says === "deny");
+        if (refusals.length === 0) throw new Error(`no reply so far refuses this. A refusal is a message that says "deny ${pending.code}". Call this tool again whenever a new reply arrives`);
+        deciding = refusals.at(-1)!;
+      } else {
         if (pending.truncated) throw new Error("the action is too long to be shown in full, so it cannot be approved; it can only be refused");
-        // What the person wrote decides, not what the model made of it. Only "approve <code>" (or
-        // its Chinese equivalents) is an approval; "deny <code>" carries the same code and is not.
         // A refusal from any member wins over an approval in the same batch, whichever came first.
-        if (replies.some(({ event }) => readDecision(event.text ?? "", pending.code) === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
-        const withCode = replies.filter(({ event }) => readDecision(event.text ?? "", pending.code) === "allow");
-        if (withCode.length === 0) throw new Error(`an approval must be a message that says just "approve ${pending.code}"; nobody has sent one`);
+        if (read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
+        let approvals = read.filter(({ says }) => says === "allow");
+        if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${pending.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
         // One message approves one question.
         const used = new Set(this.#rows<{ event: number | null }>("SELECT json_extract(answering, '$.deciding_event') AS event FROM tasks WHERE answering IS NOT NULL").map((r) => r.event));
-        const unused = withCode.filter(({ event }) => !used.has(event.id));
-        if (unused.length === 0) throw new Error("that reply was already used to approve another question");
-        withCode.splice(0, withCode.length, ...unused);
+        approvals = approvals.filter(({ event }) => !used.has(event.id));
+        if (approvals.length === 0) throw new Error("that reply was already used to approve another question");
         if (shared) {
           if (!task.requested_by) throw new Error("this task was not started by a person, so nobody can approve this; it can only be refused");
-          const byRequester = withCode.filter(({ principal }) => principal.id === task.requested_by);
-          if (byRequester.length === 0) throw new Error(`only ${task.requested_by}, who requested this task, can approve it`);
-          deciding = byRequester.at(-1)!;
-        } else {
-          deciding = withCode.at(-1)!;
+          approvals = approvals.filter(({ principal }) => principal.id === task.requested_by);
+          if (approvals.length === 0) throw new Error(`only ${task.requested_by}, who requested this task, can approve it`);
         }
+        deciding = approvals.at(-1)!;
+        // The approval has to be that person's last word. If they said anything after it, they may
+        // have been taking it back, and there is no reading that safely.
+        const lastWord = read.filter(({ principal }) => principal.id === deciding.principal.id).at(-1)!;
+        if (lastWord.event.id !== deciding.event.id) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
       }
       intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
@@ -955,7 +974,8 @@ export function readDecision(text: string, code: string): "allow" | "deny" | und
   if (!new RegExp(`(?<![A-Za-z0-9])${code}(?![A-Za-z0-9])`, "i").test(text)) return undefined;
   // An approval is the whole message and nothing else (apart from @-mentions and punctuation):
   // "approve CODE". Anything longer could be saying the opposite ("do not approve CODE").
-  const bare = text.replace(/@[^\s@]+/g, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
+  // Only mentions at the start are addressing; "@5pm" at the end is a condition, not a name.
+  const bare = text.replace(/^(\s*@[^\s@]+)+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
   if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
   // A message that mentions the code together with a refusing or negating word is a refusal.
   if (/deny|denied|refuse|reject|don'?t|do not|not|never|no\b|stop|cancel|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";

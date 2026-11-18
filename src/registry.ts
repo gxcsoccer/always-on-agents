@@ -152,7 +152,21 @@ export class Registry extends DurableObject<Env> {
       sql.exec("DELETE FROM tenant_usage WHERE day < ?", new Date(Date.now() - 40 * 86_400_000).toISOString().slice(0, 10));
     }
     const used = sql.exec<{ tokens: number }>("SELECT tokens FROM tenant_usage WHERE tenant = ? AND day = ?", tenant, day).toArray()[0]?.tokens ?? 0;
-    return { allowed: used < TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET };
+    // Allowed if the total, including what was just added, is still within the budget.
+    return { allowed: used <= TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET };
+  }
+
+  /** Corrects a reservation to what was actually used. May be negative; the total never goes below zero. */
+  async adjustUsage(tenant: string, delta: number): Promise<void> {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    const day = new Date().toISOString().slice(0, 10);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO tenant_usage (tenant, day, tokens) VALUES (?, ?, MAX(0, ?)) ON CONFLICT(tenant, day) DO UPDATE SET tokens = MAX(0, tokens + ?)",
+      tenant,
+      day,
+      Math.floor(delta),
+      Math.floor(delta),
+    );
   }
 
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */

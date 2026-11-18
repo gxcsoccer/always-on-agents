@@ -23,6 +23,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env";
 import { githubTokenFor } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
+import { registry } from "../../registry";
 import { BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
 
 // Lets the container upload and download one checkpoint object in R2, and nothing else.
@@ -96,7 +97,7 @@ export interface TaskState {
     asked_at: number;
   };
   /** Answers for held network actions, keyed by the exact request they were given for. Used once. */
-  grants: Record<string, { state: "allow" | "deny"; reason: string; until: number }>;
+  grants: Record<string, { state: "allow" | "deny"; reason: string; until: number; holder_seen_at?: number }>;
   /** Counts approval requests, so each gets its own id. */
   asks: number;
   brain?: string;
@@ -432,6 +433,8 @@ export class TaskSandbox extends DurableObject<Env> {
         state: decision,
         reason,
         until: Date.now() + GRANT_TTL_MS,
+        // The holder must still be there to collect: it is judged by when it was last seen.
+        holder_seen_at: state.pending.polled_at ?? state.pending.asked_at,
       };
     }
     state.inbox.push({ at: Date.now(), kind: "answered", body: { decision, reason, tool_use_id: state.pending.id } });
@@ -484,7 +487,12 @@ export class TaskSandbox extends DurableObject<Env> {
     if ((state.model_calls ?? 0) >= MAX_MODEL_CALLS_PER_TASK) return false;
     state.model_calls = (state.model_calls ?? 0) + 1;
     this.#save(state);
-    return true;
+    // A worker already running must stop spending when its tenant's daily budget is gone. Its own
+    // token counts are not known here, so each call is charged an estimate; the Brain adds the
+    // worker's reported total when the task ends.
+    const tenant = state.brain?.split(":")[0];
+    if (!tenant) return true;
+    return (await registry(this.env).recordUsage(tenant, 0)).allowed;
   }
 
   /**
@@ -500,7 +508,8 @@ export class TaskSandbox extends DurableObject<Env> {
     if (grant) {
       delete state.grants[requestId];
       this.#save(state);
-      if (grant.until > Date.now() && ACTIVE.has(state.phase)) return { state: grant.state, reason: grant.reason };
+      const present = Date.now() - (grant.holder_seen_at ?? 0) <= PROXY_ABANDONED_MS;
+      if (grant.until > Date.now() && present && ACTIVE.has(state.phase)) return { state: grant.state, reason: grant.reason };
       return { state: "deny", reason: "the approval expired before it was used" };
     }
     if (state.pending?.source === "proxy" && state.pending.key === requestId) {
@@ -786,8 +795,9 @@ export class TaskSandbox extends DurableObject<Env> {
       }
     }
     const running = this.#container.running;
-    // Touch the container: a request to it is what counts as activity.
-    if (running) await this.#readTail(PID_PATH, 32).catch(() => undefined);
+    // Touch the container: a request to it is what counts as activity. Not once it is overdue:
+    // from then on nothing the guest wrote is read again.
+    if (running && !overdue) await this.#readTail(PID_PATH, 32).catch(() => undefined);
 
     // Every await is done. From here to #save nothing can interleave, so this cannot overwrite
     // a state that a callback settled in the meantime.
@@ -917,6 +927,8 @@ export class TaskSandbox extends DurableObject<Env> {
   async #settle(source: "callback" | "alarm"): Promise<void> {
     const before = this.#state();
     if (!before || !ACTIVE.has(before.phase)) return;
+    // Past its lifetime a task is ended by the alarm, without looking at its files.
+    if (Date.now() - before.created_at > MAX_LIFETIME_MS) return;
 
     let exitCode: number | undefined;
     let lost: string | undefined;

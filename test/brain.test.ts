@@ -278,6 +278,9 @@ describe("tasks and approvals", () => {
     expect(readDecision("approve AB12? no, wait", "AB12")).toBe("deny");
     expect(readDecision("I disapprove AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve AB12 and also the next one", "AB12")).toBeUndefined();
+    // A trailing "@5pm" is a condition, not a mention to strip.
+    expect(readDecision("approve AB12 @5pm", "AB12")).toBeUndefined();
+    expect(readDecision("@agent @bot approve AB12", "AB12")).toBe("allow");
     expect(readDecision("approve AB123", "AB12")).toBeUndefined();
     expect(readDecision("the code is AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve ZZ99", "AB12")).toBeUndefined();
@@ -361,7 +364,7 @@ describe("tasks and approvals", () => {
 
   it("does not approve on a yes that does not quote the code", async () => {
     const { stub, id } = await taskAwaitingApproval();
-    expect((await reply(stub, id, "bob", "@agent yes, go ahead")).error).toMatch(/says just "approve/);
+    expect((await reply(stub, id, "bob", "@agent yes, go ahead")).error).toMatch(/no reply so far is an approval/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
@@ -376,7 +379,7 @@ describe("tasks and approvals", () => {
     await scope.stub.taskEvent(id, 1, "needs_input", ask);
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "bob said yes" })], [say("")], [say("")]);
     await wake(scope.stub);
-    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/has not been delivered|nobody here has answered|says just/);
+    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/has not been delivered|nobody here has answered|no reply so far/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
@@ -394,10 +397,24 @@ describe("tasks and approvals", () => {
     expect(await answersSent(id)).toHaveLength(0);
   });
 
-  it("lets any member refuse, without the code", async () => {
-    const { stub, id } = await taskAwaitingApproval();
-    expect(await reply(stub, id, "carol", "@agent no, don't", "deny")).toMatchObject({ ok: true, decision: "deny", decided_by: "carol" });
+  it("lets any member refuse, by saying so with the code", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    expect(await reply(stub, id, "carol", `@agent deny ${code}`, "deny")).toMatchObject({ ok: true, decision: "deny", decided_by: "carol" });
     expect((await answersSent(id))[0]).toMatchObject({ decision: "deny", questionId: "q-1" });
+  });
+
+  it("does not turn an unrelated message into a refusal", async () => {
+    const { stub, id } = await taskAwaitingApproval();
+    expect((await reply(stub, id, "bob", "@agent what's the status?", "deny")).error).toMatch(/no reply so far refuses/);
+    expect(await answersSent(id)).toHaveLength(0);
+    expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
+  });
+
+  it("does not approve when the requester said anything after approving", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`@agent approve ${code}`, { user: "bob", session_key: "chat" }));
+    expect((await reply(stub, id, "bob", "@agent actually hold on")).error).toMatch(/said something after approving/);
+    expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("does not let a decision be given from another conversation", async () => {
@@ -421,7 +438,7 @@ describe("tasks and approvals", () => {
     await stub.taskEvent(id, 2, "needs_input", { source: "gate", id: "q-2", command: "rm -rf /" });
     model.replies([say("")]);
     await wake(stub);
-    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/says just "approve/);
+    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/no reply so far is an approval/);
     expect(await answersSent(id)).toHaveLength(1);
   });
 

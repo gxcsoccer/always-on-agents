@@ -18,6 +18,8 @@ const HOLD_POLL_MS = 2_000;
 const MAX_MODEL_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_PUSH_BYTES = 64 * 1024 * 1024;
 const ZERO = /^0+$/;
+/** Fields whose value the provider would fetch. */
+const REMOTE_KEYS = new Set(["image_url", "file_url", "server_url", "url", "file_id", "connector_id", "container"]);
 /** Input items a coding agent produces by itself: its messages, its reasoning, calls to its own tools. */
 const LOCAL_ITEM_TYPES = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"]);
 
@@ -91,6 +93,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     if (Array.isArray(input) && input.some((item) => item === null || typeof item !== "object" || !LOCAL_ITEM_TYPES.has(item.type ?? "message"))) {
       return this.#refuse(request, url, "the request contains an item type that is not allowed from this sandbox");
     }
+    // Nor may anything in the request point the provider at an address to fetch: an image or file
+    // given by URL is the provider making a request the guest chose. Inline data is fine.
+    if (hasRemoteReference(parsed)) return this.#refuse(request, url, "the request refers to a remote URL, which is not allowed from this sandbox");
     if (!(await this.#task.countModelCall())) return new Response("this task has used its model call allowance\n", { status: 429 });
     return fetch(url, { method: "POST", headers, body, redirect: "manual" });
   }
@@ -217,6 +222,17 @@ export function describePush(repo: string, refs: RefUpdate[]): string {
     return `move ${name} from ${short(r.old)} to ${short(r.new)}`;
   });
   return `push to ${repo}: ${parts.join("; ")}`;
+}
+
+/** True if any image, file or server in the request is given as a URL to fetch rather than inline. */
+function hasRemoteReference(value: unknown, key = "", depth = 0): boolean {
+  if (depth > 40) return true;
+  if (typeof value === "string") return REMOTE_KEYS.has(key) && !value.startsWith("data:");
+  if (Array.isArray(value)) return value.some((entry) => hasRemoteReference(entry, key, depth + 1));
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).some(([name, entry]) => hasRemoteReference(entry, name, depth + 1));
+  }
+  return false;
 }
 
 /** Reads a request body, giving up (and returning undefined) as soon as it exceeds the limit. */

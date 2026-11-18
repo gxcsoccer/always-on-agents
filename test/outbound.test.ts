@@ -124,8 +124,12 @@ describe("the model key", () => {
     expect((await withInput([{ type: "mcp_approval_response", approve: true, approval_request_id: "x" }])).status).toBe(403);
     expect((await withInput([{ type: "mcp_list_tools", server_label: "x", tools: [] }])).status).toBe(403);
     expect((await withInput(["a string item"])).status).toBe(403);
+    // An image by URL would have the provider fetch an address the guest chose; inline data is fine.
+    const image = (image_url: string) => [{ role: "user", content: [{ type: "input_image", image_url }] }];
+    expect((await withInput(image("https://attacker.example/x.png?leak=secret"))).status).toBe(403);
+    expect((await withInput(image("data:image/png;base64,AAAA"))).status).toBe(200);
     expect((await send("https://model.test/v1/responses/compact", { method: "POST", body: JSON.stringify({ model: "test-model" }) })).status).toBe(403);
-    expect(forwarded).toHaveLength(2);
+    expect(forwarded).toHaveLength(3);
   });
 
   it("pays only for the configured model, on the model endpoint, within the task's allowance", async () => {
