@@ -62,9 +62,10 @@ describe("reading a push", () => {
   });
 
   it("describes a push in words a person can decide on", () => {
-    expect(describePush("acme/demo", [{ old: A, new: B, ref: "refs/heads/main" }])).toBe("push to acme/demo: move branch main from aaaaaaa to bbbbbbb");
+    // Commit ids are shown whole: this line is what a person approves.
+    expect(describePush("acme/demo", [{ old: A, new: B, ref: "refs/heads/main" }])).toBe(`push to acme/demo: move branch main from ${A} to ${B}`);
     expect(describePush("acme/demo", [{ old: A, new: ZERO, ref: "refs/heads/old" }])).toContain("delete branch old");
-    expect(describePush("acme/demo", [{ old: ZERO, new: B, ref: "refs/tags/v1" }])).toContain("create tag v1 at bbbbbbb");
+    expect(describePush("acme/demo", [{ old: ZERO, new: B, ref: "refs/tags/v1" }])).toContain(`create tag v1 at ${B}`);
   });
 
   it("recognises git endpoints and nothing else on github.com", () => {
@@ -108,6 +109,17 @@ describe("the model key", () => {
     expect(forwarded).toHaveLength(1);
     expect(forwarded[0].headers.get("authorization")).toBe("Bearer test-key");
     expect(JSON.parse(forwarded[0].body)).toEqual({ model: "test-model", input: "hi" });
+  });
+
+  it("does not let the guest have the provider reach out on its behalf", async () => {
+    const { send } = await proxyFor();
+    const withTools = (tools: unknown) => send("https://model.test/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input: "hi", tools }) });
+    expect((await withTools([{ type: "function", name: "bash" }])).status).toBe(200);
+    expect((await withTools([{ type: "mcp", server_url: "https://attacker.example/mcp" }])).status).toBe(403);
+    expect((await withTools([{ type: "function", name: "bash" }, { type: "web_search" }])).status).toBe(403);
+    expect((await withTools("not a list")).status).toBe(403);
+    expect((await send("https://model.test/v1/responses/compact", { method: "POST", body: JSON.stringify({ model: "test-model" }) })).status).toBe(403);
+    expect(forwarded).toHaveLength(1);
   });
 
   it("pays only for the configured model, on the model endpoint, within the task's allowance", async () => {

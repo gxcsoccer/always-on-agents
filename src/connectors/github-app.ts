@@ -39,7 +39,8 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string): Pr
     const body = (await response.json()) as { token: string; expires_at: string; repositories?: { full_name?: string }[] };
     // The request names the repository without its owner. Check the token is for the one we mean:
     // two owners can each have a repository of the same name.
-    if (!body.repositories?.some((r) => r.full_name?.toLowerCase() === repo.toLowerCase())) continue;
+    // and it must be for that repository alone.
+    if (body.repositories?.length !== 1 || body.repositories[0].full_name?.toLowerCase() !== repo.toLowerCase()) continue;
     return { token: body.token, expires_at: Date.parse(body.expires_at) };
   }
   return undefined;

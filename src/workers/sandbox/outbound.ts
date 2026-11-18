@@ -68,13 +68,21 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const bytes = await readBounded(request, MAX_MODEL_REQUEST_BYTES);
     if (!bytes) return this.#refuse(request, url, "model request is too large");
     const body = new TextDecoder().decode(bytes);
-    let model: unknown;
+    let parsed: { model?: unknown; tools?: unknown };
     try {
-      model = JSON.parse(body).model;
+      parsed = JSON.parse(body);
     } catch {
       return this.#refuse(request, url, "model request is not JSON");
     }
-    if (model !== this.env.WORKER_MODEL) return this.#refuse(request, url, `model ${String(model)} is not allowed from this sandbox`);
+    if (parsed === null || typeof parsed !== "object") return this.#refuse(request, url, "model request is not an object");
+    if (parsed.model !== this.env.WORKER_MODEL) return this.#refuse(request, url, `model ${String(parsed.model)} is not allowed from this sandbox`);
+    // Only tools the agent runs itself, inside the sandbox. A hosted tool (a remote MCP server, web
+    // search, a code interpreter) would have the provider reach out on the guest's behalf, which
+    // is a way around having no network.
+    const tools = parsed.tools ?? [];
+    if (!Array.isArray(tools) || tools.some((tool) => tool?.type !== "function" && tool?.type !== "custom")) {
+      return this.#refuse(request, url, "only function tools may be declared from this sandbox");
+    }
     if (!(await this.#task.countModelCall())) return new Response("this task has used its model call allowance\n", { status: 429 });
     return fetch(url, { method: "POST", headers, body, redirect: "manual" });
   }
@@ -192,7 +200,8 @@ export function parseReceivePack(body: Uint8Array): RefUpdate[] | undefined {
 
 /** One line a person can read and decide on. */
 export function describePush(repo: string, refs: RefUpdate[]): string {
-  const short = (sha: string) => sha.slice(0, 7);
+  // Full ids: this line is what a person approves, and a prefix is not a commit.
+  const short = (sha: string) => sha;
   const parts = refs.map((r) => {
     const name = r.ref.replace(/^refs\/heads\//, "branch ").replace(/^refs\/tags\//, "tag ");
     if (ZERO.test(r.new)) return `delete ${name}`;

@@ -92,6 +92,9 @@ export function normalize(type: string, payload: any): { repo: string; event: In
     const body: string = payload.comment?.body ?? "";
     // Comments that do not address the agent are other people's conversation.
     if (!MENTION.test(body) || sender.type === "Bot") return undefined;
+    // The agent's own comments carry a marker. When it posts under a person's token they come back
+    // looking like that person's words; they are not, and must never be read as a request or a reply.
+    if (body.includes("<!-- always-on-agent:")) return undefined;
     // Anyone can comment on a public repository. Only people with a standing in it can give the
     // agent work; a mention from anyone else is not acted on.
     if (!TRUSTED_ASSOCIATIONS.has(payload.comment?.author_association)) return undefined;

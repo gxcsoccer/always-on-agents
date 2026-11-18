@@ -65,4 +65,4 @@ export interface InboundEvent {
 }
 
 /** Events a worker sends back to the Brain that started it. */
-export type WorkerEventKind = "progress" | "needs_input" | "result" | "failed" | "lost" | "recovered";
+export type WorkerEventKind = "progress" | "needs_input" | "withdrawn" | "result" | "failed" | "lost" | "recovered";

@@ -499,22 +499,14 @@ export class BrainAgent extends DurableObject<Env> {
         if (!MEMORY_PATH.test(path) || path.includes("..")) throw new Error("path must look like notes/topic.md: lowercase letters, digits, - _ /");
         // instructions.md is read as instructions in every later run, so only a person who is a
         // member here may cause it to change. Text from a PR, a CI log or a worker cannot.
-        if (path === "instructions.md") {
-          const deciders = this.#deciders(run.id);
-          if (deciders.length === 0) throw new Error("instructions.md can only be changed at the request of a person in this conversation");
-          this.#audit(deciders.map((p) => p.id).join(","), "instructions.changed", { length: content.length });
-        }
+        if (path === "instructions.md") this.#audit(this.#instructionEditors(run.id).join(","), "instructions.changed", { length: content.length });
         const exists = this.#rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
         if (!exists && this.#rows<{ n: number }>("SELECT COUNT(*) AS n FROM memory")[0].n >= MAX_MEMORY_FILES) throw new Error("memory is full; delete something first");
         sql.exec("INSERT INTO memory (path, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at", path, content, Date.now());
         return { ok: true, path };
       },
       memoryDelete: (path) => {
-        if (path === "instructions.md") {
-          const deciders = this.#deciders(run.id);
-          if (deciders.length === 0) throw new Error("instructions.md can only be changed at the request of a person in this conversation");
-          this.#audit(deciders.map((p) => p.id).join(","), "instructions.deleted", {});
-        }
+        if (path === "instructions.md") this.#audit(this.#instructionEditors(run.id).join(","), "instructions.deleted", {});
         const existed = this.#rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
         sql.exec("DELETE FROM memory WHERE path = ?", path);
         return { ok: true, deleted: existed };
@@ -654,14 +646,16 @@ export class BrainAgent extends DurableObject<Env> {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be answered there");
 
-    let intent = task.answering ? (JSON.parse(task.answering) as { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string }) : undefined;
+    let intent = task.answering ? (JSON.parse(task.answering) as { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number }) : undefined;
     if (!intent || intent.call_id !== callId) {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
-      const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; delivered: boolean };
-      if (!pending.delivered) throw new Error("the question could not be delivered to anyone in this conversation, so it cannot be answered here");
+      const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
+      // "Asked" means the message actually went out, not merely that it was queued.
+      const asked = pending.ask ? this.#rows<Row>("SELECT status, sent_at FROM outbox WHERE idem = ?", pending.ask)[0] : undefined;
+      if (asked?.status !== "sent") throw new Error("the question has not been delivered to anyone in this conversation yet, so it cannot be answered");
 
       // Messages from members, sent after the question was put to them.
-      const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at >= ? ORDER BY id", run.id, pending.asked_at)
+      const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at >= ? ORDER BY id", run.id, asked.sent_at)
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
         .filter(({ principal }) => this.#isDecider(principal));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
@@ -669,9 +663,19 @@ export class BrainAgent extends DurableObject<Env> {
       const shared = this.#scope().kind !== "user";
       let deciding = replies.at(-1)!;
       if (decision === "allow") {
-        const code = new RegExp(`(^|[^A-Za-z0-9])${pending.code}([^A-Za-z0-9]|$)`, "i");
-        const withCode = replies.filter(({ event }) => code.test(event.text ?? ""));
-        if (withCode.length === 0) throw new Error(`an approval must quote the code ${pending.code} from the question; nobody has`);
+        if (pending.truncated) throw new Error("the action is too long to be shown in full, so it cannot be approved; it can only be refused");
+        // What the person wrote decides, not what the model made of it. Only "approve <code>" (or
+        // its Chinese equivalents) is an approval; "deny <code>" carries the same code and is not.
+        const withCode = replies.filter(({ event }) => readDecision(event.text ?? "", pending.code) === "allow");
+        if (withCode.length === 0) {
+          if (replies.some(({ event }) => readDecision(event.text ?? "", pending.code) === "deny")) throw new Error("the reply refuses this; pass on a denial, not an approval");
+          throw new Error(`an approval must say "approve ${pending.code}"; nobody has`);
+        }
+        // One message approves one question.
+        const used = new Set(this.#rows<{ event: number | null }>("SELECT json_extract(answering, '$.deciding_event') AS event FROM tasks WHERE answering IS NOT NULL").map((r) => r.event));
+        const unused = withCode.filter(({ event }) => !used.has(event.id));
+        if (unused.length === 0) throw new Error("that reply was already used to approve another question");
+        withCode.splice(0, withCode.length, ...unused);
         if (shared) {
           if (!task.requested_by) throw new Error("this task was not started by a person, so nobody can approve this; it can only be refused");
           const byRequester = withCode.filter(({ principal }) => principal.id === task.requested_by);
@@ -681,7 +685,7 @@ export class BrainAgent extends DurableObject<Env> {
           deciding = withCode.at(-1)!;
         }
       }
-      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id };
+      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
       this.#audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id });
@@ -750,26 +754,38 @@ export class BrainAgent extends DurableObject<Env> {
         return { known: true, wake: false, terminal: false };
       }
       if (kind === "recovered") return { known: true, wake: false, terminal: false };
+      if (kind === "withdrawn") {
+        // The held request gave up; its question no longer stands.
+        if (task.status === "needs_input" && task.pending && JSON.parse(task.pending).id === body.id) {
+          this.#sql.exec("UPDATE tasks SET status = 'running', pending = NULL, updated_at = ? WHERE id = ?", Date.now(), taskId);
+        }
+        return { known: true, wake: false, terminal: false };
+      }
       if (kind === "needs_input") {
         // The question is put to people by this code, not by the model: what they are shown is
         // exactly what the worker is held on, and the code ties their reply to this one question.
-        const code = questionCode();
+        // No two open questions in this scope share a code, so one reply cannot answer two of them.
+        const open = new Set(this.#rows<{ code: string | null }>("SELECT json_extract(pending, '$.code') AS code FROM tasks WHERE pending IS NOT NULL").map((r) => r.code));
+        let code = questionCode();
+        while (open.has(code)) code = questionCode();
         const what = describeRequest(body);
         const session = this.#rows<Row>("SELECT id FROM sessions WHERE session_key = ?", task.session_key)[0];
-        let delivered = false;
-        if (session) {
-          try {
-            this.#enqueueMessage(`ask:${taskId}:${seq}`, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\nTo approve, reply: approve ${code}\nTo refuse, reply: deny ${code}`);
-            delivered = true;
-          } catch {
-            // No reply address: the question reaches nobody, so it cannot be approved.
-          }
+        const truncated = body.truncated === true;
+        let ask: string | undefined = `ask:${taskId}:${seq}`;
+        try {
+          if (!session) throw new Error("no conversation");
+          const how = truncated ? `This is too long to show in full, so it cannot be approved.\nTo refuse, reply: deny ${code}` : `To approve, reply: approve ${code}\nTo refuse, reply: deny ${code}`;
+          this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`);
+        } catch {
+          // No reply address: the question reaches nobody, so it cannot be approved.
+          ask = undefined;
         }
-        body = { ...body, code, asked_at: Date.now(), delivered, what };
+        body = { ...body, code, asked_at: Date.now(), ask, delivered: ask !== undefined, what };
         applied = this.#setTask(taskId, "needs_input", { pending: JSON.stringify(body) });
       }
       else if (kind === "result") applied = this.#setTask(taskId, "succeeded", { result: JSON.stringify(body) });
-      else applied = this.#setTask(taskId, kind, { result: JSON.stringify(body) });
+      else if (kind === "failed" || kind === "lost") applied = this.#setTask(taskId, kind, { result: JSON.stringify(body) });
+      else return { known: true, wake: false, terminal: false };
       if (!applied) return { known: true, wake: false, terminal: false };
 
       // What the worker spent counts against the same daily budget as the Brain's own calls.
@@ -799,6 +815,19 @@ export class BrainAgent extends DurableObject<Env> {
    */
   #deciders(runId: string): Principal[] {
     return this.#runPrincipals(runId).filter((p) => this.#isDecider(p));
+  }
+
+  /**
+   * Who may be changing the standing instructions in this run, or an error. The run must have been
+   * started by members only: if a worker report, a CI event or any other untrusted text is in the
+   * same batch, the model may be acting on that text rather than on the member's words.
+   */
+  #instructionEditors(runId: string): string[] {
+    const principals = this.#runPrincipals(runId);
+    if (principals.length === 0 || !principals.every((p) => this.#isDecider(p))) {
+      throw new Error("instructions.md can only be changed in a run started solely by a person's request");
+    }
+    return [...new Set(principals.map((p) => p.id))];
   }
 
   #isDecider(principal: Principal): boolean {
@@ -905,7 +934,18 @@ function renderEvent(event: InboxRow): string {
 
 /** What a held request would do, in words. Built from the worker's structured report. */
 function describeRequest(body: Record<string, unknown>): string {
-  return body.source === "proxy" ? `${String(body.summary ?? `${body.action} on ${body.resource}`)}.` : `run this command:\n${String(body.command ?? "").slice(0, 1_500)}`;
+  return body.source === "proxy" ? `${String(body.summary ?? `${body.action} on ${body.resource}`)}.` : `run this command:\n${String(body.command ?? "")}`;
+}
+
+/**
+ * What a person's reply says about the question with this code: an approval, a refusal, or nothing.
+ * A refusal is checked first because "不同意 X" contains "同意 X".
+ */
+export function readDecision(text: string, code: string): "allow" | "deny" | undefined {
+  const quoted = (verbs: string) => new RegExp(`(?:${verbs})[\\s:：]*${code}(?![A-Za-z0-9])`, "i").test(text);
+  if (quoted("deny|refuse|reject|拒绝|不同意|不批准|否决")) return "deny";
+  if (quoted("(?<![A-Za-z])approve|同意|批准")) return "allow";
+  return undefined;
 }
 
 /** Four characters a person can read back without ambiguity (no 0/O, 1/I/L). */

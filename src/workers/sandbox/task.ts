@@ -92,6 +92,8 @@ export interface TaskState {
     refs?: RefUpdate[];
     /** Identifies the exact request being held. An approval is for this and nothing else. */
     key?: string;
+    /** When the held request last checked in. A request that stops checking in is gone. */
+    polled_at?: number;
     asked_at: number;
   };
   /** Answers for held network actions, keyed by the exact request they were given for. Used once. */
@@ -102,7 +104,7 @@ export interface TaskState {
   model_calls: number;
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
-  github_token?: { token: string; expires_at: number };
+  github_token?: { token: string; expires_at: number; source: string };
   /** When the current `starting` phase began. Startup is timed from here, not from task creation. */
   starting_since: number;
   /** Reports not yet acknowledged by the Brain, in order. Delivered at least once. */
@@ -114,7 +116,7 @@ export interface TaskState {
   /** How many times the task was restored into a new container. */
   recoveries: number;
   /** For the in-process gate: which question we opened for which of its tool calls. */
-  gate_questions: Record<string, string>;
+  gate_questions: Record<string, { id: string; command: string }>;
   /** Answers, keyed by question id. Kept here, outside the container, so the guest cannot write one. */
   decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number }>;
   /** Stand-in for the Brain's inbox: everything the container pushed to us. */
@@ -170,6 +172,11 @@ const CHECK_INTERVAL_MS = 20 * 1_000;
 // How long the proxy holds a request that needs approval, and how long an approval stays usable.
 // A push is several HTTP requests; the grant has to cover all of them and nothing after.
 const GRANT_TTL_MS = 2 * 60 * 1_000;
+/** How long the proxy may hold a request for an answer, enforced here whatever the poller does. */
+const PROXY_HOLD_MS = 50 * 60 * 1_000;
+/** The holder polls every two seconds. Silence this long means it is gone. */
+const PROXY_ABANDONED_MS = 60 * 1_000;
+const MAX_SHOWN_COMMAND = 3_000;
 // The gate waits this long for an answer, then blocks the call.
 const MAX_WAIT_FOR_ANSWER_S = 55 * 60;
 const CA_PATH = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
@@ -331,7 +338,7 @@ export class TaskSandbox extends DurableObject<Env> {
   async status(): Promise<TaskState | { error: string }> {
     const state = this.#state();
     if (!state) return { error: "no such task" };
-    return { ...state, token: "(hidden)", github_token: state.github_token ? { token: "(hidden)", expires_at: state.github_token.expires_at } : undefined };
+    return { ...state, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined };
   }
 
   /** Called through Outbound when the container reports or asks. The reply goes back to the container. */
@@ -344,9 +351,11 @@ export class TaskSandbox extends DurableObject<Env> {
 
     // The gate polls for its answer. Not recorded in the inbox: it would be one entry every two seconds.
     // It asks by its own call id; the answer is filed under the question id we made for that call.
+    // An answer is for the command the question showed; the same call id with another command gets none.
+    const command = String(request.command ?? "");
     if (kind === "decision") {
       const question = callId ? state.gate_questions[callId] : undefined;
-      const answer = question ? state.decisions[question] : undefined;
+      const answer = question && question.command === command ? state.decisions[question.id] : undefined;
       return answer ? { ok: true, decision: answer.decision, reason: answer.reason } : { ok: true, decision: "pending" };
     }
 
@@ -358,16 +367,17 @@ export class TaskSandbox extends DurableObject<Env> {
       }
       // The id of a question is ours, never the guest's: a guest that reuses or invents a call id
       // cannot make an old answer apply to a new question.
-      if (state.gate_questions[callId]) {
+      if (state.gate_questions[callId]?.command === command) {
         this.#save(state);
         return { ok: true };
       }
       state.asks += 1;
       const id = `q-${state.asks}`;
-      state.gate_questions[callId] = id;
+      state.gate_questions[callId] = { id, command };
       state.phase = "needs_input";
-      state.pending = { id, source: "gate", tool_name: request.tool_name, command: request.command, asked_at: Date.now() };
-      this.#emit(state, "needs_input", { source: "gate", id, command: String(request.command ?? "").slice(0, 2_000) });
+      state.pending = { id, source: "gate", tool_name: request.tool_name, command, asked_at: Date.now() };
+      // People are shown the whole command or told that they are not; never a silent prefix.
+      this.#emit(state, "needs_input", { source: "gate", id, command: command.slice(0, MAX_SHOWN_COMMAND), truncated: command.length > MAX_SHOWN_COMMAND });
     } else if (kind === "progress") {
       this.#emit(state, "progress", { message: String((body as { message?: unknown })?.message ?? "").slice(0, 1_000) });
     }
@@ -389,7 +399,11 @@ export class TaskSandbox extends DurableObject<Env> {
     if (decision !== "allow" && decision !== "deny") return { ok: false, error: "decision must be allow or deny" };
     // Answering the same question again is a retry whose first attempt already landed.
     if (questionId !== undefined && state.decisions[questionId]) return { ok: true };
-    if (state.phase !== "needs_input" || !state.pending) return { ok: false, error: `task is ${state.phase}, nothing to answer` };
+    this.#expireHold(state);
+    if (state.phase !== "needs_input" || !state.pending) {
+      this.#save(state);
+      return { ok: false, error: `task is ${state.phase}, nothing to answer` };
+    }
     // A late answer to an earlier question must not approve whatever is pending now.
     if (questionId !== undefined && questionId !== state.pending.id) {
       return { ok: false, error: "that question is no longer pending" };
@@ -434,12 +448,15 @@ export class TaskSandbox extends DurableObject<Env> {
     if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY ? undefined : this.env.GITHUB_TOKEN || undefined;
     const [tenant, kind, ...rest] = state.brain.split(":");
     if (kind !== "repo" || rest.join(":").toLowerCase() !== repo) return undefined;
-    if (state.github_token && state.github_token.expires_at - Date.now() > 5 * 60_000) return state.github_token.token;
+    // Checked before the cache: a credential issued under an earlier configuration is not lent on.
+    if (Boolean(this.env.GITHUB_APP_ID) !== Boolean(this.env.GITHUB_APP_PRIVATE_KEY)) return undefined;
+    const source = this.env.GITHUB_APP_ID ? `app:${this.env.GITHUB_APP_ID}` : "token";
+    if (state.github_token && state.github_token.source === source && state.github_token.expires_at - Date.now() > 5 * 60_000) return state.github_token.token;
     const issued = await githubTokenFor(this.env, tenant, repo);
     if (!issued) return undefined;
     const fresh = this.#state();
     if (fresh) {
-      fresh.github_token = issued;
+      fresh.github_token = { ...issued, source };
       this.#save(fresh);
     }
     return issued.token;
@@ -471,13 +488,18 @@ export class TaskSandbox extends DurableObject<Env> {
       if (grant.until > Date.now() && ACTIVE.has(state.phase)) return { state: grant.state, reason: grant.reason };
       return { state: "deny", reason: "the approval expired before it was used" };
     }
-    if (state.pending?.source === "proxy" && state.pending.key === requestId) return { state: "pending", reason: "" };
+    if (state.pending?.source === "proxy" && state.pending.key === requestId) {
+      // Seen again: the request is still being held.
+      state.pending.polled_at = Date.now();
+      this.#save(state);
+      return { state: "pending", reason: "" };
+    }
     // Something else is waiting for an answer, or the task is not running: wait for our turn.
     if (state.phase !== "running") {
       return ACTIVE.has(state.phase) ? { state: "pending", reason: "" } : { state: "deny", reason: `task is ${state.phase}` };
     }
     state.asks += 1;
-    state.pending = { id: `q-${state.asks}`, source: "proxy", action, resource, refs, key: requestId, asked_at: Date.now() };
+    state.pending = { id: `q-${state.asks}`, source: "proxy", action, resource, refs, key: requestId, asked_at: Date.now(), polled_at: Date.now() };
     state.phase = "needs_input";
     const body = { source: "proxy", id: state.pending.id, action, resource, refs, summary: describePush(resource, refs) };
     state.inbox.push({ at: Date.now(), kind: "needs_input", body });
@@ -491,13 +513,28 @@ export class TaskSandbox extends DurableObject<Env> {
   async withdraw(requestId: string): Promise<void> {
     const state = this.#state();
     if (!state) return;
+    this.#withdraw(state, requestId);
+    this.#save(state);
+    this.ctx.waitUntil(this.#flush());
+  }
+
+  #withdraw(state: TaskState, requestId: string): void {
     delete state.grants[requestId];
     if (state.pending?.source === "proxy" && state.pending.key === requestId) {
       state.inbox.push({ at: Date.now(), kind: "withdrawn", body: { id: state.pending.id } });
+      // The Brain is told, so it stops showing a question nobody can answer any more.
+      this.#emit(state, "withdrawn", { id: state.pending.id });
       state.pending = undefined;
       if (state.phase === "needs_input") state.phase = "running";
     }
-    this.#save(state);
+  }
+
+  /** A held request whose time is up, or whose handler has stopped checking in, no longer stands. */
+  #expireHold(state: TaskState): void {
+    const pending = state.pending;
+    if (pending?.source !== "proxy" || !pending.key) return;
+    const now = Date.now();
+    if (now - pending.asked_at > PROXY_HOLD_MS || now - (pending.polled_at ?? pending.asked_at) > PROXY_ABANDONED_MS) this.#withdraw(state, pending.key);
   }
 
   /** Stops the task for good and discards its container. */
@@ -715,7 +752,14 @@ export class TaskSandbox extends DurableObject<Env> {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    if (ACTIVE.has(before.phase)) await this.#settle("alarm");
+    if (ACTIVE.has(before.phase)) {
+      try {
+        await this.#settle("alarm");
+      } catch (err) {
+        // Whatever is wrong with the task's files, the limits below still have to be enforced.
+        console.log(JSON.stringify({ event: "settle_failed", task: before.id, error: String(err) }));
+      }
+    }
     const running = this.#container.running;
     // Touch the container: a request to it is what counts as activity.
     if (running) await this.#readOptional(PID_PATH).catch(() => undefined);
@@ -725,6 +769,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const state = this.#state();
     if (!state) return;
     state.checks.push({ at: Date.now(), phase: state.phase, container_running: running });
+    this.#expireHold(state);
     const age = Date.now() - state.created_at;
     const alive = ACTIVE.has(state.phase) || state.phase === "idle" || state.phase === "starting";
     let expired = false;
@@ -978,7 +1023,7 @@ function summarize(jsonl: string) {
       const message = event.message;
       summary.stop_reason = message.stopReason;
       summary.error = message.errorMessage;
-      summary.text = (message.content ?? [])
+      summary.text = (Array.isArray(message.content) ? message.content : [])
         .filter((block: any) => block?.type === "text")
         .map((block: any) => block.text ?? "")
         .join("");
