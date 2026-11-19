@@ -142,6 +142,12 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       return new Response(`push to ${git.repo} was not approved: ${verdict.reason}\n`, { status: 403 });
     }
     if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+    // The wait for a person can be long. Whether this task may still be lent a credential for the
+    // repository is asked again now, and the push goes out under that answer, not the one from
+    // before the wait: an operator may have withdrawn the task's access in the meantime.
+    const current = await this.#task.githubToken();
+    if (!current) return new Response(`push to ${git.repo} was approved, but this task is no longer allowed a credential for it\n`, { status: 403 });
+    headers.set("authorization", `Basic ${btoa(`x-access-token:${current}`)}`);
     return fetch(url, { method: "POST", headers, body, redirect: "manual" });
   }
 

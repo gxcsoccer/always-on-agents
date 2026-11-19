@@ -195,6 +195,15 @@ describe("git over the proxy", () => {
     expect(await recorded("authorize")).toHaveLength(0);
   });
 
+  it("does not send an approved push if the task's access to the repository was withdrawn while it waited", async () => {
+    // The credential is there when the push arrives, and gone by the time someone approves it.
+    const { send } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "pending", reason: "" }, { state: "allow", reason: "ok" }], tokenWithdrawnAfter: 1 });
+    const response = await push(send, "acme/demo", pushBody(`${A} ${B} refs/heads/main`));
+    expect(response.status).toBe(403);
+    expect(await response.text()).toMatch(/no longer allowed a credential/);
+    expect(forwarded).toHaveLength(0);
+  });
+
   it("holds a push until someone approves exactly those refs, then forwards it unchanged", async () => {
     const { send, recorded } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "pending", reason: "" }, { state: "allow", reason: "ok" }] });
     const body = pushBody(`${A} ${B} refs/heads/main`);

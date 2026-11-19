@@ -28,7 +28,7 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean }) {
+  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
@@ -42,6 +42,11 @@ export class FakeTask extends DurableObject {
     return this.#policy().ended !== true;
   }
   async githubToken() {
+    // A test can have the credential withdrawn after it has been asked for a number of times.
+    const asked = ((this.ctx.storage.kv.get("token_asks") as number | undefined) ?? 0) + 1;
+    this.ctx.storage.kv.put("token_asks", asked);
+    const limit = (this.#policy() as { tokenWithdrawnAfter?: number }).tokenWithdrawnAfter;
+    if (limit !== undefined && asked > limit) return undefined;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
   }
   async repository() {

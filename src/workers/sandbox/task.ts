@@ -507,19 +507,19 @@ export class TaskSandbox extends DurableObject<Env> {
     const [tenant, kind, ...rest] = state.brain.split(":");
     // Lent in the repository's own conversation, or in a group chat an operator has linked to this
     // very repository. Looked up each time, so removing the link stops the lending at once.
-    const own = kind === "repo" && rest.join(":").toLowerCase() === repo;
-    const linked = kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo;
-    if (!own && !linked) return undefined;
+    const entitled = async () => (kind === "repo" && rest.join(":").toLowerCase() === repo) || (kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo);
+    if (!(await entitled())) return undefined;
     // Looking the link up took a moment; the task may have ended meanwhile.
     const still = this.#state();
     if (!still || (!ACTIVE.has(still.phase) && still.phase !== "starting")) return undefined;
     // Checked before the cache: a credential issued under an earlier configuration is not lent on.
     if (Boolean(this.env.GITHUB_APP_ID) !== Boolean(this.env.GITHUB_APP_PRIVATE_KEY)) return undefined;
     const source = this.env.GITHUB_APP_ID ? `app:${this.env.GITHUB_APP_ID}` : "token";
-    if (state.github_token && state.github_token.source === source && state.github_token.expires_at - Date.now() > 5 * 60_000) return state.github_token.token;
+    if (still.github_token && still.github_token.source === source && still.github_token.expires_at - Date.now() > 5 * 60_000) return still.github_token.token;
     const issued = await githubTokenFor(this.env, tenant, repo);
     if (!issued) return undefined;
-    // Issuing took time. If the task ended meanwhile, the token is not handed over.
+    // Issuing took time. If the link was removed or the task ended meanwhile, the token is not handed over.
+    if (!(await entitled())) return undefined;
     const fresh = this.#state();
     if (!fresh || (!ACTIVE.has(fresh.phase) && fresh.phase !== "starting")) return undefined;
     fresh.github_token = { ...issued, source };
