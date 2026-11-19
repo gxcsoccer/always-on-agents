@@ -102,6 +102,29 @@ describe("pushes a task holds for approval", () => {
     expect(await stub.authorize("r5", "push", repo, move("c", "0"))).toMatchObject({ state: "pending" });
   });
 
+  it("never extends an approval for the task to tags or deletions, when given or when used", async () => {
+    const tagged = [...move("a", "b"), { ref: "refs/tags/v1", old: "0".repeat(40), new: "b".repeat(40) }];
+    // A push of a branch together with a tag, approved "for the task": it goes through, once.
+    const first = await runningTask();
+    await first.stub.authorize("r1", "push", repo, tagged);
+    await first.stub.answer("allow", "", "q-1", true);
+    expect(await first.stub.authorize("r1", "push", repo, tagged)).toMatchObject({ state: "allow" });
+    expect((await first.stub.status()).standing ?? []).toEqual([]);
+    expect(await first.stub.authorize("r2", "push", repo, move("b", "c"))).toMatchObject({ state: "pending" });
+    // Deleting a branch, approved "for the task", gives no leave to push it again.
+    const second = await runningTask();
+    await second.stub.authorize("r1", "push", repo, move("a", "0"));
+    await second.stub.answer("allow", "", "q-1", true);
+    await second.stub.authorize("r1", "push", repo, move("a", "0"));
+    expect(await second.stub.authorize("r2", "push", repo, move("0", "c"))).toMatchObject({ state: "pending" });
+    // A branch approved for the task does not cover a tag pushed later.
+    const third = await runningTask();
+    await third.stub.authorize("r1", "push", repo, move("a", "b"));
+    await third.stub.answer("allow", "", "q-1", true);
+    await third.stub.authorize("r1", "push", repo, move("a", "b"));
+    expect(await third.stub.authorize("r2", "push", repo, [{ ref: "refs/tags/v1", old: "0".repeat(40), new: "b".repeat(40) }])).toMatchObject({ state: "pending" });
+  });
+
   it("does not take a refusal, or a plain approval, as approval for the task", async () => {
     const { stub } = await runningTask();
     await stub.authorize("r1", "push", repo, move("a", "b"));

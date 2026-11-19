@@ -622,6 +622,19 @@ describe("tasks and approvals", () => {
     await reply(command.stub, command.id, "bob", `approve all ${command.code}`);
     expect((await answersSent(command.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
 
+    // Nor does a push that includes a tag: it is approved, once.
+    const scope = brain("chat");
+    model.replies([call("dispatch_task", { title: "release", brief: "tag it", repository: null })], [say("")]);
+    await scope.stub.ingest(message("@agent release", { user: "bob", session_key: "chat" }));
+    await wake(scope.stub);
+    const tagTask: string = (await scope.stub.inspect()).tasks[0].id;
+    await scope.stub.taskEvent(tagTask, 1, "needs_input", { ...pushAsk, refs: [...pushAsk.refs, { ref: "refs/tags/v1", old: "0".repeat(40), new: "b".repeat(40) }] });
+    model.replies([say("")]);
+    await wake(scope.stub);
+    const tagCode = (await scope.stub.inspect()).outbox.find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)![1];
+    await reply(scope.stub, tagTask, "bob", `approve all ${tagCode}`);
+    expect((await answersSent(tagTask)).at(-1)).toMatchObject({ decision: "allow", standing: false });
+
     expect(wantsStanding("全部批准 K7PW")).toBe(true);
     expect(wantsStanding("approve K7PW")).toBe(false);
   });

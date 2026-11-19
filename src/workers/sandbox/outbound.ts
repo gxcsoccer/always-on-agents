@@ -224,6 +224,14 @@ export function parseReceivePack(body: Uint8Array): RefUpdate[] | undefined {
 }
 
 /** One line a person can read and decide on. */
+/**
+ * Whether a push is the kind that may be approved for the rest of a task: updates or creations of
+ * branches only. A tag, a deletion, or anything mixed with one is always asked about by itself.
+ */
+export function standingEligible(refs: RefUpdate[]): boolean {
+  return refs.length > 0 && refs.every((r) => /^refs\/heads\/[^\s]+$/.test(r.ref) && !ZERO.test(r.new));
+}
+
 export function describePush(repo: string, refs: RefUpdate[]): string {
   // Full ids: this line is what a person approves, and a prefix is not a commit.
   const short = (sha: string) => sha;

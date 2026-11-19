@@ -23,6 +23,7 @@ import type { Env } from "../env";
 import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
+import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
 import { TOOLS, type ToolCall, type ToolHost, executeTool } from "./tools";
@@ -854,7 +855,9 @@ export class BrainAgent extends DurableObject<Env> {
       }
       // "For the rest of this task" is the approver's to say, in their own message; it is offered
       // only for pushes.
-      const standing = decision === "allow" && (pending as { source?: string }).source === "proxy" && wantsStanding(deciding.event.text ?? "");
+      // only for pushes that update branches, which is also the only kind it is offered for.
+      const asksAbout = pending as { source?: string; refs?: RefUpdate[] };
+      const standing = decision === "allow" && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
       intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
@@ -965,7 +968,7 @@ export class BrainAgent extends DurableObject<Env> {
             detail: body.source === "proxy" ? String(body.summary ?? `${body.action} on ${body.resource}`) : String(body.command ?? ""),
             can_approve: !truncated,
             ...(body.source === "proxy"
-              ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated }
+              ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated && standingEligible(Array.isArray(body.refs) ? (body.refs as RefUpdate[]) : []) }
               : {}),
           };
           this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);

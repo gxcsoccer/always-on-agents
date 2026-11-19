@@ -24,7 +24,7 @@ import type { Env } from "../../env";
 import { githubTokenFor } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
-import { BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
+import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
 
 // Lets the container upload and download one checkpoint object in R2, and nothing else.
 export { DirectoryBackupGateway } from "@cloudflare/sandbox";
@@ -463,8 +463,8 @@ export class TaskSandbox extends DurableObject<Env> {
       };
       // Approved for the rest of the task as well: later pushes of the same branches to the same
       // repository go through without asking. Never a deletion, and never anything else.
-      if (decision === "allow" && standing && state.pending.resource && state.pending.refs?.length) {
-        state.standing = [...(state.standing ?? []), { resource: state.pending.resource, refs: state.pending.refs.map((r) => r.ref) }];
+      if (decision === "allow" && standing && state.pending.resource && standingEligible(state.pending.refs ?? [])) {
+        state.standing = [...(state.standing ?? []), { resource: state.pending.resource, refs: (state.pending.refs ?? []).map((r) => r.ref) }];
       }
     }
     state.inbox.push({ at: Date.now(), kind: "answered", body: { decision, reason, tool_use_id: state.pending.id } });
@@ -570,7 +570,8 @@ export class TaskSandbox extends DurableObject<Env> {
     if (state.phase !== "running") {
       return ACTIVE.has(state.phase) ? { state: "pending", reason: "" } : { state: "deny", reason: `task is ${state.phase}` };
     }
-    const covered = (state.standing ?? []).some((grant) => grant.resource === resource && refs.length > 0 && refs.every((r) => grant.refs.includes(r.ref) && !/^0+$/.test(r.new)));
+    // The same test when it is used as when it was given: branches only, nothing deleted.
+    const covered = standingEligible(refs) && (state.standing ?? []).some((grant) => grant.resource === resource && refs.every((r) => grant.refs.includes(r.ref)));
     if (covered) {
       // Said once for this task. Still on record, and the Brain is told each time.
       const message = `under the standing approval for this task: ${describePush(resource, refs)}`;

@@ -311,7 +311,7 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
   // Closed: it says how it ended, and there is nothing left to press.
   if (outcome) {
     const ended = { approved: ["green", "已批准"], refused: ["red", "已拒绝"], withdrawn: ["grey", "已失效"] }[outcome.state];
-    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : outcome.state === "approved" && outcome.standing ? "已批准。这个任务之后推送同样的分支不会再问。" : `${ended[1]}。`;
+    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : outcome.state === "approved" && outcome.standing ? "已批准。这个任务之后推送同样的分支不会再问，包括改写该分支历史的推送。" : `${ended[1]}。`;
     return { config: { wide_screen_mode: true, update_multi: true }, header: { template: ended[0], title: plain(`${ended[1]} · ${ask.code}`) }, elements: [...about, { tag: "note", elements: [plain(note)] }] };
   }
   return {
@@ -328,6 +328,8 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
           button("拒绝", "danger", "deny"),
         ],
       },
+      // What the wider approval covers is said before it is given.
+      ...(ask.can_approve && ask.standing_offered ? [{ tag: "note", elements: [plain("“这个任务不再问”：这个任务之后再推送这些分支时不再询问，包括可能改写分支历史的推送；删除分支、其他分支和标签仍会询问。")] }] : []),
       // The words that always work, wherever in the chat they are typed. In a group the bot only
       // hears what mentions it, so the card says so.
       { tag: "note", elements: [plain(`${to === "chat" ? "也可以先 @我，再输入" : "也可以输入"}${ask.can_approve ? `「批准 ${ask.code}」或` : ""}「拒绝 ${ask.code}」`)] },
