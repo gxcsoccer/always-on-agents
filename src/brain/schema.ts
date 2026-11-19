@@ -140,6 +140,11 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE outbox ADD COLUMN closed TEXT;`,
   // 10: set before the first attempt to deliver, so an attempt whose outcome was never heard is known of.
   `ALTER TABLE outbox ADD COLUMN started INTEGER NOT NULL DEFAULT 0;`,
+  // 11: questions that were waiting to be delivered when the marker was introduced may already have
+  // been attempted, whatever their failure count says (an instance can die between sending and
+  // recording). They are all taken as begun: the cost of being wrong is one redundant delivery
+  // under the same id, against a card left open.
+  `UPDATE outbox SET started = 1 WHERE status = 'pending' AND ask IS NOT NULL;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -722,6 +722,32 @@ describe("tasks and approvals", () => {
     expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
   });
 
+  it("takes questions that were pending before the send marker existed as possibly sent", async () => {
+    const { migrate } = await import("../src/brain/schema");
+    const scope = brain("chat");
+    await scope.stub.ingest(message("hello", { user: "bob", session_key: "chat" }));
+    model.replies([say("hi")]);
+    await wake(scope.stub);
+    const rows = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      // Put the store back to how version 9 left it, with two questions waiting to go out.
+      sql.exec("ALTER TABLE outbox DROP COLUMN started");
+      sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
+      const target = JSON.stringify({ connector: "console", address: {} });
+      const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, ask, attempts) VALUES ('ask:x:1', ?, 'q1', 0, 0, ?, 1)", target, question);
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, ask, attempts) VALUES ('ask:x:2', ?, 'q2', 0, 0, ?, 0)", target, question);
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at) VALUES ('msg:plain', ?, 'm', 0, 0)", target);
+      migrate(state.storage);
+      return [...sql.exec("SELECT idem, started FROM outbox WHERE idem IN ('ask:x:1', 'ask:x:2', 'msg:plain') ORDER BY idem")] as any[];
+    });
+    expect(rows).toEqual([
+      { idem: "ask:x:1", started: 1 },
+      { idem: "ask:x:2", started: 1 },
+      { idem: "msg:plain", started: 0 },
+    ]);
+  });
+
   it("keeps how a delivered question ended, with the question", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await reply(stub, id, "bob", `approve ${code}`);
