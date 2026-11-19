@@ -412,6 +412,30 @@ describe("tasks and approvals", () => {
     expect(await answersSent(id)).toHaveLength(0);
   });
 
+  it("reads an edited reply from its edit, and does not re-send an approval while another reply is in doubt", async () => {
+    // carol's comment was edited and the edit is here: only the edit counts, and it does not block.
+    const first = await taskAwaitingApproval();
+    await first.stub.ingest(message("looks fine", { user: "carol", session_key: "chat", data: { subject: "test:note:c", revision: 100, holder: "h1" } }));
+    await first.stub.ingest(message("[edited their earlier comment to] still fine", { user: "carol", session_key: "chat", data: { subject: "test:note:c", revision: 200, holder: "h2" } }));
+    await first.stub.ingest(message(`approve ${first.code}`, { user: "bob", session_key: "chat" }));
+    model.replies([call("answer_task", { task_id: first.id, decision: "allow", reason: "" })], [say("")]);
+    await wake(first.stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+
+    // An approval is on record but unconfirmed; then a later reply is known to have changed.
+    const { stub, id, code } = await taskAwaitingApproval();
+    await reply(stub, id, "bob", `approve ${code}`);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE tasks SET status = 'needs_input', pending = json_object('id', 'q-1', 'code', ?, 'ask', (SELECT idem FROM outbox WHERE idem LIKE 'ask:%' LIMIT 1), 'asked_at', 0) WHERE id = ?", code, id);
+    });
+    await stub.ingest(message("looks fine", { user: "carol", session_key: "chat", data: { subject: "test:note:d", revision: 100, holder: "h1" } }));
+    await stub.revise("test:note:d", 200, false, "h2");
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBeDefined();
+    expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
+  });
+
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {
     // As long as the longest comment GitHub accepts. Too big to share a run with the approval, so
     // it is still waiting in the inbox when the approval is considered, and counts from there.

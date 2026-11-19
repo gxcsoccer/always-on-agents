@@ -481,8 +481,10 @@ export class BrainAgent extends DurableObject<Env> {
       const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
       if (!row || row.next_at > Date.now()) return;
       try {
-        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text });
-        this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
+        // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
+        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at });
+        // If an earlier attempt had in fact been posted, that is when people could first answer it.
+        this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
       } catch (err) {
         const attempts = row.attempts + 1;
         const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
@@ -696,7 +698,9 @@ export class BrainAgent extends DurableObject<Env> {
       if (ask && receipt) {
         const posted = JSON.parse(receipt) as { subject: string; holder: string };
         const now = await commentStanding(this.env, this.#scope(), posted.subject);
-        if (now && (now.deleted || now.holder !== posted.holder)) {
+        // Edited at any time, even if put back since: someone may have read and answered the other wording.
+        const touched = this.#rows("SELECT 1 FROM revisions WHERE subject = ?", posted.subject).length > 0;
+        if (touched || (now && (now.deleted || now.edited || now.holder !== posted.holder))) {
           throw new Error("the question as it was posted has since been changed or removed, so nobody can be taken to have approved this action; it can only be refused");
         }
         confirmedAsk = ask;
@@ -718,8 +722,9 @@ export class BrainAgent extends DurableObject<Env> {
     if (intent?.decision === "allow" && intent.pending_id === open) {
       const approver = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
       const code = (JSON.parse(task.pending) as { code: string }).code;
-      const since = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND id > ?", sessionKey, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal));
-      const against = since.some((event) => (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") || (JSON.parse(event.principal) as Principal).id === intent!.decided_by);
+      const later = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND id > ?", sessionKey, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)));
+      const since = later.events;
+      const against = later.unresolved || since.some((event) => (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") || (JSON.parse(event.principal) as Principal).id === intent!.decided_by);
       if (decision === "deny" || against || !approver || !this.#stillStands(approver)) {
         before = { decision: intent.decision, decided_by: intent.decided_by };
         intent = undefined;
@@ -735,7 +740,9 @@ export class BrainAgent extends DurableObject<Env> {
       if (decision === "allow" && asked.receipt && pending.ask !== confirmedAsk) throw new Error("the question changed while it was being checked; call this tool again");
 
       // Messages from members, sent after the question was put to them.
-      const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at > ? ORDER BY id", run.id, asked.sent_at)
+      // A reply whose comment was edited is represented by the edit, which is a message of its own.
+      const received = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at > ? ORDER BY id", run.id, asked.sent_at));
+      const replies = received.events
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
         .filter(({ principal }) => this.#isDecider(principal));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
@@ -759,7 +766,7 @@ export class BrainAgent extends DurableObject<Env> {
           .some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         // A reply that was edited since, whose new text has not arrived yet, may now be a refusal.
-        if (read.some(({ event }) => this.#standing(event) === "changed")) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
+        if (received.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
         let approvals = read.filter(({ says }) => says === "allow");
         if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${pending.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
         // One message approves one question.
@@ -992,6 +999,23 @@ export class BrainAgent extends DurableObject<Env> {
     const current = this.#rows<{ revision: number; deleted: number; holder: string }>("SELECT revision, deleted, holder FROM revisions WHERE subject = ?", data.subject)[0];
     if (current?.deleted) return "deleted";
     return current && current.revision === data.revision && current.holder !== "" && current.holder === data.holder ? "stands" : "changed";
+  }
+
+  /**
+   * Brings a set of messages up to date with what their sources say now. A message whose comment
+   * was edited is dropped when the edit has arrived as a message of its own; if the edit is known
+   * of but has not arrived, the set is unresolved and nothing should be approved on it.
+   */
+  #reconcile(events: InboxRow[]): { events: InboxRow[]; unresolved: boolean } {
+    let unresolved = false;
+    const current = events.filter((event) => {
+      if (this.#standing(event) !== "changed") return true;
+      const subject = (JSON.parse(event.data ?? "{}") as { subject?: string }).subject;
+      const replaced = this.#rows("SELECT 1 FROM inbox WHERE id > ? AND json_extract(data, '$.subject') = ? LIMIT 1", event.id, subject ?? "").length > 0;
+      if (!replaced) unresolved = true;
+      return !replaced;
+    });
+    return { events: current, unresolved };
   }
 
   /**

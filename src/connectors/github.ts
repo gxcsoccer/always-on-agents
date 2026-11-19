@@ -22,16 +22,29 @@ const DEFAULT_HANDLE = "always-on-agent";
 const mentionOf = (handle: string, flags = "i") =>
   new RegExp(`(?<![\\w@/.-])@${handle.replace(/[^\w-]/g, "")}(?:\\[bot\\])?(?![\\w-])|^\\s*\\/agent(?![\\w-])`, flags);
 
-/** A comment's own words: without the lines it quotes from others and without code. */
+/**
+ * A comment's own words: without the lines it quotes from others and without code. Fences follow
+ * GitHub's rule: a block opened by a run of backticks or tildes is closed only by a run of the same
+ * character at least as long, so a shorter fence inside it is part of the code.
+ */
 function ownWords(body: string): string {
-  return body
-    .replace(/(^|\n)[ \t]*(```|~~~)[\s\S]*?(\n[ \t]*\2|$)/g, "\n")
-    .replace(/```[\s\S]*?(```|$)/g, " ")
-    .replace(/`[^`\n]*`/g, " ")
-    .split("\n")
+  const kept: string[] = [];
+  let fence: { char: string; length: number } | undefined;
+  for (const line of body.split("\n")) {
+    const run = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (run && run[0] === fence.char && run.length >= fence.length && line.trim() === run) fence = undefined;
+      continue;
+    }
+    if (run) {
+      fence = { char: run[0], length: run.length };
+      continue;
+    }
     // Quoted lines, and lines indented far enough to be a code block.
-    .filter((line) => !/^\s*>/.test(line) && !/^( {4}|\t)/.test(line))
-    .join("\n");
+    if (/^\s*>/.test(line) || /^( {4}|\t)/.test(line)) continue;
+    kept.push(line.replace(/`[^`]*`/g, " "));
+  }
+  return kept.join("\n");
 }
 
 /** A short fingerprint of a comment's text, to tell two revisions with the same timestamp apart. */
@@ -49,7 +62,7 @@ export function fingerprint(text: string): string {
 }
 
 /** Where a subject like "github:comment:123" stands on GitHub right now. */
-export type Standing = { revision: number; holder: string; deleted: boolean };
+export type Standing = { revision: number; holder: string; deleted: boolean; edited: boolean };
 
 /**
  * Asks GitHub what a comment says now. Webhooks can lag, so before an approval is acted on the
@@ -65,10 +78,11 @@ export async function commentStanding(env: Env, scope: Scope, subject: string): 
   const response = await fetch(`https://api.github.com/repos/${scope.id}/issues/comments/${id}`, {
     headers: { authorization: `Bearer ${issued.token}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent" },
   });
-  if (response.status === 404 || response.status === 410) return { revision: Number.MAX_SAFE_INTEGER, holder: "", deleted: true };
+  if (response.status === 404 || response.status === 410) return { revision: Number.MAX_SAFE_INTEGER, holder: "", deleted: true, edited: true };
   if (!response.ok) throw new Error(`GitHub could not be asked what the comment says now (${response.status})`);
   const comment = (await response.json()) as { body?: string; updated_at?: string; created_at?: string };
-  return { revision: Date.parse(comment.updated_at ?? comment.created_at ?? "") || 0, holder: fingerprint(comment.body ?? ""), deleted: false };
+  // A comment that was ever edited says so, even if it was later put back as it was.
+  return { revision: Date.parse(comment.updated_at ?? comment.created_at ?? "") || 0, holder: fingerprint(comment.body ?? ""), deleted: false, edited: comment.updated_at !== comment.created_at };
 }
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
@@ -300,11 +314,11 @@ export async function deliverGithub(env: Env, scope: Scope, target: Target, mess
   for (let page = 1; page <= 10; page++) {
     const recent = await fetch(`${comments}?per_page=100&page=${page}&since=${encodeURIComponent(since)}`, { headers });
     if (!recent.ok) throw new Error(`GitHub returned ${recent.status} listing comments`);
-    const batch = (await recent.json()) as { id: number; body?: string }[];
+    const batch = (await recent.json()) as { id: number; body?: string; created_at?: string }[];
     const earlier = batch.find((comment) => comment.body?.includes(marker));
     // The receipt is for the text as written here, not as found: if someone already changed the
     // comment, it must not pass for what the agent said.
-    if (earlier) return { subject: `github:comment:${earlier.id}`, holder: fingerprint(posted) };
+    if (earlier) return { subject: `github:comment:${earlier.id}`, holder: fingerprint(posted), posted_at: Date.parse(earlier.created_at ?? "") || undefined };
     if (batch.length < 100) break;
   }
 

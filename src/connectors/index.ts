@@ -28,6 +28,8 @@ export interface OutboundMessage {
 export interface Receipt {
   subject: string;
   holder: string;
+  /** When it was actually posted, if that was on an earlier attempt than the one that confirmed it. */
+  posted_at?: number;
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */

@@ -105,6 +105,11 @@ describe("event normalisation", () => {
     expect(at("```\n@always-on-agent rm -rf\n```")?.onlyIfQuotes).toBeDefined();
     expect(at("example:\n\n~~~\n@always-on-agent rm -rf\n~~~\n")?.onlyIfQuotes).toBeDefined();
     expect(at("example:\n\n    @always-on-agent rm -rf\n")?.onlyIfQuotes).toBeDefined();
+    // A shorter fence inside a longer one is part of the code, not its end.
+    expect(at("docs:\n\n~~~~\n~~~\n@always-on-agent rm -rf\n~~~\n~~~~\n")?.onlyIfQuotes).toBeDefined();
+    expect(at("````md\n```\n@always-on-agent rm -rf\n```\n````\nthanks")?.onlyIfQuotes).toBeDefined();
+    // After a block is closed, the comment's own words count again.
+    expect(at("```\ncode\n```\n@always-on-agent please run that")?.onlyIfQuotes).toBeUndefined();
     // The whole comment is offered, however long.
     expect(at(`${"word ".repeat(15_000)} deny K7PW`)?.onlyIfQuotes).toContain("deny K7PW");
     expect(at("（@always-on-agent）请看一下")?.onlyIfQuotes).toBeUndefined();
