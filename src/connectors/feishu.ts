@@ -110,7 +110,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
       replacements.set(mention.key, own ? " " : `@${String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`);
     }
-    text = text.replace(/@_user_\d+/g, (key) => replacements.get(key) ?? " ");
+    // A placeholder with no entry in the mention list is kept visible as a mention of someone
+    // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
+    text = text.replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown");
     text = text.replace(/\s+/g, " ").trim();
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;

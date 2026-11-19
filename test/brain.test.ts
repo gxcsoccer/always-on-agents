@@ -319,6 +319,18 @@ describe("tasks and approvals", () => {
     expect(await answersSent(id)).toHaveLength(0);
   });
 
+  it("does not approve when the requester said more that is still waiting in the inbox", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    const chatter = "x".repeat(49_000);
+    for (let i = 0; i < 3; i++) await stub.ingest(message(chatter, { user: "carol", session_key: "chat" }));
+    await stub.ingest(message("actually, hold on", { user: "bob", session_key: "chat" }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")], [say("")]);
+    await wake(stub);
+    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/said something after approving/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
   it("lets a refusal win over an approval sent in the same batch", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));

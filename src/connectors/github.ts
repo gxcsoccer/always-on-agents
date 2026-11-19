@@ -45,14 +45,16 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
     tenant = await registry(env).tenantForGithubInstallation(String(installation));
     secret = env.GITHUB_WEBHOOK_SECRET;
     // A repository claimed by one tenant must not arrive through another tenant's installation.
-    if (tenant && linkedRepo && linkedRepo.tenant !== tenant) return json({ ignored: "this repository is linked to a different tenant" }, 202);
+    if (tenant && linkedRepo && linkedRepo.tenant !== tenant) tenant = null;
   } else {
     tenant = linkedRepo?.tenant ?? null;
     secret = linkedRepo?.secret;
   }
-  if (!tenant) return json({ ignored: "this installation or repository is not linked to a tenant" }, 202);
-  if (!secret) return json({ error: "no webhook secret is configured for this source" }, 503);
-  if (!(await verifySignature(secret, raw, request.headers.get("x-hub-signature-256")))) return json({ error: "bad signature" }, 401);
+  // Until the signature has been checked the caller is unknown, so every refusal looks the same:
+  // nothing here says whether a repository is registered, to whom, or what was wrong.
+  if (!tenant || !secret || !(await verifySignature(secret, raw, request.headers.get("x-hub-signature-256")))) {
+    return json({ error: "not accepted" }, 401);
+  }
 
   const normalized = normalize(type, payload);
   if (!normalized) return json({ ignored: `nothing to do for ${type}.${payload.action ?? ""}` }, 202);
@@ -113,14 +115,19 @@ export function normalize(type: string, payload: any): { repo: string; event: In
     };
   }
 
-  if (type === "issue_comment" && payload.action === "created") {
-    const body: string = payload.comment?.body ?? "";
+  if (type === "issue_comment" && ["created", "edited", "deleted"].includes(payload.action)) {
+    // An edit or a deletion is the author saying something new about what they wrote: an approval
+    // edited into a refusal, or deleted, must not leave the original standing. Each arrives as a
+    // further message from that person, after the original.
+    const current: string = payload.comment?.body ?? "";
+    const earlier: string = payload.action === "edited" ? String(payload.changes?.body?.from ?? "") : "";
+    const body = `${current}\n${earlier}`;
     // Comments that do not address the agent are other people's conversation, with one exception:
     // a comment that quotes the code of a question the agent has open is a reply to that question,
     // whatever its wording. Whether a quoted token is such a code is decided by the caller, which
     // can ask the Brain; here the candidates are collected.
     const mentioned = MENTION.test(body);
-    const quoted = mentioned || body.length > 500 ? [] : [...new Set((body.match(CODE_SHAPED) ?? []).map((token) => token.toUpperCase()))].slice(0, 20);
+    const quoted = mentioned ? [] : [...new Set((body.slice(0, 20_000).match(CODE_SHAPED) ?? []).map((token) => token.toUpperCase()))].slice(0, 2_000);
     if ((!mentioned && quoted.length === 0) || sender.type === "Bot") return undefined;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
@@ -133,13 +140,16 @@ export function normalize(type: string, payload: any): { repo: string; event: In
       repo,
       event: {
         ...base,
-        source_id: `comment:${payload.comment.id}`,
+        source_id: payload.action === "created" ? `comment:${payload.comment.id}` : `comment:${payload.comment.id}:${payload.action}:${payload.comment.updated_at ?? ""}`,
         kind: "message",
         session_key: `pr:${number}`,
         principal: person(true),
         // The agent's own handle is removed here, where it is known. Any other @handle stays in the
         // text, so "@someone-else approve K7PW" is not read as an approval addressed to this agent.
-        text: body.replace(/(^|\s)@always-on-agent(?![\w-])/gi, "$1").trim(),
+        text:
+          payload.action === "deleted"
+            ? "[deleted their earlier comment]"
+            : `${payload.action === "edited" ? "[edited their earlier comment to] " : ""}${current.replace(/(^|\s)@always-on-agent(?![\w-])/gi, "$1").trim()}`,
         data: { number, comment_id: payload.comment.id, is_pull_request: Boolean(payload.issue.pull_request) },
         reply_to: replyTo(number),
       },

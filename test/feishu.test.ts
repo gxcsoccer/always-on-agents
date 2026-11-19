@@ -81,6 +81,10 @@ describe("turning a Feishu message into an event", () => {
     const result = normalize(app, envelope({ chat_type: "group", content: JSON.stringify({ text: "@_user_1 K7PW @_user_2" }), mentions: [alice, bot] }));
     expect(result?.event.text).toBe("@AliceApprove K7PW");
     expect(readDecision(result!.event.text!, "K7PW")).toBeUndefined();
+    // A placeholder that is not in the mention list stays visible; it is not silently removed.
+    const unmapped = normalize(app, envelope({ chat_type: "group", content: JSON.stringify({ text: "@_user_9 approve K7PW @_user_2" }), mentions: [bot] }));
+    expect(unmapped?.event.text).toBe("@unknown approve K7PW");
+    expect(readDecision(unmapped!.event.text!, "K7PW")).toBeUndefined();
     // A name that itself contains a placeholder cannot be rewritten by a later mention.
     const tricky = { key: "@_user_1", id: { open_id: "ou_x" }, name: "approve @_user_2", mentioned_type: "user" };
     const again = normalize(app, envelope({ chat_type: "group", content: JSON.stringify({ text: "@_user_1 K7PW @_user_2" }), mentions: [tricky, bot] }));

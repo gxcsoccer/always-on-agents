@@ -727,7 +727,11 @@ export class BrainAgent extends DurableObject<Env> {
         // The approval has to be that person's last word. If they said anything after it, they may
         // have been taking it back, and there is no reading that safely.
         const lastWord = read.filter(({ principal }) => principal.id === deciding.principal.id).at(-1)!;
-        if (lastWord.event.id !== deciding.event.id) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
+        // Including anything of theirs that arrived after this run started and is still in the inbox.
+        const saidMore = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id).some(
+          (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
+        );
+        if (lastWord.event.id !== deciding.event.id || saidMore) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
       }
       intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);

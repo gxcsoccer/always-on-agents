@@ -69,6 +69,23 @@ describe("event normalisation", () => {
     expect(normalize("issue_comment", comment("approve K7PW", "NONE"))).toBeUndefined();
   });
 
+  it("treats an edited or deleted comment as its author speaking again", () => {
+    const edited = { ...comment("deny K7PW", "OWNER"), action: "edited", changes: { body: { from: "approve K7PW" } }, comment: { id: 5, body: "deny K7PW", author_association: "OWNER", updated_at: "2026-11-19T00:00:01Z" } };
+    const afterEdit = normalize("issue_comment", edited);
+    expect(afterEdit?.event.source_id).not.toBe("comment:5");
+    expect(readDecision(afterEdit!.event.text!, "K7PW")).toBe("deny");
+    // An edit that removes the code is still seen, because the earlier text quoted it.
+    const softened = { ...edited, comment: { ...edited.comment, body: "never mind" } };
+    expect(normalize("issue_comment", softened)?.onlyIfOpenCode).toContain("K7PW");
+    const deleted = { ...comment("approve K7PW", "OWNER"), action: "deleted" };
+    expect(normalize("issue_comment", deleted)?.event.text).toBe("[deleted their earlier comment]");
+  });
+
+  it("does not drop a long reply that quotes a code", () => {
+    const long = `${"word ".repeat(400)} so in short: deny K7PW`;
+    expect(normalize("issue_comment", comment(long, "OWNER"))?.onlyIfOpenCode).toContain("K7PW");
+  });
+
   it("removes only its own handle, so a reply addressed to someone else is not read as one to the agent", () => {
     const own = normalize("issue_comment", comment("@always-on-agent approve K7PW", "OWNER"));
     expect(own?.onlyIfOpenCode).toBeUndefined();
