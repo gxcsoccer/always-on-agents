@@ -90,6 +90,7 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
   if (typeof openId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(openId)) return undefined;
   const value = action?.value;
   if (!value || value.aoa !== "answer" || !/^[A-Z0-9]{4}$/.test(String(value.code)) || (value.decision !== "approve" && value.decision !== "deny")) return undefined;
+  if (typeof value.q !== "string" || !/^ask:[0-9a-f-]{36}:\d{1,9}$/.test(value.q)) return undefined;
   const chatId: unknown = context?.open_chat_id;
   if (typeof chatId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(chatId) || typeof body.header?.event_id !== "string") return undefined;
   const group = value.to === "chat";
@@ -102,7 +103,8 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
       session_key: group ? "chat" : "dm",
       principal: { kind: "human", id: openId, explicit: true },
       text: `${value.decision} ${value.code}`,
-      data: { chat_id: chatId, card: true, route_by_code: true },
+      // Which question's card was pressed. The press answers that question and no other.
+      data: { chat_id: chatId, card: true, route_by_code: true, question: value.q },
       reply_to: { connector: "feishu", address: { app_id: app.app_id, chat_id: chatId } },
     },
   };
@@ -235,7 +237,9 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
     tag: "button",
     text: plain(label),
     type,
-    value: { aoa: "answer", decision, code: ask.code, to },
+    // The question's own id goes with the press: a card left over from an earlier question that
+    // happened to get the same code cannot answer a later one.
+    value: { aoa: "answer", decision, code: ask.code, q: ask.id, to },
   });
   return {
     config: { wide_screen_mode: true },

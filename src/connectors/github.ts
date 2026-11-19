@@ -54,9 +54,10 @@ function ownWords(body: string): string {
     if (quoting) continue;
     // Indented far enough to be a code block.
     if (/^( {4}|\t)/.test(line)) continue;
-    kept.push(line.replace(/`[^`]*`/g, " "));
+    kept.push(line);
   }
-  return kept.join("\n");
+  // Code spans, which may run over several lines.
+  return kept.join("\n").replace(/(`+)[\s\S]*?\1/g, " ");
 }
 
 /** A short fingerprint of a comment's text, to tell two revisions with the same timestamp apart. */
@@ -72,6 +73,9 @@ export function fingerprint(text: string): string {
   b = Math.imul(b ^ (b >>> 16), 2246822507) ^ Math.imul(a ^ (a >>> 13), 3266489909);
   return `${(b >>> 0).toString(16)}${(a >>> 0).toString(16)}:${text.length}`;
 }
+
+/** The holder recorded for a revision whose text is not a message to the agent. */
+export const NOT_FOR_THE_AGENT = "-";
 
 /** Where a subject like "github:comment:123" stands on GitHub right now. */
 export type Standing = { revision: number; holder: string; deleted: boolean; edited: boolean };
@@ -140,9 +144,14 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
 
   // A comment that was edited or deleted: what was said in it before no longer stands, whoever
   // changed it and in whatever order GitHub delivers the events.
-  if (normalized.revise) await brain.revise(normalized.revise.subject, normalized.revise.revision, normalized.revise.deleted, normalized.revise.holder);
+  // An edit that leaves nothing for the agent (the mention or the code was taken out, or someone
+  // else made it) still voids the earlier text, and says so: no new message will follow it.
+  const dropped = async (why: string) => {
+    if (normalized.revise) await brain.revise(normalized.revise.subject, normalized.revise.revision, normalized.revise.deleted, normalized.revise.deleted ? "" : NOT_FOR_THE_AGENT);
+    return json({ ignored: why }, 202);
+  };
   const event = normalized.event;
-  if (!event) return json({ ignored: "recorded" }, 202);
+  if (!event) return dropped("recorded");
 
   // A linked account acts as that tenant user; an unlinked one is still identified, just not as a
   // user. Accounts are linked by GitHub's numeric id, which never changes hands. A login can be
@@ -155,7 +164,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.
   if (normalized.onlyIfQuotes !== undefined && !(await brain.quotesOpenQuestion(normalized.onlyIfQuotes, event.session_key))) {
-    return json({ ignored: "the comment does not address the agent" }, 202);
+    return dropped("the comment does not address the agent");
   }
   const result = await brain.ingest(event);
   return json({ ...result, scope: scopeName(scope), kind: event.kind }, 202);

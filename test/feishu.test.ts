@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { approvalCard, decrypt, normalize, normalizeCardAction, verifySignature } from "../src/connectors/feishu";
 import type { FeishuApp } from "../src/registry";
 
+const Q = "ask:11111111-2222-3333-4444-555555555555:1";
 const app: FeishuApp = { app_id: "cli_test", tenant: "acme", app_secret: "s", encrypt_key: "k", verification_token: "v", bot_open_id: "ou_bot", token: null, token_expires_at: null };
 
 async function sha256Hex(text: string) {
@@ -100,17 +101,17 @@ describe("turning a Feishu message into an event", () => {
   });
 
   it("shows an approval question as a card whose task-supplied text is never formatting", () => {
-    const card = approvalCard({ code: "K7PW", title: "**tidy**", kind: "command", detail: "rm -r [x](http://evil)", can_approve: true }, "chat") as any;
+    const card = approvalCard({ id: Q, code: "K7PW", title: "**tidy**", kind: "command", detail: "rm -r [x](http://evil)", can_approve: true }, "chat") as any;
     const texts = JSON.stringify(card.elements.filter((e: any) => e.tag === "div"));
     expect(texts).toContain("rm -r [x](http://evil)");
     expect(texts).not.toContain("lark_md");
     const buttons = card.elements.find((e: any) => e.tag === "action").actions;
     expect(buttons.map((b: any) => b.value)).toEqual([
-      { aoa: "answer", decision: "approve", code: "K7PW", to: "chat" },
-      { aoa: "answer", decision: "deny", code: "K7PW", to: "chat" },
+      { aoa: "answer", decision: "approve", code: "K7PW", q: Q, to: "chat" },
+      { aoa: "answer", decision: "deny", code: "K7PW", q: Q, to: "chat" },
     ]);
     // Too long to show: there is nothing to press but "refuse".
-    const refuseOnly = approvalCard({ code: "K7PW", title: "t", kind: "push", detail: "…", can_approve: false }, "user") as any;
+    const refuseOnly = approvalCard({ id: Q, code: "K7PW", title: "t", kind: "push", detail: "…", can_approve: false }, "user") as any;
     expect(refuseOnly.elements.find((e: any) => e.tag === "action").actions.map((b: any) => b.value.decision)).toEqual(["deny"]);
   });
 
@@ -120,16 +121,18 @@ describe("turning a Feishu message into an event", () => {
       header: { event_id: "evt-1", event_type: "card.action.trigger", tenant_key: "tk", app_id: "cli_test" },
       event: { operator: { open_id: "ou_bob", tenant_key: "tk" }, action: { tag: "button", value }, context: { open_chat_id: "oc_room", open_message_id: "om_card" }, ...extra },
     });
-    const inGroup = normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW", to: "chat" }));
+    const inGroup = normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW", q: Q, to: "chat" }));
     expect(inGroup?.scope).toEqual({ tenant: "acme", kind: "chat", id: "oc_room" });
-    expect(inGroup?.event).toMatchObject({ source_id: "card:evt-1", text: "approve K7PW", principal: { id: "ou_bob", explicit: true }, data: { route_by_code: true } });
+    expect(inGroup?.event).toMatchObject({ source_id: "card:evt-1", text: "approve K7PW", principal: { id: "ou_bob", explicit: true }, data: { route_by_code: true, question: Q } });
+    // A press that does not say which question it answers is nothing.
+    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW", to: "chat" }))).toBeUndefined();
     // In a direct chat the scope is the person who pressed it, whoever the card says it was for.
-    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "deny", code: "K7PW", to: "user" }))?.scope).toEqual({ tenant: "acme", kind: "user", id: "ou_bob" });
+    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "deny", code: "K7PW", q: Q, to: "user" }))?.scope).toEqual({ tenant: "acme", kind: "user", id: "ou_bob" });
     // Someone from another organisation, a value we did not write, a malformed code: nothing.
-    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW", to: "chat" }, { operator: { open_id: "ou_x", tenant_key: "other" } }))).toBeUndefined();
+    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW", q: Q, to: "chat" }, { operator: { open_id: "ou_x", tenant_key: "other" } }))).toBeUndefined();
     expect(normalizeCardAction(app, press({ decision: "approve", code: "K7PW" }))).toBeUndefined();
-    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW; deny", to: "chat" }))).toBeUndefined();
-    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "maybe", code: "K7PW", to: "chat" }))).toBeUndefined();
+    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "approve", code: "K7PW; deny", q: Q, to: "chat" }))).toBeUndefined();
+    expect(normalizeCardAction(app, press({ aoa: "answer", decision: "maybe", code: "K7PW", q: Q, to: "chat" }))).toBeUndefined();
   });
 
   it("keeps a group thread as its own conversation and replies inside it", () => {

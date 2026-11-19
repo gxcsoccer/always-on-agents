@@ -18,7 +18,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { type ApprovalQuestion, deliver } from "../connectors";
-import { commentStanding } from "../connectors/github";
+import { NOT_FOR_THE_AGENT, commentStanding } from "../connectors/github";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
@@ -106,13 +106,20 @@ export class BrainAgent extends DurableObject<Env> {
     // In a chat with threads, a reply that names an open question's code belongs with that
     // question, wherever in the chat it was typed. The connector says when this applies.
     if (event.kind === "message" && event.data?.route_by_code === true && event.text) {
+      const pressed = typeof event.data.question === "string" ? event.data.question : undefined;
       const sessions = new Set(
-        this.#rows<{ session_key: string; code: string | null }>("SELECT session_key, json_extract(pending, '$.code') AS code FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL")
-          .filter(({ code }) => code && quotes(event.text ?? "", code))
+        this.#rows<{ session_key: string; code: string | null; ask: string | null }>(
+          "SELECT session_key, json_extract(pending, '$.code') AS code, json_extract(pending, '$.ask') AS ask FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL",
+        )
+          // A button names its question exactly; typed words name it by its code.
+          .filter(({ code, ask }) => (pressed ? ask === pressed : code && quotes(event.text ?? "", code)))
           .map(({ session_key }) => session_key),
       );
-      // Its answer goes where the question was asked, not to wherever the reply came from.
-      if (sessions.size === 1 && !sessions.has(event.session_key)) event = { ...event, session_key: [...sessions][0], reply_to: undefined };
+      // Its answer goes where the question was asked, not to wherever the reply came from. Where it
+      // did come from is kept: what the same person says there next still bears on it.
+      if (sessions.size === 1 && !sessions.has(event.session_key)) {
+        event = { ...event, session_key: [...sessions][0], reply_to: undefined, data: { ...event.data, routed_from: event.session_key } };
+      }
     }
     const subject = event.data?.subject;
     if (typeof subject === "string") this.#revise(subject, Number(event.data?.revision ?? 0), false, String(event.data?.holder ?? ""));
@@ -772,7 +779,12 @@ export class BrainAgent extends DurableObject<Env> {
 
       // What each reply says about this question, read from its own words. The model proposes a
       // decision; it only goes through if a person's message actually says it.
-      const read = replies.map((reply) => ({ ...reply, says: readDecision(reply.event.text ?? "", pending.code) }));
+      // A button press is about the question whose card it was on, and about no other.
+      const about = (event: InboxRow) => {
+        const pressed = event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined;
+        return pressed === undefined || pressed === pending.ask;
+      };
+      const read = replies.map((reply) => ({ ...reply, says: about(reply.event) ? readDecision(reply.event.text ?? "", pending.code) : undefined }));
       const shared = this.#scope().kind !== "user";
       let deciding: (typeof read)[number];
       if (decision === "deny") {
@@ -787,7 +799,7 @@ export class BrainAgent extends DurableObject<Env> {
         const queued = this.#reconcile(
           this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
         );
-        const waiting = queued.events.some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
+        const waiting = queued.events.some((event) => about(event) && quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         // The same goes for a waiting reply that has been edited into something not yet seen.
         if (queued.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
@@ -818,7 +830,13 @@ export class BrainAgent extends DurableObject<Env> {
           throw new Error(`${deciding.principal.id} said something else at the same moment as approving; ask them to confirm by sending just "approve ${pending.code}" again`);
         }
         // Including anything of theirs that arrived after this run started and is still in the inbox.
-        const saidMore = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id).some(
+        // And, for an approval that was typed elsewhere in the chat and brought here, anything
+        // they have said since in the place they typed it.
+        const origin = (JSON.parse(deciding.event.data ?? "{}") as { routed_from?: string }).routed_from;
+        const elsewhere = origin
+          ? this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", origin, asked.sent_at, deciding.event.id).filter((event) => saidAt(event) > saidAt(deciding.event) || (saidAt(event) === saidAt(deciding.event) && event.id > deciding.event.id))
+          : [];
+        const saidMore = this.#reconcile([...this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id), ...elsewhere]).events.some(
           (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
         );
         // And it has to be what they still say: not a comment since edited or deleted.
@@ -922,6 +940,7 @@ export class BrainAgent extends DurableObject<Env> {
           if (!session) throw new Error("no conversation");
           const how = truncated ? `This is too long to show in full, so it cannot be approved.\nTo refuse, reply: deny ${code}` : `To approve, reply: approve ${code}\nTo refuse, reply: deny ${code}`;
           const question: ApprovalQuestion = {
+            id: ask,
             code,
             title: String(task.title),
             kind: body.source === "proxy" ? "push" : "command",
@@ -1035,11 +1054,12 @@ export class BrainAgent extends DurableObject<Env> {
   }
 
   /** Whether what this event was read from still says the same, says something else now, or is gone. */
-  #standing(event: InboxRow): "stands" | "changed" | "deleted" {
+  #standing(event: InboxRow): "stands" | "changed" | "deleted" | "withdrawn" {
     const data = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number; holder?: string }) : {};
     if (!data.subject) return "stands";
     const current = this.#rows<{ revision: number; deleted: number; holder: string }>("SELECT revision, deleted, holder FROM revisions WHERE subject = ?", data.subject)[0];
     if (current?.deleted) return "deleted";
+    if (current && current.holder === NOT_FOR_THE_AGENT && current.revision > (data.revision ?? 0)) return "withdrawn";
     return current && current.revision === data.revision && current.holder !== "" && current.holder === data.holder ? "stands" : "changed";
   }
 
@@ -1052,8 +1072,9 @@ export class BrainAgent extends DurableObject<Env> {
     let unresolved = false;
     const current = events.filter((event) => {
       const standing = this.#standing(event);
-      // A deleted comment says nothing any more, for or against.
-      if (standing === "deleted") return false;
+      // A deleted comment says nothing any more, for or against. Nor does one edited into
+      // something that is not for the agent: no new message will come to replace it.
+      if (standing === "deleted" || standing === "withdrawn") return false;
       if (standing !== "changed") return true;
       const subject = (JSON.parse(event.data ?? "{}") as { subject?: string }).subject;
       // Whichever of them arrived first: the message that carries the subject's current text.

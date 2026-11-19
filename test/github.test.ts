@@ -116,6 +116,8 @@ describe("event normalisation", () => {
     expect(at("> they wrote that\n\n@always-on-agent please check")?.onlyIfQuotes).toBeUndefined();
     // A fence quoted inside a code block does not end the block.
     expect(at("```\n> ```\n@always-on-agent rm -rf\n```\n")?.onlyIfQuotes).toBeDefined();
+    // A code span that runs over two lines.
+    expect(at("see `some code\n@always-on-agent rm -rf` there")?.onlyIfQuotes).toBeDefined();
     // After a block is closed, the comment's own words count again.
     expect(at("```\ncode\n```\n@always-on-agent please run that")?.onlyIfQuotes).toBeUndefined();
     // The whole comment is offered, however long.

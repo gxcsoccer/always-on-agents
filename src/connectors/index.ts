@@ -27,6 +27,8 @@ export interface OutboundMessage {
 }
 
 export interface ApprovalQuestion {
+  /** Names this one question for good. Codes are short and come round again; this does not. */
+  id: string;
   code: string;
   /** The task's title. */
   title: string;

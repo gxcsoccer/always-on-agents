@@ -509,6 +509,48 @@ describe("tasks and approvals", () => {
     expect(toolOutputs().at(-1).error).toMatch(/different conversation/);
   });
 
+  it("lets a button press answer only the question whose card it was on", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    const asked = (await stub.inspect()).outbox.find((m: any) => m.text.includes("needs approval"));
+    // A press on a card from some earlier question that had the same code.
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { card: true, question: "ask:00000000-0000-0000-0000-000000000000:1" } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBeDefined();
+    expect(await answersSent(id)).toHaveLength(0);
+    // A press on this question's own card.
+    const own = await stub.outboxSince(0);
+    const idem = `ask:${id}:1`;
+    expect(own.some((m: any) => m.text.includes(code))).toBe(true);
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { card: true, question: idem } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+    void asked;
+  });
+
+  it("counts what the approver says next in the place an approval was typed, after it was moved to the question", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "thread:omt_1", data: { route_by_code: true } }));
+    await stub.ingest(message("actually wait", { user: "bob", session_key: "thread:omt_1", data: { route_by_code: true } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")], [say("")]);
+    await wake(stub);
+    // The two conversations run one after the other; look through every model call for the outcome.
+    const outputs = modelCalls.flatMap((c: any) => c.input.filter((item: any) => item.type === "function_call_output").map((item: any) => JSON.parse(item.output)));
+    expect(outputs.find((o: any) => o.error)?.error).toMatch(/said something after approving/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not wait for the new text of a reply that was edited into something not for the agent", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message("looks fine", { user: "carol", session_key: "chat", data: { subject: "test:note:gone", revision: 100, holder: "h1" } }));
+    await stub.revise("test:note:gone", 200, false, "-");
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+  });
+
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {
     // As long as the longest comment GitHub accepts. Too big to share a run with the approval, so
     // it is still waiting in the inbox when the approval is considered, and counts from there.
