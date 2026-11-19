@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readDecision } from "../src/brain/agent";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
@@ -259,13 +259,15 @@ describe("tasks and approvals", () => {
 
   it("approves when the requester replies with the code", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    expect(await reply(stub, id, "bob", `@agent approve ${code.toLowerCase()}`)).toMatchObject({ ok: true, decided_by: "bob" });
-    expect(await answersSent(id)).toEqual([{ decision: "allow", reason: `@agent approve ${code.toLowerCase()}`, questionId: "q-1" }]);
+    expect(await reply(stub, id, "bob", `approve ${code.toLowerCase()}`)).toMatchObject({ ok: true, decided_by: "bob" });
+    expect(await answersSent(id)).toEqual([{ decision: "allow", reason: `approve ${code.toLowerCase()}`, questionId: "q-1" }]);
     expect((await stub.inspect()).tasks[0].status).toBe("running");
   });
 
   it("reads the decision from what the person wrote, in English or Chinese", () => {
-    expect(readDecision("@agent approve AB12", "AB12")).toBe("allow");
+    expect(readDecision("approve AB12", "AB12")).toBe("allow");
+    // Mentions are the connector's business. One that is still in the text is somebody else's.
+    expect(readDecision("@reviewer approve AB12", "AB12")).toBeUndefined();
     expect(readDecision("同意 ab12", "AB12")).toBe("allow");
     expect(readDecision("批准：AB12", "AB12")).toBe("allow");
     expect(readDecision("deny AB12", "AB12")).toBe("deny");
@@ -280,7 +282,7 @@ describe("tasks and approvals", () => {
     expect(readDecision("approve AB12 and also the next one", "AB12")).toBeUndefined();
     // A trailing "@5pm" is a condition, not a mention to strip.
     expect(readDecision("approve AB12 @5pm", "AB12")).toBeUndefined();
-    expect(readDecision("@agent @bot approve AB12", "AB12")).toBe("allow");
+    expect(readDecision("@agent @bot approve AB12", "AB12")).toBeUndefined();
     // Words glued to the mention are words, not part of a name to strip.
     expect(readDecision("@agent不要 approve AB12", "AB12")).toBe("deny");
     expect(readDecision("@agent不要批准 AB12", "AB12")).toBe("deny");
@@ -297,14 +299,29 @@ describe("tasks and approvals", () => {
   it("does not approve when the person quoted the code in order to refuse", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     // The model gets it wrong and proposes an approval; the reply says deny.
-    expect((await reply(stub, id, "bob", `@agent deny ${code}`, "allow")).error).toMatch(/refuses this/);
-    expect((await reply(stub, id, "bob", `@agent 不同意 ${code}`, "allow")).error).toMatch(/refuses this/);
+    expect((await reply(stub, id, "bob", `deny ${code}`, "allow")).error).toMatch(/refuses this/);
+    expect((await reply(stub, id, "bob", `不同意 ${code}`, "allow")).error).toMatch(/refuses this/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("lets a refusal that is still waiting in the inbox win over an approval being handled", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    // A run takes a bounded amount of a conversation. Enough other chatter follows the approval
+    // that the refusal behind it is not part of the run that handles the approval.
+    const chatter = "x".repeat(49_000);
+    for (let i = 0; i < 3; i++) await stub.ingest(message(chatter, { user: "carol", session_key: "chat" }));
+    await stub.ingest(message(`deny ${code}`, { user: "bob", session_key: "chat" }));
+
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")], [say("")]);
+    await wake(stub);
+    expect(JSON.stringify(modelCalls.map((c) => c.input))).toMatch(/a reply refuses this/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("lets a refusal win over an approval sent in the same batch", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    await stub.ingest(message(`@agent approve ${code}`, { user: "bob", session_key: "chat" }));
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
     expect((await reply(stub, id, "bob", `@agent wait, deny ${code}`, "allow")).error).toMatch(/refuses this/);
     expect(await answersSent(id)).toHaveLength(0);
   });
@@ -313,7 +330,7 @@ describe("tasks and approvals", () => {
     const { stub, id, code } = await taskAwaitingApproval();
     // The approval is recorded and sent, but the task row still shows the question as open,
     // as it would if the worker's acknowledgement had been lost.
-    await reply(stub, id, "bob", `@agent approve ${code}`);
+    await reply(stub, id, "bob", `approve ${code}`);
     await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
       state.storage.sql.exec("UPDATE tasks SET status = 'needs_input', pending = json_object('id', 'q-1', 'code', ?) WHERE id = ?", code, id);
     });
@@ -367,7 +384,7 @@ describe("tasks and approvals", () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await stub.taskEvent(id, 2, "withdrawn", { id: "q-1" });
     expect((await stub.inspect()).tasks[0].status).toBe("running");
-    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/not waiting for an answer/);
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/not waiting for an answer/);
   });
 
   it("does not approve on a yes that does not quote the code", async () => {
@@ -393,7 +410,7 @@ describe("tasks and approvals", () => {
 
   it("lets only the requester approve in a shared scope, even with the code", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    expect((await reply(stub, id, "carol", `@agent approve ${code}`)).error).toMatch(/only bob/);
+    expect((await reply(stub, id, "carol", `approve ${code}`)).error).toMatch(/only bob/);
     expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
     expect(await answersSent(id)).toHaveLength(0);
   });
@@ -401,13 +418,13 @@ describe("tasks and approvals", () => {
   it("is not fooled by the requester speaking in the same batch as someone else's approval", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await stub.ingest(message("@agent how is it going?", { user: "bob", session_key: "chat" }));
-    expect((await reply(stub, id, "carol", `@agent approve ${code}`)).error).toMatch(/only bob/);
+    expect((await reply(stub, id, "carol", `approve ${code}`)).error).toMatch(/only bob/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("lets any member refuse, by saying so with the code", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    expect(await reply(stub, id, "carol", `@agent deny ${code}`, "deny")).toMatchObject({ ok: true, decision: "deny", decided_by: "carol" });
+    expect(await reply(stub, id, "carol", `deny ${code}`, "deny")).toMatchObject({ ok: true, decision: "deny", decided_by: "carol" });
     expect((await answersSent(id))[0]).toMatchObject({ decision: "deny", questionId: "q-1" });
   });
 
@@ -420,14 +437,14 @@ describe("tasks and approvals", () => {
 
   it("does not approve when the requester said anything after approving", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    await stub.ingest(message(`@agent approve ${code}`, { user: "bob", session_key: "chat" }));
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
     expect((await reply(stub, id, "bob", "@agent actually hold on")).error).toMatch(/said something after approving/);
     expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("does not let a decision be given from another conversation", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    expect((await reply(stub, id, "bob", `@agent approve ${code}`, "allow", { session_key: "thread:other" })).error).toMatch(/different conversation/);
+    expect((await reply(stub, id, "bob", `approve ${code}`, "allow", { session_key: "thread:other" })).error).toMatch(/different conversation/);
   });
 
   it("does not let the model approve on the strength of a worker report alone", async () => {
@@ -442,11 +459,11 @@ describe("tasks and approvals", () => {
 
   it("gives a second question a new code, so an old approval cannot be reused", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
-    await reply(stub, id, "bob", `@agent approve ${code}`);
+    await reply(stub, id, "bob", `approve ${code}`);
     await stub.taskEvent(id, 2, "needs_input", { source: "gate", id: "q-2", command: "rm -rf /" });
     model.replies([say("")]);
     await wake(stub);
-    expect((await reply(stub, id, "bob", `@agent approve ${code}`)).error).toMatch(/no reply so far is an approval/);
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/no reply so far is an approval/);
     expect(await answersSent(id)).toHaveLength(1);
   });
 
@@ -462,7 +479,7 @@ describe("tasks and approvals", () => {
     await wake(scope.stub);
     const code = (await scope.stub.inspect()).outbox.find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "ok" })], [say("")]);
-    await scope.stub.ingest(message(`@always-on-agent approve ${code}`, { user: "dana", session_key: "pr:7" }));
+    await scope.stub.ingest(message(`approve ${code}`, { user: "dana", session_key: "pr:7" }));
     await wake(scope.stub);
     expect(toolOutputs().at(-1).error).toMatch(/not started by a person/);
   });
@@ -548,7 +565,7 @@ describe("records and limits", () => {
 
     const code = question.match(/approve ([A-Z0-9]{4})/)[1];
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "fine" })], [say("")]);
-    await stub.ingest(message(`@agent approve ${code}`, { user: "bob", session_key: "chat" }));
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
     await wake(stub);
 
     const audit = (await stub.inspect()).audit.map((entry: any) => ({ actor: entry.actor, action: entry.action, detail: JSON.parse(entry.detail) }));
@@ -614,6 +631,19 @@ describe("records and limits", () => {
     expect(afterRun).toBe(30); // two model calls of 15 tokens each
     await stub.taskEvent((await stub.inspect()).tasks[0].id, 1, "result", { text: "done", usage: { total_tokens: 1_000 } });
     expect((await registry.recordUsage(name.split(":")[0], 0)).used).toBe(afterRun + 1_000);
+  });
+
+  it("knows which codes belong to open questions, for connectors deciding what is a reply", async () => {
+    const { stub } = brain("repo");
+    model.replies([call("dispatch_task", { title: "t", brief: "b", repository: null })], [say("")]);
+    await stub.ingest(message("@always-on-agent fix it", { user: "dana", session_key: "pr:1" }));
+    await wake(stub);
+    const id = (await stub.inspect()).tasks[0].id;
+    expect(await stub.hasOpenQuestion(["HTTP", "TODO"])).toBe(false);
+    await stub.taskEvent(id, 1, "needs_input", { source: "gate", id: "q-1", command: "rm -rf x" });
+    const code = (await stub.outboxSince(0)).find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
+    expect(await stub.hasOpenQuestion(["HTTP", code])).toBe(true);
+    expect(await stub.hasOpenQuestion(["HTTP", "TODO"])).toBe(false);
   });
 
   it("reports the figures an operator would watch", async () => {

@@ -733,21 +733,20 @@ export class TaskSandbox extends DurableObject<Env> {
       const record = await this.#backups.backup({ dir: WORKSPACE_DIRECTORY, name: `task ${before.id}` });
       const state = this.#state();
       if (!state) return;
+      // The checkpoint being replaced is written down as stale in the same save that installs the
+      // new one. If this object stops before the old one is deleted, the record survives and the
+      // clean-up at the end of the task removes it; it is the only pointer to that object.
       const previous = state.checkpoint?.record;
+      if (previous) state.stale_checkpoints = [...(state.stale_checkpoints ?? []), previous];
       state.checkpoint = { record, at: started, took_ms: Date.now() - started };
       state.checkpoints_taken += 1;
       this.#save(state);
-      // Only the latest one is ever restored. If the old one cannot be deleted now, its record is
-      // kept so the clean-up at the end of the task can try again; it is the only pointer to it.
       if (previous) {
-        try {
-          await this.#backups.delete(previous);
-        } catch {
-          const later = this.#state();
-          if (later) {
-            later.stale_checkpoints = [...(later.stale_checkpoints ?? []), previous];
-            this.#save(later);
-          }
+        await this.#backups.delete(previous);
+        const later = this.#state();
+        if (later) {
+          later.stale_checkpoints = (later.stale_checkpoints ?? []).filter((stale) => stale.id !== previous.id);
+          this.#save(later);
         }
       }
     } catch (err) {

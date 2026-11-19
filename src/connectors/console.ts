@@ -50,7 +50,8 @@ export async function handleConsole(request: Request, env: Env, tenant: string, 
       kind: "message",
       session_key: scope.kind === "user" ? "dm" : typeof body.thread === "string" && ID.test(body.thread) ? `thread:${body.thread}` : "chat",
       principal: { kind: "human", id: speaker, explicit: true },
-      text: body.text,
+      // In this channel "@agent" is how a group message addresses the agent; it is not part of what was said.
+      text: body.text.replace(/^\s*@agent(?![\w-])\s*/i, ""),
       reply_to: { connector: "console", address: {} },
     };
     return json({ ...(await brain.ingest(event)), scope: scopeName(scope) }, 202);

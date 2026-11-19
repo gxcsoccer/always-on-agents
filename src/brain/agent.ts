@@ -706,8 +706,12 @@ export class BrainAgent extends DurableObject<Env> {
         deciding = refusals.at(-1)!;
       } else {
         if (pending.truncated) throw new Error("the action is too long to be shown in full, so it cannot be approved; it can only be refused");
-        // A refusal from any member wins over an approval in the same batch, whichever came first.
-        if (read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
+        // A refusal from any member wins over an approval, whichever came first. That includes one
+        // that arrived after this run started and is still waiting in the inbox.
+        const waiting = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at)
+          .filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal))
+          .some((event) => readDecision(event.text ?? "", pending.code) === "deny");
+        if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         let approvals = read.filter(({ says }) => says === "allow");
         if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${pending.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
         // One message approves one question.
@@ -881,6 +885,12 @@ export class BrainAgent extends DurableObject<Env> {
 
   // ------------------------------------------------------------------ reads for connectors and admins
 
+  /** Whether any of these codes belongs to an approval question that is open in this scope. */
+  async hasOpenQuestion(codes: string[]): Promise<boolean> {
+    const open = new Set(this.#rows<{ code: string | null }>("SELECT json_extract(pending, '$.code') AS code FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL").map((r) => r.code));
+    return codes.some((code) => open.has(code));
+  }
+
   /** Records where this scope's messages go when an event does not say. Set by the first connector to reach it. */
   async setDefaultTarget(target: Target): Promise<void> {
     if (!this.#meta("default_target")) this.#setMeta("default_target", JSON.stringify(target));
@@ -988,9 +998,10 @@ export function readDecision(text: string, code: string): "allow" | "deny" | und
   // code makes it a refusal, wherever it sits and whatever it is attached to. English words are
   // matched whole, so "notebook" or "another" is not one.
   if (/(?<![A-Za-z])(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel)(?![A-Za-z])|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
-  // An approval is the whole message and nothing else: optional plain @handles in front, then
-  // "approve CODE". Anything longer could be a condition or a different statement.
-  const bare = text.replace(/^(\s*@[A-Za-z0-9_-]+(?=\s))+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
+  // An approval is the whole message and nothing else: "approve CODE". Anything longer could be a
+  // condition or a different statement. Mentions are not stripped here: each connector removes the
+  // agent's own, where it knows which that is, and a message addressed to anyone else is not for us.
+  const bare = text.replace(/[\s:：,，.。!！]+/g, " ").trim();
   if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
   return undefined;
 }

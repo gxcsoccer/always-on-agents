@@ -131,12 +131,15 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     if (!body) return this.#refuse(request, url, "push is too large");
     const refs = parseReceivePack(body);
     if (!refs) return this.#refuse(request, url, "could not read what this push would change");
+    // Reading the body took time; the task may have ended since the check at the door.
+    if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
     if (refs.length === 0) return fetch(url, { method: "POST", headers, body, redirect: "manual" });
 
     const verdict = await this.#authorize(git.repo, refs);
     if (verdict.state !== "allow") {
       return new Response(`push to ${git.repo} was not approved: ${verdict.reason}\n`, { status: 403 });
     }
+    if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
     return fetch(url, { method: "POST", headers, body, redirect: "manual" });
   }
 
@@ -245,7 +248,8 @@ function isLocalItem(item: unknown): boolean {
   if (typeof type !== "string" || !LOCAL_ITEM_TYPES.has(type)) return false;
   // A call or its output must be spelled out too; an empty shell of one is not something an agent writes.
   const fields = item as Record<string, unknown>;
-  if (type === "function_call" || type === "custom_tool_call") return typeof fields.call_id === "string" && typeof fields.name === "string";
+  if (type === "function_call") return typeof fields.call_id === "string" && typeof fields.name === "string" && typeof fields.arguments === "string";
+  if (type === "custom_tool_call") return typeof fields.call_id === "string" && typeof fields.name === "string" && typeof fields.input === "string";
   if (type === "function_call_output" || type === "custom_tool_call_output") return typeof fields.call_id === "string" && fields.output !== undefined;
   return true;
 }

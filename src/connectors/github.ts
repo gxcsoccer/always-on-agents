@@ -16,17 +16,10 @@ import { githubTokenFor } from "./github-app";
 import type { OutboundMessage } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-// A verb in any capitalisation, a separator, then a four-character code. The code's own case is
-// checked by the Brain; here the point is only that "Deny K7PW" must not be dropped while
-// "approve K7PW" gets through, which would discard a person's change of mind.
-const DECISION_REPLY = /^\s*(?:approve|deny|同意|批准|拒绝|不同意)[\s:：]+[A-Za-z0-9]{4}\s*[.!。！]?\s*$/i;
 // The agent's own handle, whole: "@always-on-agent-staging" is someone else.
 const MENTION = /(^|\s)@always-on-agent(?![\w-])|^\s*\/agent(?![\w-])/i;
-// A short comment that pairs a deciding word with something shaped like a question's code. It is
-// let through so the Brain can read it: dropping "do not approve K7PW" here would leave an earlier
-// "approve K7PW" standing after its author took it back.
-const ABOUT_A_DECISION = /approve|deny|refuse|reject|cancel|stop|同意|批准|拒绝|否决|取消|不要/i;
-const CODE_SHAPED = /(?<![A-Za-z0-9])[A-Z0-9]{4}(?![A-Za-z0-9])/;
+// Anything shaped like the code of an approval question. Compared with the codes actually open.
+const CODE_SHAPED = /(?<![A-Za-z0-9])[A-Za-z0-9]{4}(?![A-Za-z0-9])/g;
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   const raw = await request.text();
@@ -75,6 +68,10 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
 
   const scope: Scope = { tenant, kind: "repo", id: normalized.repo };
   const brain = env.BRAIN.getByName(scopeName(scope));
+  // An unaddressed comment is only for the agent if it quotes the code of a question that is open.
+  if (normalized.onlyIfOpenCode && !(await brain.hasOpenQuestion(normalized.onlyIfOpenCode))) {
+    return json({ ignored: "the comment does not address the agent" }, 202);
+  }
   const result = await brain.ingest(normalized.event);
   return json({ ...result, scope: scopeName(scope), kind: normalized.event.kind }, 202);
 }
@@ -86,7 +83,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
  * the delivery header: that header is outside the signature, so a captured request could be replayed
  * under a new delivery id.
  */
-export function normalize(type: string, payload: any): { repo: string; event: InboundEvent } | undefined {
+export function normalize(type: string, payload: any): { repo: string; event: InboundEvent; onlyIfOpenCode?: string[] } | undefined {
   const repo: string | undefined = payload.repository?.full_name;
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   const sender = payload.sender ?? {};
@@ -118,10 +115,13 @@ export function normalize(type: string, payload: any): { repo: string; event: In
 
   if (type === "issue_comment" && payload.action === "created") {
     const body: string = payload.comment?.body ?? "";
-    // Comments that do not address the agent are other people's conversation. A bare reply to an
-    // approval question ("approve K7PW") is addressed to it without saying so.
-    const aboutDecision = DECISION_REPLY.test(body) || (body.length <= 300 && ABOUT_A_DECISION.test(body) && CODE_SHAPED.test(body));
-    if ((!MENTION.test(body) && !aboutDecision) || sender.type === "Bot") return undefined;
+    // Comments that do not address the agent are other people's conversation, with one exception:
+    // a comment that quotes the code of a question the agent has open is a reply to that question,
+    // whatever its wording. Whether a quoted token is such a code is decided by the caller, which
+    // can ask the Brain; here the candidates are collected.
+    const mentioned = MENTION.test(body);
+    const quoted = mentioned || body.length > 500 ? [] : [...new Set((body.match(CODE_SHAPED) ?? []).map((token) => token.toUpperCase()))].slice(0, 20);
+    if ((!mentioned && quoted.length === 0) || sender.type === "Bot") return undefined;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
     if (body.includes("<!-- always-on-agent:")) return undefined;
@@ -143,6 +143,7 @@ export function normalize(type: string, payload: any): { repo: string; event: In
         data: { number, comment_id: payload.comment.id, is_pull_request: Boolean(payload.issue.pull_request) },
         reply_to: replyTo(number),
       },
+      ...(mentioned ? {} : { onlyIfOpenCode: quoted }),
     };
   }
 
