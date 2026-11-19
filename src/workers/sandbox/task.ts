@@ -329,7 +329,9 @@ export class TaskSandbox extends DurableObject<Env> {
         const t1 = Date.now();
         const branch = input.ref ? ["--branch", input.ref] : [];
         const clone = await this.#run(
-          ["git", "clone", "--depth", "1", ...branch, "--", input.repository, REPOSITORY_DIRECTORY],
+          // Shallow, but with every branch's tip: a shallow clone otherwise knows only the default
+          // branch, and a task asked to work on another one finds it does not exist.
+          ["git", "clone", "--depth", "1", "--no-single-branch", ...branch, "--", input.repository, REPOSITORY_DIRECTORY],
           WORKSPACE_DIRECTORY,
           TRUST_ENV,
         );
