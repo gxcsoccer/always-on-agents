@@ -121,7 +121,9 @@ export class FakeFeishu extends DurableObject {
     const server = pair[1];
     server.binaryType = "arraybuffer";
     server.accept();
-    server.addEventListener("message", (event) => this.#received.push([...new Uint8Array(event.data as ArrayBuffer)]));
+    server.addEventListener("message", (event) => {
+      this.#received.push([...new Uint8Array(event.data as ArrayBuffer)]);
+    });
     this.#server = server;
     return new Response(null, { status: 101, webSocket: pair[0] });
   }

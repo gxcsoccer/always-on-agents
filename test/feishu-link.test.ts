@@ -145,7 +145,8 @@ describe("the Feishu long connection", () => {
     expect(JSON.parse(new TextDecoder().decode(refused.payload))).toEqual({ code: 500 });
     expect((await link.status()).trouble).toBe("too_busy");
     // Nonsense about its own pieces: refused too, not taken as a whole message.
-    await feishu.send(encodeFrame({ seqId: 9n, logId: 9n, service: 7, method: DATA, headers: [{ key: "type", value: "event" }, { key: "message_id", value: "odd" }, { key: "sum", value: "0" }, { key: "seq", value: "3" }], payload: new Uint8Array(10) }));
+    // The body is a perfectly good event, so the refusal can only be for the piece count.
+    await feishu.send(encodeFrame({ seqId: 9n, logId: 9n, service: 7, method: DATA, headers: [{ key: "type", value: "event" }, { key: "message_id", value: "odd" }, { key: "sum", value: "0" }, { key: "seq", value: "3" }], payload: new TextEncoder().encode(JSON.stringify(message(appId, "om_odd", "valid body"))) }));
     expect(JSON.parse(new TextDecoder().decode((await feishu.waitFor(3))[2].payload))).toEqual({ code: 500 });
     // The first piece of an ordinary two-part message gets no answer yet: it is only incomplete.
     await feishu.send(encodeFrame({ seqId: 9n, logId: 9n, service: 7, method: DATA, headers: [{ key: "type", value: "event" }, { key: "message_id", value: "pending" }, { key: "sum", value: "2" }, { key: "seq", value: "0" }], payload: new Uint8Array(10) }));
