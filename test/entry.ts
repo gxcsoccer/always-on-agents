@@ -1,3 +1,4 @@
+import { TaskSandbox } from "../src/workers/sandbox/task";
 import { DurableObject } from "cloudflare:workers";
 
 import { handleFeishuWebhook } from "../src/connectors/feishu";
@@ -85,3 +86,17 @@ export default {
     return new Response("test worker");
   },
 };
+
+
+/**
+ * The real task object, with a container that is never running. Enough to exercise what the object
+ * does on its own: the questions it holds for the gate, and when it lets go of them.
+ */
+export class GateTask extends TaskSandbox {
+  constructor(ctx: DurableObjectState, env: any) {
+    // Own properties on the real state object, in front of the runtime's own.
+    Object.defineProperty(ctx, "container", { value: { running: false }, configurable: true });
+    Object.defineProperty(ctx, "exports", { value: { Outbound: () => ({}), DirectoryBackupGateway: {} }, configurable: true });
+    super(ctx as any, env);
+  }
+}

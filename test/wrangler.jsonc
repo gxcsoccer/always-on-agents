@@ -18,12 +18,14 @@
     "bindings": [
       { "name": "BRAIN", "class_name": "BrainAgent" },
       { "name": "TASKS", "class_name": "FakeTask" },
+      { "name": "GATE_TASKS", "class_name": "GateTask" },
       { "name": "REGISTRY", "class_name": "Registry" }
     ]
   },
   "exports": {
     "BrainAgent": { "type": "durable-object", "storage": "sqlite" },
     "FakeTask": { "type": "durable-object", "storage": "sqlite" },
+    "GateTask": { "type": "durable-object", "storage": "sqlite" },
     "Registry": { "type": "durable-object", "storage": "sqlite" }
   }
 }
