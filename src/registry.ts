@@ -44,6 +44,7 @@ export class Registry extends DurableObject<Env> {
         PRIMARY KEY (tenant, provider, external_id)
       );
       CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS chat_repos (tenant TEXT NOT NULL, chat TEXT NOT NULL, repo TEXT NOT NULL, PRIMARY KEY (tenant, chat));
       CREATE TABLE IF NOT EXISTS feishu_apps (
         app_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, app_secret TEXT NOT NULL, encrypt_key TEXT, verification_token TEXT,
         bot_open_id TEXT, token TEXT, token_expires_at INTEGER
@@ -160,6 +161,28 @@ export class Registry extends DurableObject<Env> {
       externalId,
       userId,
     );
+  }
+
+  /**
+   * Lets one group chat work on one repository: tasks started in that chat are lent the tenant's
+   * credential for that repository, as tasks started in the repository's own conversation are.
+   * An operator's decision, made per chat. Without it a chat's tasks get no repository credential
+   * at all, since a chat can name any repository. Passing no repository removes the link.
+   */
+  async linkChatRepo(tenant: string, chat: string, repo: string | null): Promise<void> {
+    this.#requireTenant(tenant);
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(chat)) throw new Error("chat must be a chat id");
+    if (repo === null) {
+      this.ctx.storage.sql.exec("DELETE FROM chat_repos WHERE tenant = ? AND chat = ?", tenant, chat);
+      return;
+    }
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("repo must be owner/name");
+    this.ctx.storage.sql.exec("INSERT INTO chat_repos (tenant, chat, repo) VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET repo = excluded.repo", tenant, chat, repo.toLowerCase());
+  }
+
+  /** The repository a chat's tasks may be lent a credential for, as lowercase owner/name, if any. */
+  async chatRepo(tenant: string, chat: string): Promise<string | null> {
+    return this.ctx.storage.sql.exec<{ repo: string }>("SELECT repo FROM chat_repos WHERE tenant = ? AND chat = ?", tenant, chat).toArray()[0]?.repo ?? null;
   }
 
   async resolveIdentity(tenant: string, provider: string, externalId: string): Promise<string | null> {

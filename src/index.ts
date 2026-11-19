@@ -71,6 +71,11 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     });
     return json({ ok: true, webhook: `${url.origin}/v1/feishu/events/${app.app_id}` });
   }
+  if (path[0] === "tenants" && path[2] === "chat-repos" && method === "POST") {
+    const { chat, repo } = await body();
+    await registry(env).linkChatRepo(path[1], String(chat ?? ""), repo === null || repo === undefined ? null : String(repo));
+    return json({ ok: true });
+  }
   if (path[0] === "tenants" && path[2] === "identities" && method === "POST") {
     const { provider, external_id, user_id } = await body();
     await registry(env).linkIdentity(path[1], String(provider), String(external_id), String(user_id));

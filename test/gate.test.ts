@@ -133,3 +133,38 @@ describe("pushes a task holds for approval", () => {
     expect(await stub.authorize("r2", "push", repo, move("a", "b"))).toMatchObject({ state: "pending" });
   });
 });
+
+describe("the repository credential a task is lent", () => {
+  const registry = () => (env as any).REGISTRY.getByName("global");
+  /** A running task that says which conversation started it and which repository it works on. */
+  async function taskFrom(brain: string, repository: string) {
+    const { stub } = await runningTask();
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const task = state.storage.kv.get("state") as any;
+      state.storage.kv.put("state", { ...task, brain, repository });
+    });
+    return stub;
+  }
+
+  it("lends it in the repository's own conversation and in a chat linked to that repository, and nowhere else", async () => {
+    await registry().createTenant("lend", "lend");
+    const repo = "https://github.com/acme/demo";
+    expect(await (await taskFrom("lend:repo:acme/demo", repo)).githubToken()).toBe("test-github-token");
+    // A chat gets nothing for any repository until an operator links it to one.
+    expect(await (await taskFrom("lend:chat:oc_room", repo)).githubToken()).toBeUndefined();
+    await registry().linkChatRepo("lend", "oc_room", "Acme/Demo");
+    expect(await (await taskFrom("lend:chat:oc_room", repo)).githubToken()).toBe("test-github-token");
+    // Only for that repository, only for that chat, and never for a direct chat.
+    expect(await (await taskFrom("lend:chat:oc_room", "https://github.com/acme/other")).githubToken()).toBeUndefined();
+    expect(await (await taskFrom("lend:chat:oc_elsewhere", repo)).githubToken()).toBeUndefined();
+    expect(await (await taskFrom("lend:user:oc_room", repo)).githubToken()).toBeUndefined();
+    // Another tenant's chat of the same name is another chat.
+    await registry().createTenant("lend2", "lend2");
+    expect(await (await taskFrom("lend2:chat:oc_room", repo)).githubToken()).toBeUndefined();
+    // Removing the link stops the lending, for a task already running too.
+    const running = await taskFrom("lend:chat:oc_room", repo);
+    expect(await running.githubToken()).toBe("test-github-token");
+    await registry().linkChatRepo("lend", "oc_room", null);
+    expect(await running.githubToken()).toBeUndefined();
+  });
+});

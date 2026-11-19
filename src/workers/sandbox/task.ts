@@ -492,7 +492,8 @@ export class TaskSandbox extends DurableObject<Env> {
    * Credentials are lent only to a task that was started from that repository's own scope, which
    * exists only because GitHub delivered a signed event for it under this tenant's installation.
    * A task started from a chat can name any repository, so it gets none and can only read what is
-   * public: being in a tenant is not the same as having access to all of its code.
+   * public: being in a tenant is not the same as having access to all of its code. The exception
+   * is a group chat that an operator has linked to one repository, for that repository only.
    */
   async githubToken(): Promise<string | undefined> {
     const state = this.#state();
@@ -504,7 +505,14 @@ export class TaskSandbox extends DurableObject<Env> {
     // A task with no Brain is a development probe; it gets the development token or nothing.
     if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY ? undefined : this.env.GITHUB_TOKEN || undefined;
     const [tenant, kind, ...rest] = state.brain.split(":");
-    if (kind !== "repo" || rest.join(":").toLowerCase() !== repo) return undefined;
+    // Lent in the repository's own conversation, or in a group chat an operator has linked to this
+    // very repository. Looked up each time, so removing the link stops the lending at once.
+    const own = kind === "repo" && rest.join(":").toLowerCase() === repo;
+    const linked = kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo;
+    if (!own && !linked) return undefined;
+    // Looking the link up took a moment; the task may have ended meanwhile.
+    const still = this.#state();
+    if (!still || (!ACTIVE.has(still.phase) && still.phase !== "starting")) return undefined;
     // Checked before the cache: a credential issued under an earlier configuration is not lent on.
     if (Boolean(this.env.GITHUB_APP_ID) !== Boolean(this.env.GITHUB_APP_PRIVATE_KEY)) return undefined;
     const source = this.env.GITHUB_APP_ID ? `app:${this.env.GITHUB_APP_ID}` : "token";
