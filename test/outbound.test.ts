@@ -136,6 +136,7 @@ describe("the model key", () => {
     // An item given only by id points at something stored on the provider's side.
     expect((await withInput([{ id: "msg_someone_elses" }])).status).toBe(403);
     expect((await withInput([{ type: "item_reference", id: "msg_someone_elses" }])).status).toBe(403);
+    expect((await withInput([{ type: "function_call", id: "fc_someone_elses" }])).status).toBe(403);
     // Nothing stored on the provider's side may be referred to: under a shared key it could be anyone's.
     const withField = (extra: Record<string, unknown>) => send("https://model.test/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input: "hi", ...extra }) });
     expect((await withField({ previous_response_id: "resp_someone_elses" })).status).toBe(403);

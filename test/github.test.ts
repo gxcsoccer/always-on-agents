@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { readDecision } from "../src/brain/agent";
 import { normalize, verifySignature } from "../src/connectors/github";
 
 async function sign(secret: string, body: string): Promise<string> {
@@ -60,12 +61,19 @@ describe("event normalisation", () => {
     expect(normalize("issue_comment", comment("deny K7PW.", "MEMBER"))?.event.text).toBe("deny K7PW.");
     // Still only from people with standing, and only when that is the whole comment.
     expect(normalize("issue_comment", comment("approve K7PW", "NONE"))).toBeUndefined();
-    expect(normalize("issue_comment", comment("I would approve K7PW if the tests pass", "OWNER"))).toBeUndefined();
+    // A longer comment about the decision reaches the Brain, which does not read it as an approval.
+    const hedged = normalize("issue_comment", comment("I would approve K7PW if the tests pass", "OWNER"))?.event.text ?? "";
+    expect(readDecision(hedged, "K7PW")).toBeUndefined();
     // Capitalised or not, a decision reply gets through, so a change of mind is never dropped.
     expect(normalize("issue_comment", comment("Deny K7PW", "OWNER"))?.event.text).toBe("Deny K7PW");
     // A person is identified by the account's numeric id, which a renamed login cannot take over.
     const withId = { ...comment("approve K7PW", "OWNER"), sender: { login: "erin", id: 4711, type: "User" } };
     expect(normalize("issue_comment", withId)?.event.principal).toMatchObject({ id: "github:4711", display: "erin" });
+    // A withdrawal in other words is passed on too, for the Brain to read.
+    expect(normalize("issue_comment", comment("do not approve K7PW", "OWNER"))?.event.text).toBe("do not approve K7PW");
+    // A similarly named account is not this agent.
+    expect(normalize("issue_comment", comment("@always-on-agent-staging please look", "OWNER"))).toBeUndefined();
+    expect(normalize("issue_comment", comment("@always-on-agent approve K7PW", "OWNER"))?.event.text).toBe("approve K7PW");
     // One word that merely starts like a decision is not one.
     expect(normalize("issue_comment", comment("denylist", "OWNER"))).toBeUndefined();
     expect(normalize("issue_comment", comment("approved", "OWNER"))).toBeUndefined();

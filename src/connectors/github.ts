@@ -20,7 +20,13 @@ const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 // checked by the Brain; here the point is only that "Deny K7PW" must not be dropped while
 // "approve K7PW" gets through, which would discard a person's change of mind.
 const DECISION_REPLY = /^\s*(?:approve|deny|同意|批准|拒绝|不同意)[\s:：]+[A-Za-z0-9]{4}\s*[.!。！]?\s*$/i;
-const MENTION = /(^|\s)@always-on-agent\b|^\s*\/agent\b/i;
+// The agent's own handle, whole: "@always-on-agent-staging" is someone else.
+const MENTION = /(^|\s)@always-on-agent(?![\w-])|^\s*\/agent(?![\w-])/i;
+// A short comment that pairs a deciding word with something shaped like a question's code. It is
+// let through so the Brain can read it: dropping "do not approve K7PW" here would leave an earlier
+// "approve K7PW" standing after its author took it back.
+const ABOUT_A_DECISION = /approve|deny|refuse|reject|cancel|stop|同意|批准|拒绝|否决|取消|不要/i;
+const CODE_SHAPED = /(?<![A-Za-z0-9])[A-Z0-9]{4}(?![A-Za-z0-9])/;
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   const raw = await request.text();
@@ -114,7 +120,8 @@ export function normalize(type: string, payload: any): { repo: string; event: In
     const body: string = payload.comment?.body ?? "";
     // Comments that do not address the agent are other people's conversation. A bare reply to an
     // approval question ("approve K7PW") is addressed to it without saying so.
-    if ((!MENTION.test(body) && !DECISION_REPLY.test(body)) || sender.type === "Bot") return undefined;
+    const aboutDecision = DECISION_REPLY.test(body) || (body.length <= 300 && ABOUT_A_DECISION.test(body) && CODE_SHAPED.test(body));
+    if ((!MENTION.test(body) && !aboutDecision) || sender.type === "Bot") return undefined;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
     if (body.includes("<!-- always-on-agent:")) return undefined;
@@ -130,7 +137,9 @@ export function normalize(type: string, payload: any): { repo: string; event: In
         kind: "message",
         session_key: `pr:${number}`,
         principal: person(true),
-        text: body,
+        // The agent's own handle is removed here, where it is known. Any other @handle stays in the
+        // text, so "@someone-else approve K7PW" is not read as an approval addressed to this agent.
+        text: body.replace(/(^|\s)@always-on-agent(?![\w-])/gi, "$1").trim(),
         data: { number, comment_id: payload.comment.id, is_pull_request: Boolean(payload.issue.pull_request) },
         reply_to: replyTo(number),
       },

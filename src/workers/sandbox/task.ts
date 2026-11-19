@@ -172,6 +172,7 @@ const MAX_LIFETIME_MS = 2 * 60 * 60 * 1_000;
 // Checkpoints: at most this often, and a task is restored at most this many times.
 const CHECKPOINT_MIN_INTERVAL_MS = 30 * 1_000;
 const MAX_RECOVERIES = 2;
+const MAX_STALE_CHECKPOINTS = 20;
 // A running process does not keep a container awake; requests do. Check well within the timeout.
 const CHECK_INTERVAL_MS = 20 * 1_000;
 // How long the proxy holds a request that needs approval, and how long an approval stays usable.
@@ -503,7 +504,10 @@ export class TaskSandbox extends DurableObject<Env> {
     // worker's reported total when the task ends.
     const tenant = state.brain?.split(":")[0];
     if (!tenant) return true;
-    return (await registry(this.env).recordUsage(tenant, 0)).allowed;
+    const allowed = (await registry(this.env).recordUsage(tenant, 0)).allowed;
+    // The lookup took time; the task may have been cancelled or have ended meanwhile.
+    const now = this.#state();
+    return allowed && Boolean(now) && (ACTIVE.has(now!.phase) || now!.phase === "starting");
   }
 
   /**
@@ -720,6 +724,9 @@ export class TaskSandbox extends DurableObject<Env> {
     const before = this.#state();
     if (!before || this.#checkpointing || !ACTIVE.has(before.phase) || !this.#container.running) return;
     if (before.checkpoint && Date.now() - before.checkpoint.at < CHECKPOINT_MIN_INTERVAL_MS) return;
+    // If old checkpoints cannot be deleted, stop making new ones rather than pile them up: every
+    // one that is made has to be remembered until it is gone.
+    if ((before.stale_checkpoints?.length ?? 0) >= MAX_STALE_CHECKPOINTS) return;
     this.#checkpointing = true;
     const started = Date.now();
     try {
@@ -738,7 +745,7 @@ export class TaskSandbox extends DurableObject<Env> {
         } catch {
           const later = this.#state();
           if (later) {
-            later.stale_checkpoints = [...(later.stale_checkpoints ?? []), previous].slice(-50);
+            later.stale_checkpoints = [...(later.stale_checkpoints ?? []), previous];
             this.#save(later);
           }
         }

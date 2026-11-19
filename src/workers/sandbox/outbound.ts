@@ -242,7 +242,12 @@ function isLocalItem(item: unknown): boolean {
   if (type === undefined || type === "message") {
     return typeof role === "string" && ["user", "assistant", "system", "developer"].includes(role) && (typeof content === "string" || Array.isArray(content));
   }
-  return typeof type === "string" && LOCAL_ITEM_TYPES.has(type);
+  if (typeof type !== "string" || !LOCAL_ITEM_TYPES.has(type)) return false;
+  // A call or its output must be spelled out too; an empty shell of one is not something an agent writes.
+  const fields = item as Record<string, unknown>;
+  if (type === "function_call" || type === "custom_tool_call") return typeof fields.call_id === "string" && typeof fields.name === "string";
+  if (type === "function_call_output" || type === "custom_tool_call_output") return typeof fields.call_id === "string" && fields.output !== undefined;
+  return true;
 }
 
 /** True if any image, file or server in the request is given as a URL to fetch rather than inline. */
