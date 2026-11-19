@@ -436,6 +436,38 @@ describe("tasks and approvals", () => {
     expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
   });
 
+  it("settles revisions the same way whichever arrived first", async () => {
+    for (const order of ["oldest-first", "newest-first"]) {
+      const { stub, id, code } = await taskAwaitingApproval();
+      const older = message("looks fine", { user: "carol", session_key: "chat", data: { subject: `test:note:${order}`, revision: 100, holder: "h1" } });
+      const newer = message("[edited their earlier comment to] still fine", { user: "carol", session_key: "chat", data: { subject: `test:note:${order}`, revision: 200, holder: "h2" } });
+      for (const event of order === "oldest-first" ? [older, newer] : [newer, older]) await stub.ingest(event);
+      await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+      model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+      await wake(stub);
+      expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+    }
+  });
+
+  it("takes a person's last word by when it was said, not by when it arrived", async () => {
+    // bob approved at 100 and said "wait" at 200, but the "wait" was delivered first.
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message("wait, let me reconsider", { user: "bob", session_key: "chat", data: { subject: "test:note:wait", revision: 200, holder: "w" } }));
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: "test:note:ok", revision: 100, holder: "a" } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toMatch(/said something after approving/);
+
+    // Said in the same second: no telling which was last.
+    const same = await taskAwaitingApproval();
+    await same.stub.ingest(message("hmm", { user: "bob", session_key: "chat", data: { subject: "test:note:hmm", revision: 100, holder: "w" } }));
+    await same.stub.ingest(message(`approve ${same.code}`, { user: "bob", session_key: "chat", data: { subject: "test:note:ok2", revision: 100, holder: "a" } }));
+    model.replies([call("answer_task", { task_id: same.id, decision: "allow", reason: "" })], [say("")]);
+    await wake(same.stub);
+    expect(toolOutputs().at(-1).error).toMatch(/same moment/);
+    expect(await answersSent(same.id)).toHaveLength(0);
+  });
+
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {
     // As long as the longest comment GitHub accepts. Too big to share a run with the approval, so
     // it is still waiting in the inbox when the approval is considered, and counts from there.

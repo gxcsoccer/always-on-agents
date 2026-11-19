@@ -761,10 +761,13 @@ export class BrainAgent extends DurableObject<Env> {
         if (pending.truncated) throw new Error("the action is too long to be shown in full, so it cannot be approved; it can only be refused");
         // A refusal from any member wins over an approval, whichever came first. That includes one
         // that arrived after this run started and is still waiting in the inbox.
-        const waiting = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at)
-          .filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal))
-          .some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
+        const queued = this.#reconcile(
+          this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+        );
+        const waiting = queued.events.some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
+        // The same goes for a waiting reply that has been edited into something not yet seen.
+        if (queued.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
         // A reply that was edited since, whose new text has not arrived yet, may now be a refusal.
         if (received.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
         let approvals = read.filter(({ says }) => says === "allow");
@@ -778,10 +781,18 @@ export class BrainAgent extends DurableObject<Env> {
           approvals = approvals.filter(({ principal }) => principal.id === task.requested_by);
           if (approvals.length === 0) throw new Error(`only ${task.requested_by}, who requested this task, can approve it`);
         }
-        deciding = approvals.at(-1)!;
+        // "Last" is by when a thing was said, where the source tells us: deliveries can arrive out
+        // of order, and a "wait" sent after the approval may get here before it.
+        const bySaid = (a: (typeof read)[number], b: (typeof read)[number]) => saidAt(a.event) - saidAt(b.event) || a.event.id - b.event.id;
+        deciding = [...approvals].sort(bySaid).at(-1)!;
         // The approval has to be that person's last word. If they said anything after it, they may
         // have been taking it back, and there is no reading that safely.
-        const lastWord = read.filter(({ principal }) => principal.id === deciding.principal.id).at(-1)!;
+        const theirs = read.filter(({ principal }) => principal.id === deciding.principal.id).sort(bySaid);
+        const lastWord = theirs.at(-1)!;
+        // Said in the same instant as far as the source can tell: which came last is anyone's guess.
+        if (theirs.some(({ event }) => event.id !== deciding.event.id && saidAt(event) === saidAt(deciding.event))) {
+          throw new Error(`${deciding.principal.id} said something else at the same moment as approving; ask them to confirm by sending just "approve ${pending.code}" again`);
+        }
         // Including anything of theirs that arrived after this run started and is still in the inbox.
         const saidMore = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id).some(
           (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
@@ -1011,7 +1022,8 @@ export class BrainAgent extends DurableObject<Env> {
     const current = events.filter((event) => {
       if (this.#standing(event) !== "changed") return true;
       const subject = (JSON.parse(event.data ?? "{}") as { subject?: string }).subject;
-      const replaced = this.#rows("SELECT 1 FROM inbox WHERE id > ? AND json_extract(data, '$.subject') = ? LIMIT 1", event.id, subject ?? "").length > 0;
+      // Whichever of them arrived first: the message that carries the subject's current text.
+      const replaced = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id != ? AND json_extract(data, '$.subject') = ?", event.id, subject ?? "").some((other) => this.#standing(other) === "stands");
       if (!replaced) unresolved = true;
       return !replaced;
     });
@@ -1124,6 +1136,12 @@ function renderEvent(event: InboxRow): string {
           ? "a timer you set"
           : `${principal.display ?? principal.id} (automated)`;
   return `[${new Date(event.received_at).toISOString()}] ${event.kind} from ${who}: ${event.text ?? ""}`.trim();
+}
+
+/** When a message was said, according to its source if it tells us, else when it arrived. */
+function saidAt(event: InboxRow): number {
+  const revision = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number }) : {};
+  return revision.subject && typeof revision.revision === "number" ? revision.revision : event.received_at;
 }
 
 /** Whether a message mentions this question's code at all. */

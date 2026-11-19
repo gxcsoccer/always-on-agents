@@ -31,9 +31,11 @@ function ownWords(body: string): string {
   const kept: string[] = [];
   let fence: { char: string; length: number } | undefined;
   for (const line of body.split("\n")) {
-    const run = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    // At any indentation: inside a list item a fence sits deeper than three spaces. Taking a line
+    // for code when it was not only means a mention there has to be made again.
+    const run = /^[ \t>*+\-\d.)]*(`{3,}|~{3,})/.exec(line)?.[1];
     if (fence) {
-      if (run && run[0] === fence.char && run.length >= fence.length && line.trim() === run) fence = undefined;
+      if (run && run[0] === fence.char && run.length >= fence.length && line.trim().replace(/^[>*+\-\d.) \t]+/, "") === run) fence = undefined;
       continue;
     }
     if (run) {
