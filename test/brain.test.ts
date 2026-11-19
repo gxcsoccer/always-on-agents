@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readDecision, readTiedDecision } from "../src/brain/agent";
+import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
 
 beforeEach(() => installFakeModel());
@@ -260,7 +260,7 @@ describe("tasks and approvals", () => {
   it("approves when the requester replies with the code", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     expect(await reply(stub, id, "bob", `approve ${code.toLowerCase()}`)).toMatchObject({ ok: true, decided_by: "bob" });
-    expect(await answersSent(id)).toEqual([{ decision: "allow", reason: `approve ${code.toLowerCase()}`, questionId: "q-1" }]);
+    expect(await answersSent(id)).toEqual([{ decision: "allow", reason: `approve ${code.toLowerCase()}`, questionId: "q-1", standing: false }]);
     expect((await stub.inspect()).tasks[0].status).toBe("running");
   });
 
@@ -593,6 +593,37 @@ describe("tasks and approvals", () => {
     await wake(stub);
     expect(toolOutputs().at(-1).error).toBeDefined();
     expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
+  });
+
+  it("passes on an approval for the rest of the task only when the approver said so, and only for a push", async () => {
+    const pushAsk = { source: "proxy", id: "q-1", action: "push", resource: "acme/demo", refs: [{ ref: "refs/heads/feature", old: "a".repeat(40), new: "b".repeat(40) }], summary: "push to acme/demo: move branch feature" };
+    const waitingOnPush = async () => {
+      const scope = brain("chat");
+      model.replies([call("dispatch_task", { title: "ship", brief: "push the fix", repository: null })], [say("")]);
+      await scope.stub.ingest(message("@agent ship it", { user: "bob", session_key: "chat" }));
+      await wake(scope.stub);
+      const id: string = (await scope.stub.inspect()).tasks[0].id;
+      await scope.stub.taskEvent(id, 1, "needs_input", pushAsk);
+      model.replies([say("")]);
+      await wake(scope.stub);
+      const code = (await scope.stub.inspect()).outbox.find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)![1];
+      return { ...scope, id, code };
+    };
+    const once = await waitingOnPush();
+    expect(await reply(once.stub, once.id, "bob", `approve ${once.code}`)).not.toHaveProperty("standing");
+    expect((await answersSent(once.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
+
+    const always = await waitingOnPush();
+    expect(await reply(always.stub, always.id, "bob", `approve all ${always.code}`)).toHaveProperty("standing");
+    expect((await answersSent(always.id)).at(-1)).toMatchObject({ decision: "allow", standing: true });
+
+    // A command question has no "rest of the task": the words approve it, once.
+    const command = await taskAwaitingApproval();
+    await reply(command.stub, command.id, "bob", `approve all ${command.code}`);
+    expect((await answersSent(command.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
+
+    expect(wantsStanding("全部批准 K7PW")).toBe(true);
+    expect(wantsStanding("approve K7PW")).toBe(false);
   });
 
   it("never gives the same code to two questions", async () => {

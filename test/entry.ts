@@ -15,8 +15,8 @@ export class FakeTask extends DurableObject {
     this.#record("start", input);
     return { phase: "running" };
   }
-  async answer(decision: string, reason: string, questionId?: string) {
-    this.#record("answer", { decision, reason, questionId });
+  async answer(decision: string, reason: string, questionId?: string, standing = false) {
+    this.#record("answer", { decision, reason, questionId, standing });
     // Like the real task: the first answer to a question stands.
     const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
     answers[questionId ?? ""] ??= decision;

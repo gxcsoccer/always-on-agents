@@ -24,6 +24,8 @@ export interface Env {
   GITHUB_BOT_HANDLE?: string;
   /** The address commits are made under; for an App, `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. */
   GITHUB_BOT_EMAIL?: string;
+  /** Optional: a regular expression for shell commands inside the sandbox that a person must approve. Default: none. */
+  GATE_HOLD_PATTERN?: string;
   /** A single deployment-wide token, used only when no App is configured. For local development. */
   GITHUB_TOKEN?: string;
 }

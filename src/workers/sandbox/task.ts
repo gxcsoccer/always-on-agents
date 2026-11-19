@@ -98,6 +98,8 @@ export interface TaskState {
   };
   /** Answers for held network actions, keyed by the exact request they were given for. Used once. */
   grants: Record<string, { state: "allow" | "deny"; reason: string; until: number; holder_seen_at?: number }>;
+  /** Pushes a person approved for the rest of the task: which branches of which repository. */
+  standing?: { resource: string; refs: string[] }[];
   /** Counts approval requests, so each gets its own id. */
   asks: number;
   brain?: string;
@@ -431,7 +433,7 @@ export class TaskSandbox extends DurableObject<Env> {
    * Answers the call the gate is holding. The answer is stored here and handed to the gate when it
    * next polls; nothing is written into the container. No awaits, so this cannot interleave.
    */
-  async answer(decision: "allow" | "deny", reason: string, questionId?: string): Promise<{ ok: true; decision: "allow" | "deny" } | { ok: false; error: string }> {
+  async answer(decision: "allow" | "deny", reason: string, questionId?: string, standing = false): Promise<{ ok: true; decision: "allow" | "deny" } | { ok: false; error: string }> {
     const state = this.#state();
     if (!state) return { ok: false, error: "no such task" };
     if (decision !== "allow" && decision !== "deny") return { ok: false, error: "decision must be allow or deny" };
@@ -459,6 +461,11 @@ export class TaskSandbox extends DurableObject<Env> {
         // The holder must still be there to collect: it is judged by when it was last seen.
         holder_seen_at: state.pending.polled_at ?? state.pending.asked_at,
       };
+      // Approved for the rest of the task as well: later pushes of the same branches to the same
+      // repository go through without asking. Never a deletion, and never anything else.
+      if (decision === "allow" && standing && state.pending.resource && state.pending.refs?.length) {
+        state.standing = [...(state.standing ?? []), { resource: state.pending.resource, refs: state.pending.refs.map((r) => r.ref) }];
+      }
     }
     state.inbox.push({ at: Date.now(), kind: "answered", body: { decision, reason, tool_use_id: state.pending.id } });
     state.pending = undefined;
@@ -562,6 +569,16 @@ export class TaskSandbox extends DurableObject<Env> {
     // Something else is waiting for an answer, or the task is not running: wait for our turn.
     if (state.phase !== "running") {
       return ACTIVE.has(state.phase) ? { state: "pending", reason: "" } : { state: "deny", reason: `task is ${state.phase}` };
+    }
+    const covered = (state.standing ?? []).some((grant) => grant.resource === resource && refs.length > 0 && refs.every((r) => grant.refs.includes(r.ref) && !/^0+$/.test(r.new)));
+    if (covered) {
+      // Said once for this task. Still on record, and the Brain is told each time.
+      const message = `under the standing approval for this task: ${describePush(resource, refs)}`;
+      state.inbox.push({ at: Date.now(), kind: "standing", body: { action, resource, refs } });
+      this.#emit(state, "progress", { message: message.slice(0, 1_000) });
+      this.#save(state);
+      this.ctx.waitUntil(this.#flush());
+      return { state: "allow", reason: "standing approval" };
     }
     state.asks += 1;
     state.pending = { id: `q-${state.asks}`, source: "proxy", action, resource, refs, key: requestId, asked_at: Date.now(), polled_at: Date.now() };
@@ -948,6 +965,7 @@ export class TaskSandbox extends DurableObject<Env> {
       TASK_PASS: state.token,
       TASK_DIRECTORY,
       GATE_WAIT_SECONDS: String(MAX_WAIT_FOR_ANSWER_S),
+      ...(this.env.GATE_HOLD_PATTERN ? { GATE_HOLD_PATTERN: this.env.GATE_HOLD_PATTERN } : {}),
       // Who commits are by. Set here, and in the environment so that it outranks anything the
       // agent configures for itself: left to choose, it makes up a name and an address, and
       // GitHub then credits the commit to whichever stranger owns that address.

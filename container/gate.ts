@@ -8,10 +8,12 @@ import { appendFileSync } from "node:fs";
 const TASK_DIRECTORY = process.env.TASK_DIRECTORY ?? "/workspace/job/task";
 const WAIT_SECONDS = Number(process.env.GATE_WAIT_SECONDS ?? 3300);
 const POLL_MS = Number(process.env.GATE_POLL_MS ?? 2000);
-// Only for actions that never leave the container, where there is no network boundary to enforce
-// them at. Matching command text is easy to get around; anything that goes over the network
-// (a push, for example) is decided by the Worker's outbound proxy instead.
-const RISKY = /\brm\s+-[a-z]*r/;
+// Nothing a command does inside the sandbox outlives the sandbox, so by default nothing here needs
+// a person: deleting a directory the agent made a minute ago is not a decision for anyone. What
+// does reach the outside (a push, any network request) is decided by the Worker's outbound proxy,
+// which sees the real request rather than the text of a command. A deployment that wants a person
+// asked about some local commands all the same can name them with GATE_HOLD_PATTERN.
+const RISKY = process.env.GATE_HOLD_PATTERN ? new RegExp(process.env.GATE_HOLD_PATTERN) : undefined;
 
 async function ask(kind: string, body: unknown): Promise<{ ok: boolean; decision?: string; reason?: string }> {
   const response = await fetch(`http://brain.internal/callback/${kind}`, {
@@ -38,7 +40,7 @@ function log(entry: Record<string, unknown>) {
 export default function (pi: any) {
   pi.on("tool_call", async (event: any) => {
     const command = event.toolName === "bash" ? String(event.input?.command ?? "") : "";
-    const risky = RISKY.test(command);
+    const risky = RISKY !== undefined && RISKY.test(command);
     const entry = {
       tool_name: event.toolName,
       tool_use_id: event.toolCallId,

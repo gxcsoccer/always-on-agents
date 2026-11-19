@@ -42,13 +42,22 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
 
   // Every rejection below looks the same from outside, so the endpoint cannot be used to find out
   // which part of a forged request was wrong.
-  // Why is logged for the operator (the reason and the names of the fields present, never their
-  // contents); the caller is told nothing.
-  const rejected = (why = "unspecified") => {
-    console.log(JSON.stringify({ feishu_rejected: why, app: appId, fields: body && typeof body === "object" ? Object.keys(body).slice(0, 12) : [], signed_headers: ["x-lark-request-timestamp", "x-lark-request-nonce", "x-lark-signature"].filter((h) => request.headers.has(h)), shape: { signature_length: request.headers.get("x-lark-signature")?.length ?? 0, timestamp_length: request.headers.get("x-lark-request-timestamp")?.length ?? 0, skew_s: Math.round(Date.now() / 1_000 - Number(request.headers.get("x-lark-request-timestamp") ?? 0)), header_fields: Object.keys(body?.header ?? {}), has_token: typeof body?.header?.token === "string" } }));
+  // Why is logged for the operator, as one of a fixed set of reasons and a few yes/no facts about
+  // the request. Nothing the sender wrote is logged, not even the names of its fields.
+  const rejected = (why: "not_encrypted" | "does_not_decrypt" | "bad_signature" | "wrong_token" | "wrong_app" | "bad_challenge") => {
+    const stamp = request.headers.get("x-lark-request-timestamp") ?? "";
+    console.log(
+      JSON.stringify({
+        feishu_rejected: why,
+        app: appId,
+        has_signature: request.headers.has("x-lark-signature"),
+        has_nonce: request.headers.has("x-lark-request-nonce"),
+        timestamp: stamp === "" ? "missing" : sentAt(stamp) === undefined ? "unreadable" : "readable",
+      }),
+    );
     return json({ error: "not accepted" }, 401);
   };
-  if (typeof body.encrypt !== "string") return rejected("not encrypted");
+  if (typeof body.encrypt !== "string") return rejected("not_encrypted");
 
   // The signature covers the raw body, so it is checked before anything is decrypted. The one
   // exception is the address check Feishu performs when the webhook URL is saved: Feishu does not
@@ -57,16 +66,16 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   try {
     body = JSON.parse(await decrypt(app.encrypt_key, body.encrypt));
   } catch {
-    return rejected("does not decrypt");
+    return rejected("does_not_decrypt");
   }
   if (body?.type === "url_verification") {
-    if (typeof body.challenge !== "string" || body.challenge.length > 200) return rejected();
-    if (app.verification_token && body.token !== app.verification_token) return rejected();
+    if (typeof body.challenge !== "string" || body.challenge.length > 200) return rejected("bad_challenge");
+    if (app.verification_token && body.token !== app.verification_token) return rejected("wrong_token");
     return json({ challenge: body.challenge });
   }
-  if (!signed) return rejected("bad signature");
-  if (app.verification_token && body.header?.token !== app.verification_token) return rejected("wrong verification token");
-  if (body.header?.app_id !== app.app_id) return rejected(`app id mismatch; header fields: ${Object.keys(body.header ?? {}).join(",")}; top: ${Object.keys(body ?? {}).join(",")}`);
+  if (!signed) return rejected("bad_signature");
+  if (app.verification_token && body.header?.token !== app.verification_token) return rejected("wrong_token");
+  if (body.header?.app_id !== app.app_id) return rejected("wrong_app");
 
   // A button pressed on one of the agent's cards. Feishu shows what we return as a toast.
   if (body.header?.event_type === "card.action.trigger") {
@@ -94,7 +103,7 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
   const openId: unknown = operator.open_id;
   if (typeof openId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(openId)) return undefined;
   const value = action?.value;
-  if (!value || value.aoa !== "answer" || !/^[A-Z0-9]{4}$/.test(String(value.code)) || (value.decision !== "approve" && value.decision !== "deny")) return undefined;
+  if (!value || value.aoa !== "answer" || !/^[A-Z0-9]{4}$/.test(String(value.code)) || !["approve", "approve_all", "deny"].includes(value.decision)) return undefined;
   if (typeof value.q !== "string" || !/^ask:[0-9a-f-]{36}:\d{1,9}$/.test(value.q)) return undefined;
   const chatId: unknown = context?.open_chat_id;
   if (typeof chatId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(chatId) || typeof body.header?.event_id !== "string") return undefined;
@@ -107,7 +116,7 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
       kind: "message",
       session_key: group ? "chat" : "dm",
       principal: { kind: "human", id: openId, explicit: true },
-      text: `${value.decision} ${value.code}`,
+      text: `${value.decision === "approve_all" ? "approve all" : value.decision} ${value.code}`,
       // Which question's card was pressed. The press answers that question and no other.
       data: { chat_id: chatId, card: true, route_by_code: true, question: value.q },
       reply_to: { connector: "feishu", address: { app_id: app.app_id, chat_id: chatId } },
@@ -236,7 +245,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const uuid = (await hex(message.idem)).slice(0, 40);
   // An approval question goes out as a card with buttons; everything else as text.
   const msgType = message.ask ? "interactive" : "text";
-  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user", undefined, thread === "1") : { text: message.text });
+  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : { text: message.text });
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
@@ -275,9 +284,9 @@ export async function amendFeishu(env: Env, target: Target, receipt: Receipt, as
  * The approval question as a card. Everything that comes from the task is plain text, so nothing in
  * a command or a branch name can be rendered as formatting or as a link.
  */
-export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user", outcome?: Outcome, inTopic = false): unknown {
+export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user", outcome?: Outcome): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
-  const button = (label: string, type: string, decision: "approve" | "deny") => ({
+  const button = (label: string, type: string, decision: "approve" | "approve_all" | "deny") => ({
     tag: "button",
     text: plain(label),
     type,
@@ -285,15 +294,24 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
     // happened to get the same code cannot answer a later one.
     value: { aoa: "answer", decision, code: ask.code, q: ask.id, to },
   });
+  // First what would happen, in a sentence. Then the exact thing, in full, for anyone who wants
+  // to check it: that is what the approval is for.
+  const zero = /^0+$/;
+  const moves = (ask.refs ?? []).map((r) => {
+    const name = r.ref.replace(/^refs\/heads\//, "分支 ").replace(/^refs\/tags\//, "标签 ");
+    if (zero.test(r.new)) return `删除${name}`;
+    if (zero.test(r.old)) return `新建${name}（${r.new.slice(0, 7)}）`;
+    return `更新${name}（${r.old.slice(0, 7)} → ${r.new.slice(0, 7)}）`;
+  });
+  const summary = ask.kind === "push" ? `把代码推送到 ${ask.resource || "仓库"}${moves.length ? `：${moves.join("；")}` : ""}` : "在沙箱里执行一条命令";
   const about = [
-    { tag: "div", text: plain(`任务：${ask.title}`) },
-    { tag: "div", text: plain(ask.kind === "push" ? "它要推送代码：" : "它要执行这条命令：") },
-    { tag: "div", text: plain(ask.detail) },
+    { tag: "div", text: plain(`任务“${ask.title}”想要${summary}。`) },
+    { tag: "note", elements: [plain(ask.kind === "push" ? `完整内容：${ask.detail}` : `命令：${ask.detail}`)] },
   ];
   // Closed: it says how it ended, and there is nothing left to press.
   if (outcome) {
     const ended = { approved: ["green", "已批准"], refused: ["red", "已拒绝"], withdrawn: ["grey", "已失效"] }[outcome.state];
-    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : `${ended[1]}。`;
+    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : outcome.state === "approved" && outcome.standing ? "已批准。这个任务之后推送同样的分支不会再问。" : `${ended[1]}。`;
     return { config: { wide_screen_mode: true, update_multi: true }, header: { template: ended[0], title: plain(`${ended[1]} · ${ask.code}`) }, elements: [...about, { tag: "note", elements: [plain(note)] }] };
   }
   return {
@@ -302,18 +320,17 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
     elements: [
       ...about,
       ...(ask.can_approve ? [] : [{ tag: "div", text: plain("内容太长，无法完整显示，所以只能拒绝。") }]),
-      { tag: "action", actions: [...(ask.can_approve ? [button("批准", "primary", "approve")] : []), button("拒绝", "danger", "deny")] },
-      // Inside a topic a reply cannot be tied to this card, so there the words have to carry the code.
       {
-        tag: "note",
-        elements: [
-          plain(
-            inTopic
-              ? ask.can_approve ? `也可以回复：批准 ${ask.code} / 拒绝 ${ask.code}` : `也可以回复：拒绝 ${ask.code}`
-              : ask.can_approve ? "也可以直接回复这条消息：批准 / 拒绝" : "也可以直接回复这条消息：拒绝",
-          ),
+        tag: "action",
+        actions: [
+          ...(ask.can_approve ? [button("批准", "primary", "approve")] : []),
+          ...(ask.can_approve && ask.standing_offered ? [button("批准，这个任务不再问", "default", "approve_all")] : []),
+          button("拒绝", "danger", "deny"),
         ],
       },
+      // The words that always work, wherever in the chat they are typed. In a group the bot only
+      // hears what mentions it, so the card says so.
+      { tag: "note", elements: [plain(`${to === "chat" ? "也可以先 @我，再输入" : "也可以输入"}${ask.can_approve ? `「批准 ${ask.code}」或` : ""}「拒绝 ${ask.code}」`)] },
     ],
   };
 }

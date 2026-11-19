@@ -37,6 +37,11 @@ export interface ApprovalQuestion {
   detail: string;
   /** False when the action is too long to show in full: it can then only be refused. */
   can_approve: boolean;
+  /** For a push: where to, and which refs would move from which commit to which. */
+  resource?: string;
+  refs?: { ref: string; old: string; new: string }[];
+  /** Whether the person may also approve the same kind of action for the rest of the task. */
+  standing_offered?: boolean;
 }
 
 /**
@@ -51,7 +56,7 @@ export interface Receipt {
 }
 
 /** How an approval question ended. */
-export type Outcome = { state: "approved" | "refused"; by?: string } | { state: "withdrawn" };
+export type Outcome = { state: "approved" | "refused"; by?: string; standing?: boolean } | { state: "withdrawn" };
 
 /**
  * Marks a delivered approval question as closed where it is shown, if the connector can: the

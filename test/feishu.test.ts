@@ -116,7 +116,7 @@ describe("turning a Feishu message into an event", () => {
 
   it("shows an approval question as a card whose task-supplied text is never formatting", () => {
     const card = approvalCard({ id: Q, code: "K7PW", title: "**tidy**", kind: "command", detail: "rm -r [x](http://evil)", can_approve: true }, "chat") as any;
-    const texts = JSON.stringify(card.elements.filter((e: any) => e.tag === "div"));
+    const texts = JSON.stringify(card.elements.filter((e: any) => e.tag === "div" || e.tag === "note"));
     expect(texts).toContain("rm -r [x](http://evil)");
     expect(texts).not.toContain("lark_md");
     const buttons = card.elements.find((e: any) => e.tag === "action").actions;
@@ -124,6 +124,17 @@ describe("turning a Feishu message into an event", () => {
       { aoa: "answer", decision: "approve", code: "K7PW", q: Q, to: "chat" },
       { aoa: "answer", decision: "deny", code: "K7PW", q: Q, to: "chat" },
     ]);
+    // The typed alternative always carries the code, and in a group says to mention the bot.
+    expect(JSON.stringify(card.elements.at(-1))).toContain("也可以先 @我，再输入「批准 K7PW」或「拒绝 K7PW」");
+    // A push says in a sentence what would move, keeps the full detail, and offers "for this task".
+    const push = approvalCard(
+      { id: Q, code: "K7PW", title: "ship", kind: "push", detail: "push to acme/demo: move branch feature from aaaa to bbbb", can_approve: true, resource: "acme/demo", refs: [{ ref: "refs/heads/feature", old: "a".repeat(40), new: "b".repeat(40) }], standing_offered: true },
+      "chat",
+    ) as any;
+    expect(JSON.stringify(push.elements[0])).toContain("把代码推送到 acme/demo：更新分支 feature（aaaaaaa → bbbbbbb）");
+    expect(JSON.stringify(push.elements[1])).toContain("move branch feature from aaaa to bbbb");
+    expect(push.elements.find((e: any) => e.tag === "action").actions.map((b: any) => b.value.decision)).toEqual(["approve", "approve_all", "deny"]);
+    expect(normalizeCardAction(app, { schema: "2.0", header: { event_id: "e9", event_type: "card.action.trigger", tenant_key: "tk", app_id: "cli_test" }, event: { operator: { open_id: "ou_bob", tenant_key: "tk" }, action: { value: { aoa: "answer", decision: "approve_all", code: "K7PW", q: Q, to: "chat" } }, context: { open_chat_id: "oc_room" } } })?.event.text).toBe("approve all K7PW");
     // Once it is closed it says how it ended and offers nothing to press.
     const closed = approvalCard({ id: Q, code: "K7PW", title: "t", kind: "command", detail: "rm -r x", can_approve: true }, "chat", { state: "approved" }) as any;
     expect(closed.elements.some((e: any) => e.tag === "action")).toBe(false);

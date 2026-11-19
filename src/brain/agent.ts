@@ -705,7 +705,7 @@ export class BrainAgent extends DurableObject<Env> {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be answered there");
 
-    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; before?: { decision: "allow" | "deny"; decided_by: string } };
+    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; standing?: boolean; before?: { decision: "allow" | "deny"; decided_by: string } };
     let intent = task.answering ? (JSON.parse(task.answering) as Intent) : undefined;
     // An approval is about to be acted on: look again at where the replies it could rest on were
     // read from. From here to the worker call nothing else can interleave.
@@ -852,13 +852,16 @@ export class BrainAgent extends DurableObject<Env> {
         if (!this.#stillStands(deciding.event)) throw new Error("that reply has since been edited or deleted; it no longer approves anything");
         if (lastWord.event.id !== deciding.event.id || saidMore) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
       }
-      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(before ? { before } : {}) };
+      // "For the rest of this task" is the approver's to say, in their own message; it is offered
+      // only for pushes.
+      const standing = decision === "allow" && (pending as { source?: string }).source === "proxy" && wantsStanding(deciding.event.text ?? "");
+      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
-      this.#audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id });
+      this.#audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id, ...(standing ? { standing: true } : {}) });
     }
 
-    const answered = await this.env.TASKS.getByName(taskId).answer(intent.decision, intent.reason, intent.pending_id);
+    const answered = await this.env.TASKS.getByName(taskId).answer(intent.decision, intent.reason, intent.pending_id, intent.standing === true);
     if (!answered.ok) throw new Error(answered.error);
     // The worker may already have acted on an earlier answer to this question; report what it holds.
     const decided = answered.decision ?? intent.decision;
@@ -870,8 +873,9 @@ export class BrainAgent extends DurableObject<Env> {
       intent.pending_id,
     );
     const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
-    if (askedAs.id === intent.pending_id) this.#closeQuestion(askedAs.ask, { state: decided === "allow" ? "approved" : "refused" });
-    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by };
+    const forTheTask = decided === "allow" && intent.decision === "allow" && intent.standing === true;
+    if (askedAs.id === intent.pending_id) this.#closeQuestion(askedAs.ask, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
+    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
     this.#audit(intent.decided_by, "task.answer_too_late", { task_id: taskId, question: intent.pending_id, wanted: intent.decision, in_force: decided, in_force_by: earlier ?? null });
@@ -960,6 +964,9 @@ export class BrainAgent extends DurableObject<Env> {
             kind: body.source === "proxy" ? "push" : "command",
             detail: body.source === "proxy" ? String(body.summary ?? `${body.action} on ${body.resource}`) : String(body.command ?? ""),
             can_approve: !truncated,
+            ...(body.source === "proxy"
+              ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated }
+              : {}),
           };
           this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);
         } catch {
@@ -1263,7 +1270,12 @@ export function readTiedDecision(text: string, code: string): "allow" | "deny" |
   if (named) return named;
   if (/(?<![A-Za-z])(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel|wait)(?![A-Za-z])|拒绝|不同意|不批准|否决|不要|不行|不可以|别|取消|等等|等一下|先别/i.test(text)) return "deny";
   const bare = text.replace(/[\s:：,，.。!！~～]+/g, " ").trim().toLowerCase();
-  return /^(approve|approved|yes|ok|okay|同意|批准|可以|好|好的|行|确认|通过)$/.test(bare) ? "allow" : undefined;
+  return /^(approve all|全部批准|都批准|approve|approved|yes|ok|okay|同意|批准|可以|好|好的|行|确认|通过)$/.test(bare) ? "allow" : undefined;
+}
+
+/** Whether an approval also says "and for the rest of this task". Only ever read from an approval. */
+export function wantsStanding(text: string): boolean {
+  return /(?<![A-Za-z])approve all(?![A-Za-z])|全部批准|都批准/i.test(text);
 }
 
 /** When a message was said, according to its source if it tells us, else when it arrived. */
@@ -1302,7 +1314,7 @@ export function readDecision(text: string, code: string): "allow" | "deny" | und
   // condition or a different statement. Mentions are not stripped here: each connector removes the
   // agent's own, where it knows which that is, and a message addressed to anyone else is not for us.
   const bare = text.replace(/[\s:：,，.。!！]+/g, " ").trim();
-  if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
+  if (new RegExp(`^(?:approve all|approve|全部批准|都批准|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
   return undefined;
 }
 

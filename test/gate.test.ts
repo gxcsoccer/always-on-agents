@@ -69,3 +69,44 @@ describe("the questions a task holds for its gate", () => {
     expect(await stub.answer("allow", "", "q-1")).toMatchObject({ ok: false });
   });
 });
+
+describe("pushes a task holds for approval", () => {
+  const repo = "acme/demo";
+  const move = (from: string, to: string, ref = "refs/heads/feature") => [{ ref, old: from.repeat(40), new: to.repeat(40) }];
+
+  it("asks every time unless the approval was given for the rest of the task", async () => {
+    const { stub } = await runningTask();
+    expect(await stub.authorize("r1", "push", repo, move("a", "b"))).toMatchObject({ state: "pending" });
+    expect(await stub.answer("allow", "", "q-1")).toMatchObject({ ok: true });
+    expect(await stub.authorize("r1", "push", repo, move("a", "b"))).toMatchObject({ state: "allow" });
+    // The next push of the same branch asks again.
+    expect(await stub.authorize("r2", "push", repo, move("b", "c"))).toMatchObject({ state: "pending" });
+    expect((await stub.status()).pending.id).toBe("q-2");
+  });
+
+  it("lets later pushes of the same branches through once approved for the task, and nothing else", async () => {
+    const { stub } = await runningTask();
+    await stub.authorize("r1", "push", repo, move("a", "b"));
+    expect(await stub.answer("allow", "", "q-1", true)).toMatchObject({ ok: true });
+    expect(await stub.authorize("r1", "push", repo, move("a", "b"))).toMatchObject({ state: "allow" });
+    // Same branch, same repository: no question, but it is on record.
+    expect(await stub.authorize("r2", "push", repo, move("b", "c"))).toMatchObject({ state: "allow", reason: "standing approval" });
+    expect((await stub.status()).inbox.map((item: any) => item.kind)).toContain("standing");
+    // Another branch, another repository, or deleting the branch: asked as before.
+    expect(await stub.authorize("r3", "push", repo, move("b", "c", "refs/heads/main"))).toMatchObject({ state: "pending" });
+    await stub.answer("deny", "", "q-2");
+    await stub.authorize("r3", "push", repo, move("b", "c", "refs/heads/main"));
+    expect(await stub.authorize("r4", "push", "acme/other", move("b", "c"))).toMatchObject({ state: "pending" });
+    await stub.answer("deny", "", "q-3");
+    await stub.authorize("r4", "push", "acme/other", move("b", "c"));
+    expect(await stub.authorize("r5", "push", repo, move("c", "0"))).toMatchObject({ state: "pending" });
+  });
+
+  it("does not take a refusal, or a plain approval, as approval for the task", async () => {
+    const { stub } = await runningTask();
+    await stub.authorize("r1", "push", repo, move("a", "b"));
+    await stub.answer("deny", "", "q-1", true);
+    await stub.authorize("r1", "push", repo, move("a", "b"));
+    expect(await stub.authorize("r2", "push", repo, move("a", "b"))).toMatchObject({ state: "pending" });
+  });
+});
