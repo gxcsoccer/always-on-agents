@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { deliver } from "../connectors";
+import { type ApprovalQuestion, deliver } from "../connectors";
 import { commentStanding } from "../connectors/github";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
@@ -103,6 +103,17 @@ export class BrainAgent extends DurableObject<Env> {
     // Larger than the longest comment any connector passes on, so a reply is stored whole: what it
     // says about an open question is read from the stored text, and a cut-off refusal would be lost.
     if ((event.text?.length ?? 0) > 300_000) throw new Error("event text is too long");
+    // In a chat with threads, a reply that names an open question's code belongs with that
+    // question, wherever in the chat it was typed. The connector says when this applies.
+    if (event.kind === "message" && event.data?.route_by_code === true && event.text) {
+      const sessions = new Set(
+        this.#rows<{ session_key: string; code: string | null }>("SELECT session_key, json_extract(pending, '$.code') AS code FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL")
+          .filter(({ code }) => code && quotes(event.text ?? "", code))
+          .map(({ session_key }) => session_key),
+      );
+      // Its answer goes where the question was asked, not to wherever the reply came from.
+      if (sessions.size === 1 && !sessions.has(event.session_key)) event = { ...event, session_key: [...sessions][0], reply_to: undefined };
+    }
     const subject = event.data?.subject;
     if (typeof subject === "string") this.#revise(subject, Number(event.data?.revision ?? 0), false, String(event.data?.holder ?? ""));
     const inserted = this.#insertEvent(event);
@@ -458,11 +469,11 @@ export class BrainAgent extends DurableObject<Env> {
 
   // ------------------------------------------------------------------ outbox
 
-  #enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string): { ok: true } {
+  #enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion): { ok: true } {
     const target = this.#rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
-    this.#sql.exec("INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?)", idem, runId, target, text, now, now);
+    this.#sql.exec("INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask) VALUES (?, ?, ?, ?, ?, ?, ?)", idem, runId, target, text, now, now, ask ? JSON.stringify(ask) : null);
     return { ok: true };
   }
 
@@ -482,7 +493,7 @@ export class BrainAgent extends DurableObject<Env> {
       if (!row || row.next_at > Date.now()) return;
       try {
         // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at });
+        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
         // If an earlier attempt had in fact been posted, that is when people could first answer it.
         this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
       } catch (err) {
@@ -910,7 +921,14 @@ export class BrainAgent extends DurableObject<Env> {
         try {
           if (!session) throw new Error("no conversation");
           const how = truncated ? `This is too long to show in full, so it cannot be approved.\nTo refuse, reply: deny ${code}` : `To approve, reply: approve ${code}\nTo refuse, reply: deny ${code}`;
-          this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`);
+          const question: ApprovalQuestion = {
+            code,
+            title: String(task.title),
+            kind: body.source === "proxy" ? "push" : "command",
+            detail: body.source === "proxy" ? String(body.summary ?? `${body.action} on ${body.resource}`) : String(body.command ?? ""),
+            can_approve: !truncated,
+          };
+          this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);
         } catch {
           // No reply address: the question reaches nobody, so it cannot be approved.
           ask = undefined;

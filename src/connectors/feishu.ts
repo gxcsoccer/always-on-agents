@@ -63,10 +63,49 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   if (app.verification_token && body.header?.token !== app.verification_token) return rejected();
   if (body.header?.app_id !== app.app_id) return rejected();
 
+  // A button pressed on one of the agent's cards. Feishu shows what we return as a toast.
+  if (body.header?.event_type === "card.action.trigger") {
+    const pressed = normalizeCardAction(app, body);
+    if (!pressed) return json({ toast: { type: "error", content: "这个操作无法处理" } });
+    await env.BRAIN.getByName(scopeName(pressed.scope)).ingest(pressed.event);
+    return json({ toast: { type: "info", content: `已收到：${pressed.event.text}，结果会在对话里回复` } });
+  }
+
   const normalized = normalize(app, body);
   if (!normalized) return json({ ignored: true });
   const brain = env.BRAIN.getByName(scopeName(normalized.scope));
   return json({ ...(await brain.ingest(normalized.event)), scope: scopeName(normalized.scope) });
+}
+
+/**
+ * A press of "approve" or "refuse" on an approval card becomes that person's message "approve CODE"
+ * or "deny CODE". Who pressed it comes from Feishu's signed callback, not from the card. The card's
+ * own value only says which button it was and whether the card was sent to a group or a person; the
+ * chat itself is taken from the callback.
+ */
+export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; event: InboundEvent } | undefined {
+  const { operator, action, context } = body.event ?? {};
+  if (!operator?.tenant_key || operator.tenant_key !== body.header?.tenant_key) return undefined;
+  const openId: unknown = operator.open_id;
+  if (typeof openId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(openId)) return undefined;
+  const value = action?.value;
+  if (!value || value.aoa !== "answer" || !/^[A-Z0-9]{4}$/.test(String(value.code)) || (value.decision !== "approve" && value.decision !== "deny")) return undefined;
+  const chatId: unknown = context?.open_chat_id;
+  if (typeof chatId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(chatId) || typeof body.header?.event_id !== "string") return undefined;
+  const group = value.to === "chat";
+  return {
+    scope: { tenant: app.tenant, kind: group ? "chat" : "user", id: group ? chatId : openId },
+    event: {
+      source: "feishu",
+      source_id: `card:${body.header.event_id}`,
+      kind: "message",
+      session_key: group ? "chat" : "dm",
+      principal: { kind: "human", id: openId, explicit: true },
+      text: `${value.decision} ${value.code}`,
+      data: { chat_id: chatId, card: true, route_by_code: true },
+      reply_to: { connector: "feishu", address: { app_id: app.app_id, chat_id: chatId } },
+    },
+  };
 }
 
 /** Exported for tests. Returns undefined for events the agent does not act on. */
@@ -118,7 +157,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
-  const thread: string | undefined = message.thread_id || message.root_id || undefined;
+  // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
+  // the chat's conversation, which is where people answer what the agent just said.
+  const thread: string | undefined = message.thread_id || undefined;
   return {
     scope: { tenant: app.tenant, kind: group ? "chat" : "user", id: group ? message.chat_id : openId },
     event: {
@@ -129,7 +170,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       session_key: group ? (thread ? `thread:${thread}` : "chat") : "dm",
       principal: { kind: "human", id: openId, explicit: true },
       text,
-      data: { message_id: message.message_id, chat_id: message.chat_id, chat_type: message.chat_type },
+      data: { message_id: message.message_id, chat_id: message.chat_id, chat_type: message.chat_type, route_by_code: true },
       reply_to: {
         connector: "feishu",
         address: { app_id: app.app_id, chat_id: message.chat_id, ...(group ? { message_id: message.message_id, ...(thread ? { thread: "1" } : {}) } : {}) },
@@ -159,27 +200,55 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 }
 
 /** Sends as the bot. A direct chat gets a new message; a group gets a reply to the message that asked. */
-export async function deliverFeishu(env: Env, _scope: Scope, target: Target, message: OutboundMessage): Promise<void> {
+export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<void> {
   const { app_id: appId, chat_id: chatId, message_id: messageId, thread } = target.address;
   if (!appId || !chatId) throw new Error("bad Feishu address");
   const token = await tenantAccessToken(env, appId);
   // Feishu drops a repeat of the same uuid within an hour, which makes a retry safe.
   const uuid = (await hex(message.idem)).slice(0, 40);
-  const content = JSON.stringify({ text: message.text });
+  // An approval question goes out as a card with buttons; everything else as text.
+  const msgType = message.ask ? "interactive" : "text";
+  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : { text: message.text });
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ msg_type: "text", content, uuid, reply_in_thread: thread === "1" }),
+        body: JSON.stringify({ msg_type: msgType, content, uuid, reply_in_thread: thread === "1" }),
       })
     : await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ receive_id: chatId, msg_type: "text", content, uuid }),
+        body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string };
   if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
+}
+
+/**
+ * The approval question as a card. Everything that comes from the task is plain text, so nothing in
+ * a command or a branch name can be rendered as formatting or as a link.
+ */
+export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user"): unknown {
+  const plain = (content: string) => ({ tag: "plain_text", content });
+  const button = (label: string, type: string, decision: "approve" | "deny") => ({
+    tag: "button",
+    text: plain(label),
+    type,
+    value: { aoa: "answer", decision, code: ask.code, to },
+  });
+  return {
+    config: { wide_screen_mode: true },
+    header: { template: "orange", title: plain(`需要你批准 · ${ask.code}`) },
+    elements: [
+      { tag: "div", text: plain(`任务：${ask.title}`) },
+      { tag: "div", text: plain(ask.kind === "push" ? "它要推送代码：" : "它要执行这条命令：") },
+      { tag: "div", text: plain(ask.detail) },
+      ...(ask.can_approve ? [] : [{ tag: "div", text: plain("内容太长，无法完整显示，所以只能拒绝。") }]),
+      { tag: "action", actions: [...(ask.can_approve ? [button("批准", "primary", "approve")] : []), button("拒绝", "danger", "deny")] },
+      { tag: "note", elements: [plain(ask.can_approve ? `也可以直接回复：approve ${ask.code} 或 deny ${ask.code}` : `也可以直接回复：deny ${ask.code}`)] },
+    ],
+  };
 }
 
 /** The app's tenant_access_token, cached in the registry until shortly before it expires. */

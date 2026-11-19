@@ -493,6 +493,22 @@ describe("tasks and approvals", () => {
     expect(await answersSent(id)).toHaveLength(0);
   });
 
+  it("takes a reply that names an open question's code into that question's conversation, where the connector allows", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // Typed in a thread of the same chat; the connector marks it as routable by code.
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "thread:omt_1", data: { route_by_code: true } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow", decided_by: "bob" });
+
+    // Without the connector's say-so, a reply elsewhere stays elsewhere.
+    const other = await taskAwaitingApproval();
+    await other.stub.ingest(message(`approve ${other.code}`, { user: "bob", session_key: "pr:8" }));
+    model.replies([call("answer_task", { task_id: other.id, decision: "allow", reason: "" })], [say("")]);
+    await wake(other.stub);
+    expect(toolOutputs().at(-1).error).toMatch(/different conversation/);
+  });
+
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {
     // As long as the longest comment GitHub accepts. Too big to share a run with the approval, so
     // it is still waiting in the inbox when the approval is considered, and counts from there.

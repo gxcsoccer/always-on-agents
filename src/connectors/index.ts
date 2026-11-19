@@ -19,6 +19,22 @@ export interface OutboundMessage {
   text: string;
   /** When the message was written, in ms. */
   created_at?: number;
+  /**
+   * Set when the message is an approval question. `text` says the same in words; a connector that
+   * can show something better than text (buttons, say) builds it from this.
+   */
+  ask?: ApprovalQuestion;
+}
+
+export interface ApprovalQuestion {
+  code: string;
+  /** The task's title. */
+  title: string;
+  kind: "command" | "push";
+  /** The command, or what would be pushed where. Shown literally. */
+  detail: string;
+  /** False when the action is too long to show in full: it can then only be refused. */
+  can_approve: boolean;
 }
 
 /**

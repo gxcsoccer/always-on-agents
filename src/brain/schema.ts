@@ -132,6 +132,8 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE revisions ADD COLUMN holder TEXT NOT NULL DEFAULT '';`,
   // 6: where a delivered message lives and what it said, when others can change it afterwards.
   `ALTER TABLE outbox ADD COLUMN receipt TEXT;`,
+  // 7: what an approval question is about, in parts, for connectors that show more than text.
+  `ALTER TABLE outbox ADD COLUMN ask TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
