@@ -105,7 +105,8 @@ export async function receiveFeishu(env: Env, app: FeishuApp, body: any, defer?:
       .then(
         () => "filed" as const,
         (err: unknown) => {
-          console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: app.app_id }));
+          // The reason is kept to the kind of error: its text can quote what the person sent.
+          console.log(JSON.stringify({ feishu_press_not_filed: err instanceof Error ? err.name : "error", app: app.app_id }));
           return "failed" as const;
         },
       );

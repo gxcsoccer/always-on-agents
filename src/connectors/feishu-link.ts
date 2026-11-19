@@ -45,7 +45,8 @@ const MAX_FRAME_BYTES = 1_000_000;
 const MAX_IN_FLIGHT = 16;
 
 /** Why something went wrong, as one of a fixed set of words: never text that came from outside. */
-type Trouble = "discovery_unreachable" | "upgrade_unreachable" | "discovery_refused" | "credentials_rejected" | "address_not_feishu" | "upgrade_refused" | "frame_invalid" | "handling_failed" | "too_busy";
+const TROUBLES = ["discovery_unreachable", "upgrade_unreachable", "discovery_refused", "credentials_rejected", "address_not_feishu", "upgrade_refused", "frame_invalid", "handling_failed", "too_busy"] as const;
+type Trouble = (typeof TROUBLES)[number];
 
 interface LinkStats {
   connects: number;
@@ -124,8 +125,23 @@ export class FeishuLink extends DurableObject<Env> {
     return this.#socket !== undefined && this.#socket.readyState === 1;
   }
 
+  /** Only the fields named here: whatever else an earlier version stored is neither kept nor shown. */
   #stats(): LinkStats {
-    return { connects: 0, events: 0, failures: 0, ...(this.ctx.storage.kv.get<LinkStats>("stats") ?? {}) };
+    const stored = (this.ctx.storage.kv.get<Record<string, unknown>>("stats") ?? {}) as Record<string, unknown>;
+    const number = (key: string): number | undefined => (typeof stored[key] === "number" ? (stored[key] as number) : undefined);
+    const trouble = typeof stored.trouble === "string" && (TROUBLES as readonly string[]).includes(stored.trouble) ? (stored.trouble as Trouble) : undefined;
+    return {
+      connects: number("connects") ?? 0,
+      events: number("events") ?? 0,
+      failures: number("failures") ?? 0,
+      connected_at: number("connected_at"),
+      last_frame_at: number("last_frame_at"),
+      last_event_at: number("last_event_at"),
+      trouble,
+      trouble_code: number("trouble_code"),
+      trouble_at: number("trouble_at"),
+      retry_at: number("retry_at"),
+    };
   }
 
   #note(change: Partial<LinkStats>): void {
@@ -267,22 +283,25 @@ export class FeishuLink extends DurableObject<Env> {
     if (frame.method !== DATA) return;
     const type = headerOf(frame, "type");
     if (type !== "event" && type !== "card") return;
-    const payload = this.#whole(frame);
-    if (!payload) return;
+    const assembled = this.#whole(frame);
+    if (assembled === "incomplete") return;
 
     const started = Date.now();
     const reply: { code: number; data?: string } = { code: 200 };
-    if (this.#inFlight >= MAX_IN_FLIGHT) {
+    if (assembled === "rejected" || this.#inFlight >= MAX_IN_FLIGHT) {
       // Told to Feishu as a failure, so that it delivers the message again.
       reply.code = 500;
       this.#trouble("too_busy");
     } else {
+      // The slot is held until everything started for this message has finished, including work
+      // that carries on after the answer has gone back.
       this.#inFlight += 1;
+      const later: Promise<unknown>[] = [];
       try {
-        const body = JSON.parse(new TextDecoder().decode(payload));
+        const body = JSON.parse(new TextDecoder().decode(assembled));
         const app = await this.#wanted(this.ctx.storage.kv.get<string>("app_id") ?? "");
         if (!app || body?.header?.app_id !== app.app_id) throw new Error("not for this app");
-        const answer = await receiveFeishu(this.env, app, body, (work) => this.ctx.waitUntil(work));
+        const answer = await receiveFeishu(this.env, app, body, (work) => later.push(work));
         // Only a card callback has an answer Feishu shows to anyone.
         if (body?.header?.event_type === "card.action.trigger") reply.data = base64(JSON.stringify(answer));
         this.#note({ events: this.#stats().events + 1, last_event_at: Date.now() });
@@ -290,7 +309,11 @@ export class FeishuLink extends DurableObject<Env> {
         reply.code = 500;
         this.#trouble("handling_failed");
       } finally {
-        this.#inFlight -= 1;
+        this.ctx.waitUntil(
+          Promise.allSettled(later).then(() => {
+            this.#inFlight -= 1;
+          }),
+        );
       }
     }
     if (socket === this.#socket && socket.readyState === 1) {
@@ -298,34 +321,39 @@ export class FeishuLink extends DurableObject<Env> {
     }
   }
 
-  /** Puts a message that came in several frames back together; returns it once it is complete. */
-  #whole(frame: Frame): Uint8Array | undefined {
+  /**
+   * Puts a message that came in several frames back together. Returns the whole message once it
+   * is complete, "incomplete" while pieces are still missing, and "rejected" when it cannot be
+   * taken at all (malformed, or more than this object is willing to hold).
+   */
+  #whole(frame: Frame): Uint8Array | "incomplete" | "rejected" {
     const sum = Number(headerOf(frame, "sum") ?? 1);
     const seq = Number(headerOf(frame, "seq") ?? 0);
     const id = headerOf(frame, "message_id") ?? "";
     const part = frame.payload ?? new Uint8Array();
     if (!Number.isInteger(sum) || sum <= 1) return part;
-    if (sum > MAX_PARTS || !Number.isInteger(seq) || seq < 0 || seq >= sum || !id || id.length > 200) return undefined;
+    if (sum > MAX_PARTS || !Number.isInteger(seq) || seq < 0 || seq >= sum || !id || id.length > 200) return "rejected";
     let entry = this.#parts.get(id);
+    if (entry && entry.parts.length !== sum) {
+      this.#parts.delete(id);
+      return "rejected";
+    }
+    if (!entry && this.#parts.size >= MAX_PARTIAL_MESSAGES) return "rejected";
+    // What all half-arrived messages hold between them, counted on every piece, not just the first.
+    let buffered = 0;
+    for (const other of this.#parts.values()) buffered += other.bytes;
+    const added = part.length - (entry?.parts[seq]?.length ?? 0);
+    if (buffered + added > MAX_BUFFERED_BYTES) {
+      this.#parts.delete(id);
+      return "rejected";
+    }
     if (!entry) {
-      // Bounded in how many messages are half-arrived and in how much they hold between them.
-      let buffered = 0;
-      for (const other of this.#parts.values()) buffered += other.bytes;
-      if (this.#parts.size >= MAX_PARTIAL_MESSAGES || buffered + part.length > MAX_BUFFERED_BYTES) {
-        this.#trouble("too_busy");
-        return undefined;
-      }
       entry = { parts: new Array<Uint8Array | undefined>(sum).fill(undefined), bytes: 0, at: Date.now() };
       this.#parts.set(id, entry);
     }
-    if (entry.parts.length !== sum) return undefined;
-    entry.bytes += part.length - (entry.parts[seq]?.length ?? 0);
+    entry.bytes += added;
     entry.parts[seq] = part;
-    if (entry.bytes > MAX_BUFFERED_BYTES) {
-      this.#parts.delete(id);
-      return undefined;
-    }
-    if (entry.parts.some((p) => p === undefined)) return undefined;
+    if (entry.parts.some((p) => p === undefined)) return "incomplete";
     this.#parts.delete(id);
     const whole = new Uint8Array(entry.bytes);
     let at = 0;

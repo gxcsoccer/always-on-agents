@@ -1,4 +1,4 @@
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CONTROL, DATA, type Frame, decodeFrame, encodeFrame, headerOf } from "../src/connectors/feishu-frame";
@@ -122,6 +122,32 @@ describe("the Feishu long connection", () => {
     expect(status.trouble).toBe("handling_failed");
     expect(JSON.stringify(status)).not.toContain("not ours");
     expect(JSON.stringify(status)).not.toContain("the-secret");
+  });
+
+  it("answers a message it will not hold with a failure, so that Feishu sends it again, and shows nothing an earlier version stored", async () => {
+    const feishu = fakeFeishu();
+    const { appId, link } = await linkedApp();
+    // Something a previous version left in storage.
+    await runInDurableObject(link, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.kv.put("stats", { connects: 3, last_error: "Error: parse failed near {\"secret\":\"the-secret\"}" });
+    });
+    await link.ensure(appId, true);
+    await runDurableObjectAlarm(link);
+    await feishu.waitFor(1);
+    const status = await link.status();
+    expect(status.connects).toBe(4);
+    expect(JSON.stringify(status)).not.toContain("the-secret");
+    expect(status).not.toHaveProperty("last_error");
+
+    // Claims more pieces than are ever accepted: refused outright, with an answer.
+    await feishu.send(encodeFrame({ seqId: 9n, logId: 9n, service: 7, method: DATA, headers: [{ key: "type", value: "event" }, { key: "message_id", value: "huge" }, { key: "sum", value: "500" }, { key: "seq", value: "0" }], payload: new Uint8Array(10) }));
+    const refused = (await feishu.waitFor(2))[1];
+    expect(JSON.parse(new TextDecoder().decode(refused.payload))).toEqual({ code: 500 });
+    expect((await link.status()).trouble).toBe("too_busy");
+    // The first piece of an ordinary two-part message gets no answer yet: it is only incomplete.
+    await feishu.send(encodeFrame({ seqId: 9n, logId: 9n, service: 7, method: DATA, headers: [{ key: "type", value: "event" }, { key: "message_id", value: "pending" }, { key: "sum", value: "2" }, { key: "seq", value: "0" }], payload: new Uint8Array(10) }));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await feishu.waitFor(2)).toHaveLength(2);
   });
 
   it("only follows an encrypted address on a Feishu host, and backs off when refused", async () => {
