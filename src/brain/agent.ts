@@ -689,7 +689,8 @@ export class BrainAgent extends DurableObject<Env> {
     // The question whose posted text was confirmed unchanged, if it was posted somewhere editable.
     let confirmedAsk: string | undefined;
     if (decision === "allow") {
-      const candidates = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? OR id = ?", run.id, intent?.deciding_event ?? -1);
+      // Everything in this conversation that could bear on it, handled or still waiting.
+      const candidates = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ?", sessionKey, task.created_at ?? 0);
       await this.#refreshStanding(candidates);
       // The question itself is a comment others may be able to edit. People approve what they
       // read, so it has to still say what the agent wrote.
@@ -722,9 +723,18 @@ export class BrainAgent extends DurableObject<Env> {
     if (intent?.decision === "allow" && intent.pending_id === open) {
       const approver = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
       const code = (JSON.parse(task.pending) as { code: string }).code;
-      const later = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND id > ?", sessionKey, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)));
-      const since = later.events;
-      const against = later.unresolved || since.some((event) => (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") || (JSON.parse(event.principal) as Principal).id === intent!.decided_by);
+      // Everything else members have said in this conversation since the task began, whenever it
+      // arrived: a later word from the approver, or anything about this question that is not an approval.
+      const later = this.#reconcile(
+        this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+      );
+      const against =
+        later.unresolved ||
+        later.events.some(
+          (event) =>
+            (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") ||
+            ((JSON.parse(event.principal) as Principal).id === intent!.decided_by && approver !== undefined && saidAt(event) >= saidAt(approver)),
+        );
       if (decision === "deny" || against || !approver || !this.#stillStands(approver)) {
         before = { decision: intent.decision, decided_by: intent.decided_by };
         intent = undefined;
@@ -741,7 +751,9 @@ export class BrainAgent extends DurableObject<Env> {
 
       // Messages from members, sent after the question was put to them.
       // A reply whose comment was edited is represented by the edit, which is a message of its own.
-      const received = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at > ? ORDER BY id", run.id, asked.sent_at));
+      // Not only this run's: a "wait" that was handled in an earlier run still counts against an
+      // older approval that arrives after it.
+      const received = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND status != 'pending' AND received_at > ? ORDER BY id", sessionKey, asked.sent_at));
       const replies = received.events
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
         .filter(({ principal }) => this.#isDecider(principal));
@@ -790,7 +802,8 @@ export class BrainAgent extends DurableObject<Env> {
         const theirs = read.filter(({ principal }) => principal.id === deciding.principal.id).sort(bySaid);
         const lastWord = theirs.at(-1)!;
         // Said in the same instant as far as the source can tell: which came last is anyone's guess.
-        if (theirs.some(({ event }) => event.id !== deciding.event.id && saidAt(event) === saidAt(deciding.event))) {
+        // (Only where the time is the source's, which may be coarse. Arrival times order themselves.)
+        if (theirs.some(({ event }) => event.id !== deciding.event.id && fromSource(event) && fromSource(deciding.event) && saidAt(event) === saidAt(deciding.event))) {
           throw new Error(`${deciding.principal.id} said something else at the same moment as approving; ask them to confirm by sending just "approve ${pending.code}" again`);
         }
         // Including anything of theirs that arrived after this run started and is still in the inbox.
@@ -1020,7 +1033,10 @@ export class BrainAgent extends DurableObject<Env> {
   #reconcile(events: InboxRow[]): { events: InboxRow[]; unresolved: boolean } {
     let unresolved = false;
     const current = events.filter((event) => {
-      if (this.#standing(event) !== "changed") return true;
+      const standing = this.#standing(event);
+      // A deleted comment says nothing any more, for or against.
+      if (standing === "deleted") return false;
+      if (standing !== "changed") return true;
       const subject = (JSON.parse(event.data ?? "{}") as { subject?: string }).subject;
       // Whichever of them arrived first: the message that carries the subject's current text.
       const replaced = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id != ? AND json_extract(data, '$.subject') = ?", event.id, subject ?? "").some((other) => this.#standing(other) === "stands");
@@ -1142,6 +1158,12 @@ function renderEvent(event: InboxRow): string {
 function saidAt(event: InboxRow): number {
   const revision = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number }) : {};
   return revision.subject && typeof revision.revision === "number" ? revision.revision : event.received_at;
+}
+
+/** Whether the time a message was said comes from its source rather than from its arrival. */
+function fromSource(event: InboxRow): boolean {
+  const data = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number }) : {};
+  return Boolean(data.subject) && typeof data.revision === "number";
 }
 
 /** Whether a message mentions this question's code at all. */

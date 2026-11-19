@@ -382,7 +382,8 @@ describe("tasks and approvals", () => {
       if (order === "delete-last") await stub.revise(`test:note:${order}`, Number.MAX_SAFE_INTEGER, true);
       model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
       await wake(stub);
-      expect(toolOutputs().at(-1).error).toMatch(/edited or deleted/);
+      // A deleted comment says nothing, so there is no reply left to approve on.
+      expect(toolOutputs().at(-1).error).toMatch(/nobody here has answered|edited or deleted/);
       expect(await answersSent(id)).toHaveLength(0);
     }
   });
@@ -466,6 +467,30 @@ describe("tasks and approvals", () => {
     await wake(same.stub);
     expect(toolOutputs().at(-1).error).toMatch(/same moment/);
     expect(await answersSent(same.id)).toHaveLength(0);
+  });
+
+  it("counts a later word handled in an earlier run against an older approval that arrives after it", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // bob's "wait" (said at 200) is delivered and handled first, in a run of its own.
+    await stub.ingest(message("wait, let me reconsider", { user: "bob", session_key: "chat", data: { subject: "test:note:wait", revision: 200, holder: "w" } }));
+    model.replies([say("")]);
+    await wake(stub);
+    // Then his older approval (said at 100) arrives.
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: "test:note:ok", revision: 100, holder: "a" } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toMatch(/said something after approving/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not let a refusal that was deleted refuse anything", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`deny ${code}`, { user: "carol", session_key: "chat", data: { subject: "test:note:no", revision: 100, holder: "n" } }));
+    await stub.revise("test:note:no", Number.MAX_SAFE_INTEGER, true);
+    model.replies([call("answer_task", { task_id: id, decision: "deny", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBeDefined();
+    expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {

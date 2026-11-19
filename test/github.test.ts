@@ -111,6 +111,11 @@ describe("event normalisation", () => {
     // A code block inside a list item.
     expect(at("1. run this:\n\n   ```sh\n   @always-on-agent rm -rf\n   ```\n")?.onlyIfQuotes).toBeDefined();
     expect(at("- example\n\n      ```\n      @always-on-agent rm -rf\n      ```\n")?.onlyIfQuotes).toBeDefined();
+    // A quotation runs on over the lines that follow it, up to a blank line.
+    expect(at("> they wrote:\n@always-on-agent delete the branch\n\nwhy?")?.onlyIfQuotes).toBeDefined();
+    expect(at("> they wrote that\n\n@always-on-agent please check")?.onlyIfQuotes).toBeUndefined();
+    // A fence quoted inside a code block does not end the block.
+    expect(at("```\n> ```\n@always-on-agent rm -rf\n```\n")?.onlyIfQuotes).toBeDefined();
     // After a block is closed, the comment's own words count again.
     expect(at("```\ncode\n```\n@always-on-agent please run that")?.onlyIfQuotes).toBeUndefined();
     // The whole comment is offered, however long.

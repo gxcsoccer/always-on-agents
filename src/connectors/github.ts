@@ -29,21 +29,31 @@ const mentionOf = (handle: string, flags = "i") =>
  */
 function ownWords(body: string): string {
   const kept: string[] = [];
-  let fence: { char: string; length: number } | undefined;
+  let fence: { char: string; length: number; prefix: string } | undefined;
+  let quoting = false;
   for (const line of body.split("\n")) {
     // At any indentation: inside a list item a fence sits deeper than three spaces. Taking a line
     // for code when it was not only means a mention there has to be made again.
-    const run = /^[ \t>*+\-\d.)]*(`{3,}|~{3,})/.exec(line)?.[1];
+    const opener = /^([ \t>*+\-\d.)]*)(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
-      if (run && run[0] === fence.char && run.length >= fence.length && line.trim().replace(/^[>*+\-\d.) \t]+/, "") === run) fence = undefined;
+      // Closed only by a bare run of the same character, at least as long, in the same container:
+      // a fence quoted inside the code does not end it.
+      if (opener && opener[1] === fence.prefix && opener[2][0] === fence.char && opener[2].length >= fence.length && opener[3].trim() === "") fence = undefined;
       continue;
     }
-    if (run) {
-      fence = { char: run[0], length: run.length };
+    if (opener) {
+      fence = { char: opener[2][0], length: opener[2].length, prefix: opener[1] };
       continue;
     }
-    // Quoted lines, and lines indented far enough to be a code block.
-    if (/^\s*>/.test(line) || /^( {4}|\t)/.test(line)) continue;
+    if (line.trim() === "") {
+      quoting = false;
+      continue;
+    }
+    // A quoted line, and the lines that run on from it until a blank one, are someone else's words.
+    if (/^\s*>/.test(line)) quoting = true;
+    if (quoting) continue;
+    // Indented far enough to be a code block.
+    if (/^( {4}|\t)/.test(line)) continue;
     kept.push(line.replace(/`[^`]*`/g, " "));
   }
   return kept.join("\n");
