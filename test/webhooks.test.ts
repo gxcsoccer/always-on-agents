@@ -1,3 +1,4 @@
+import { handleFeishuWebhook } from "../src/connectors/feishu";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -127,6 +128,42 @@ describe("the Feishu webhook endpoint", () => {
     await registry().setFeishuApp(t, { app_id: appId, app_secret: "s", encrypt_key: ENCRYPT_KEY, bot_open_id: "ou_bot" });
     return { t, appId };
   }
+
+  it("tells the person to press again when a card press could not be filed, and never says it was received", async () => {
+    const { appId } = await app();
+    const press = (decision: string) => ({
+      schema: "2.0",
+      header: { event_id: `press-${decision}`, event_type: "card.action.trigger", app_id: appId, tenant_key: "org" },
+      event: { operator: { open_id: "ou_frank", tenant_key: "org" }, action: { value: { aoa: "answer", decision, code: "K7PW", q: "ask:11111111-2222-3333-4444-555555555555:1", to: "chat" } }, context: { open_chat_id: "oc_group" } },
+    });
+    const request = async (payload: unknown) => {
+      const body = JSON.stringify({ encrypt: await encrypt(JSON.stringify(payload)) });
+      const timestamp = String(Math.floor(Date.now() / 1_000));
+      const signature = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${timestamp}nonce${ENCRYPT_KEY}${body}`)));
+      return new Request(`https://agent.test/v1/feishu/events/${appId}`, { method: "POST", body, headers: { "x-lark-request-timestamp": timestamp, "x-lark-request-nonce": "nonce", "x-lark-signature": signature } });
+    };
+    // Filed: the person is told so.
+    const filed = await handleFeishuWebhook(await request(press("deny")), env as any, appId);
+    expect(((await filed.json()) as any).toast).toMatchObject({ type: "info" });
+    // The store fails: a refusal must not be reported as received.
+    const broken = { ...(env as any), BRAIN: { getByName: () => ({ ingest: () => Promise.reject(new Error("storage is unavailable")) }) } };
+    const lost = await handleFeishuWebhook(await request(press("deny")), broken, appId);
+    const toast = ((await lost.json()) as any).toast;
+    expect(toast.type).toBe("error");
+    expect(toast.content).toContain("请再点一次");
+    expect(toast.content).not.toContain("已收到");
+    // The store is slow: the answer goes back in time, says it is not confirmed, and filing goes on.
+    let finish: () => void = () => {};
+    const deferred: Promise<unknown>[] = [];
+    const slow = { ...(env as any), BRAIN: { getByName: () => ({ ingest: () => new Promise<void>((resolve) => (finish = resolve)) }) } };
+    const started = Date.now();
+    const pending = await handleFeishuWebhook(await request(press("approve")), slow, appId, (work) => deferred.push(work));
+    expect(Date.now() - started).toBeLessThan(2_900);
+    expect(((await pending.json()) as any).toast).toMatchObject({ type: "warning" });
+    expect(deferred).toHaveLength(1);
+    finish();
+    expect(await deferred[0]).toBe("filed");
+  });
 
   it("answers Feishu's address check, which is encrypted but not signed", async () => {
     const { appId } = await app();

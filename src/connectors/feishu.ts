@@ -23,6 +23,8 @@ import type { ApprovalQuestion, OutboundMessage, Outcome, Receipt } from "./inde
 
 const API = "https://open.feishu.cn/open-apis";
 /** Feishu signs with a timestamp; anything much older is a replay. */
+/** How long a card press may take to be filed before Feishu's three-second limit forces an answer. */
+const PRESS_FILING_BUDGET_MS = 2_000;
 const MAX_SKEW_S = 10 * 60;
 
 export async function handleFeishuWebhook(request: Request, env: Env, appId: string, defer?: (work: Promise<unknown>) => void): Promise<Response> {
@@ -81,16 +83,26 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   if (body.header?.event_type === "card.action.trigger") {
     const pressed = normalizeCardAction(app, body);
     if (!pressed) return json({ toast: { type: "error", content: "这个操作无法处理" } });
-    // Feishu shows the person an error unless it is answered within three seconds, so the answer
-    // goes back first and the press is filed right after. If filing fails it is logged; the person
-    // sees no result in the chat and can press again.
-    const filed = env.BRAIN.getByName(scopeName(pressed.scope))
-      .ingest(pressed.event)
-      .catch((err: unknown) => console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: appId })));
-    if (defer) defer(filed);
-    else await filed;
+    // The press is filed before the person is told it was received: a refusal that was shown as
+    // received and then lost would leave an approval free to go through. Feishu, though, shows an
+    // error unless it is answered within three seconds. So filing gets most of that time; if it
+    // has not finished, it carries on in the background and the person is told plainly that it is
+    // not confirmed yet, and if it fails they are told to press again.
     const said = pressed.event.text?.startsWith("deny") ? "拒绝" : pressed.event.text?.startsWith("approve all") ? "批准（这个任务不再问）" : "批准";
-    return json({ toast: { type: "info", content: `已收到你的选择：${said}。结果会在对话里回复` } });
+    const filing: Promise<"filed" | "failed"> = env.BRAIN.getByName(scopeName(pressed.scope))
+      .ingest(pressed.event)
+      .then(
+        () => "filed" as const,
+        (err: unknown) => {
+          console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: appId }));
+          return "failed" as const;
+        },
+      );
+    const outcome = defer ? await Promise.race([filing, new Promise<"slow">((resolve) => setTimeout(() => resolve("slow"), PRESS_FILING_BUDGET_MS))]) : await filing;
+    if (outcome === "slow") defer?.(filing);
+    if (outcome === "filed") return json({ toast: { type: "info", content: `已收到你的选择：${said}。结果会在对话里回复` } });
+    if (outcome === "failed") return json({ toast: { type: "error", content: `没能记下你的选择（${said}），请再点一次` } });
+    return json({ toast: { type: "warning", content: `正在记录你的选择：${said}。如果对话里一直没有回应，请再点一次` } });
   }
 
   const normalized = normalize(app, body);
