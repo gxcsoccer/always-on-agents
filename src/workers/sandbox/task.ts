@@ -212,7 +212,7 @@ node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
 After each meaningful step, run the shell command: report progress "<one sentence on what you just finished>"
-Some commands pause until a reviewer approves them; that is expected, just wait.
+Some commands pause until a person approves them; that is expected, just wait. A git push in particular is held until someone approves it, which can take up to an hour: run it with a timeout of at least 3600 seconds, and never treat the wait as a failure, cancel it, or retry it while it is waiting.
 If a command is denied, do not retry it or work around it; say so in your final answer.`;
 
 const RESUME_PROMPT = `The sandbox you were working in was replaced. Your files and this conversation were restored from a checkpoint, so the last few things you did before the interruption may be missing. Look at the current state of the directory, work out which steps are actually done, and continue the original task from there. Do not redo steps that are already done.`;

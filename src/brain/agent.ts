@@ -979,8 +979,13 @@ export class BrainAgent extends DurableObject<Env> {
         body = { ...body, code, asked_at: Date.now(), ask, delivered: ask !== undefined, what };
         applied = this.#setTask(taskId, "needs_input", { pending: JSON.stringify(body) });
       }
-      else if (kind === "result") applied = this.#setTask(taskId, "succeeded", { result: JSON.stringify(body) });
-      else if (kind === "failed" || kind === "lost") applied = this.#setTask(taskId, kind, { result: JSON.stringify(body) });
+      else if (kind === "result" || kind === "failed" || kind === "lost") {
+        // A task that ends while a question of its is still open leaves nothing to answer: the
+        // question is closed where it is shown, so nobody presses a button that does nothing.
+        const open = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
+        applied = kind === "result" ? this.#setTask(taskId, "succeeded", { result: JSON.stringify(body) }) : this.#setTask(taskId, kind, { result: JSON.stringify(body) });
+        if (applied) this.#closeQuestion(open, { state: "withdrawn" });
+      }
       else return { known: true, wake: false, terminal: false };
       if (!applied) return { known: true, wake: false, terminal: false };
 
