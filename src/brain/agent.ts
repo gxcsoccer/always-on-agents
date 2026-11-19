@@ -191,6 +191,8 @@ export class BrainAgent extends DurableObject<Env> {
     if (timer != null) candidates.push(timer);
     const outbox = this.#rows<{ next_at: number }>("SELECT next_at FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0]?.next_at;
     if (outbox != null) candidates.push(outbox);
+    const reconciling = this.#rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM outbox WHERE status = 'reconciling'")[0]?.next_at;
+    if (reconciling != null) candidates.push(reconciling);
     // Housekeeping is work too: a scope that has gone quiet still has old records to remove.
     const housekeeping = Number(this.#meta("housekeeping_at") ?? 0);
     if (housekeeping > 0 && this.#rows("SELECT 1 FROM inbox LIMIT 1").length > 0) candidates.push(housekeeping);
@@ -220,7 +222,7 @@ export class BrainAgent extends DurableObject<Env> {
       // pair is what makes a replayed webhook a duplicate, and a signed webhook never expires.
       this.#sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead') AND received_at < ? AND text IS NOT NULL", old);
       this.#sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead') AND received_at < ?", now - RETAIN_AUDIT_MS);
-      this.#sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn') AND created_at < ?", old);
+      this.#sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn', 'reconciling') AND created_at < ?", old);
       this.#sql.exec("DELETE FROM runs WHERE status != 'running' AND ended_at < ?", old);
       this.#sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ?", old);
       this.#sql.exec("DELETE FROM task_events WHERE at < ?", old);
@@ -501,41 +503,54 @@ export class BrainAgent extends DurableObject<Env> {
 
   /** Delivers strictly in order: the oldest undelivered message goes first, even while it is backing off. */
   async #flushOutbox(): Promise<void> {
-    for (;;) {
-      const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
-      if (!row) return;
-      // A question that was closed before any attempt to send it is not put to anyone. This comes
-      // before the back-off check: a closed question waiting out a back-off must not hold up the
-      // messages behind it.
-      if (row.ask && row.closed && row.attempts === 0) {
-        this.#sql.exec("UPDATE outbox SET status = 'withdrawn', error = NULL WHERE id = ? AND status = 'pending'", row.id);
-        continue;
+    try {
+      for (;;) {
+        const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
+        if (!row) return;
+        // A closed question leaves the ordered queue at once, whatever back-off it is in, so it
+        // never holds up the messages behind it. If no attempt to send it was ever begun, nobody
+        // has seen it and it is simply not sent. If one was begun, it may have reached people
+        // although we never heard so: it is set aside to be found and shown as closed (below).
+        if (row.ask && row.closed) {
+          this.#sql.exec("UPDATE outbox SET status = ?, error = NULL WHERE id = ? AND status = 'pending'", row.started ? "reconciling" : "withdrawn", row.id);
+          continue;
+        }
+        if (row.next_at > Date.now()) return;
+        if (!(await this.#attempt(row, "pending"))) return;
       }
-      if (row.next_at > Date.now()) return;
-      // A closed question that was attempted before may have reached people although we never
-      // heard so. It is sent again under the same id, which the connector does not duplicate, to
-      // learn where it is; it is then shown as closed straight away (below).
-      try {
-        // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
-        // If an earlier attempt had in fact been posted, that is when people could first answer it.
-        this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
-        // It may have been closed while it was on its way.
-        if (row.ask) this.#showClosed(row.idem);
-      } catch (err) {
-        const attempts = row.attempts + 1;
-        const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
-        this.#sql.exec(
-          "UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?",
-          dead ? "dead" : "pending",
-          attempts,
-          Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0),
-          String(err).slice(0, 500),
-          row.id,
-        );
-        if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
-        return;
-      }
+    } finally {
+      await this.#reconcileClosed();
+    }
+  }
+
+  /**
+   * Closed questions whose delivery was begun but never confirmed. Each is sent again under its own
+   * id, which the connector does not duplicate, to learn where it is, and is then shown as closed.
+   * Outside the ordered queue: these hold nothing up, and one failing does not stop the others.
+   */
+  async #reconcileClosed(): Promise<void> {
+    for (const row of this.#rows<Row>("SELECT * FROM outbox WHERE status = 'reconciling' AND next_at <= ? ORDER BY id LIMIT 20", Date.now())) await this.#attempt(row, "reconciling");
+  }
+
+  /** One attempt to deliver a row. Returns whether it was delivered. */
+  async #attempt(row: Row, status: "pending" | "reconciling"): Promise<boolean> {
+    // Recorded before anything is sent: if this instance dies between the send and the receipt,
+    // the row still says that an attempt was begun.
+    this.#sql.exec("UPDATE outbox SET started = 1 WHERE id = ?", row.id);
+    try {
+      // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
+      const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
+      // If an earlier attempt had in fact been posted, that is when people could first answer it.
+      this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
+      // It may have been closed while it was on its way.
+      if (row.ask) this.#showClosed(row.idem);
+      return true;
+    } catch (err) {
+      const attempts = row.attempts + 1;
+      const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
+      this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), String(err).slice(0, 500), row.id);
+      if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
+      return false;
     }
   }
 
@@ -1191,7 +1206,7 @@ export class BrainAgent extends DurableObject<Env> {
   /** Messages written since `afterId`, for connectors whose clients pull instead of being pushed to. */
   async outboxSince(afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
     // A question withdrawn before it went out was never said to anyone, on any channel.
-    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status != 'withdrawn' AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
+    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status NOT IN ('withdrawn', 'reconciling') AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
   }
 
   async inspect(): Promise<Record<string, unknown>> {

@@ -689,7 +689,8 @@ describe("tasks and approvals", () => {
     await scope.stub.taskEvent(id, 1, "needs_input", ask);
     // One attempt was made and its answer never came back.
     await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => {
-      state.storage.sql.exec("UPDATE outbox SET attempts = 1, next_at = 0 WHERE idem = ?", `ask:${id}:1`);
+      // Begun, and never heard of again: no failure was counted either.
+      state.storage.sql.exec("UPDATE outbox SET started = 1, next_at = 0 WHERE idem = ?", `ask:${id}:1`);
     });
     await scope.stub.taskEvent(id, 2, "result", { text: "done" });
     model.replies([say("")], [say("")]);
@@ -698,6 +699,27 @@ describe("tasks and approvals", () => {
     // Not dropped unseen: delivered under its own id, with its outcome on record to show.
     expect(row.status).toBe("sent");
     expect(JSON.parse(row.closed)).toEqual({ state: "withdrawn" });
+  });
+
+  it("sets a closed question whose delivery keeps failing aside, so the messages behind it still go out", async () => {
+    const scope = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "remove the build directory", repository: null })], [say("")]);
+    await scope.stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(scope.stub);
+    const id: string = (await scope.stub.inspect()).tasks[0].id;
+    await scope.stub.taskEvent(id, 1, "needs_input", ask);
+    // Five attempts have failed and the next is fifteen minutes away; then the task ends.
+    await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET started = 1, attempts = 5, next_at = ? WHERE idem = ?", Date.now() + 900_000, `ask:${id}:1`);
+    });
+    await scope.stub.taskEvent(id, 2, "result", { text: "done without it" });
+    model.replies([say("the task finished")], [say("")]);
+    await wake(scope.stub);
+    const rows = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT idem, status FROM outbox ORDER BY id")] as any[]);
+    // Out of the ordered queue, waiting its turn to be looked for; not sent, not dropped.
+    expect(rows.find((r) => r.idem === `ask:${id}:1`).status).toBe("reconciling");
+    expect(rows.filter((r) => r.idem !== `ask:${id}:1`).every((r) => r.status === "sent")).toBe(true);
+    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
   });
 
   it("keeps how a delivered question ended, with the question", async () => {

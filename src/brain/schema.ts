@@ -138,6 +138,8 @@ const MIGRATIONS: string[] = [
   `CREATE TABLE used_codes (code TEXT PRIMARY KEY, used_at INTEGER NOT NULL);`,
   // 9: how a question ended, kept with the question so it holds whenever its delivery completes.
   `ALTER TABLE outbox ADD COLUMN closed TEXT;`,
+  // 10: set before the first attempt to deliver, so an attempt whose outcome was never heard is known of.
+  `ALTER TABLE outbox ADD COLUMN started INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
