@@ -69,12 +69,22 @@ curl $B/v1/admin/scopes/acme:user:alice -H "authorization: Bearer $ADMIN_KEY"  #
 wrangler r2 bucket create always-on-agent-checkpoints
 wrangler secret put OPENAI_API_KEY
 wrangler secret put ADMIN_KEY
-wrangler secret put GITHUB_WEBHOOK_SECRET   # 可选
+wrangler secret put GITHUB_APP_ID            # 以下四项：接 GitHub App 时需要
+wrangler secret put GITHUB_APP_PRIVATE_KEY
+wrangler secret put GITHUB_WEBHOOK_SECRET
+wrangler secret put GITHUB_BOT_HANDLE        # App 的 slug，人们用 @它 来称呼 agent
 wrangler deploy
+```
+
+接 GitHub App 时，装好 App 后要把安装登记到租户，之后这个安装发来的 webhook 才会被接受（之前的一律 401，可以在 App 的 Advanced 页重新投递）：
+
+```bash
+curl -X POST $B/v1/admin/tenants/acme/github-installations -H "authorization: Bearer $ADMIN_KEY" \
+  -H 'content-type: application/json' -d '{"installation_id":"<id>"}'
 ```
 
 ## 现状
 
-已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库跑通了从 PR 评论派活到批准后 push 的整条链路；飞书的入站用自己加密签名的请求验证过。
+已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书的入站用自己加密签名的请求验证过。
 
-还没有和真实系统联调的部分：飞书的出站、GitHub App 按安装签发令牌，以及豆包。详见架构文档的"尚未完成"和"验证过什么"。
+还没有和真实系统联调的部分：飞书的真实消息收发，以及豆包（未实现）。详见架构文档的"尚未完成"和"验证过什么"。
