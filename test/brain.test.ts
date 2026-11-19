@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readDecision } from "../src/brain/agent";
+import { readDecision, readTiedDecision } from "../src/brain/agent";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
 
 beforeEach(() => installFakeModel());
@@ -549,6 +549,41 @@ describe("tasks and approvals", () => {
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
     await wake(stub);
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+  });
+
+  it("reads a plain yes or no only from a reply that is tied to the question", () => {
+    for (const yes of ["可以", "好的", "批准", "OK", "yes", "同意。", "approve K7PW"]) expect(readTiedDecision(yes, "K7PW")).toBe("allow");
+    for (const no of ["不可以", "不行", "先别", "等一下", "no", "wait", "don't", "deny K7PW", "可以，但是别删 main"]) expect(readTiedDecision(no, "K7PW")).toBe("deny");
+    for (const neither of ["这是要干什么？", "可以先解释一下吗", "好像有点问题", "okay but why"]) expect(readTiedDecision(neither, "K7PW")).toBeUndefined();
+    // The same words anywhere else are not an answer to anything.
+    expect(readDecision("可以", "K7PW")).toBeUndefined();
+  });
+
+  it("takes a reply to the question's own message as an answer to it, without the code", async () => {
+    const { stub, id } = await taskAwaitingApproval();
+    const idem = `ask:${id}:1`;
+    // The connector recorded where the question was posted.
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET receipt = ? WHERE idem = ?", JSON.stringify({ subject: "feishu:message:om_card", holder: "" }), idem);
+    });
+    // "可以" said in the chat at large answers nothing.
+    await stub.ingest(message("可以", { user: "bob", session_key: "chat" }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBeDefined();
+    expect(await answersSent(id)).toHaveLength(0);
+    // The same word as a reply to the question does, wherever in the chat it was typed.
+    await stub.ingest(message("可以", { user: "bob", session_key: "thread:omt_2", data: { route_by_code: true, replies_to: "feishu:message:om_card" } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow", decided_by: "bob" });
+  });
+
+  it("never gives the same code to two questions", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    const seen = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT code FROM used_codes")].map((r: any) => r.code));
+    expect(seen).toEqual([code]);
+    void id;
   });
 
   it("stores a very long reply whole, so a refusal at its end still counts", async () => {

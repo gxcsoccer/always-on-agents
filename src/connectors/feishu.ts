@@ -19,7 +19,7 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import type { OutboundMessage } from "./index";
+import type { ApprovalQuestion, OutboundMessage, Outcome, Receipt } from "./index";
 
 const API = "https://open.feishu.cn/open-apis";
 /** Feishu signs with a timestamp; anything much older is a replay. */
@@ -172,7 +172,15 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       session_key: group ? (thread ? `thread:${thread}` : "chat") : "dm",
       principal: { kind: "human", id: openId, explicit: true },
       text,
-      data: { message_id: message.message_id, chat_id: message.chat_id, chat_type: message.chat_type, route_by_code: true },
+      data: {
+        message_id: message.message_id,
+        chat_id: message.chat_id,
+        chat_type: message.chat_type,
+        route_by_code: true,
+        // The message this one was written in reply to, if any. A reply to the agent's question is
+        // an answer to that question, whatever its wording.
+        ...(typeof (message.parent_id || message.root_id) === "string" ? { replies_to: `feishu:message:${message.parent_id || message.root_id}` } : {}),
+      },
       reply_to: {
         connector: "feishu",
         address: { app_id: app.app_id, chat_id: message.chat_id, ...(group ? { message_id: message.message_id, ...(thread ? { thread: "1" } : {}) } : {}) },
@@ -202,7 +210,7 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 }
 
 /** Sends as the bot. A direct chat gets a new message; a group gets a reply to the message that asked. */
-export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<void> {
+export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
   const { app_id: appId, chat_id: chatId, message_id: messageId, thread } = target.address;
   if (!appId || !chatId) throw new Error("bad Feishu address");
   const token = await tenantAccessToken(env, appId);
@@ -223,6 +231,24 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
       });
+  const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
+  if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
+  // Which message the question is, so a reply to it can be told from a reply to anything else,
+  // and so the card can be closed later.
+  if (message.ask && result.data?.message_id) return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** Replaces a question's card with one that says how it ended and has no buttons. */
+export async function amendFeishu(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void> {
+  const messageId = /^feishu:message:([A-Za-z0-9_-]{1,100})$/.exec(receipt.subject)?.[1];
+  const appId = target.address.app_id;
+  if (!messageId || !appId) return;
+  const token = await tenantAccessToken(env, appId);
+  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}`, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ content: JSON.stringify(approvalCard(ask, "chat", outcome)) }),
+  });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string };
   if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
 }
@@ -231,7 +257,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
  * The approval question as a card. Everything that comes from the task is plain text, so nothing in
  * a command or a branch name can be rendered as formatting or as a link.
  */
-export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user"): unknown {
+export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user", outcome?: Outcome): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   const button = (label: string, type: string, decision: "approve" | "deny") => ({
     tag: "button",
@@ -241,16 +267,25 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
     // happened to get the same code cannot answer a later one.
     value: { aoa: "answer", decision, code: ask.code, q: ask.id, to },
   });
+  const about = [
+    { tag: "div", text: plain(`任务：${ask.title}`) },
+    { tag: "div", text: plain(ask.kind === "push" ? "它要推送代码：" : "它要执行这条命令：") },
+    { tag: "div", text: plain(ask.detail) },
+  ];
+  // Closed: it says how it ended, and there is nothing left to press.
+  if (outcome) {
+    const ended = { approved: ["green", "已批准"], refused: ["red", "已拒绝"], withdrawn: ["grey", "已失效"] }[outcome.state];
+    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : `${ended[1]}。`;
+    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: ended[0], title: plain(`${ended[1]} · ${ask.code}`) }, elements: [...about, { tag: "note", elements: [plain(note)] }] };
+  }
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: "orange", title: plain(`需要你批准 · ${ask.code}`) },
     elements: [
-      { tag: "div", text: plain(`任务：${ask.title}`) },
-      { tag: "div", text: plain(ask.kind === "push" ? "它要推送代码：" : "它要执行这条命令：") },
-      { tag: "div", text: plain(ask.detail) },
+      ...about,
       ...(ask.can_approve ? [] : [{ tag: "div", text: plain("内容太长，无法完整显示，所以只能拒绝。") }]),
       { tag: "action", actions: [...(ask.can_approve ? [button("批准", "primary", "approve")] : []), button("拒绝", "danger", "deny")] },
-      { tag: "note", elements: [plain(ask.can_approve ? `也可以直接回复：approve ${ask.code} 或 deny ${ask.code}` : `也可以直接回复：deny ${ask.code}`)] },
+      { tag: "note", elements: [plain(ask.can_approve ? "也可以直接回复这条消息：批准 / 拒绝" : "也可以直接回复这条消息：拒绝")] },
     ],
   };
 }

@@ -9,7 +9,7 @@
  */
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";
-import { deliverFeishu } from "./feishu";
+import { amendFeishu, deliverFeishu } from "./feishu";
 import { deliverGithub } from "./github";
 
 export interface OutboundMessage {
@@ -48,6 +48,17 @@ export interface Receipt {
   holder: string;
   /** When it was actually posted, if that was on an earlier attempt than the one that confirmed it. */
   posted_at?: number;
+}
+
+/** How an approval question ended. */
+export type Outcome = { state: "approved" | "refused"; by?: string } | { state: "withdrawn" };
+
+/**
+ * Marks a delivered approval question as closed where it is shown, if the connector can: the
+ * question stops inviting an answer and says how it ended. Best effort; nothing depends on it.
+ */
+export async function amend(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void> {
+  if (target.connector === "feishu") await amendFeishu(env, target, receipt, ask, outcome);
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */

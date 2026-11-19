@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, deliver } from "../connectors";
+import { type ApprovalQuestion, type Outcome, type Receipt, amend, deliver } from "../connectors";
 import { NOT_FOR_THE_AGENT, commentStanding } from "../connectors/github";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
@@ -105,6 +105,11 @@ export class BrainAgent extends DurableObject<Env> {
     if ((event.text?.length ?? 0) > 300_000) throw new Error("event text is too long");
     // In a chat with threads, a reply that names an open question's code belongs with that
     // question, wherever in the chat it was typed. The connector says when this applies.
+    // A message written in reply to one of the agent's questions answers that question.
+    if (event.kind === "message" && typeof event.data?.replies_to === "string" && event.data.question === undefined) {
+      const asked = this.#rows<{ idem: string }>("SELECT idem FROM outbox WHERE ask IS NOT NULL AND json_extract(receipt, '$.subject') = ?", event.data.replies_to)[0];
+      if (asked) event = { ...event, data: { ...event.data, question: asked.idem } };
+    }
     if (event.kind === "message" && event.data?.route_by_code === true && event.text) {
       const pressed = typeof event.data.question === "string" ? event.data.question : undefined;
       const sessions = new Set(
@@ -752,7 +757,9 @@ export class BrainAgent extends DurableObject<Env> {
           (event) =>
             (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") ||
             ((JSON.parse(event.principal) as Principal).id === intent!.decided_by && approver !== undefined && saidAt(event) >= saidAt(approver)),
-        );
+        ) ||
+        // And anything the approver has said since in the place the approval was typed, if it was moved here.
+        (approver !== undefined && this.#saidSinceWhereTyped(approver, task.created_at ?? 0));
       if (decision === "deny" || against || !approver || !this.#stillStands(approver)) {
         before = { decision: intent.decision, decided_by: intent.decided_by };
         intent = undefined;
@@ -784,7 +791,11 @@ export class BrainAgent extends DurableObject<Env> {
         const pressed = event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined;
         return pressed === undefined || pressed === pending.ask;
       };
-      const read = replies.map((reply) => ({ ...reply, says: about(reply.event) ? readDecision(reply.event.text ?? "", pending.code) : undefined }));
+      // One that is tied to this very question (a press on its card, a reply to its message) need
+      // not repeat the code: "可以" under the question is an answer to it.
+      const tied = (event: InboxRow) => (event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined) === pending.ask && pending.ask !== undefined;
+      const says = (event: InboxRow) => (!about(event) ? undefined : tied(event) ? readTiedDecision(event.text ?? "", pending.code) : readDecision(event.text ?? "", pending.code));
+      const read = replies.map((reply) => ({ ...reply, says: says(reply.event) }));
       const shared = this.#scope().kind !== "user";
       let deciding: (typeof read)[number];
       if (decision === "deny") {
@@ -799,7 +810,7 @@ export class BrainAgent extends DurableObject<Env> {
         const queued = this.#reconcile(
           this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
         );
-        const waiting = queued.events.some((event) => about(event) && quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
+        const waiting = queued.events.some((event) => about(event) && (tied(event) || quotes(event.text ?? "", pending.code)) && says(event) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         // The same goes for a waiting reply that has been edited into something not yet seen.
         if (queued.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
@@ -832,13 +843,11 @@ export class BrainAgent extends DurableObject<Env> {
         // Including anything of theirs that arrived after this run started and is still in the inbox.
         // And, for an approval that was typed elsewhere in the chat and brought here, anything
         // they have said since in the place they typed it.
-        const origin = (JSON.parse(deciding.event.data ?? "{}") as { routed_from?: string }).routed_from;
-        const elsewhere = origin
-          ? this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", origin, asked.sent_at, deciding.event.id).filter((event) => saidAt(event) > saidAt(deciding.event) || (saidAt(event) === saidAt(deciding.event) && event.id > deciding.event.id))
-          : [];
-        const saidMore = this.#reconcile([...this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id), ...elsewhere]).events.some(
-          (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
-        );
+        const saidMore =
+          this.#saidSinceWhereTyped(deciding.event, asked.sent_at) ||
+          this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id)).events.some(
+            (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
+          );
         // And it has to be what they still say: not a comment since edited or deleted.
         if (!this.#stillStands(deciding.event)) throw new Error("that reply has since been edited or deleted; it no longer approves anything");
         if (lastWord.event.id !== deciding.event.id || saidMore) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
@@ -860,6 +869,8 @@ export class BrainAgent extends DurableObject<Env> {
       taskId,
       intent.pending_id,
     );
+    const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
+    if (askedAs.id === intent.pending_id) this.#closeQuestion(askedAs.ask, { state: decided === "allow" ? "approved" : "refused" });
     if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
@@ -922,6 +933,7 @@ export class BrainAgent extends DurableObject<Env> {
         // The held request gave up; its question no longer stands.
         if (task.status === "needs_input" && task.pending && JSON.parse(task.pending).id === body.id) {
           this.#sql.exec("UPDATE tasks SET status = 'running', pending = NULL, updated_at = ? WHERE id = ?", Date.now(), taskId);
+          this.#closeQuestion((JSON.parse(task.pending) as { ask?: string }).ask, { state: "withdrawn" });
         }
         return { known: true, wake: false, terminal: false };
       }
@@ -929,9 +941,11 @@ export class BrainAgent extends DurableObject<Env> {
         // The question is put to people by this code, not by the model: what they are shown is
         // exactly what the worker is held on, and the code ties their reply to this one question.
         // No two open questions in this scope share a code, so one reply cannot answer two of them.
-        const open = new Set(this.#rows<{ code: string | null }>("SELECT json_extract(pending, '$.code') AS code FROM tasks WHERE pending IS NOT NULL").map((r) => r.code));
+        // Nor is a code ever given twice here: an old question's code, still on someone's screen,
+        // must not come to mean a new question.
         let code = questionCode();
-        while (open.has(code)) code = questionCode();
+        while (this.#rows("SELECT 1 FROM used_codes WHERE code = ?", code).length > 0) code = questionCode();
+        this.#sql.exec("INSERT INTO used_codes (code, used_at) VALUES (?, ?)", code, Date.now());
         const what = describeRequest(body);
         const session = this.#rows<Row>("SELECT id FROM sessions WHERE session_key = ?", task.session_key)[0];
         const truncated = body.truncated === true;
@@ -1045,7 +1059,9 @@ export class BrainAgent extends DurableObject<Env> {
     }
     if (deleted) this.#sql.exec("UPDATE revisions SET deleted = 1 WHERE subject = ?", subject);
     else if (revision > current.revision) this.#sql.exec("UPDATE revisions SET revision = ?, holder = ? WHERE subject = ?", revision, holder, subject);
-    else if (revision === current.revision && holder !== current.holder) this.#sql.exec("UPDATE revisions SET holder = '' WHERE subject = ?", subject);
+    // Told twice about one revision with different texts: nobody holds it. Except that a revision
+    // known not to be for the agent stays so, whatever its text is.
+    else if (revision === current.revision && holder !== current.holder && current.holder !== NOT_FOR_THE_AGENT) this.#sql.exec("UPDATE revisions SET holder = '' WHERE subject = ?", subject);
   }
 
   /** False if the thing this event was read from has since been edited or deleted. */
@@ -1061,6 +1077,32 @@ export class BrainAgent extends DurableObject<Env> {
     if (current?.deleted) return "deleted";
     if (current && current.holder === NOT_FOR_THE_AGENT && current.revision > (data.revision ?? 0)) return "withdrawn";
     return current && current.revision === data.revision && current.holder !== "" && current.holder === data.holder ? "stands" : "changed";
+  }
+
+  /**
+   * Whether the author of a reply that was moved to its question's conversation has said anything
+   * since in the conversation where they typed it.
+   */
+  #saidSinceWhereTyped(reply: InboxRow, since: number): boolean {
+    const origin = (JSON.parse(reply.data ?? "{}") as { routed_from?: string }).routed_from;
+    if (!origin) return false;
+    const author = (JSON.parse(reply.principal) as Principal).id;
+    const later = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", origin, since, reply.id).filter(
+      (event) => (JSON.parse(event.principal) as Principal).id === author && (saidAt(event) > saidAt(reply) || (saidAt(event) === saidAt(reply) && event.id > reply.id)),
+    );
+    return this.#reconcile(later).events.length > 0;
+  }
+
+  /** Shows, where the question was put, that it is closed. Never holds anything up. */
+  #closeQuestion(ask: string | undefined, outcome: Outcome): void {
+    if (!ask) return;
+    const row = this.#rows<{ target: string; receipt: string | null; ask: string | null }>("SELECT target, receipt, ask FROM outbox WHERE idem = ?", ask)[0];
+    if (!row?.receipt || !row.ask) return;
+    this.ctx.waitUntil(
+      amend(this.env, JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, JSON.parse(row.ask) as ApprovalQuestion, outcome).catch((err) =>
+        this.#log("question_not_closed", { ask, error: String(err).slice(0, 300) }),
+      ),
+    );
   }
 
   /**
@@ -1191,6 +1233,19 @@ function renderEvent(event: InboxRow): string {
           ? "a timer you set"
           : `${principal.display ?? principal.id} (automated)`;
   return `[${new Date(event.received_at).toISOString()}] ${event.kind} from ${who}: ${event.text ?? ""}`.trim();
+}
+
+/**
+ * What a reply says when it is tied to one question (a press on its card, a reply to its message).
+ * It need not name the code, and a plain yes is an approval; anything refusing is a refusal, and
+ * anything else is nothing.
+ */
+export function readTiedDecision(text: string, code: string): "allow" | "deny" | undefined {
+  const named = readDecision(text, code);
+  if (named) return named;
+  if (/(?<![A-Za-z])(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel|wait)(?![A-Za-z])|拒绝|不同意|不批准|否决|不要|不行|不可以|别|取消|等等|等一下|先别/i.test(text)) return "deny";
+  const bare = text.replace(/[\s:：,，.。!！~～]+/g, " ").trim().toLowerCase();
+  return /^(approve|approved|yes|ok|okay|同意|批准|可以|好|好的|行|确认|通过)$/.test(bare) ? "allow" : undefined;
 }
 
 /** When a message was said, according to its source if it tells us, else when it arrived. */

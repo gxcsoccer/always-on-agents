@@ -97,7 +97,7 @@ describe("turning a Feishu message into an event", () => {
     const result = normalize(app, envelope({ chat_type: "group", root_id: "om_question", parent_id: "om_question", mentions: [mention] }));
     expect(result?.event.session_key).toBe("chat");
     expect(result?.event.reply_to?.address).not.toHaveProperty("thread");
-    expect(result?.event.data).toMatchObject({ route_by_code: true });
+    expect(result?.event.data).toMatchObject({ route_by_code: true, replies_to: "feishu:message:om_question" });
   });
 
   it("shows an approval question as a card whose task-supplied text is never formatting", () => {
@@ -110,6 +110,10 @@ describe("turning a Feishu message into an event", () => {
       { aoa: "answer", decision: "approve", code: "K7PW", q: Q, to: "chat" },
       { aoa: "answer", decision: "deny", code: "K7PW", q: Q, to: "chat" },
     ]);
+    // Once it is closed it says how it ended and offers nothing to press.
+    const closed = approvalCard({ id: Q, code: "K7PW", title: "t", kind: "command", detail: "rm -r x", can_approve: true }, "chat", { state: "approved" }) as any;
+    expect(closed.elements.some((e: any) => e.tag === "action")).toBe(false);
+    expect(closed.header.title.content).toContain("已批准");
     // Too long to show: there is nothing to press but "refuse".
     const refuseOnly = approvalCard({ id: Q, code: "K7PW", title: "t", kind: "push", detail: "…", can_approve: false }, "user") as any;
     expect(refuseOnly.elements.find((e: any) => e.tag === "action").actions.map((b: any) => b.value.decision)).toEqual(["deny"]);
