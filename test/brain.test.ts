@@ -639,6 +639,32 @@ describe("tasks and approvals", () => {
     expect(wantsStanding("approve K7PW")).toBe(false);
   });
 
+  it("does not put a question to anyone if its task ended before the question went out, and keeps how it ended", async () => {
+    const scope = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "remove the build directory", repository: null })], [say("")]);
+    await scope.stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(scope.stub);
+    const id: string = (await scope.stub.inspect()).tasks[0].id;
+    // The worker asks, and is finished before the question has been delivered.
+    await scope.stub.taskEvent(id, 1, "needs_input", ask);
+    await scope.stub.taskEvent(id, 2, "result", { text: "gave up waiting" });
+    model.replies([say("")], [say("")]);
+    await wake(scope.stub);
+    const row = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT status, closed FROM outbox WHERE idem = ?", `ask:${id}:1`)][0] as any);
+    expect(row.status).toBe("withdrawn");
+    expect(JSON.parse(row.closed)).toEqual({ state: "withdrawn" });
+    // Nobody was shown it.
+    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
+  });
+
+  it("keeps how a delivered question ended, with the question", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await reply(stub, id, "bob", `approve ${code}`);
+    const row = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT status, closed FROM outbox WHERE idem = ?", `ask:${id}:1`)][0] as any);
+    expect(row.status).toBe("sent");
+    expect(JSON.parse(row.closed)).toMatchObject({ state: "approved" });
+  });
+
   it("never gives the same code to two questions", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     const seen = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT code FROM used_codes")].map((r: any) => r.code));

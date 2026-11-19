@@ -220,7 +220,7 @@ export class BrainAgent extends DurableObject<Env> {
       // pair is what makes a replayed webhook a duplicate, and a signed webhook never expires.
       this.#sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead') AND received_at < ? AND text IS NOT NULL", old);
       this.#sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead') AND received_at < ?", now - RETAIN_AUDIT_MS);
-      this.#sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead') AND created_at < ?", old);
+      this.#sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn') AND created_at < ?", old);
       this.#sql.exec("DELETE FROM runs WHERE status != 'running' AND ended_at < ?", old);
       this.#sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ?", old);
       this.#sql.exec("DELETE FROM task_events WHERE at < ?", old);
@@ -504,11 +504,18 @@ export class BrainAgent extends DurableObject<Env> {
     for (;;) {
       const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
       if (!row || row.next_at > Date.now()) return;
+      // A question that was closed before it went out is not put to anyone.
+      if (row.ask && row.closed) {
+        this.#sql.exec("UPDATE outbox SET status = 'withdrawn', error = NULL WHERE id = ? AND status = 'pending'", row.id);
+        continue;
+      }
       try {
         // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
         const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
         // If an earlier attempt had in fact been posted, that is when people could first answer it.
         this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
+        // It may have been closed while it was on its way.
+        if (row.ask) this.#showClosed(row.idem);
       } catch (err) {
         const attempts = row.attempts + 1;
         const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
@@ -1110,13 +1117,23 @@ export class BrainAgent extends DurableObject<Env> {
     return this.#reconcile(later).events.length > 0;
   }
 
-  /** Shows, where the question was put, that it is closed. Never holds anything up. */
+  /**
+   * Records that a question is closed and shows it where the question was put. The outcome is kept
+   * with the question, so it also holds if the question has not been delivered yet: an unsent one
+   * is then not sent at all, and one whose delivery is under way is closed as soon as it lands.
+   */
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
-    const row = this.#rows<{ target: string; receipt: string | null; ask: string | null }>("SELECT target, receipt, ask FROM outbox WHERE idem = ?", ask)[0];
-    if (!row?.receipt || !row.ask) return;
+    this.#sql.exec("UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND closed IS NULL", JSON.stringify(outcome), ask);
+    this.#showClosed(ask);
+  }
+
+  /** Replaces a delivered question by its closed form. Never holds anything up. */
+  #showClosed(ask: string): void {
+    const row = this.#rows<{ target: string; receipt: string | null; ask: string | null; closed: string | null }>("SELECT target, receipt, ask, closed FROM outbox WHERE idem = ?", ask)[0];
+    if (!row?.receipt || !row.ask || !row.closed) return;
     this.ctx.waitUntil(
-      amend(this.env, JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, JSON.parse(row.ask) as ApprovalQuestion, outcome).catch((err) =>
+      amend(this.env, JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, JSON.parse(row.ask) as ApprovalQuestion, JSON.parse(row.closed) as Outcome).catch((err) =>
         this.#log("question_not_closed", { ask, error: String(err).slice(0, 300) }),
       ),
     );
@@ -1167,7 +1184,8 @@ export class BrainAgent extends DurableObject<Env> {
 
   /** Messages written since `afterId`, for connectors whose clients pull instead of being pushed to. */
   async outboxSince(afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
-    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
+    // A question withdrawn before it went out was never said to anyone, on any channel.
+    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status != 'withdrawn' ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
   }
 
   async inspect(): Promise<Record<string, unknown>> {

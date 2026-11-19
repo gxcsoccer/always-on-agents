@@ -136,6 +136,8 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE outbox ADD COLUMN ask TEXT;`,
   // 8: every code ever given to a question here, so none is given twice.
   `CREATE TABLE used_codes (code TEXT PRIMARY KEY, used_at INTEGER NOT NULL);`,
+  // 9: how a question ended, kept with the question so it holds whenever its delivery completes.
+  `ALTER TABLE outbox ADD COLUMN closed TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
