@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { approvalCard, decrypt, normalize, normalizeCardAction, verifySignature } from "../src/connectors/feishu";
+import { approvalCard, decrypt, normalize, normalizeCardAction, sentAt, verifySignature } from "../src/connectors/feishu";
 import type { FeishuApp } from "../src/registry";
 
 const Q = "ask:11111111-2222-3333-4444-555555555555:1";
@@ -98,6 +98,20 @@ describe("turning a Feishu message into an event", () => {
     expect(result?.event.session_key).toBe("chat");
     expect(result?.event.reply_to?.address).not.toHaveProperty("thread");
     expect(result?.event.data).toMatchObject({ route_by_code: true, replies_to: "feishu:message:om_question" });
+  });
+
+  it("reads the send time from both forms of the timestamp header, and checks the signature over the header as sent", async () => {
+    expect(sentAt("1794034201")).toBe(1794034201);
+    const written = "2026-11-19 14:50:01.123456789 +0800 CST m=+12345.678901234";
+    expect(sentAt(written)).toBe(Date.parse("2026-11-19T14:50:01+08:00") / 1_000);
+    expect(sentAt("yesterday")).toBeUndefined();
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${written}nonce1k{"a":1}`)));
+    const signature = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const at = Date.parse("2026-11-19T14:50:30+08:00");
+    expect(await verifySignature("k", '{"a":1}', written, "nonce1", signature, at)).toBe(true);
+    // Stale, or signed over something else: no.
+    expect(await verifySignature("k", '{"a":1}', written, "nonce1", signature, at + 3_600_000)).toBe(false);
+    expect(await verifySignature("k", '{"a":2}', written, "nonce1", signature, at)).toBe(false);
   });
 
   it("shows an approval question as a card whose task-supplied text is never formatting", () => {

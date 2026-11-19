@@ -42,8 +42,13 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
 
   // Every rejection below looks the same from outside, so the endpoint cannot be used to find out
   // which part of a forged request was wrong.
-  const rejected = () => json({ error: "not accepted" }, 401);
-  if (typeof body.encrypt !== "string") return rejected();
+  // Why is logged for the operator (the reason and the names of the fields present, never their
+  // contents); the caller is told nothing.
+  const rejected = (why = "unspecified") => {
+    console.log(JSON.stringify({ feishu_rejected: why, app: appId, fields: body && typeof body === "object" ? Object.keys(body).slice(0, 12) : [], signed_headers: ["x-lark-request-timestamp", "x-lark-request-nonce", "x-lark-signature"].filter((h) => request.headers.has(h)), shape: { signature_length: request.headers.get("x-lark-signature")?.length ?? 0, timestamp_length: request.headers.get("x-lark-request-timestamp")?.length ?? 0, skew_s: Math.round(Date.now() / 1_000 - Number(request.headers.get("x-lark-request-timestamp") ?? 0)), header_fields: Object.keys(body?.header ?? {}), has_token: typeof body?.header?.token === "string" } }));
+    return json({ error: "not accepted" }, 401);
+  };
+  if (typeof body.encrypt !== "string") return rejected("not encrypted");
 
   // The signature covers the raw body, so it is checked before anything is decrypted. The one
   // exception is the address check Feishu performs when the webhook URL is saved: Feishu does not
@@ -52,16 +57,16 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   try {
     body = JSON.parse(await decrypt(app.encrypt_key, body.encrypt));
   } catch {
-    return rejected();
+    return rejected("does not decrypt");
   }
   if (body?.type === "url_verification") {
     if (typeof body.challenge !== "string" || body.challenge.length > 200) return rejected();
     if (app.verification_token && body.token !== app.verification_token) return rejected();
     return json({ challenge: body.challenge });
   }
-  if (!signed) return rejected();
-  if (app.verification_token && body.header?.token !== app.verification_token) return rejected();
-  if (body.header?.app_id !== app.app_id) return rejected();
+  if (!signed) return rejected("bad signature");
+  if (app.verification_token && body.header?.token !== app.verification_token) return rejected("wrong verification token");
+  if (body.header?.app_id !== app.app_id) return rejected(`app id mismatch; header fields: ${Object.keys(body.header ?? {}).join(",")}; top: ${Object.keys(body ?? {}).join(",")}`);
 
   // A button pressed on one of the agent's cards. Feishu shows what we return as a toast.
   if (body.header?.event_type === "card.action.trigger") {
@@ -194,12 +199,23 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
 /** sha256(timestamp + nonce + encrypt_key + raw body), hex. */
 export async function verifySignature(encryptKey: string, raw: string, timestamp: string | null, nonce: string | null, signature: string | null, now = Date.now()): Promise<boolean> {
   if (!timestamp || !nonce || !signature || !/^[0-9a-f]{64}$/.test(signature)) return false;
-  const seconds = Number(timestamp);
-  if (!Number.isFinite(seconds) || Math.abs(now / 1_000 - seconds) > MAX_SKEW_S) return false;
+  // The signature is over the header exactly as sent. What the header holds differs: events send
+  // Unix seconds, card callbacks a written-out time ("2026-11-19 14:50:01.123456789 +0800 CST m=+…").
+  const seconds = sentAt(timestamp);
+  if (seconds === undefined || Math.abs(now / 1_000 - seconds) > MAX_SKEW_S) return false;
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(timestamp + nonce + encryptKey + raw)));
   let diff = 0;
   for (let i = 0; i < digest.length; i++) diff |= digest[i] ^ Number.parseInt(signature.slice(i * 2, i * 2 + 2), 16);
   return diff === 0;
+}
+
+/** When a request says it was sent, in Unix seconds, from either form of the timestamp header. */
+export function sentAt(timestamp: string): number | undefined {
+  if (/^\d{9,11}$/.test(timestamp)) return Number(timestamp);
+  const written = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.\d+)? ([+-]\d{2})(\d{2})\b/.exec(timestamp);
+  if (!written) return undefined;
+  const ms = Date.parse(`${written[1]}T${written[2]}${written[3]}:${written[4]}`);
+  return Number.isFinite(ms) ? ms / 1_000 : undefined;
 }
 
 /** AES-256-CBC, key = SHA-256(encrypt key), IV = the first 16 bytes of the decoded ciphertext. */
@@ -220,7 +236,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const uuid = (await hex(message.idem)).slice(0, 40);
   // An approval question goes out as a card with buttons; everything else as text.
   const msgType = message.ask ? "interactive" : "text";
-  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : { text: message.text });
+  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user", undefined, thread === "1") : { text: message.text });
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
@@ -259,7 +275,7 @@ export async function amendFeishu(env: Env, target: Target, receipt: Receipt, as
  * The approval question as a card. Everything that comes from the task is plain text, so nothing in
  * a command or a branch name can be rendered as formatting or as a link.
  */
-export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user", outcome?: Outcome): unknown {
+export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat" | "user", outcome?: Outcome, inTopic = false): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   const button = (label: string, type: string, decision: "approve" | "deny") => ({
     tag: "button",
@@ -287,7 +303,17 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
       ...about,
       ...(ask.can_approve ? [] : [{ tag: "div", text: plain("内容太长，无法完整显示，所以只能拒绝。") }]),
       { tag: "action", actions: [...(ask.can_approve ? [button("批准", "primary", "approve")] : []), button("拒绝", "danger", "deny")] },
-      { tag: "note", elements: [plain(ask.can_approve ? "也可以直接回复这条消息：批准 / 拒绝" : "也可以直接回复这条消息：拒绝")] },
+      // Inside a topic a reply cannot be tied to this card, so there the words have to carry the code.
+      {
+        tag: "note",
+        elements: [
+          plain(
+            inTopic
+              ? ask.can_approve ? `也可以回复：批准 ${ask.code} / 拒绝 ${ask.code}` : `也可以回复：拒绝 ${ask.code}`
+              : ask.can_approve ? "也可以直接回复这条消息：批准 / 拒绝" : "也可以直接回复这条消息：拒绝",
+          ),
+        ],
+      },
     ],
   };
 }
