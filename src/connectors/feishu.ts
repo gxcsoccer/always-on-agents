@@ -25,7 +25,7 @@ const API = "https://open.feishu.cn/open-apis";
 /** Feishu signs with a timestamp; anything much older is a replay. */
 const MAX_SKEW_S = 10 * 60;
 
-export async function handleFeishuWebhook(request: Request, env: Env, appId: string): Promise<Response> {
+export async function handleFeishuWebhook(request: Request, env: Env, appId: string, defer?: (work: Promise<unknown>) => void): Promise<Response> {
   const app = await registry(env).feishuApp(appId);
   if (!app) return json({ error: "unknown app" }, 404);
   // Events are accepted only encrypted and signed. The Verification Token alone is a fixed string in
@@ -81,8 +81,16 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   if (body.header?.event_type === "card.action.trigger") {
     const pressed = normalizeCardAction(app, body);
     if (!pressed) return json({ toast: { type: "error", content: "这个操作无法处理" } });
-    await env.BRAIN.getByName(scopeName(pressed.scope)).ingest(pressed.event);
-    return json({ toast: { type: "info", content: `已收到：${pressed.event.text}，结果会在对话里回复` } });
+    // Feishu shows the person an error unless it is answered within three seconds, so the answer
+    // goes back first and the press is filed right after. If filing fails it is logged; the person
+    // sees no result in the chat and can press again.
+    const filed = env.BRAIN.getByName(scopeName(pressed.scope))
+      .ingest(pressed.event)
+      .catch((err: unknown) => console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: appId })));
+    if (defer) defer(filed);
+    else await filed;
+    const said = pressed.event.text?.startsWith("deny") ? "拒绝" : pressed.event.text?.startsWith("approve all") ? "批准（这个任务不再问）" : "批准";
+    return json({ toast: { type: "info", content: `已收到你的选择：${said}。结果会在对话里回复` } });
   }
 
   const normalized = normalize(app, body);

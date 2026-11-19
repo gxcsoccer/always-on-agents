@@ -15,7 +15,7 @@ export { Outbound } from "./workers/sandbox/outbound";
 export { DirectoryBackupGateway, TaskSandbox } from "./workers/sandbox/task";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.split("/").filter(Boolean);
     try {
@@ -24,7 +24,7 @@ export default {
 
       if (path[1] === "github" && path[2] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
 
-      if (path[1] === "feishu" && path[2] === "events" && path[3] && request.method === "POST") return handleFeishuWebhook(request, env, path[3]);
+      if (path[1] === "feishu" && path[2] === "events" && path[3] && request.method === "POST") return handleFeishuWebhook(request, env, path[3], (work) => ctx.waitUntil(work));
 
       if (path[1] === "console") {
         const tenant = await registry(env).authenticate(bearer(request));
