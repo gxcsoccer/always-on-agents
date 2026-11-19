@@ -86,7 +86,7 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     });
     // Over the long connection there is nothing for Feishu to call; we connect to it instead.
     if (app.transport === "long_connection") {
-      return json({ ok: true, transport: "long_connection", link: await env.FEISHU_LINKS.getByName(String(app.app_id)).ensure(String(app.app_id)) });
+      return json({ ok: true, transport: "long_connection", link: await env.FEISHU_LINKS.getByName(String(app.app_id)).ensure(String(app.app_id), true) });
     }
     return json({ ok: true, webhook: `${url.origin}/v1/feishu/events/${app.app_id}` });
   }

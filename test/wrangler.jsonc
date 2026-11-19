@@ -19,6 +19,8 @@
       { "name": "BRAIN", "class_name": "BrainAgent" },
       { "name": "TASKS", "class_name": "FakeTask" },
       { "name": "GATE_TASKS", "class_name": "GateTask" },
+      { "name": "FEISHU_LINKS", "class_name": "FeishuLink" },
+      { "name": "FAKE_FEISHU", "class_name": "FakeFeishu" },
       { "name": "REGISTRY", "class_name": "Registry" }
     ]
   },
@@ -26,6 +28,8 @@
     "BrainAgent": { "type": "durable-object", "storage": "sqlite" },
     "FakeTask": { "type": "durable-object", "storage": "sqlite" },
     "GateTask": { "type": "durable-object", "storage": "sqlite" },
+    "FeishuLink": { "type": "durable-object", "storage": "sqlite" },
+    "FakeFeishu": { "type": "durable-object", "storage": "sqlite" },
     "Registry": { "type": "durable-object", "storage": "sqlite" }
   }
 }

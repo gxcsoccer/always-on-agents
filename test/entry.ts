@@ -6,6 +6,7 @@ import { handleGithubWebhook } from "../src/connectors/github";
 import type { Env } from "../src/env";
 
 export { BrainAgent } from "../src/brain/agent";
+export { FeishuLink } from "../src/connectors/feishu-link";
 export { Registry } from "../src/registry";
 export { Outbound } from "../src/workers/sandbox/outbound";
 
@@ -103,5 +104,34 @@ export class GateTask extends TaskSandbox {
     Object.defineProperty(ctx, "container", { value: { running: false }, configurable: true });
     Object.defineProperty(ctx, "exports", { value: { Outbound: () => ({}), DirectoryBackupGateway: {} }, configurable: true });
     super(ctx as any, env);
+  }
+}
+
+
+/**
+ * The other end of a Feishu long connection, for tests. It lives in its own object so that the
+ * connection crosses a real boundary, as it does in production: a test tells it what to send and
+ * asks it what it received.
+ */
+export class FakeFeishu extends DurableObject {
+  #server?: WebSocket;
+  #received: number[][] = [];
+  async fetch(_request: Request): Promise<Response> {
+    const pair = new WebSocketPair();
+    const server = pair[1];
+    server.binaryType = "arraybuffer";
+    server.accept();
+    server.addEventListener("message", (event) => this.#received.push([...new Uint8Array(event.data as ArrayBuffer)]));
+    this.#server = server;
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+  async send(bytes: number[]): Promise<void> {
+    this.#server?.send(Uint8Array.from(bytes));
+  }
+  async received(): Promise<number[][]> {
+    return this.#received;
+  }
+  async connected(): Promise<boolean> {
+    return this.#server !== undefined;
   }
 }

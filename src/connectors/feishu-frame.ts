@@ -71,13 +71,12 @@ export function encodeFrame(frame: Frame): Uint8Array {
 /** Reads a frame. Throws on anything that is not well-formed; unknown fields are skipped. */
 export function decodeFrame(bytes: Uint8Array): Frame {
   let at = 0;
-  const readVarint = (data: Uint8Array = bytes, position?: { at: number }): bigint => {
+  const readVarint = (): bigint => {
     let result = 0n;
     let shift = 0n;
     for (;;) {
-      const index = position ? position.at++ : at++;
-      if (index >= data.length) throw new Error("frame ends inside a number");
-      const byte = data[index];
+      if (at >= bytes.length) throw new Error("frame ends inside a number");
+      const byte = bytes[at++];
       result |= BigInt(byte & 0x7f) << shift;
       if ((byte & 0x80) === 0) return result;
       shift += 7n;
@@ -85,8 +84,9 @@ export function decodeFrame(bytes: Uint8Array): Frame {
     }
   };
   const readBytes = (): Uint8Array => {
-    const length = Number(readVarint());
-    if (length < 0 || at + length > bytes.length) throw new Error("frame ends inside a field");
+    const declared = readVarint();
+    if (declared > BigInt(bytes.length - at)) throw new Error("frame ends inside a field");
+    const length = Number(declared);
     const slice = bytes.subarray(at, at + length);
     at += length;
     return slice;
@@ -124,24 +124,29 @@ export function decodeFrame(bytes: Uint8Array): Frame {
 function decodeHeader(bytes: Uint8Array): { key: string; value: string } {
   const header = { key: "", value: "" };
   let at = 0;
-  while (at < bytes.length) {
-    const tag = bytes[at++];
-    if ((tag & 7) !== 2) throw new Error("malformed header");
-    let length = 0;
-    let shift = 0;
-    for (;;) {
-      if (at >= bytes.length) throw new Error("header ends inside a length");
+  // Lengths are read as plain non-negative numbers and checked against what is left; nothing here
+  // uses 32-bit arithmetic that could turn a large length negative.
+  const number = (): number => {
+    let result = 0;
+    let scale = 1;
+    for (let i = 0; i < 5; i++) {
+      if (at >= bytes.length) throw new Error("header ends inside a number");
       const byte = bytes[at++];
-      length |= (byte & 0x7f) << shift;
-      if ((byte & 0x80) === 0) break;
-      shift += 7;
-      if (shift > 28) throw new Error("header length is too long");
+      result += (byte & 0x7f) * scale;
+      if ((byte & 0x80) === 0) return result;
+      scale *= 128;
     }
-    if (at + length > bytes.length) throw new Error("header ends inside a field");
+    throw new Error("header number is too long");
+  };
+  while (at < bytes.length) {
+    const tag = number();
+    if ((tag & 7) !== 2) throw new Error("malformed header");
+    const length = number();
+    if (length > bytes.length - at) throw new Error("header ends inside a field");
     const value = utf8.decode(bytes.subarray(at, at + length));
     at += length;
-    if (tag >> 3 === 1) header.key = value;
-    else if (tag >> 3 === 2) header.value = value;
+    if (tag >>> 3 === 1) header.key = value;
+    else if (tag >>> 3 === 2) header.value = value;
   }
   return header;
 }

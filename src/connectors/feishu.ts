@@ -32,6 +32,8 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   if (!app) return json({ error: "unknown app" }, 404);
   // Events are accepted only encrypted and signed. The Verification Token alone is a fixed string in
   // the body: it proves nothing about freshness, so an app without an Encrypt Key is not served.
+  // An app whose events arrive over the long connection is not served here at all: one way in.
+  if (app.transport !== "webhook") return json({ error: "not accepted" }, 401);
   if (!app.encrypt_key) return json({ error: "the app has no encrypt key configured" }, 503);
 
   const raw = await request.text();
