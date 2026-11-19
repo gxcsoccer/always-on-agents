@@ -16,7 +16,8 @@ import { githubTokenFor } from "./github-app";
 import type { OutboundMessage } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-const DECISION_REPLY = /^\s*(approve|deny|同意|批准|拒绝|不同意)[\s:：]*[A-Z0-9]{4}\s*[.!。！]?\s*$/i;
+// A verb, a separator, then a four-character code in capitals as the question prints it.
+const DECISION_REPLY = /^\s*(?:approve|deny|同意|批准|拒绝|不同意)[\s:：]+[A-Z0-9]{4}\s*[.!。！]?\s*$/;
 const MENTION = /(^|\s)@always-on-agent\b|^\s*\/agent\b/i;
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {

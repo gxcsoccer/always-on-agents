@@ -104,7 +104,10 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     for (const mention of mentions) {
       if (typeof mention.key !== "string") continue;
       const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
-      text = text.split(mention.key).join(own ? " " : `@${String(mention.name ?? "someone").replace(/\s+/g, " ")}`);
+      // A display name is whatever its owner typed. It is squeezed into one token so that no word
+      // of it can be read as part of the message ("Alice Approve" must not supply an "approve").
+      const handle = String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone";
+      text = text.split(mention.key).join(own ? " " : `@${handle}`);
     }
     text = text.replace(/\s+/g, " ").trim();
   } else {

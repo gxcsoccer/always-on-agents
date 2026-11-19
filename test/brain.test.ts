@@ -285,6 +285,8 @@ describe("tasks and approvals", () => {
     expect(readDecision("@agent不要 approve AB12", "AB12")).toBe("deny");
     expect(readDecision("@agent不要批准 AB12", "AB12")).toBe("deny");
     // "not" inside another word is not a refusal.
+    expect(readDecision("@agent.not approve AB12", "AB12")).toBe("deny");
+    expect(readDecision("@agent.x approve AB12", "AB12")).toBeUndefined();
     expect(readDecision("notebook AB12", "AB12")).toBeUndefined();
     expect(readDecision("another note: AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve AB123", "AB12")).toBeUndefined();

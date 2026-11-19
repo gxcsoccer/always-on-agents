@@ -475,11 +475,11 @@ export class TaskSandbox extends DurableObject<Env> {
     if (state.github_token && state.github_token.source === source && state.github_token.expires_at - Date.now() > 5 * 60_000) return state.github_token.token;
     const issued = await githubTokenFor(this.env, tenant, repo);
     if (!issued) return undefined;
+    // Issuing took time. If the task ended meanwhile, the token is not handed over.
     const fresh = this.#state();
-    if (fresh) {
-      fresh.github_token = { ...issued, source };
-      this.#save(fresh);
-    }
+    if (!fresh || (!ACTIVE.has(fresh.phase) && fresh.phase !== "starting")) return undefined;
+    fresh.github_token = { ...issued, source };
+    this.#save(fresh);
     return issued.token;
   }
 
@@ -815,7 +815,8 @@ export class TaskSandbox extends DurableObject<Env> {
       expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
       if (expired) state.error = "startup did not finish in time";
     } else if (alive && !running) {
-      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && !overdue) {
+      // Judged on the task's age now, not as it was before the awaits above.
+      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && age <= MAX_LIFETIME_MS) {
         this.#save(state);
         await this.#recover();
         return;

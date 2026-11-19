@@ -60,6 +60,9 @@ describe("event normalisation", () => {
     // Still only from people with standing, and only when that is the whole comment.
     expect(normalize("issue_comment", comment("approve K7PW", "NONE"))).toBeUndefined();
     expect(normalize("issue_comment", comment("I would approve K7PW if the tests pass", "OWNER"))).toBeUndefined();
+    // One word that merely starts like a decision is not one.
+    expect(normalize("issue_comment", comment("denylist", "OWNER"))).toBeUndefined();
+    expect(normalize("issue_comment", comment("approved", "OWNER"))).toBeUndefined();
   });
 
   it("does not read its own comments back as someone's words", () => {

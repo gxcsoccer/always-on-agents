@@ -124,6 +124,10 @@ describe("the model key", () => {
     expect((await withInput([{ type: "mcp_approval_response", approve: true, approval_request_id: "x" }])).status).toBe(403);
     expect((await withInput([{ type: "mcp_list_tools", server_label: "x", tools: [] }])).status).toBe(403);
     expect((await withInput(["a string item"])).status).toBe(403);
+    // Nothing stored on the provider's side may be referred to: under a shared key it could be anyone's.
+    const withField = (extra: Record<string, unknown>) => send("https://model.test/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input: "hi", ...extra }) });
+    expect((await withField({ previous_response_id: "resp_someone_elses" })).status).toBe(403);
+    expect((await withField({ conversation: "conv_someone_elses" })).status).toBe(403);
     // An image by URL would have the provider fetch an address the guest chose; inline data is fine.
     const image = (image_url: string) => [{ role: "user", content: [{ type: "input_image", image_url }] }];
     expect((await withInput(image("https://attacker.example/x.png?leak=secret"))).status).toBe(403);

@@ -80,6 +80,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     }
     if (parsed === null || typeof parsed !== "object") return this.#refuse(request, url, "model request is not an object");
     if (parsed.model !== this.env.WORKER_MODEL) return this.#refuse(request, url, `model ${String(parsed.model)} is not allowed from this sandbox`);
+    // Every tenant's sandboxes call the provider under one key, so a request may not refer to
+    // anything stored on the provider's side: that could be another tenant's conversation.
+    const stored = ["previous_response_id", "conversation", "prompt", "background"].filter((field) => (parsed as Record<string, unknown>)[field] != null);
+    if (stored.length > 0) return this.#refuse(request, url, `the request uses ${stored.join(", ")}, which is not allowed from this sandbox`);
     // Only tools the agent runs itself, inside the sandbox. A hosted tool (a remote MCP server, web
     // search, a code interpreter) would have the provider reach out on the guest's behalf, which
     // is a way around having no network.

@@ -319,8 +319,9 @@ export class BrainAgent extends DurableObject<Env> {
       // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
       // The tenant's share is reserved before the call and trued up after it, so several scopes
       // admitted at the same moment cannot all slip under the limit together.
-      const reservedOn = today();
       const tenant = await registry(this.env).recordUsage(this.#scope().tenant, MODEL_CALL_RESERVE);
+      // The day the registry charged, which is not necessarily today as seen from here.
+      const reservedOn = tenant.day;
       if (!this.#stillActive(runId)) return;
       if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
         await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
@@ -610,6 +611,8 @@ export class BrainAgent extends DurableObject<Env> {
     try {
       slot = await registry(this.env).acquireTaskSlot(scope.tenant, task.id);
     } catch (err) {
+      // The reservation may have been made even though its reply was lost; give it back.
+      await registry(this.env).releaseTaskSlot(task.id).catch(() => undefined);
       // The task must not be left "dispatching": nothing would ever pick it up again.
       this.#setTask(task.id, "failed", { result: JSON.stringify({ error: `the registry could not be reached: ${String(err).slice(0, 300)}` }) });
       throw new Error("the sandbox could not be started; try again");
@@ -981,15 +984,14 @@ function describeRequest(body: Record<string, unknown>): string {
  */
 export function readDecision(text: string, code: string): "allow" | "deny" | undefined {
   if (!new RegExp(`(?<![A-Za-z0-9])${code}(?![A-Za-z0-9])`, "i").test(text)) return undefined;
-  // An approval is the whole message and nothing else (apart from @-mentions and punctuation):
-  // "approve CODE". Anything longer could be saying the opposite ("do not approve CODE").
-  // Only mentions at the start are addressing; "@5pm" at the end is a condition, not a name.
-  // A mention is a plain handle followed by a space. Anything glued to it ("@agent不要…") is words.
-  const bare = text.replace(/^(\s*@[A-Za-z0-9_.-]+(?=\s))+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
+  // Refusal first, on the message exactly as written: any refusing or negating word next to the
+  // code makes it a refusal, wherever it sits and whatever it is attached to. English words are
+  // matched whole, so "notebook" or "another" is not one.
+  if (/(?<![A-Za-z])(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel)(?![A-Za-z])|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
+  // An approval is the whole message and nothing else: optional plain @handles in front, then
+  // "approve CODE". Anything longer could be a condition or a different statement.
+  const bare = text.replace(/^(\s*@[A-Za-z0-9_-]+(?=\s))+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
   if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
-  // A message that mentions the code together with a refusing or negating word is a refusal.
-  // English words are matched whole, so "notebook" or "another" is not a refusal.
-  if (/\b(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel)\b|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
   return undefined;
 }
 

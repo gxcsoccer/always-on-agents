@@ -173,7 +173,7 @@ export class Registry extends DurableObject<Env> {
    * Records model tokens a tenant used and says whether it may keep spending today. All tenants
    * share one provider key, so this is what stops one tenant from using up everyone's allowance.
    */
-  async recordUsage(tenant: string, tokens: number): Promise<{ allowed: boolean; used: number; budget: number }> {
+  async recordUsage(tenant: string, tokens: number): Promise<{ allowed: boolean; used: number; budget: number; day: string }> {
     const day = new Date().toISOString().slice(0, 10);
     const sql = this.ctx.storage.sql;
     const add = Number.isFinite(tokens) && tokens > 0 ? Math.min(Math.floor(tokens), 1_000_000_000) : 0;
@@ -183,7 +183,7 @@ export class Registry extends DurableObject<Env> {
     }
     const used = sql.exec<{ tokens: number }>("SELECT tokens FROM tenant_usage WHERE tenant = ? AND day = ?", tenant, day).toArray()[0]?.tokens ?? 0;
     // Allowed if the total, including what was just added, is still within the budget.
-    return { allowed: used <= TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET };
+    return { allowed: used <= TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET, day };
   }
 
   /** Corrects a reservation to what was actually used. May be negative; the total never goes below zero. */
