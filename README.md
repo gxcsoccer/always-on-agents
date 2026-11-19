@@ -22,6 +22,8 @@ src/
     github.ts             GitHub webhook 和评论
     github-app.ts         按安装、按仓库签发 GitHub 令牌
     feishu.ts             飞书机器人
+    feishu-link.ts        飞书长连接：每个应用一个常驻对象，主动连飞书收事件和卡片点击
+    feishu-frame.ts       长连接的帧格式
   workers/sandbox/      沙箱 worker：每个任务一个 Durable Object 加一个容器
     task.ts               容器生命周期、回报、审批、检查点
     outbound.ts           容器唯一的出口：放行规则、加凭据、挂起待批准的推送
@@ -77,7 +79,7 @@ wrangler secret put GITHUB_BOT_EMAIL         # 提交用的邮箱：<bot 用户 
 wrangler deploy
 ```
 
-接飞书时，事件订阅的请求地址要用自定义域名（`wrangler.jsonc` 里的 `routes`）：飞书的服务器访问不到 `*.workers.dev`。
+接飞书有两种方式，登记应用时用 `transport` 选择。推荐 `long_connection`：我们主动连飞书，飞书后台的事件和回调都选“使用长连接接收”；同一个应用不能再有别的长连接客户端。`webhook` 方式下，请求地址要用自定义域名（`wrangler.jsonc` 里的 `routes`），因为飞书的服务器访问不到 `*.workers.dev`，而且卡片点击偶尔到不了。
 
 接 GitHub App 时，装好 App 后要把安装登记到租户，之后这个安装发来的 webhook 才会被接受（之前的一律 401，可以在 App 的 Advanced 页重新投递）：
 
@@ -88,6 +90,6 @@ curl -X POST $B/v1/admin/tenants/acme/github-installations -H "authorization: Be
 
 ## 现状
 
-已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书用一个真实应用跑通了单聊、群聊和卡片审批。
+已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书用一个真实应用跑通了单聊、群聊和卡片审批，webhook 和长连接两种接入方式都走过。
 
 还没有做的部分：豆包（未实现）；审批目前按命令的形状判断，还没有按后果分级。详见架构文档的"尚未完成"和"验证过什么"。

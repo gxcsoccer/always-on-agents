@@ -331,8 +331,11 @@ export class FeishuLink extends DurableObject<Env> {
     const seq = Number(headerOf(frame, "seq") ?? 0);
     const id = headerOf(frame, "message_id") ?? "";
     const part = frame.payload ?? new Uint8Array();
-    if (!Number.isInteger(sum) || sum <= 1) return part;
-    if (sum > MAX_PARTS || !Number.isInteger(seq) || seq < 0 || seq >= sum || !id || id.length > 200) return "rejected";
+    // The piece count and position are checked before anything is taken as whole: a message
+    // that says it has no pieces, or names a piece it cannot have, is malformed.
+    if (!Number.isInteger(sum) || sum < 1 || sum > MAX_PARTS || !Number.isInteger(seq) || seq < 0 || seq >= sum) return "rejected";
+    if (sum === 1) return part;
+    if (!id || id.length > 200) return "rejected";
     let entry = this.#parts.get(id);
     if (entry && entry.parts.length !== sum) {
       this.#parts.delete(id);
