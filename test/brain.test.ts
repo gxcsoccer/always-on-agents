@@ -657,6 +657,49 @@ describe("tasks and approvals", () => {
     expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
   });
 
+  it("does not let a closed question that is backing off hold up the messages behind it, or show on the console", async () => {
+    const scope = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "remove the build directory", repository: null })], [say("")]);
+    await scope.stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(scope.stub);
+    const id: string = (await scope.stub.inspect()).tasks[0].id;
+    await scope.stub.taskEvent(id, 1, "needs_input", ask);
+    // The question is waiting out a long back-off (as after a failed delivery that never happened),
+    // then its task ends.
+    await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET next_at = ? WHERE idem = ?", Date.now() + 900_000, `ask:${id}:1`);
+    });
+    await scope.stub.taskEvent(id, 2, "result", { text: "done without it" });
+    // Closed but not yet flushed: the console does not show it.
+    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
+    model.replies([say("the task finished")], [say("")]);
+    await wake(scope.stub);
+    const rows = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT idem, status FROM outbox ORDER BY id")] as any[]);
+    expect(rows.find((r) => r.idem === `ask:${id}:1`).status).toBe("withdrawn");
+    // Whatever was queued behind it went out.
+    expect(rows.filter((r) => r.idem !== `ask:${id}:1`).every((r) => r.status === "sent")).toBe(true);
+  });
+
+  it("sends a closed question again if an earlier attempt may have reached people, so that it can be shown as closed", async () => {
+    const scope = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "remove the build directory", repository: null })], [say("")]);
+    await scope.stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(scope.stub);
+    const id: string = (await scope.stub.inspect()).tasks[0].id;
+    await scope.stub.taskEvent(id, 1, "needs_input", ask);
+    // One attempt was made and its answer never came back.
+    await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET attempts = 1, next_at = 0 WHERE idem = ?", `ask:${id}:1`);
+    });
+    await scope.stub.taskEvent(id, 2, "result", { text: "done" });
+    model.replies([say("")], [say("")]);
+    await wake(scope.stub);
+    const row = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT status, closed FROM outbox WHERE idem = ?", `ask:${id}:1`)][0] as any);
+    // Not dropped unseen: delivered under its own id, with its outcome on record to show.
+    expect(row.status).toBe("sent");
+    expect(JSON.parse(row.closed)).toEqual({ state: "withdrawn" });
+  });
+
   it("keeps how a delivered question ended, with the question", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await reply(stub, id, "bob", `approve ${code}`);

@@ -503,12 +503,18 @@ export class BrainAgent extends DurableObject<Env> {
   async #flushOutbox(): Promise<void> {
     for (;;) {
       const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
-      if (!row || row.next_at > Date.now()) return;
-      // A question that was closed before it went out is not put to anyone.
-      if (row.ask && row.closed) {
+      if (!row) return;
+      // A question that was closed before any attempt to send it is not put to anyone. This comes
+      // before the back-off check: a closed question waiting out a back-off must not hold up the
+      // messages behind it.
+      if (row.ask && row.closed && row.attempts === 0) {
         this.#sql.exec("UPDATE outbox SET status = 'withdrawn', error = NULL WHERE id = ? AND status = 'pending'", row.id);
         continue;
       }
+      if (row.next_at > Date.now()) return;
+      // A closed question that was attempted before may have reached people although we never
+      // heard so. It is sent again under the same id, which the connector does not duplicate, to
+      // learn where it is; it is then shown as closed straight away (below).
       try {
         // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
         const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
@@ -1185,7 +1191,7 @@ export class BrainAgent extends DurableObject<Env> {
   /** Messages written since `afterId`, for connectors whose clients pull instead of being pushed to. */
   async outboxSince(afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
     // A question withdrawn before it went out was never said to anyone, on any channel.
-    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status != 'withdrawn' ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
+    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status != 'withdrawn' AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
   }
 
   async inspect(): Promise<Record<string, unknown>> {
