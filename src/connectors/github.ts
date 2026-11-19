@@ -16,8 +16,10 @@ import { githubTokenFor } from "./github-app";
 import type { OutboundMessage } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-// A verb, a separator, then a four-character code in capitals as the question prints it.
-const DECISION_REPLY = /^\s*(?:approve|deny|同意|批准|拒绝|不同意)[\s:：]+[A-Z0-9]{4}\s*[.!。！]?\s*$/;
+// A verb in any capitalisation, a separator, then a four-character code. The code's own case is
+// checked by the Brain; here the point is only that "Deny K7PW" must not be dropped while
+// "approve K7PW" gets through, which would discard a person's change of mind.
+const DECISION_REPLY = /^\s*(?:approve|deny|同意|批准|拒绝|不同意)[\s:：]+[A-Za-z0-9]{4}\s*[.!。！]?\s*$/i;
 const MENTION = /(^|\s)@always-on-agent\b|^\s*\/agent\b/i;
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
@@ -56,10 +58,12 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   const normalized = normalize(type, payload);
   if (!normalized) return json({ ignored: `nothing to do for ${type}.${payload.action ?? ""}` }, 202);
 
-  // A linked account acts as that tenant user; an unlinked one is still identified, just not as a user.
+  // A linked account acts as that tenant user; an unlinked one is still identified, just not as a
+  // user. Accounts are linked by GitHub's numeric id, which never changes hands. A login can be
+  // renamed and then claimed by someone else.
   if (normalized.event.principal.kind === "human") {
-    const login = normalized.event.principal.id.replace(/^github:/, "");
-    const user = await registry(env).resolveIdentity(tenant, "github", login);
+    const accountId = normalized.event.principal.id.replace(/^github:/, "");
+    const user = await registry(env).resolveIdentity(tenant, "github", accountId);
     if (user) normalized.event.principal.id = user;
   }
 
@@ -81,10 +85,12 @@ export function normalize(type: string, payload: any): { repo: string; event: In
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   const sender = payload.sender ?? {};
   const base = { source: "github" };
+  // Identified by the account's numeric id; the login is only for display.
+  const account = `github:${Number.isInteger(sender.id) ? sender.id : `login:${sender.login}`}`;
   const person = (explicit: boolean): Principal =>
     sender.type === "Bot"
-      ? { kind: "automation", id: `github:${sender.login}`, display: sender.login, explicit: false }
-      : { kind: "human", id: `github:${sender.login}`, display: sender.login, explicit };
+      ? { kind: "automation", id: account, display: sender.login, explicit: false }
+      : { kind: "human", id: account, display: sender.login, explicit };
   const replyTo = (number: number): Target => ({ connector: "github", address: { repo, number: String(number) } });
 
   if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize"].includes(payload.action)) {
@@ -196,7 +202,10 @@ export async function deliverGithub(env: Env, scope: Scope, target: Target, mess
     if (batch.length < 100) break;
   }
 
-  const response = await fetch(comments, { method: "POST", headers, body: JSON.stringify({ body: `${message.text}\n\n${marker}` }) });
+  // A question someone will approve is shown literally. Rendered as Markdown, a branch called
+  // __release__ would appear as "release" in bold, which is not the branch being pushed.
+  const shown = message.idem.startsWith("ask:") ? `<pre>${message.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>` : message.text;
+  const response = await fetch(comments, { method: "POST", headers, body: JSON.stringify({ body: `${shown}\n\n${marker}` }) });
   if (!response.ok) throw new Error(`GitHub returned ${response.status}: ${(await response.text()).slice(0, 200)}`);
 }
 

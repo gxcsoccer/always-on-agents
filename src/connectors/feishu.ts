@@ -99,16 +99,18 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     } catch {
       return undefined;
     }
-    // Mentions arrive as placeholders (@_user_1). The bot's own is dropped: it only says the message
-    // is for the agent, which the event already records. The others get their names back.
+    // Mentions arrive as placeholders (@_user_1). They are replaced in a single pass over the
+    // original text, so nothing inserted for one mention can be rewritten while handling another.
+    // The bot's own is dropped: it only says the message is for the agent, which the event already
+    // records. A person's display name is whatever they typed, so it is squeezed into one token and
+    // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
+    const replacements = new Map<string, string>();
     for (const mention of mentions) {
-      if (typeof mention.key !== "string") continue;
+      if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
       const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
-      // A display name is whatever its owner typed. It is squeezed into one token so that no word
-      // of it can be read as part of the message ("Alice Approve" must not supply an "approve").
-      const handle = String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone";
-      text = text.split(mention.key).join(own ? " " : `@${handle}`);
+      replacements.set(mention.key, own ? " " : `@${String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`);
     }
+    text = text.replace(/@_user_\d+/g, (key) => replacements.get(key) ?? " ");
     text = text.replace(/\s+/g, " ").trim();
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;

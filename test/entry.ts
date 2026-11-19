@@ -19,15 +19,18 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number }) {
+  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
-    return (this.ctx.storage.kv.get("policy") as { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number } | undefined) ?? {};
+    return (this.ctx.storage.kv.get("policy") as { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean } | undefined) ?? {};
   }
   async callback(kind: string, token: string, body: unknown) {
     this.#record("callback", { kind, token, body });
     return { ok: token === "good" };
+  }
+  async isActive() {
+    return this.#policy().ended !== true;
   }
   async githubToken() {
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;

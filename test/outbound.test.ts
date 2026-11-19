@@ -99,6 +99,15 @@ describe("what a sandbox can reach", () => {
   });
 });
 
+describe("after a task has ended", () => {
+  it("lets nothing out on its behalf, not even a read", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", ended: true });
+    expect((await send("https://model.test/v1/models")).status).toBe(403);
+    expect((await send("https://github.com/acme/demo.git/info/refs?service=git-upload-pack")).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+});
+
 describe("the model key", () => {
   const callModel = (send: (url: string, init?: RequestInit) => Promise<Response>, model: string, path = "/v1/responses") =>
     send(`https://model.test${path}`, { method: "POST", headers: { authorization: "Bearer provided-by-worker" }, body: JSON.stringify({ model, input: "hi" }) });
@@ -124,6 +133,9 @@ describe("the model key", () => {
     expect((await withInput([{ type: "mcp_approval_response", approve: true, approval_request_id: "x" }])).status).toBe(403);
     expect((await withInput([{ type: "mcp_list_tools", server_label: "x", tools: [] }])).status).toBe(403);
     expect((await withInput(["a string item"])).status).toBe(403);
+    // An item given only by id points at something stored on the provider's side.
+    expect((await withInput([{ id: "msg_someone_elses" }])).status).toBe(403);
+    expect((await withInput([{ type: "item_reference", id: "msg_someone_elses" }])).status).toBe(403);
     // Nothing stored on the provider's side may be referred to: under a shared key it could be anyone's.
     const withField = (extra: Record<string, unknown>) => send("https://model.test/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input: "hi", ...extra }) });
     expect((await withField({ previous_response_id: "resp_someone_elses" })).status).toBe(403);

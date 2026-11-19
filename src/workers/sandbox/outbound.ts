@@ -49,6 +49,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
 
     // A credential added to plain HTTP would cross the internet unencrypted.
     if (url.protocol !== "https:") return this.#refuse(request, url, `${url.hostname} is reachable only over HTTPS`);
+    // A finished task keeps its container for inspection, and something may still be running in it.
+    // Nothing leaves on its behalf any more, with or without credentials.
+    if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
 
     const upstream = new URL(this.env.OPENAI_BASE_URL);
     if (url.hostname === upstream.hostname) return this.#model(request, url, upstream);
@@ -94,7 +97,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // The same goes for the conversation itself: only the kinds of item a local agent produces.
     // Items that stand for hosted tools (MCP, web search, code interpreter…) are not among them.
     const input = (parsed as { input?: unknown }).input;
-    if (Array.isArray(input) && input.some((item) => item === null || typeof item !== "object" || !LOCAL_ITEM_TYPES.has(item.type ?? "message"))) {
+    if (Array.isArray(input) && input.some((item) => !isLocalItem(item))) {
       return this.#refuse(request, url, "the request contains an item type that is not allowed from this sandbox");
     }
     // Nor may anything in the request point the provider at an address to fetch: an image or file
@@ -226,6 +229,20 @@ export function describePush(repo: string, refs: RefUpdate[]): string {
     return `move ${name} from ${short(r.old)} to ${short(r.new)}`;
   });
   return `push to ${repo}: ${parts.join("; ")}`;
+}
+
+/**
+ * An item the agent wrote out in full. An item given only by id is a reference to something stored
+ * on the provider's side, which under a shared key could be anyone's; a message must carry its own
+ * role and content.
+ */
+function isLocalItem(item: unknown): boolean {
+  if (item === null || typeof item !== "object") return false;
+  const { type, role, content } = item as { type?: unknown; role?: unknown; content?: unknown };
+  if (type === undefined || type === "message") {
+    return typeof role === "string" && ["user", "assistant", "system", "developer"].includes(role) && (typeof content === "string" || Array.isArray(content));
+  }
+  return typeof type === "string" && LOCAL_ITEM_TYPES.has(type);
 }
 
 /** True if any image, file or server in the request is given as a URL to fetch rather than inline. */

@@ -30,7 +30,8 @@ describe("event normalisation", () => {
   it("treats an opened pull request as something that happened, not a request", () => {
     const result = normalize("pull_request", { action: "opened", repository, sender: { login: "dana", type: "User" }, pull_request: pr });
     expect(result?.repo).toBe("acme/demo");
-    expect(result?.event).toMatchObject({ kind: "github.pull_request", session_key: "pr:7", principal: { kind: "human", id: "github:dana", explicit: false } });
+    // No numeric id in this payload, so the account is identified as a login and can never match a linked user.
+    expect(result?.event).toMatchObject({ kind: "github.pull_request", session_key: "pr:7", principal: { kind: "human", id: "github:login:dana", display: "dana", explicit: false } });
   });
 
   it("derives the dedupe id from the signed body, so a replay under a new delivery id is still a duplicate", () => {
@@ -60,6 +61,11 @@ describe("event normalisation", () => {
     // Still only from people with standing, and only when that is the whole comment.
     expect(normalize("issue_comment", comment("approve K7PW", "NONE"))).toBeUndefined();
     expect(normalize("issue_comment", comment("I would approve K7PW if the tests pass", "OWNER"))).toBeUndefined();
+    // Capitalised or not, a decision reply gets through, so a change of mind is never dropped.
+    expect(normalize("issue_comment", comment("Deny K7PW", "OWNER"))?.event.text).toBe("Deny K7PW");
+    // A person is identified by the account's numeric id, which a renamed login cannot take over.
+    const withId = { ...comment("approve K7PW", "OWNER"), sender: { login: "erin", id: 4711, type: "User" } };
+    expect(normalize("issue_comment", withId)?.event.principal).toMatchObject({ id: "github:4711", display: "erin" });
     // One word that merely starts like a decision is not one.
     expect(normalize("issue_comment", comment("denylist", "OWNER"))).toBeUndefined();
     expect(normalize("issue_comment", comment("approved", "OWNER"))).toBeUndefined();

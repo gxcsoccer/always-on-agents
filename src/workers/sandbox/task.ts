@@ -113,6 +113,8 @@ export interface TaskState {
   /** The latest copy of /workspace in R2: the agent's files and its session transcript. */
   checkpoint?: { record: DirectoryBackupRecord; at: number; took_ms: number };
   checkpoints_taken: number;
+  /** Earlier checkpoints whose deletion failed. Deleted with the task. */
+  stale_checkpoints?: DirectoryBackupRecord[];
   /** How many times the task was restored into a new container. */
   recoveries: number;
   /** For the in-process gate: which question we opened for which of its tool calls. */
@@ -444,6 +446,12 @@ export class TaskSandbox extends DurableObject<Env> {
     return { ok: true };
   }
 
+  /** Whether the task is still entitled to reach the outside world. */
+  async isActive(): Promise<boolean> {
+    const state = this.#state();
+    return Boolean(state) && (ACTIVE.has(state!.phase) || state!.phase === "starting" || state!.phase === "idle");
+  }
+
   /** The repository this task was started on, as lowercase owner/name, or "" if none. */
   async repository(): Promise<string> {
     const match = this.#state()?.repository?.match(/^https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?$/);
@@ -722,8 +730,19 @@ export class TaskSandbox extends DurableObject<Env> {
       state.checkpoint = { record, at: started, took_ms: Date.now() - started };
       state.checkpoints_taken += 1;
       this.#save(state);
-      // Only the latest one is ever restored.
-      if (previous) await this.#backups.delete(previous).catch(() => undefined);
+      // Only the latest one is ever restored. If the old one cannot be deleted now, its record is
+      // kept so the clean-up at the end of the task can try again; it is the only pointer to it.
+      if (previous) {
+        try {
+          await this.#backups.delete(previous);
+        } catch {
+          const later = this.#state();
+          if (later) {
+            later.stale_checkpoints = [...(later.stale_checkpoints ?? []), previous].slice(-50);
+            this.#save(later);
+          }
+        }
+      }
     } catch (err) {
       const state = this.#state();
       if (state) {
@@ -854,9 +873,10 @@ export class TaskSandbox extends DurableObject<Env> {
   /** Removes everything a finished task left: its checkpoint in R2, its container, its own record. */
   async #purge(state: TaskState): Promise<void> {
     if (this.#container.running) await this.#container.destroy();
-    if (state.checkpoint) {
+    const records = [...(state.stale_checkpoints ?? []), ...(state.checkpoint ? [state.checkpoint.record] : [])];
+    if (records.length > 0) {
       try {
-        await this.#backups.delete(state.checkpoint.record);
+        for (const record of records) await this.#backups.delete(record);
       } catch (err) {
         // The record is the only pointer to the object in R2. Keep it and try again later.
         console.log(JSON.stringify({ event: "checkpoint_delete_failed", task: state.id, error: String(err) }));
