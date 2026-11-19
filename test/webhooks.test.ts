@@ -1,3 +1,4 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -159,6 +160,18 @@ describe("the Feishu webhook endpoint", () => {
   it("does not let one tenant take over another tenant's app registration", async () => {
     const { appId } = await app();
     const other = await tenant();
-    await expect(registry().setFeishuApp(other, { app_id: appId, app_secret: "x", encrypt_key: "k" })).rejects.toThrow(/another tenant/);
+    // Called inside the object and caught there: a refusal thrown across the RPC boundary is also
+    // reported by the test runtime as an unhandled error, which fails the run although the test passes.
+    const refusal = await runInDurableObject(registry(), async (instance: any) => {
+      try {
+        await instance.setFeishuApp(other, { app_id: appId, app_secret: "x", encrypt_key: "k" });
+        return "accepted";
+      } catch (err) {
+        return String(err);
+      }
+    });
+    expect(refusal).toMatch(/another tenant/);
+    // And the registration is still the first tenant's.
+    expect((await registry().feishuApp(appId))?.tenant).not.toBe(other);
   });
 });
