@@ -1,3 +1,8 @@
+/**
+ * The Brain's system prompt. It tells the model how to behave in the kind of scope it is in. It is
+ * guidance only: nothing that must hold (who may approve, what may be changed) is left to it; those
+ * rules are enforced in code.
+ */
 import type { Scope } from "../events";
 
 const BASE = `You are an always-on agent. You are not in a live chat: you sleep, an event wakes you, you act, and you go back to sleep. Each wake-up is one run.

@@ -1,20 +1,20 @@
 /**
  * Feishu (Lark) connector.
  *
- * Inbound: the event subscription webhook of a bot app. Each tenant registers its own app; the
- * app id is in the webhook path, and the app's Encrypt Key and Verification Token (held in the
- * registry) prove a request came from Feishu. A direct message becomes an event in the sender's
- * user scope; a group message that @-mentions the bot becomes an event in that chat's scope.
+ * Inbound: events and card callbacks of a bot app. Each tenant registers its own app. They arrive
+ * one of two ways, chosen per app:
+ *   - over the long connection (see feishu-link.ts), which this deployment opens to Feishu;
+ *   - at a webhook, where the app id is in the path and the app's Encrypt Key proves a request
+ *     came from Feishu: only encrypted and signed deliveries are accepted.
+ * Either way the same function, `receiveFeishu`, handles what arrived. A direct message becomes an
+ * event in the sender's user scope; a group message that mentions the bot becomes an event in that
+ * chat's scope; a press on an approval card becomes the presser's own "approve" or "deny".
  *
- * Identity: the sender's open_id, which Feishu puts in the signed event. A direct message or an
- * @-mention is the person deliberately addressing the agent.
+ * Identity: the sender's (or presser's) open_id, as Feishu states it. A direct message, a mention
+ * and a button press are each the person deliberately addressing the agent.
  *
- * Outbound: replies as the bot, using the app's tenant_access_token.
- *
- * NOT YET VERIFIED AGAINST A REAL FEISHU APP. Signature, decryption and the event and message
- * shapes follow the open platform documentation, and decryption is checked against its published
- * test vector. The URL-verification handshake follows the long-standing documented behaviour but
- * the page describing it could not be retrieved when this was written.
+ * Outbound: replies as the bot, using the app's tenant_access_token. An approval question goes out
+ * as a card, and is replaced by a closed card once it is decided or withdrawn.
  */
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, scopeName } from "../events";

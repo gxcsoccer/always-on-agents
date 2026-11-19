@@ -1,4 +1,5 @@
-// pi extension: holds risky tool calls until the Worker answers.
+// pi extension: holds a shell command until a person has answered, for commands the deployment
+// has asked to be reviewed (GATE_HOLD_PATTERN). By default nothing is held here.
 //
 // It runs inside the pi process, so it can simply await the answer. The answer lives in the task's
 // Durable Object and is fetched over brain.internal; nothing in the container's filesystem decides.

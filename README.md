@@ -1,95 +1,122 @@
 # always-on-agents
 
-一个跑在 Cloudflare 上的 always-on agent：平时休眠，被事件唤醒，无人值守地行动，跨多次运行保持状态。多租户，支持单聊、群聊和代码仓库（CI）三种场景，耗时的工作派给沙箱里的 coding agent。
+**English** | [简体中文](README.zh-CN.md)
 
-设计依据是 Anthropic 的文章 [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents)。架构和各项决定的理由见 [docs/architecture.md](docs/architecture.md)。
+An always-on agent built on Cloudflare. It sleeps until something happens, wakes up, acts without anyone watching, and remembers what it did. It serves many tenants, works in direct chats, group chats and code repositories, and hands anything slow to a coding agent running in a sandbox.
 
-## 目录
+The design follows Anthropic's article [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents) and its five primitives: an event inbox, timers, memory, permissions and an outbox.
 
 ```
-src/
-  index.ts              入口 Worker：鉴权、路由，本身不存状态
-  events.ts             作用域、事件、身份的定义
-  registry.ts           租户注册表（一个 Durable Object）
-  brain/                Brain：每个作用域一个 Durable Object
-    agent.ts              inbox、定时器、run 循环、任务、outbox
-    schema.ts             表结构和迁移
-    tools.ts              模型可用的工具
-    prompt.ts             系统提示词
-  model/openai.ts       模型客户端
-  connectors/           每个外部系统一个：入站验证、身份、出站投递
-    console.ts            HTTP 通道，用于联调和部署验证
-    github.ts             GitHub webhook 和评论
-    github-app.ts         按安装、按仓库签发 GitHub 令牌
-    feishu.ts             飞书机器人
-    feishu-link.ts        飞书长连接：每个应用一个常驻对象，主动连飞书收事件和卡片点击
-    feishu-frame.ts       长连接的帧格式
-  workers/sandbox/      沙箱 worker：每个任务一个 Durable Object 加一个容器
-    task.ts               容器生命周期、回报、审批、检查点
-    outbound.ts           容器唯一的出口：放行规则、加凭据、挂起待批准的推送
-container/              打进沙箱镜像的脚本
-test/                   测试（跑在 Workers 运行时里，模型和沙箱用替身）
-docs/                   架构文档
-docs/spikes/            早期实验的记录（代码已归档到 git 历史）
+Feishu / GitHub / console / timers / worker reports
+        │
+   Ingress Worker          verify, find the tenant, pick the scope, return at once
+        │ ingest()
+┌───────▼────────────────────────────────────────────┐
+│ Brain  (one Durable Object per scope)               │
+│ SQLite: inbox · sessions · items · memory · timers  │
+│         · tasks · outbox · runs · audit             │
+│ alarm(): fire timers → deliver outbox → run         │
+└───┬────────────────────────────────────┬───────────┘
+    │ dispatch / answer / cancel         │ deliver
+┌───▼──────────────────────────┐   ┌─────▼──────────────┐
+│ TaskSandbox (one per task)    │   │ Connectors          │
+│ a container running a coding  │   │ console · GitHub ·  │
+│ agent; one guarded way out    │   │ Feishu              │
+└───────────────────────────────┘   └────────────────────┘
 ```
 
-## 本地运行
+## What it does
 
-需要 Node、pnpm，以及一个 Docker 兼容的运行时（沙箱镜像要构建）。Apple 芯片上用 Colima 时要开 Rosetta：
+- **One brain per scope.** A user, a group chat or a repository each gets its own Durable Object with its own inbox, memory and outbox. Nothing is shared between scopes.
+- **Events in, messages out.** Every trigger is written to the inbox first and handled in a short run. A run that is interrupted by a crash or a deploy picks up where it stopped.
+- **Timers and memory.** The agent can remind, follow up and keep notes across conversations.
+- **Sandboxed workers.** Long work goes to a coding agent in a container that has no credentials and one way out: a proxy that allows the model API and git, and nothing else.
+- **Approvals decided by code.** What leaves the sandbox (a `git push`) is held until a person approves the exact refs and commits. The model only passes the answer on; the rules are enforced outside it.
+- **Connectors.** A plain HTTP console, GitHub (webhooks or a GitHub App), and Feishu/Lark (long connection or webhooks, with approval cards).
+
+## Documentation
+
+| | |
+|---|---|
+| [Architecture](docs/architecture.md) | How the pieces fit and why |
+| [Approvals](docs/approvals.md) | Who may approve what, and how that is enforced |
+| [Connectors](docs/connectors.md) | Console, GitHub and Feishu: setup and behaviour |
+| [Operations](docs/operations.md) | Deploying, configuration, the admin API, limits |
+| [Status](docs/status.md) | What has been verified, and known limitations |
+
+## Quick start
+
+You need Node 22 or later, pnpm, and a Docker-compatible runtime (the sandbox image is built locally). On Apple silicon with Colima, enable Rosetta:
 
 ```bash
 colima start --cpu 4 --memory 6 --vm-type vz --vz-rosetta
 export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+```
 
-cp .dev.vars.example .dev.vars   # 填 OPENAI_API_KEY 和 ADMIN_KEY
+```bash
 pnpm install
-pnpm test                        # 不需要 Docker 和 key
+pnpm test                        # needs neither Docker nor keys
+cp .dev.vars.example .dev.vars   # set OPENAI_API_KEY and ADMIN_KEY
 pnpm dev --port 8797
 ```
 
-建一个租户，然后和它说话：
+Create a tenant and talk to the agent:
 
 ```bash
 B=http://localhost:8797
+
+# Returns the tenant's API key. It is shown once.
 curl -X POST $B/v1/admin/tenants -H "authorization: Bearer $ADMIN_KEY" \
-  -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'      # 返回租户的 API key，只显示一次
+  -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'
 
 curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENANT_KEY" \
-  -H 'content-type: application/json' -d '{"text":"30 秒后提醒我喝水"}'
+  -H 'content-type: application/json' -d '{"text":"Remind me to drink water in 30 seconds"}'
+
+# Long-poll for replies, including the reminder the agent sends on its own.
 curl "$B/v1/console/users/alice/messages?after=0&wait=25" -H "authorization: Bearer $TENANT_KEY"
 
-curl $B/v1/admin/scopes/acme:user:alice -H "authorization: Bearer $ADMIN_KEY"  # 看这个作用域的内部状态
+# Look inside that scope.
+curl $B/v1/admin/scopes/acme:user:alice -H "authorization: Bearer $ADMIN_KEY"
 ```
 
-群聊用 `/v1/console/chats/<chat>/messages`，请求体里带 `"user"`。
+To deploy, and to connect GitHub or Feishu, see [Operations](docs/operations.md) and [Connectors](docs/connectors.md).
 
-## 部署
+## Repository layout
 
-需要 Workers Paid 套餐和 R2。
-
-```bash
-wrangler r2 bucket create always-on-agent-checkpoints
-wrangler secret put OPENAI_API_KEY
-wrangler secret put ADMIN_KEY
-wrangler secret put GITHUB_APP_ID            # 以下四项：接 GitHub App 时需要
-wrangler secret put GITHUB_APP_PRIVATE_KEY
-wrangler secret put GITHUB_WEBHOOK_SECRET
-wrangler secret put GITHUB_BOT_HANDLE        # App 的 slug，人们用 @它 来称呼 agent
-wrangler secret put GITHUB_BOT_EMAIL         # 提交用的邮箱：<bot 用户 id>+<slug>[bot]@users.noreply.github.com
-wrangler deploy
+```
+src/
+  index.ts              ingress Worker: authentication and routing, no state
+  events.ts             scopes, events and principals
+  registry.ts           tenants, keys, app registrations (one Durable Object)
+  brain/                the Brain: one Durable Object per scope
+    agent.ts              inbox, timers, the run loop, tasks, outbox
+    schema.ts             tables and migrations
+    tools.ts              what the model may call
+    prompt.ts             the system prompt
+  model/openai.ts       model client
+  connectors/           one per outside system: verify, identify, deliver
+    console.ts            HTTP channel for development and checks
+    github.ts             GitHub webhooks and comments
+    github-app.ts         tokens per installation and repository
+    feishu.ts             Feishu events, cards and messages
+    feishu-link.ts        Feishu long connection (one Durable Object per app)
+    feishu-frame.ts       the long connection's frame format
+  workers/sandbox/      the sandbox worker: one Durable Object and one container per task
+    task.ts               container lifecycle, reports, approvals, checkpoints
+    outbound.ts           the container's only way out
+container/              scripts built into the sandbox image
+test/                   tests, run inside the Workers runtime
+docs/                   documentation
 ```
 
-接飞书有两种方式，登记应用时用 `transport` 选择。推荐 `long_connection`：我们主动连飞书，飞书后台的事件和回调都选“使用长连接接收”；同一个应用不能再有别的长连接客户端。`webhook` 方式下，请求地址要用自定义域名（`wrangler.jsonc` 里的 `routes`），因为飞书的服务器访问不到 `*.workers.dev`，而且卡片点击偶尔到不了。
+## Status
 
-接 GitHub App 时，装好 App 后要把安装登记到租户，之后这个安装发来的 webhook 才会被接受（之前的一律 401，可以在 App 的 Advanced 页重新投递）：
+The agent runs on Cloudflare and has been exercised end to end against real GitHub and Feishu apps. It is young software: read [Status](docs/status.md) before relying on it, in particular the list of known limitations.
 
-```bash
-curl -X POST $B/v1/admin/tenants/acme/github-installations -H "authorization: Bearer $ADMIN_KEY" \
-  -H 'content-type: application/json' -d '{"installation_id":"<id>"}'
-```
+## Contributing
 
-## 现状
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md).
 
-已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书用一个真实应用跑通了单聊、群聊和卡片审批，webhook 和长连接两种接入方式都走过。
+## License
 
-还没有做的部分：豆包（未实现）；审批目前按命令的形状判断，还没有按后果分级。详见架构文档的"尚未完成"和"验证过什么"。
+[MIT](LICENSE)

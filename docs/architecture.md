@@ -1,142 +1,99 @@
-# 架构
+# Architecture
 
-## 一句话
+**English** | [简体中文](architecture.zh-CN.md)
 
-每个作用域（一个用户、一个群、一个仓库）是一个 Durable Object，叫 Brain。所有触发先写进它的 inbox，再由它在一次很短的 run 里处理；凡是耗时的事都交出去，结果以事件的形式回到 inbox。
+## In one paragraph
+
+Every scope (a user, a group chat, a repository) is one Durable Object called the Brain. Everything that happens is first written to its inbox and then handled in a short run. Anything slow is handed off, and the outcome comes back as another event in the inbox.
 
 ```
-飞书 / GitHub / 控制台 / 定时器 / worker 回报
+Feishu / GitHub / console / timers / worker reports
         │
-   入口 Worker            验签、认租户、算作用域，立刻返回
+   Ingress Worker          verify, find the tenant, pick the scope, return at once
         │ ingest()
 ┌───────▼────────────────────────────────────────────┐
-│ Brain（Durable Object，每个作用域一个）               │
+│ Brain  (one Durable Object per scope)               │
 │ SQLite: inbox · sessions · items · memory · timers  │
-│         · tasks · outbox · runs                     │
-│ alarm(): 触发到期定时器 → 投递 outbox → 跑 run       │
+│         · tasks · outbox · runs · audit             │
+│ alarm(): fire timers → deliver outbox → run         │
 └───┬────────────────────────────────────┬───────────┘
     │ dispatch / answer / cancel         │ deliver
-┌───▼──────────────────────────┐   ┌─────▼─────────┐
-│ TaskSandbox（每个任务一个 DO） │   │ Connector      │
-│ 容器里跑 pi；Outbound 是唯一出口│   │ 控制台 / GitHub │
-└───┬──────────────────────────┘   └───────────────┘
-    └─ taskEvent(): progress / needs_input / result / failed / lost
+┌───▼──────────────────────────┐   ┌─────▼──────────────┐
+│ TaskSandbox (one per task)    │   │ Connectors          │
+│ container + outbound proxy    │   │ console · GitHub ·  │
+└───┬───────────────────────────┘   │ Feishu              │
+    └─ taskEvent(): progress /      └────────────────────┘
+       needs_input / result / failed / lost
 ```
 
-## 五个原语怎么落地
+## The five primitives
 
-| 原语 | 实现 | 关键性质 |
+| Primitive | Where it lives | What matters about it |
 |---|---|---|
-| Event inbox | Brain 的 `inbox` 表 | `(source, source_id)` 去重；写入成功即确认；每次激活都会检查并补设 alarm |
-| Timers | `timers` 表，复用 DO 的单个 alarm | 到期只往 inbox 插事件，不直接跑 agent；错过的周期不补发 |
-| Memory | `memory` 表，按路径存 Markdown | `instructions.md` 和 `index.md` 每次 run 都加载；不跨作用域 |
-| Permissions | 见下文"谁说了算" | 由代码判定，不靠提示词 |
-| Outbox | `outbox` 表 | 严格按顺序投递，失败退避重试；每条消息有幂等键 |
+| Event inbox | the Brain's `inbox` table | Deduplicated on `(source, source_id)`. A successful insert is the acknowledgement. Every activation checks that an alarm is set. |
+| Timers | the `timers` table, on the object's single alarm | A due timer only inserts an event; it never runs the agent directly. Missed periods are not replayed. |
+| Memory | the `memory` table, Markdown by path | `instructions.md` and `index.md` are loaded into every run. Memory never crosses scopes. |
+| Permissions | see [Approvals](approvals.md) | Decided by code, not by the prompt. |
+| Outbox | the `outbox` table | Delivered strictly in order, retried with back-off, one idempotency key per message. |
 
-## 一次 run
+## Scopes and tenants
 
-run 只在 `alarm()` 里执行。alarm 不会重入，所以同一个作用域同时最多一个 run。
+A scope is named `tenant:kind:id`, where kind is `user`, `chat` or `repo`. That name is the Durable Object's name, so each scope's data is physically separate.
 
-1. **认领**：取最早一条待处理事件，把同一会话的待处理事件（有数量和大小上限）一起认领，建 run，把事件渲染成一条 user 消息写进对话记录。这些在一个同步事务里完成。
-2. **循环**：有未执行的工具调用就执行并记录输出；否则调模型，把返回的条目写进对话记录。每一步之后状态都已落盘。
-3. **结束**：事件标为完成，清除"当前 run"。
+- The ingress Worker works out the tenant from an API key, a GitHub installation or a Feishu app registration. A caller cannot name its own tenant.
+- A task id can only be looked up in the database of the Brain that created it. Holding another scope's task id gets you nothing.
+- Each scope and each tenant has a daily token budget. When it runs out, the scope pauses until the next day and loses no events.
 
-**崩溃和部署**：对话记录就是进度。重新进入同一个 run 时，没有输出的工具调用会被重新执行，所以每个工具的副作用都以工具调用 ID 为幂等键。连续进入 5 次仍未完成的 run 会被放弃，放弃不依赖能否通知到人。
+Tenants, API keys and app registrations live in a single Durable Object, the Registry.
 
-**为什么不用 Cloudflare Workflows**：Brain 的 run 很短，耗时的活都派出去了。用 Workflow 会多出第二份持久状态，需要和 DO 里的那份对齐，而"同时只有一个 run"恰恰会在两者交接处被打破。
+## A run
 
-## 谁说了算
+Runs happen only inside `alarm()`. An alarm never re-enters, so a scope has at most one run at a time.
 
-每个事件带一个 `principal`，说明是谁引起的，以及这个人是不是在**明确地对 agent 说话**（`explicit`）。授权只看它，不看消息文本。
+1. **Claim.** Take the oldest pending event and, with it, the other pending events of the same conversation (bounded in number and size). Create the run and write the events into the transcript as one user message. All of this is one synchronous transaction.
+2. **Loop.** If the transcript has tool calls without outputs, execute them and record the outputs. Otherwise call the model and append what it returns. State is on disk after every step.
+3. **Finish.** Mark the events done and clear the active run.
 
-**审批的流程由代码走完，模型只负责传话：**
+**Crashes and deploys.** The transcript is the progress. Re-entering the same run re-executes any tool call that has no output, so every tool's side effect is keyed by the tool call id. A run that is entered five times without finishing is abandoned, and abandoning it does not depend on being able to tell anyone.
 
-1. worker 被拦住后上报一个问题。问题的编号由沙箱一侧生成，不采用容器里给的编号。
-2. Brain 自己把问题发到任务所在的会话：原样写出要执行的命令，或者要推送的仓库、分支和提交，并附一个只对这一个问题有效的 4 位确认码。
-3. 有人回复后，模型调用 `answer_task`。代码检查通过才会把决定传给 worker。
+**Why not Cloudflare Workflows.** A Brain run is short; the slow work is dispatched. A Workflow would add a second copy of durable state that has to agree with the one in the Durable Object, and the guarantee of one run at a time would break exactly where the two meet.
 
-| 规则 | 在哪里强制 |
+## The sandbox worker
+
+Each task gets one `TaskSandbox` Durable Object and one container. The container runs a coding agent ([pi](https://pi.dev)) in headless mode.
+
+**No network and no credentials.** Every request the container makes goes through `Outbound` (`src/workers/sandbox/outbound.ts`):
+
+- *Model API.* Only the configured model and the one endpoint are allowed. Request size and the number of calls per task are bounded. Only function tools that run inside the sandbox may be declared, the conversation items must be of kinds a local agent produces, and nothing may point the provider at a remote address to fetch. The Worker adds the key.
+- *GitHub.* Only git's smart-HTTP endpoints. Reads pass through.
+- *Everything else* gets a 403 and is recorded on the task.
+
+**Pushes.** A task can push only to the repository it was started on. The proxy parses the push request into the refs that would move and the full commit ids; that list is what a person approves. Each held request has its own id and its answer can be collected once, by that request. The hold is limited on the Worker's side: when time runs out, or the holder goes quiet for a minute, the question is withdrawn and the Brain is told. See [Approvals](approvals.md).
+
+**Credentials.** A GitHub token is lent only to a task started from that repository's own scope, or from a group chat that an operator has linked to that repository. With a GitHub App the token is issued per installation and for that one repository, and the result is checked. The credential for a push is fetched at the moment the push is sent, not before the wait for approval.
+
+**Reports.** Progress, requests for approval, results, failures and loss are numbered and delivered to the Brain at least once; the Brain deduplicates by number. Process exit is reported by a wrapper script, not by the model.
+
+**Losing the container.** The task directory is copied to R2 after progress reports and on alarms (at most every 30 seconds). If the container disappears, a new one is started, the copy is restored and the agent continues its session. Work done since the last checkpoint may be redone.
+
+**Deploys.** When the Durable Object restarts it re-attaches the container's outbound route; without that the container could neither reach the model nor report.
+
+**Limits.** Five minutes to start, fifteen idle, two hours in total, two recoveries, 400 model calls. At most three tasks per scope and five per tenant at once. A day after a task ends, its container, checkpoints and records are deleted.
+
+What a worker says about itself is not trusted: it is a process in a container talking. Results reach the Brain marked as unverified.
+
+## Connectors
+
+A connector owns three things for one outside system: verifying an inbound request and turning it into an event, saying who caused it and whether they were addressing the agent, and delivering messages. The Brain never talks to an outside system directly. See [Connectors](connectors.md).
+
+## Where to read the code
+
+| To understand | Read |
 |---|---|
-| 批准必须来自问题**实际送出**之后的一条消息，整条消息就是"approve 确认码"（或"同意""批准"加确认码），多一句别的都不算，"do not approve 确认码"因此不是批准。决定从消息原文读出，不取模型的转述；同一批回复里只要有人带着确认码拒绝，就按拒绝处理 | `#answerTask`、`readDecision` |
-| 同一作用域内未决问题的确认码互不相同；一条消息只能批准一个问题；一个问题只有一次决定，重试只会重发这次决定 | `taskEvent`、`#answerTask` |
-| 要执行的内容太长、无法完整展示时，只能拒绝，不能批准 | `taskEvent`、`#answerTask` |
-| 这条消息必须来自本作用域的成员，且是明确对 agent 说的 | `#isDecider` |
-| 只能在任务所属的会话里批准或取消 | `#answerTask`、`#cancelTask` |
-| 群聊和仓库里，只有发起任务的那一个人能批准 | `#answerTask` |
-| 一批消息里有多个人同时提出请求时，任务不记发起人，于是没人能批准 | `#dispatchTask` |
-| 不是由人发起的任务（如 CI 失败后自动派出的）不能被批准，只能被拒绝 | `#answerTask` |
-| 问题送不到任何人（会话没有回复地址）时不能被批准 | `taskEvent`、`#answerTask` |
-| 拒绝也要说出来：任何成员发"deny 确认码"即可拒绝。一句无关的话不会被当成拒绝 | `#answerTask`、`readDecision` |
-| 批准必须是那个人在这批消息里的最后一句话；之后又说了别的，就要重新确认 | `#answerTask` |
-| 仓库里，没有关联到租户用户的 GitHub 账号不算成员 | `#isDecider` |
-| GitHub 评论只有 OWNER / MEMBER / COLLABORATOR 的才会被当成对 agent 的请求 | `connectors/github.ts` |
-| 飞书群里只认 @ 了本机器人的消息，且发送者必须属于安装该应用的组织 | `connectors/feishu.ts` |
-| GitHub 评论可以事后编辑或删除，所以批准只在它所依据的那条评论此刻仍是原样时才算数：每条评论记着当前的修订（时间加文本指纹），编辑、删除的通知不论先后都会让旧文本作废；动手之前还会向 GitHub 再读一遍那条评论，因为通知可能还在路上。读不到（比如仓库权限被收回）就不批准。agent 自己发的那条提问评论也会被核对：仓库管理员能改别人的评论，提问只要被改过（哪怕又改了回去）就不能再批准，只能拒绝，agent 会重新发问。引用块和代码里的 @ 不算对 agent 说话 | `connectors/github.ts`、`brain/agent.ts` |
-| `instructions.md` 只能在完全由成员消息触发的 run 里修改或删除；同一批里混有 worker 回报或自动事件就不行 | `#instructionEditors` |
-| agent 自己发的 GitHub 评论带有标记，再从 webhook 回来时不会被当成任何人的话 | `connectors/github.ts` |
-| PR 打开、CI 失败这类自动事件，不算任何人的请求或同意 | connector 给出 `explicit: false` |
-
-系统和 worker 发来的文本只是信息。提示词里这样告诉了模型，但上面这些规则不依赖模型听不听。每次派活、批准、拒绝、取消和改动长期指令都写入 `audit` 表，批准记录里有问题原文和作出决定的那条消息。
-
-## 沙箱 worker
-
-每个任务一个 `TaskSandbox` 加一个容器，容器里用无界面模式跑 pi。
-
-- **没有网络，也没有凭据**。容器发出的所有请求都经过 `Outbound`（`workers/sandbox/outbound.ts`）：
-  - 模型接口：只放行配置的那个模型和那一个接口路径，限制请求大小和每个任务的调用次数，只允许声明在沙箱内执行的函数工具，请求里的对话条目也只能是本地 agent 自己会产生的类型，且不能带让服务方去抓取的远程地址（图片、文件只能内联），由 Worker 加上 key。
-  - GitHub：只放行 git 的智能 HTTP 接口。读操作直接放行。
-  - 其他一律 403，并记到任务上。
-- **推送**：只能推到任务启动时指定的仓库。代理解析推送请求，得到每个要改动的引用和完整的提交号，人批准的就是这一份清单。它是客户端**请求**的改动，服务端仍可能拒绝其中某一项。每个被挂起的请求有自己的编号，答复只能被这一个请求领取一次；同样内容的第二次推送要重新问。挂起的时限由沙箱一侧强制：到时间或者挂起方 60 秒没有动静，问题就撤回，并通知 Brain。
-- **凭据**：GitHub 令牌只借给从该仓库自己的作用域派出的任务。从单聊或群聊派出的任务可以指定任意仓库，所以不给令牌，只能读公开仓库。例外是运维方登记过的“群 ↔ 仓库”绑定（`POST /v1/admin/tenants/:id/chat-repos`）：那个群里派出的任务，对那一个仓库可以借到令牌；每次借用都重新查绑定，解除后立即失效；等待批准的推送在批准之后、发出之前重新取一次凭据，所以等待期间解除绑定，批准了也推不出去。单聊不能绑定。配置了 GitHub App 时，令牌按租户的安装和单个仓库签发，并核对签发结果确实是这个仓库。
-- **回报**：进度、求批准、结果、失败、丢失，都编号后送到 Brain，至少送达一次，Brain 按编号去重。进程退出由包装脚本上报，不依赖模型。
-- **审批分两层**：会出网的动作在 `Outbound` 上按请求本身判断，换命令写法绕不过去；不出网的动作（如 `rm -r`）由进程内扩展按命令文本拦，只能防误操作。
-- **容器丢失**：进度回报后和每次 alarm 时把任务目录备份到 R2（最多 30 秒一次）。容器没了就起一个新的，还原后让 pi 接着原会话继续。检查点之后的工作可能重做一遍。
-- **部署**：DO 重启时重新接上容器的出站通道，否则容器会既调不了模型也回报不了。
-- **上限**：启动 5 分钟、空闲 15 分钟、总时长 2 小时、恢复 2 次、模型调用 400 次。每个作用域最多 3 个任务同时跑，每个租户最多 5 个。
-- **清理**：任务结束 24 小时后删除容器、R2 里的检查点和任务自己的记录。检查点删除失败会保留记录并重试。
-
-worker 的自述不可信：它是容器里的进程说的。Brain 收到的结果会标明"未经验证"。
-
-## Connector
-
-每个外部系统一个 connector，负责三件事：验证入站请求并转成事件；说明是谁、是否在对 agent 说话；把消息投递出去。
-
-| Connector | 入站 | 投递 | 实测情况 |
-|---|---|---|---|
-| 控制台 | 租户 API key | 客户端拉取 | 本地和线上都完整跑过。API key 是给租户自己的后端用的，持有者可以代表该租户的任何用户说话 |
-| GitHub | webhook 验签，按安装或按登记的仓库找租户，去重键取自签名覆盖的内容 | 在 PR 下评论，带标记防重复 | 用一个私有测试仓库对真实 GitHub 跑通了两遍，一遍用个人令牌，一遍用真实的 GitHub App（只装在这一个仓库上，令牌按安装和仓库签发，评论以 App 的机器人身份发出）：PR 事件、评论里 @ 派活、带令牌克隆、push 被拦下、不带 @ 的评论凭确认码批准、分支头移到被批准的提交、结果评论 |
-| 飞书 | 每个租户登记自己的应用；只接受加密且签名的事件，10 分钟内有效 | 以机器人身份回复 | 用一个真实的企业自建应用跑通了单聊：飞书的地址校验握手、加密签名的消息事件、以机器人身份回复。群聊 @ 也跑通了，卡片审批由真人走过一遍：收到卡片、点“批准”、任务执行、卡片变成“已批准”。绑定了仓库的群里也由真人走过一遍推送审批：卡片出现、点“批准，这个任务不再问”、第一次推送放行、同一任务的第二次推送不再询问。之后改过点击的回应方式和 worker 等待推送的时限，又由真人走了一遍：提问发出一分半钟后批准，点击入库，推送成功。改用长连接接入后再走了一遍：消息、卡片、点击都经长连接到达，点击在卡片出现后约 9 秒入库，推送成功，期间连接没有重连。审批提问在飞书里是一张带“批准 / 拒绝”按钮的卡片，按下按钮等于那个人说了 `approve 码` 或 `deny 码`，是谁按的取自飞书签名的回调；对着这张卡片“回复”一句“可以”或“不行”也算回答，因为回复的是哪条消息由飞书给出，不需要再报确认码；在别处说同样的话则不算。决定作出或请求失效后，卡片会更新成“已批准 / 已拒绝 / 已失效”，按钮消失。确认码在一个作用域里永不重复使用。需要人批准的只有会离开沙箱的动作，目前就是推送：沙箱里的命令做什么都留不到沙箱之外，所以默认不问（部署可以用 `GATE_HOLD_PATTERN` 指定仍要询问的本地命令）。批准推送时可以选“这个任务不再问”，之后同一任务里对同一仓库同一批分支的推送直接放行并留有记录；删除分支、标签、别的分支、别的仓库照旧询问；这种授权只对“只更新分支”的推送提供，包含之后可能改写该分支历史的推送，卡片上事先写明。卡片先用一句话说要做什么，完整内容列在下面。同一个群里，带着未决问题确认码的回复不管打在哪个话题里，都归到那个问题所在的对话。普通的“回复”不另开对话，只有话题才是。飞书的服务器访问不到 `*.workers.dev`，请求地址必须用自定义域名 |
-| 豆包（作为 worker） | — | — | 未实现。调研记录见 `docs/spikes/doubao-worker.md` |
-
-## 多租户
-
-- 作用域名是 `租户:类型:ID`，直接作为 Durable Object 的名字，所以每个作用域的数据物理上是分开的。
-- 入口从 API key 或 GitHub 安装查出租户，调用方不能自己指定。
-- 任务 ID 只在创建它的 Brain 的库里查得到，拿着别的作用域的任务 ID 什么也做不了。
-- 每个作用域有每日 token 上限，到了就暂停到第二天，不丢事件。
-
-## 尚未完成
-
-按重要性排序：
-
-1. **GitHub 上判断一条评论是不是在对 agent 说话**，用的是一个简化的 Markdown 读法，不是完整的 GFM 解析：把一段话误当成代码只会让人需要再 @ 一次，反过来的情况已知的都堵上了，但不保证穷尽。“这个任务不再问”目前只在飞书卡片上有按钮；在 GitHub 上要回复 `approve all 码`。
-2. **豆包 worker** 没有接入正式版。
-3. **沙箱里的 token 用量是容器自己报的**。调用次数在代理上计数并有上限，但 token 数取自 agent 日志的末尾 8 MB，日志特别长、容器丢失或被取消时会少记。
-4. **推送没有校验 push option 和 capability**，也没有限制可以推哪些分支；批准的人看到的是引用和提交，决定权在人。单聊里由定时器等非人工触发派出的任务，该用户本人可以批准（单聊只有一个成员）。
-5. **不出网的高危命令**只有进程内扩展一层，靠正则匹配。
-6. **观测**只有结构化日志和每个作用域的健康数字，没有接告警。
-7. **对话变长时只是截断**，没有做摘要压缩，也没有离线整理记忆。
-8. **沙箱状态是整份读写的**，已处理了已知的几处并发覆盖，没有系统性地改成按字段更新。
-9. **管理接口只有一个密钥**，没有分角色，也没有按租户的管理权限。
-10. **租户的 API key、飞书应用密钥存放在注册表的 Durable Object 里**，依赖平台的静态加密，没有再加一层。
-11. **所有租户共用一个模型服务的 key**。每个作用域和每个租户各有每日 token 上限，租户的额度在调用前预留。但沙箱里的用量是任务结束时才按容器的汇报入账的，运行中的任务只在每次调用前检查租户是否已超限，所以实际用量可能越过上限一些。
-12. **升级时正在等待审批的任务**：审批记录的格式在开发过程中变过，旧格式的待批问题在升级后无法被回答，只能取消重来。
-13. **飞书用 webhook 接入时，卡片回调不总能到达我们**。真人点击时见过三种失败：我们验签出错（已修）；飞书提示超时（200670），那次点击其实已记下并生效；以及回调根本没有到达我们的服务（200341，Cloudflare 的请求日志里没有这次请求）。后两种的原因没有完全查实，能确定的是：一次回调在我们这边只用 0.04 到 0.34 秒；从国内测端到端是 0.8 到 2.4 秒（入口在新加坡），偶尔连接会直接超时。所以默认建议用长连接接入（应用登记时 `transport: long_connection`）：由我们主动连飞书，不依赖飞书访问我们。长连接的代价是每个应用有一个常驻对象（每月最多约 4 美元），而且同一个应用不能再有别的长连接客户端，否则飞书会把事件随机分给其中一个。
-14. **已结束的提问，卡片偶尔关不掉**。提问发出后、我们拿到回执前如果出了岔子，会用同一个编号再发一次来找回那条消息并把它改成“已失效”。飞书文档只保证一小时内同一编号不重复发送，不保证返回原消息的编号；拿不到的话，那张卡片会留着按钮。点它不会批准任何东西，因为提问已经关闭。
-
-## 验证过什么
-
-- `pnpm test`：151 个用例（新增的长连接用例用一个独立对象冒充飞书），跑在 Workers 运行时里，模型和沙箱用替身。覆盖 inbox 去重和批量、会话隔离、幂等、放弃不卡死、对话窗口、预算暂停、定时器、记忆写入限制、审批的各条规则、任务回报去重、审计、数据清理、出站代理的每条放行和拒绝规则、推送请求解析（含浅克隆的真实格式）、GitHub 验签和归一化、GitHub App 的 JWT、飞书的解密验签和归一化。
-- 在 Cloudflare 上手工端到端跑过：对话和记忆、定时器主动提醒、租户隔离、群聊隔离、派活、带确认码的审批（无码被拒、非发起人被拒、发起人带码通过）、13 分 45 秒的长任务、运行中重新部署、销毁容器后自动续跑、带旧数据的作用域升级、GitHub 和飞书的入站。
-- 飞书和 GitHub 的 webhook 处理函数有整体测试：真实的加密、签名、按仓库密钥验签、租户路由、未决问题确认码的判断，以及各种拒绝返回一致。
-- 没有自动化测试覆盖的：沙箱 `TaskSandbox` 本身（容器在测试运行时里跑不了，靠线上手工验证）、alarm 的自愈和任务清理。
+| Events, scopes, principals | `src/events.ts` |
+| The inbox, runs, tasks, the outbox | `src/brain/agent.ts` |
+| What the model can do | `src/brain/tools.ts`, `src/brain/prompt.ts` |
+| The approval rules | `#answerTask` and `readDecision` in `src/brain/agent.ts` |
+| The sandbox's boundary | `src/workers/sandbox/outbound.ts` |
+| A task's life | `src/workers/sandbox/task.ts` |
+| How an outside system is connected | `src/connectors/` |

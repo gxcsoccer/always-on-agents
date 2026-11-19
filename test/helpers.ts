@@ -1,3 +1,7 @@
+/**
+ * Shared test helpers: a scripted stand-in for the model (it replaces global fetch), builders for
+ * events and model outputs, and handles on the objects under test.
+ */
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { vi } from "vitest";
