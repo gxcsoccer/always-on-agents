@@ -745,7 +745,8 @@ export class BrainAgent extends DurableObject<Env> {
     // arrived since speaks against it.
     if (intent?.decision === "allow" && intent.pending_id === open) {
       const approver = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
-      const code = (JSON.parse(task.pending) as { code: string }).code;
+      const onRecord = JSON.parse(task.pending) as { code: string; ask?: string };
+      const code = onRecord.code;
       // Everything else members have said in this conversation since the task began, whenever it
       // arrived: a later word from the approver, or anything about this question that is not an approval.
       const later = this.#reconcile(
@@ -755,7 +756,9 @@ export class BrainAgent extends DurableObject<Env> {
         later.unresolved ||
         later.events.some(
           (event) =>
-            (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") ||
+            // The same test as for a fresh decision: anything about this question, by its code or
+            // by being tied to it, that is not an approval.
+            (isAbout(event, onRecord.ask) && (isTiedTo(event, onRecord.ask) || quotes(event.text ?? "", code)) && saysAbout(event, onRecord) !== "allow") ||
             ((JSON.parse(event.principal) as Principal).id === intent!.decided_by && approver !== undefined && saidAt(event) >= saidAt(approver)),
         ) ||
         // And anything the approver has said since in the place the approval was typed, if it was moved here.
@@ -787,14 +790,11 @@ export class BrainAgent extends DurableObject<Env> {
       // What each reply says about this question, read from its own words. The model proposes a
       // decision; it only goes through if a person's message actually says it.
       // A button press is about the question whose card it was on, and about no other.
-      const about = (event: InboxRow) => {
-        const pressed = event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined;
-        return pressed === undefined || pressed === pending.ask;
-      };
+      const about = (event: InboxRow) => isAbout(event, pending.ask);
       // One that is tied to this very question (a press on its card, a reply to its message) need
       // not repeat the code: "可以" under the question is an answer to it.
-      const tied = (event: InboxRow) => (event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined) === pending.ask && pending.ask !== undefined;
-      const says = (event: InboxRow) => (!about(event) ? undefined : tied(event) ? readTiedDecision(event.text ?? "", pending.code) : readDecision(event.text ?? "", pending.code));
+      const tied = (event: InboxRow) => isTiedTo(event, pending.ask);
+      const says = (event: InboxRow) => saysAbout(event, pending);
       const read = replies.map((reply) => ({ ...reply, says: says(reply.event) }));
       const shared = this.#scope().kind !== "user";
       let deciding: (typeof read)[number];
@@ -1061,6 +1061,8 @@ export class BrainAgent extends DurableObject<Env> {
     else if (revision > current.revision) this.#sql.exec("UPDATE revisions SET revision = ?, holder = ? WHERE subject = ?", revision, holder, subject);
     // Told twice about one revision with different texts: nobody holds it. Except that a revision
     // known not to be for the agent stays so, whatever its text is.
+    // known not to be for the agent is so whatever its text, whichever of the two was heard first.
+    else if (revision === current.revision && holder === NOT_FOR_THE_AGENT) this.#sql.exec("UPDATE revisions SET holder = ? WHERE subject = ?", NOT_FOR_THE_AGENT, subject);
     else if (revision === current.revision && holder !== current.holder && current.holder !== NOT_FOR_THE_AGENT) this.#sql.exec("UPDATE revisions SET holder = '' WHERE subject = ?", subject);
   }
 
@@ -1233,6 +1235,22 @@ function renderEvent(event: InboxRow): string {
           ? "a timer you set"
           : `${principal.display ?? principal.id} (automated)`;
   return `[${new Date(event.received_at).toISOString()}] ${event.kind} from ${who}: ${event.text ?? ""}`.trim();
+}
+
+/** A button press or a reply to a question's message is about that question and no other. */
+function isAbout(event: InboxRow, ask: string | undefined): boolean {
+  const question = event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined;
+  return question === undefined || question === ask;
+}
+
+function isTiedTo(event: InboxRow, ask: string | undefined): boolean {
+  return ask !== undefined && (event.data ? (JSON.parse(event.data) as { question?: string }).question : undefined) === ask;
+}
+
+/** What a message says about one open question: by its code, or, if it is tied to the question, in plain words. */
+function saysAbout(event: InboxRow, pending: { code: string; ask?: string }): "allow" | "deny" | undefined {
+  if (!isAbout(event, pending.ask)) return undefined;
+  return isTiedTo(event, pending.ask) ? readTiedDecision(event.text ?? "", pending.code) : readDecision(event.text ?? "", pending.code);
 }
 
 /**

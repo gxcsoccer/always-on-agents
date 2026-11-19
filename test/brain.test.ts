@@ -579,6 +579,22 @@ describe("tasks and approvals", () => {
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow", decided_by: "bob" });
   });
 
+  it("does not re-send an approval on record after another member refuses on the question itself", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    const idem = `ask:${id}:1`;
+    await reply(stub, id, "bob", `approve ${code}`);
+    // The worker never confirmed it: the question still shows as open.
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE tasks SET status = 'needs_input', pending = json_object('id', 'q-1', 'code', ?, 'ask', ?, 'asked_at', 0) WHERE id = ?", code, idem, id);
+    });
+    // carol replies "不行" to the question's own message, without the code.
+    await stub.ingest(message("不行", { user: "carol", session_key: "chat", data: { question: idem } }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBeDefined();
+    expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
+  });
+
   it("never gives the same code to two questions", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     const seen = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT code FROM used_codes")].map((r: any) => r.code));

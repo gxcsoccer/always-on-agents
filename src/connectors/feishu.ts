@@ -179,7 +179,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         route_by_code: true,
         // The message this one was written in reply to, if any. A reply to the agent's question is
         // an answer to that question, whatever its wording.
-        ...(typeof (message.parent_id || message.root_id) === "string" ? { replies_to: `feishu:message:${message.parent_id || message.root_id}` } : {}),
+        // Not inside a topic: there every post points at the topic's first message, so a post
+        // cannot be told from a reply to it, and an answer has to use the button or the code.
+        ...(!message.thread_id && typeof (message.parent_id || message.root_id) === "string" ? { replies_to: `feishu:message:${message.parent_id || message.root_id}` } : {}),
       },
       reply_to: {
         connector: "feishu",
