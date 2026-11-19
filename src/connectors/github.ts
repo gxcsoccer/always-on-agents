@@ -33,9 +33,15 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   } catch {
     return json({ error: "body is not JSON" }, 400);
   }
+  // An App delivery names its installation; a webhook set on one repository names only the repository.
   const installation = payload.installation?.id;
-  const tenant = installation ? await registry(env).tenantForGithubInstallation(String(installation)) : null;
-  if (!tenant) return json({ ignored: "this installation is not linked to a tenant" }, 202);
+  const repoName: unknown = payload.repository?.full_name;
+  const tenant = installation
+    ? await registry(env).tenantForGithubInstallation(String(installation))
+    : typeof repoName === "string"
+      ? await registry(env).tenantForGithubRepo(repoName)
+      : null;
+  if (!tenant) return json({ ignored: "this installation or repository is not linked to a tenant" }, 202);
 
   const normalized = normalize(type, payload);
   if (!normalized) return json({ ignored: `nothing to do for ${type}.${payload.action ?? ""}` }, 202);

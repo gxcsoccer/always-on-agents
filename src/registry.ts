@@ -49,6 +49,7 @@ export class Registry extends DurableObject<Env> {
         bot_open_id TEXT, token TEXT, token_expires_at INTEGER
       );
       DROP TABLE IF EXISTS github_tokens;
+      CREATE TABLE IF NOT EXISTS github_repos (repo TEXT PRIMARY KEY, tenant TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
   }
@@ -85,6 +86,22 @@ export class Registry extends DurableObject<Env> {
       .exec<{ tenant: string }>("SELECT tenant FROM github_installations WHERE installation_id = ?", installationId)
       .toArray();
     return rows[0]?.tenant ?? null;
+  }
+
+  /**
+   * Registers one repository as a tenant's, for a webhook configured on the repository itself
+   * rather than through a GitHub App (such webhooks carry no installation id).
+   */
+  async linkGithubRepo(repo: string, tenant: string): Promise<void> {
+    this.#requireTenant(tenant);
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("repo must be owner/name");
+    const owner = this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0]?.tenant;
+    if (owner && owner !== tenant) throw new Error("that repository is registered to another tenant");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO github_repos (repo, tenant) VALUES (?, ?)", repo.toLowerCase(), tenant);
+  }
+
+  async tenantForGithubRepo(repo: string): Promise<string | null> {
+    return this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0]?.tenant ?? null;
   }
 
   async githubInstallations(tenant: string): Promise<string[]> {

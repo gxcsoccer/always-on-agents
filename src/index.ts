@@ -56,6 +56,10 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     await registry(env).linkGithubInstallation(String((await body()).installation_id ?? ""), path[1]);
     return json({ ok: true });
   }
+  if (path[0] === "tenants" && path[2] === "github-repos" && method === "POST") {
+    await registry(env).linkGithubRepo(String((await body()).repo ?? ""), path[1]);
+    return json({ ok: true });
+  }
   if (path[0] === "tenants" && path[2] === "feishu-apps" && method === "POST") {
     const app = await body();
     await registry(env).setFeishuApp(path[1], {
