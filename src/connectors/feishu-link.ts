@@ -45,7 +45,7 @@ const MAX_FRAME_BYTES = 1_000_000;
 const MAX_IN_FLIGHT = 16;
 
 /** Why something went wrong, as one of a fixed set of words: never text that came from outside. */
-type Trouble = "discovery_unreachable" | "discovery_refused" | "credentials_rejected" | "address_not_feishu" | "upgrade_refused" | "frame_invalid" | "handling_failed" | "too_busy";
+type Trouble = "discovery_unreachable" | "upgrade_unreachable" | "discovery_refused" | "credentials_rejected" | "address_not_feishu" | "upgrade_refused" | "frame_invalid" | "handling_failed" | "too_busy";
 
 interface LinkStats {
   connects: number;
@@ -167,7 +167,9 @@ export class FeishuLink extends DurableObject<Env> {
           method: "POST",
           headers: { "content-type": "application/json", locale: "zh" },
           body: JSON.stringify({ AppID: app.app_id, AppSecret: app.app_secret }),
-          redirect: "error",
+          // Not followed: a redirect would send the app's secret somewhere else. (The runtime
+          // knows "follow" and "manual" only.) A 3xx then counts as a refusal below.
+          redirect: "manual",
           signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
         });
       } catch {
@@ -195,9 +197,17 @@ export class FeishuLink extends DurableObject<Env> {
       address.protocol = "https:";
       let response: Response;
       try {
-        response = await fetch(address.toString(), { headers: { Upgrade: "websocket" }, redirect: "error", signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS) });
+        // The time limit is on the handshake only. A signal that fires on its own later would
+        // cut the connection it belongs to, so this one is disarmed as soon as the answer is in.
+        const handshake = new AbortController();
+        const limit = setTimeout(() => handshake.abort(), CONNECT_TIMEOUT_MS);
+        try {
+          response = await fetch(address.toString(), { headers: { Upgrade: "websocket" }, redirect: "manual", signal: handshake.signal });
+        } finally {
+          clearTimeout(limit);
+        }
       } catch {
-        return this.#failed("discovery_unreachable");
+        return this.#failed("upgrade_unreachable");
       }
       const socket = response.webSocket;
       if (!socket) return this.#failed("upgrade_refused", response.status);
