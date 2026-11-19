@@ -1,9 +1,10 @@
 node_modules/
 .wrangler/
-.dev.vars
 *.log
+
+# Local secrets and deployment details. Never commit these.
 .env
 .env.*
-.deploy.key
-.secrets.json
+.dev.vars
 .deploy.*
+.secrets.json

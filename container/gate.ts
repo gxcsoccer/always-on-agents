@@ -33,7 +33,7 @@ function log(entry: Record<string, unknown>) {
   try {
     appendFileSync(`${TASK_DIRECTORY}/hooks.jsonl`, `${JSON.stringify({ at: Date.now(), ...entry })}\n`);
   } catch {
-    // The log is for the spike; it must never decide the outcome.
+    // The log is for debugging; it must never decide the outcome.
   }
 }
 

@@ -1,5 +1,19 @@
+# Copy to .dev.vars for `pnpm dev`. For a deployment, set the same names with `wrangler secret put`.
+
+# Required
 OPENAI_API_KEY=sk-xxx
-ADMIN_KEY=pick-a-long-random-string
-# Optional
-# GITHUB_WEBHOOK_SECRET=the-secret-configured-on-the-github-app
+# Guards the admin API. Pick a long random string.
+ADMIN_KEY=change-me
+
+# GitHub, as an App (recommended). All four belong together.
+# GITHUB_APP_ID=123456
+# GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+# GITHUB_WEBHOOK_SECRET=the-secret-configured-on-the-app
+# GITHUB_BOT_HANDLE=your-app-slug
+# GITHUB_BOT_EMAIL=123456789+your-app-slug[bot]@users.noreply.github.com
+
+# GitHub, with one token for everything. Local development only.
 # GITHUB_TOKEN=ghp_xxx
+
+# Optional: a regular expression for shell commands inside the sandbox that a person must approve.
+# GATE_HOLD_PATTERN=\\brm\\s+-[a-z]*r
