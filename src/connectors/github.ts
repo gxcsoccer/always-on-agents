@@ -17,19 +17,22 @@ import type { OutboundMessage } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 // The agent's own handle, whole: "@always-on-agent-staging" is someone else.
-const MENTION = /(^|\s)@always-on-agent(?![\w-])|^\s*\/agent(?![\w-])/i;
-// Anything shaped like the code of an approval question. Compared with the codes actually open.
-const CODE_SHAPED = /(?<![A-Za-z0-9])[A-Za-z0-9]{4}(?![A-Za-z0-9])/g;
+const DEFAULT_HANDLE = "always-on-agent";
+/** Matches a mention of exactly this handle (not a longer one that starts with it), or "/agent". */
+const mentionOf = (handle: string, flags = "i") => new RegExp(`(^|\\s)@${handle.replace(/[^\w-]/g, "")}(?:\\[bot\\])?(?![\\w-])|^\\s*\\/agent(?![\\w-])`, flags);
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
+  // Until the signature has been checked the caller is unknown, so every refusal is the same 401,
+  // whatever was wrong: a missing header, a body that is not JSON, an unknown source, a bad signature.
+  const refused = () => json({ error: "not accepted" }, 401);
   const raw = await request.text();
   const type = request.headers.get("x-github-event");
-  if (!type) return json({ error: "missing GitHub headers" }, 400);
+  if (!type) return refused();
   let payload: any;
   try {
     payload = JSON.parse(raw);
   } catch {
-    return json({ error: "body is not JSON" }, 400);
+    return refused();
   }
 
   // Nothing in the body is believed yet; it is only used to pick which secret must have signed it.
@@ -50,32 +53,35 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
     tenant = linkedRepo?.tenant ?? null;
     secret = linkedRepo?.secret;
   }
-  // Until the signature has been checked the caller is unknown, so every refusal looks the same:
-  // nothing here says whether a repository is registered, to whom, or what was wrong.
-  if (!tenant || !secret || !(await verifySignature(secret, raw, request.headers.get("x-hub-signature-256")))) {
-    return json({ error: "not accepted" }, 401);
-  }
+  if (!tenant || !secret || !(await verifySignature(secret, raw, request.headers.get("x-hub-signature-256")))) return refused();
 
-  const normalized = normalize(type, payload);
+  const normalized = normalize(type, payload, env.GITHUB_BOT_HANDLE || DEFAULT_HANDLE);
   if (!normalized) return json({ ignored: `nothing to do for ${type}.${payload.action ?? ""}` }, 202);
+
+  const scope: Scope = { tenant, kind: "repo", id: normalized.repo };
+  const brain = env.BRAIN.getByName(scopeName(scope));
+
+  // A comment that was edited or deleted: what was said in it before no longer stands, whoever
+  // changed it and in whatever order GitHub delivers the events.
+  if (normalized.revise) await brain.revise(normalized.revise.subject, normalized.revise.revision, normalized.revise.deleted);
+  const event = normalized.event;
+  if (!event) return json({ ignored: "recorded" }, 202);
 
   // A linked account acts as that tenant user; an unlinked one is still identified, just not as a
   // user. Accounts are linked by GitHub's numeric id, which never changes hands. A login can be
   // renamed and then claimed by someone else.
-  if (normalized.event.principal.kind === "human") {
-    const accountId = normalized.event.principal.id.replace(/^github:/, "");
+  if (event.principal.kind === "human") {
+    const accountId = event.principal.id.replace(/^github:/, "");
     const user = await registry(env).resolveIdentity(tenant, "github", accountId);
-    if (user) normalized.event.principal.id = user;
+    if (user) event.principal.id = user;
   }
-
-  const scope: Scope = { tenant, kind: "repo", id: normalized.repo };
-  const brain = env.BRAIN.getByName(scopeName(scope));
-  // An unaddressed comment is only for the agent if it quotes the code of a question that is open.
-  if (normalized.onlyIfOpenCode && !(await brain.hasOpenQuestion(normalized.onlyIfOpenCode))) {
+  // An unaddressed comment is only for the agent if it quotes the code of a question that is open
+  // in that same pull request. The whole comment is checked, however long it is.
+  if (normalized.onlyIfQuotes !== undefined && !(await brain.quotesOpenQuestion(normalized.onlyIfQuotes, event.session_key))) {
     return json({ ignored: "the comment does not address the agent" }, 202);
   }
-  const result = await brain.ingest(normalized.event);
-  return json({ ...result, scope: scopeName(scope), kind: normalized.event.kind }, 202);
+  const result = await brain.ingest(event);
+  return json({ ...result, scope: scopeName(scope), kind: event.kind }, 202);
 }
 
 /**
@@ -85,7 +91,12 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
  * the delivery header: that header is outside the signature, so a captured request could be replayed
  * under a new delivery id.
  */
-export function normalize(type: string, payload: any): { repo: string; event: InboundEvent; onlyIfOpenCode?: string[] } | undefined {
+export function normalize(
+  type: string,
+  payload: any,
+  /** The agent's own account name on GitHub, which is how people address it. */
+  handle: string = DEFAULT_HANDLE,
+): { repo: string; event?: InboundEvent; onlyIfQuotes?: string; revise?: { subject: string; revision: number; deleted: boolean } } | undefined {
   const repo: string | undefined = payload.repository?.full_name;
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   const sender = payload.sender ?? {};
@@ -115,45 +126,57 @@ export function normalize(type: string, payload: any): { repo: string; event: In
     };
   }
 
-  if (type === "issue_comment" && ["created", "edited", "deleted"].includes(payload.action)) {
-    // An edit or a deletion is the author saying something new about what they wrote: an approval
-    // edited into a refusal, or deleted, must not leave the original standing. Each arrives as a
-    // further message from that person, after the original.
-    const current: string = payload.comment?.body ?? "";
-    const earlier: string = payload.action === "edited" ? String(payload.changes?.body?.from ?? "") : "";
-    const body = `${current}\n${earlier}`;
-    // Comments that do not address the agent are other people's conversation, with one exception:
-    // a comment that quotes the code of a question the agent has open is a reply to that question,
-    // whatever its wording. Whether a quoted token is such a code is decided by the caller, which
-    // can ask the Brain; here the candidates are collected.
-    const mentioned = MENTION.test(body);
-    const quoted = mentioned ? [] : [...new Set((body.slice(0, 20_000).match(CODE_SHAPED) ?? []).map((token) => token.toUpperCase()))].slice(0, 2_000);
-    if ((!mentioned && quoted.length === 0) || sender.type === "Bot") return undefined;
+  if (type === "issue_comment" && ["created", "edited", "deleted"].includes(payload.action) && Number.isInteger(payload.comment?.id)) {
+    const subject = `github:comment:${payload.comment.id}`;
+    const revision = Date.parse(payload.comment.updated_at ?? payload.comment.created_at ?? "") || 0;
+    // A deletion says nothing; it only makes what the comment said void. It may be a moderator's
+    // doing, so it is never attributed to anyone as a message.
+    if (payload.action === "deleted") return { repo, revise: { subject, revision: Number.MAX_SAFE_INTEGER, deleted: true } };
+    const revise = payload.action === "edited" ? { subject, revision, deleted: false } : undefined;
+
+    const body: string = payload.comment.body ?? "";
+    // Only the author's own words are the author's message. Someone else editing the comment still
+    // voids its earlier text (above), but does not speak for the author.
+    const byAuthor = payload.comment.user?.id === undefined || payload.comment.user.id === sender.id;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
-    if (body.includes("<!-- always-on-agent:")) return undefined;
+    const own = body.includes("<!-- always-on-agent:");
     // Anyone can comment on a public repository. Only people with a standing in it can give the
-    // agent work; a mention from anyone else is not acted on.
-    if (!TRUSTED_ASSOCIATIONS.has(payload.comment?.author_association)) return undefined;
+    // agent work or answer its questions.
+    const trusted = TRUSTED_ASSOCIATIONS.has(payload.comment.author_association);
+    if (!byAuthor || own || !trusted || sender.type === "Bot") return revise ? { repo, revise } : undefined;
+
+    // Comments that do not address the agent are other people's conversation, with one exception:
+    // a comment that quotes the code of a question the agent has open in this pull request is a
+    // reply to that question, whatever its wording. Whether it does is for the caller to ask the
+    // Brain, which is given the whole text (and, for an edit, what it said before).
+    const mentioned = mentionOf(handle).test(body);
     const number = payload.issue.number;
     return {
       repo,
+      revise,
+      ...(mentioned ? {} : { onlyIfQuotes: `${body}\n${payload.action === "edited" ? String(payload.changes?.body?.from ?? "") : ""}` }),
       event: {
         ...base,
-        source_id: payload.action === "created" ? `comment:${payload.comment.id}` : `comment:${payload.comment.id}:${payload.action}:${payload.comment.updated_at ?? ""}`,
+        source_id: payload.action === "created" ? `comment:${payload.comment.id}` : `comment:${payload.comment.id}:edited:${revision}`,
         kind: "message",
         session_key: `pr:${number}`,
         principal: person(true),
         // The agent's own handle is removed here, where it is known. Any other @handle stays in the
         // text, so "@someone-else approve K7PW" is not read as an approval addressed to this agent.
-        text:
-          payload.action === "deleted"
-            ? "[deleted their earlier comment]"
-            : `${payload.action === "edited" ? "[edited their earlier comment to] " : ""}${current.replace(/(^|\s)@always-on-agent(?![\w-])/gi, "$1").trim()}`,
-        data: { number, comment_id: payload.comment.id, is_pull_request: Boolean(payload.issue.pull_request) },
+        text: `${payload.action === "edited" ? "[edited their earlier comment to] " : ""}${body.replace(mentionOf(handle, "gi"), "$1").trim()}`,
+        data: {
+          number,
+          comment_id: payload.comment.id,
+          is_pull_request: Boolean(payload.issue.pull_request),
+          // Which revision of which comment this is, so a later edit or deletion can void it.
+          subject,
+          revision,
+          // Admitted only as a reply to an open question; it is not a request to the agent.
+          ...(mentioned ? {} : { reply_only: true }),
+        },
         reply_to: replyTo(number),
       },
-      ...(mentioned ? {} : { onlyIfOpenCode: quoted }),
     };
   }
 

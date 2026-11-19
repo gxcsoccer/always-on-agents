@@ -73,6 +73,8 @@ export default function (pi: any) {
         return { block: true, reason: `Denied by reviewer: ${reply.reason || "no reason given"}` };
       }
     }
+    // Tell the Worker the question is withdrawn, so it stops showing as open.
+    await ask("gate_timeout", call).catch(() => undefined);
     log({ ...entry, decision: "block", why: "timeout" });
     return { block: true, reason: "No reviewer answered in time, so this command was not run." };
   });

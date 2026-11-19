@@ -20,6 +20,8 @@ export interface Env {
   /** The GitHub App the agent acts as. With these set, tokens are issued per installation and per repository. */
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /** The agent's account name on GitHub (an App's bot is `<app-slug>`), used to recognise mentions. */
+  GITHUB_BOT_HANDLE?: string;
   /** A single deployment-wide token, used only when no App is configured. For local development. */
   GITHUB_TOKEN?: string;
 }

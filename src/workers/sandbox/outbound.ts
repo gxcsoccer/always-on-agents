@@ -53,9 +53,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // Nothing leaves on its behalf any more, with or without credentials.
     if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
 
+    // Credentials are for an exact origin: scheme, host and port. The same host on another port is
+    // a different service and gets neither a credential nor a route.
     const upstream = new URL(this.env.OPENAI_BASE_URL);
-    if (url.hostname === upstream.hostname) return this.#model(request, url, upstream);
-    if (url.hostname === "github.com") return this.#github(request, url);
+    if (url.origin === upstream.origin) return this.#model(request, url, upstream);
+    if (url.origin === "https://github.com") return this.#github(request, url);
     return this.#refuse(request, url, `${url.hostname} is not reachable from this sandbox`);
   }
 

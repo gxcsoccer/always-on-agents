@@ -126,6 +126,8 @@ const MIGRATIONS: string[] = [
      action TEXT NOT NULL,
      detail TEXT
    );`,
+  // 4: the current revision of things people wrote that can be edited or deleted after the fact.
+  `CREATE TABLE revisions (subject TEXT PRIMARY KEY, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

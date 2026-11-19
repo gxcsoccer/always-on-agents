@@ -379,6 +379,18 @@ export class TaskSandbox extends DurableObject<Env> {
     }
 
     state.inbox.push({ at: Date.now(), kind, body });
+    if (kind === "gate_timeout") {
+      // The gate stopped waiting and blocked the call. Its question no longer stands, here or in the Brain.
+      const question = callId ? state.gate_questions[callId] : undefined;
+      if (question && state.pending?.source === "gate" && state.pending.id === question.id) {
+        this.#emit(state, "withdrawn", { id: question.id });
+        state.pending = undefined;
+        if (state.phase === "needs_input") state.phase = "running";
+      }
+      this.#save(state);
+      this.ctx.waitUntil(this.#flush());
+      return { ok: true };
+    }
     if (kind === "needs_input") {
       if (!callId || state.phase !== "running") {
         this.#save(state);
@@ -412,12 +424,13 @@ export class TaskSandbox extends DurableObject<Env> {
    * Answers the call the gate is holding. The answer is stored here and handed to the gate when it
    * next polls; nothing is written into the container. No awaits, so this cannot interleave.
    */
-  async answer(decision: "allow" | "deny", reason: string, questionId?: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  async answer(decision: "allow" | "deny", reason: string, questionId?: string): Promise<{ ok: true; decision: "allow" | "deny" } | { ok: false; error: string }> {
     const state = this.#state();
     if (!state) return { ok: false, error: "no such task" };
     if (decision !== "allow" && decision !== "deny") return { ok: false, error: "decision must be allow or deny" };
-    // Answering the same question again is a retry whose first attempt already landed.
-    if (questionId !== undefined && state.decisions[questionId]) return { ok: true };
+    // A question is answered once. Answering it again returns the answer it already has, which the
+    // guest may have acted on; it cannot be changed after the fact.
+    if (questionId !== undefined && state.decisions[questionId]) return { ok: true, decision: state.decisions[questionId].decision };
     this.#expireHold(state);
     if (state.phase !== "needs_input" || !state.pending) {
       this.#save(state);
@@ -444,7 +457,7 @@ export class TaskSandbox extends DurableObject<Env> {
     state.pending = undefined;
     state.phase = "running";
     this.#save(state);
-    return { ok: true };
+    return { ok: true, decision };
   }
 
   /** Whether the task is still entitled to reach the outside world. */

@@ -86,6 +86,12 @@ describe("the GitHub webhook endpoint", () => {
     // And one from somebody without standing in the repository still is not.
     expect((await deliver(webhook_secret, "issue_comment", comment(repo, 4, `approve ${code}`, "NONE"))).status).toBe(202);
     expect((await brain.inspect()).recent_events.filter((e: any) => e.text?.includes(code) && e.kind === "message")).toHaveLength(1);
+    // The same code quoted in another pull request is not a reply to this one's question.
+    const elsewhere = { ...comment(repo, 5, `deny ${code}`), issue: { number: 9, pull_request: {} } };
+    expect(await (await deliver(webhook_secret, "issue_comment", elsewhere)).json()).toMatchObject({ ignored: expect.any(String) });
+    // A request with no event header, or a body that is not JSON, is refused like any other.
+    expect((await post("/v1/github/webhook", "{}", {})).status).toBe(401);
+    expect((await post("/v1/github/webhook", "not json", { "x-github-event": "ping" })).status).toBe(401);
   });
 });
 

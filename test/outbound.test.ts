@@ -90,6 +90,13 @@ describe("what a sandbox can reach", () => {
     expect(forwarded).toHaveLength(0);
   });
 
+  it("lends credentials to an exact origin, not to the same host on another port", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo" });
+    expect((await send("https://model.test:8443/v1/responses", { method: "POST", body: JSON.stringify({ model: "test-model", input: "hi" }) })).status).toBe(403);
+    expect((await send("https://github.com:8443/acme/demo.git/info/refs?service=git-upload-pack")).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+
   it("blocks every other host and records the attempt", async () => {
     const { send, recorded } = await proxyFor();
     expect((await send("https://example.com/")).status).toBe(403);

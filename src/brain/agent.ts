@@ -100,6 +100,8 @@ export class BrainAgent extends DurableObject<Env> {
   async ingest(event: InboundEvent): Promise<{ accepted: true; duplicate: boolean }> {
     if (!event.source || !event.source_id || !event.kind || !event.session_key) throw new Error("event is missing a required field");
     if ((event.text?.length ?? 0) > 50_000) throw new Error("event text is too long");
+    const subject = event.data?.subject;
+    if (typeof subject === "string") this.#revise(subject, Number(event.data?.revision ?? 0), false);
     const inserted = this.#insertEvent(event);
     // Also on a duplicate: the first delivery may have been stored without its wake-up being scheduled.
     await this.#wakeBy(Date.now() + BATCH_WINDOW_MS);
@@ -681,6 +683,16 @@ export class BrainAgent extends DurableObject<Env> {
     // again; it does not get to make a new one.
     const open = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { id: string }).id : undefined;
     if (intent && intent.pending_id !== open && intent.call_id !== callId) intent = undefined;
+    // An approval on record but not yet confirmed by the worker does not outrank a change of mind:
+    // a refusal proposed now is judged afresh, and an approval is only re-sent if nothing that has
+    // arrived since speaks against it.
+    if (intent?.decision === "allow" && intent.pending_id === open) {
+      const approver = this.#rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
+      const code = (JSON.parse(task.pending) as { code: string }).code;
+      const since = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND id > ?", sessionKey, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal));
+      const against = since.some((event) => (quotes(event.text ?? "", code) && readDecision(event.text ?? "", code) !== "allow") || (JSON.parse(event.principal) as Principal).id === intent!.decided_by);
+      if (decision === "deny" || against || !approver || !this.#stillStands(approver)) intent = undefined;
+    }
     if (!intent) {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
       const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
@@ -710,7 +722,7 @@ export class BrainAgent extends DurableObject<Env> {
         // that arrived after this run started and is still waiting in the inbox.
         const waiting = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at)
           .filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal))
-          .some((event) => readDecision(event.text ?? "", pending.code) === "deny");
+          .some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
         let approvals = read.filter(({ says }) => says === "allow");
         if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${pending.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
@@ -731,6 +743,8 @@ export class BrainAgent extends DurableObject<Env> {
         const saidMore = this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND id > ?", sessionKey, deciding.event.id).some(
           (event) => (JSON.parse(event.principal) as Principal).id === deciding.principal.id,
         );
+        // And it has to be what they still say: not a comment since edited or deleted.
+        if (!this.#stillStands(deciding.event)) throw new Error("that reply has since been edited or deleted; it no longer approves anything");
         if (lastWord.event.id !== deciding.event.id || saidMore) throw new Error(`${deciding.principal.id} said something after approving; ask them to confirm by sending just "approve ${pending.code}" again`);
       }
       intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id };
@@ -741,6 +755,8 @@ export class BrainAgent extends DurableObject<Env> {
 
     const answered = await this.env.TASKS.getByName(taskId).answer(intent.decision, intent.reason, intent.pending_id);
     if (!answered.ok) throw new Error(answered.error);
+    // The worker may already have acted on an earlier answer to this question; report what it holds.
+    const decided = answered.decision ?? intent.decision;
     // Only clear the question that was answered; a newer one may have arrived meanwhile.
     this.#sql.exec(
       "UPDATE tasks SET status = 'running', pending = NULL, updated_at = ? WHERE id = ? AND status = 'needs_input' AND json_extract(pending, '$.id') = ?",
@@ -748,7 +764,7 @@ export class BrainAgent extends DurableObject<Env> {
       taskId,
       intent.pending_id,
     );
-    return { ok: true, task_id: taskId, decision: intent.decision, decided_by: intent.decided_by };
+    return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(decided !== intent.decision ? { note: `the worker had already been told to ${decided}` } : {}) };
   }
 
   async #cancelTask(sessionKey: string, taskId: string): Promise<unknown> {
@@ -873,7 +889,9 @@ export class BrainAgent extends DurableObject<Env> {
    */
   #instructionEditors(runId: string): string[] {
     const principals = this.#runPrincipals(runId);
-    if (principals.length === 0 || !principals.every((p) => this.#isDecider(p))) {
+    // A comment that was only let in as a reply to an approval question is not a request either.
+    const replyOnly = this.#rows<{ data: string | null }>("SELECT data FROM inbox WHERE run_id = ?", runId).some((row) => row.data && JSON.parse(row.data).reply_only === true);
+    if (principals.length === 0 || replyOnly || !principals.every((p) => this.#isDecider(p))) {
       throw new Error("instructions.md can only be changed in a run started solely by a person's request");
     }
     return [...new Set(principals.map((p) => p.id))];
@@ -889,10 +907,43 @@ export class BrainAgent extends DurableObject<Env> {
 
   // ------------------------------------------------------------------ reads for connectors and admins
 
-  /** Whether any of these codes belongs to an approval question that is open in this scope. */
-  async hasOpenQuestion(codes: string[]): Promise<boolean> {
-    const open = new Set(this.#rows<{ code: string | null }>("SELECT json_extract(pending, '$.code') AS code FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL").map((r) => r.code));
-    return codes.some((code) => open.has(code));
+  /**
+   * Whether this text quotes the code of an approval question that is open in this conversation.
+   * The whole text is searched, so a reply cannot be missed for being long.
+   */
+  async quotesOpenQuestion(text: string, sessionKey: string): Promise<boolean> {
+    const codes = this.#rows<{ code: string | null }>(
+      "SELECT json_extract(pending, '$.code') AS code FROM tasks WHERE status = 'needs_input' AND pending IS NOT NULL AND session_key = ?",
+      sessionKey,
+    );
+    return codes.some(({ code }) => code && new RegExp(`(?<![A-Za-z0-9])${code}(?![A-Za-z0-9])`, "i").test(text));
+  }
+
+  /**
+   * Records that something a person wrote (a comment, say) now stands at this revision, or is gone.
+   * A message that came from an earlier revision can no longer decide anything. Revisions only move
+   * forward, so events delivered out of order end in the same state.
+   */
+  async revise(subject: string, revision: number, deleted: boolean): Promise<void> {
+    this.#revise(subject, revision, deleted);
+  }
+
+  #revise(subject: string, revision: number, deleted: boolean): void {
+    this.#sql.exec(
+      `INSERT INTO revisions (subject, revision, deleted) VALUES (?, ?, ?)
+       ON CONFLICT(subject) DO UPDATE SET revision = MAX(revision, excluded.revision), deleted = MAX(deleted, excluded.deleted)`,
+      subject,
+      revision,
+      deleted ? 1 : 0,
+    );
+  }
+
+  /** False if the thing this event was read from has since been edited or deleted. */
+  #stillStands(event: InboxRow): boolean {
+    const data = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number }) : {};
+    if (!data.subject) return true;
+    const current = this.#rows<{ revision: number; deleted: number }>("SELECT revision, deleted FROM revisions WHERE subject = ?", data.subject)[0];
+    return !current || (current.deleted === 0 && current.revision <= (data.revision ?? 0));
   }
 
   /** Records where this scope's messages go when an event does not say. Set by the first connector to reach it. */
@@ -985,6 +1036,11 @@ function renderEvent(event: InboxRow): string {
           ? "a timer you set"
           : `${principal.display ?? principal.id} (automated)`;
   return `[${new Date(event.received_at).toISOString()}] ${event.kind} from ${who}: ${event.text ?? ""}`.trim();
+}
+
+/** Whether a message mentions this question's code at all. */
+function quotes(text: string, code: string): boolean {
+  return new RegExp(`(?<![A-Za-z0-9])${code}(?![A-Za-z0-9])`, "i").test(text);
 }
 
 /** What a held request would do, in words. Built from the worker's structured report. */
