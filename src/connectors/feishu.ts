@@ -79,10 +79,19 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
   if (app.verification_token && body.header?.token !== app.verification_token) return rejected("wrong_token");
   if (body.header?.app_id !== app.app_id) return rejected("wrong_app");
 
+  return json(await receiveFeishu(env, app, body, defer));
+}
+
+/**
+ * Handles one event or card callback from Feishu that is known to be genuine: a webhook delivery
+ * after its signature has been checked, or a frame from the long connection. Returns what Feishu
+ * should be answered with.
+ */
+export async function receiveFeishu(env: Env, app: FeishuApp, body: any, defer?: (work: Promise<unknown>) => void): Promise<unknown> {
   // A button pressed on one of the agent's cards. Feishu shows what we return as a toast.
   if (body.header?.event_type === "card.action.trigger") {
     const pressed = normalizeCardAction(app, body);
-    if (!pressed) return json({ toast: { type: "error", content: "这个操作无法处理" } });
+    if (!pressed) return { toast: { type: "error", content: "这个操作无法处理" } };
     // The press is filed before the person is told it was received: a refusal that was shown as
     // received and then lost would leave an approval free to go through. Feishu, though, shows an
     // error unless it is answered within three seconds. So filing gets most of that time; if it
@@ -94,21 +103,21 @@ export async function handleFeishuWebhook(request: Request, env: Env, appId: str
       .then(
         () => "filed" as const,
         (err: unknown) => {
-          console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: appId }));
+          console.log(JSON.stringify({ feishu_press_not_filed: String(err).slice(0, 300), app: app.app_id }));
           return "failed" as const;
         },
       );
     const outcome = defer ? await Promise.race([filing, new Promise<"slow">((resolve) => setTimeout(() => resolve("slow"), PRESS_FILING_BUDGET_MS))]) : await filing;
     if (outcome === "slow") defer?.(filing);
-    if (outcome === "filed") return json({ toast: { type: "info", content: `已收到你的选择：${said}。结果会在对话里回复` } });
-    if (outcome === "failed") return json({ toast: { type: "error", content: `没能记下你的选择（${said}），请再点一次` } });
-    return json({ toast: { type: "warning", content: `正在记录你的选择：${said}。如果对话里一直没有回应，请再点一次` } });
+    if (outcome === "filed") return { toast: { type: "info", content: `已收到你的选择：${said}。结果会在对话里回复` } };
+    if (outcome === "failed") return { toast: { type: "error", content: `没能记下你的选择（${said}），请再点一次` } };
+    return { toast: { type: "warning", content: `正在记录你的选择：${said}。如果对话里一直没有回应，请再点一次` } };
   }
 
   const normalized = normalize(app, body);
-  if (!normalized) return json({ ignored: true });
+  if (!normalized) return { ignored: true };
   const brain = env.BRAIN.getByName(scopeName(normalized.scope));
-  return json({ ...(await brain.ingest(normalized.event)), scope: scopeName(normalized.scope) });
+  return { ...(await brain.ingest(normalized.event)), scope: scopeName(normalized.scope) };
 }
 
 /**

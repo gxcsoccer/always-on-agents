@@ -1,11 +1,13 @@
 import type { BrainAgent } from "./brain/agent";
 import type { Registry } from "./registry";
+import type { FeishuLink } from "./connectors/feishu-link";
 import type { TaskSandbox } from "./workers/sandbox/task";
 
 export interface Env {
   BRAIN: DurableObjectNamespace<BrainAgent>;
   TASKS: DurableObjectNamespace<TaskSandbox>;
   REGISTRY: DurableObjectNamespace<Registry>;
+  FEISHU_LINKS: DurableObjectNamespace<FeishuLink>;
   CHECKPOINTS: R2Bucket;
 
   /** Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host. */

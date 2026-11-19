@@ -23,7 +23,8 @@
     "bindings": [
       { "name": "BRAIN", "class_name": "BrainAgent" },
       { "name": "TASKS", "class_name": "TaskSandbox" },
-      { "name": "REGISTRY", "class_name": "Registry" }
+      { "name": "REGISTRY", "class_name": "Registry" },
+      { "name": "FEISHU_LINKS", "class_name": "FeishuLink" }
     ]
   },
   "containers": [
@@ -38,7 +39,10 @@
   "exports": {
     "BrainAgent": { "type": "durable-object", "storage": "sqlite" },
     "TaskSandbox": { "type": "durable-object", "storage": "sqlite" },
-    "Registry": { "type": "durable-object", "storage": "sqlite" }
+    "Registry": { "type": "durable-object", "storage": "sqlite" },
+    "FeishuLink": { "type": "durable-object", "storage": "sqlite" }
   },
+  // The backstop for Feishu long connections; see `scheduled` in src/index.ts.
+  "triggers": { "crons": ["* * * * *"] },
   "observability": { "enabled": true }
 }

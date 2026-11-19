@@ -11,6 +11,7 @@ import { registry } from "./registry";
 
 export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
+export { FeishuLink } from "./connectors/feishu-link";
 export { Outbound } from "./workers/sandbox/outbound";
 export { DirectoryBackupGateway, TaskSandbox } from "./workers/sandbox/task";
 
@@ -42,6 +43,19 @@ export default {
       return json({ error: err instanceof Error ? err.message : String(err) }, 500);
     }
   },
+  /**
+   * Every minute: make sure each long connection's watchdog is running. The watchdog rearms
+   * itself; this is for the case where it could not, such as an object that failed to start.
+   */
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        for (const appId of await registry(env).feishuLongConnectionApps()) {
+          await env.FEISHU_LINKS.getByName(appId).ensure(appId).catch((err) => console.log(JSON.stringify({ feishu_link_not_ensured: String(err).slice(0, 300), app: appId })));
+        }
+      })(),
+    );
+  },
 } satisfies ExportedHandler<Env>;
 
 async function admin(request: Request, env: Env, path: string[], url: URL): Promise<Response> {
@@ -68,8 +82,16 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
       encrypt_key: app.encrypt_key ? String(app.encrypt_key) : undefined,
       verification_token: app.verification_token ? String(app.verification_token) : undefined,
       bot_open_id: app.bot_open_id ? String(app.bot_open_id) : undefined,
+      transport: app.transport === undefined ? undefined : app.transport,
     });
+    // Over the long connection there is nothing for Feishu to call; we connect to it instead.
+    if (app.transport === "long_connection") {
+      return json({ ok: true, transport: "long_connection", link: await env.FEISHU_LINKS.getByName(String(app.app_id)).ensure(String(app.app_id)) });
+    }
     return json({ ok: true, webhook: `${url.origin}/v1/feishu/events/${app.app_id}` });
+  }
+  if (path[0] === "feishu-links" && path[1] && method === "GET") {
+    return json(await env.FEISHU_LINKS.getByName(path[1]).status());
   }
   if (path[0] === "tenants" && path[2] === "chat-repos" && method === "POST") {
     const { chat, repo } = await body();

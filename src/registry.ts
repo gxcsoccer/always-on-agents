@@ -17,6 +17,8 @@ export interface FeishuApp {
   bot_open_id: string | null;
   token: string | null;
   token_expires_at: number | null;
+  /** How this app's events reach us: Feishu calls our webhook, or we hold a connection open to Feishu. */
+  transport: "webhook" | "long_connection";
 }
 
 export interface Tenant {
@@ -54,6 +56,7 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
+    this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
   }
 
   /** Adds a column to a table made by an earlier deploy. A no-op once it exists. */
@@ -123,28 +126,41 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Registers (or updates) the Feishu bot app a tenant uses. Its webhook is /v1/feishu/events/<app_id>. */
-  async setFeishuApp(tenant: string, app: { app_id: string; app_secret: string; encrypt_key?: string; verification_token?: string; bot_open_id?: string }): Promise<void> {
+  async setFeishuApp(
+    tenant: string,
+    app: { app_id: string; app_secret: string; encrypt_key?: string; verification_token?: string; bot_open_id?: string; transport?: "webhook" | "long_connection" },
+  ): Promise<void> {
     this.#requireTenant(tenant);
     if (!/^[A-Za-z0-9_]{1,64}$/.test(app.app_id) || !app.app_secret) throw new Error("app_id and app_secret are required");
-    if (!app.encrypt_key) throw new Error("an encrypt_key is required: events are only accepted encrypted and signed");
+    const transport = app.transport ?? "webhook";
+    if (transport !== "webhook" && transport !== "long_connection") throw new Error("transport must be webhook or long_connection");
+    // Over the long connection nothing is delivered to a public address, so there is nothing to
+    // encrypt or sign. A webhook is only served encrypted and signed.
+    if (transport === "webhook" && !app.encrypt_key) throw new Error("an encrypt_key is required: events are only accepted encrypted and signed");
     const owner = this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM feishu_apps WHERE app_id = ?", app.app_id).toArray()[0]?.tenant;
     if (owner && owner !== tenant) throw new Error("that app is registered to another tenant");
     this.ctx.storage.sql.exec(
-      `INSERT INTO feishu_apps (app_id, tenant, app_secret, encrypt_key, verification_token, bot_open_id) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO feishu_apps (app_id, tenant, app_secret, encrypt_key, verification_token, bot_open_id, transport) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(app_id) DO UPDATE SET app_secret = excluded.app_secret, encrypt_key = excluded.encrypt_key,
-         verification_token = excluded.verification_token, bot_open_id = excluded.bot_open_id, token = NULL, token_expires_at = NULL`,
+         verification_token = excluded.verification_token, bot_open_id = excluded.bot_open_id, transport = excluded.transport, token = NULL, token_expires_at = NULL`,
       app.app_id,
       tenant,
       app.app_secret,
       app.encrypt_key ?? null,
       app.verification_token ?? null,
       app.bot_open_id ?? null,
+      transport,
     );
   }
 
   async feishuApp(appId: string): Promise<FeishuApp | null> {
     const row = this.ctx.storage.sql.exec("SELECT * FROM feishu_apps WHERE app_id = ?", appId).toArray()[0] as unknown as FeishuApp | undefined;
     return row ? { ...row } : null;
+  }
+
+  /** The apps whose events arrive over a connection we hold open. */
+  async feishuLongConnectionApps(): Promise<string[]> {
+    return this.ctx.storage.sql.exec<{ app_id: string }>("SELECT app_id FROM feishu_apps WHERE transport = 'long_connection'").toArray().map((row) => row.app_id);
   }
 
   async saveFeishuToken(appId: string, token: string, expiresAt: number): Promise<void> {
