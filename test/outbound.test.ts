@@ -204,6 +204,13 @@ describe("git over the proxy", () => {
     expect(forwarded).toHaveLength(0);
   });
 
+  it("does not send even a push that moves nothing once the task's access was withdrawn", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", tokenWithdrawnAfter: 1 });
+    const response = await push(send, "acme/demo", new TextEncoder().encode("0000"));
+    expect(response.status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+
   it("holds a push until someone approves exactly those refs, then forwards it unchanged", async () => {
     const { send, recorded } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "pending", reason: "" }, { state: "allow", reason: "ok" }] });
     const body = pushBody(`${A} ${B} refs/heads/main`);

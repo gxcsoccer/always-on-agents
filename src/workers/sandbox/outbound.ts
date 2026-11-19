@@ -135,20 +135,23 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     if (!refs) return this.#refuse(request, url, "could not read what this push would change");
     // Reading the body took time; the task may have ended since the check at the door.
     if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
-    if (refs.length === 0) return fetch(url, { method: "POST", headers, body, redirect: "manual" });
+    // Whatever is sent from here on goes out under a credential asked for at that moment: reading
+    // the body and waiting for a person both take time, and access may have been withdrawn since.
+    const send = async (): Promise<Response> => {
+      const current = await this.#task.githubToken();
+      if (!current) return new Response(`this task is no longer allowed a credential for ${git.repo}\n`, { status: 403 });
+      headers.set("authorization", `Basic ${btoa(`x-access-token:${current}`)}`);
+      return fetch(url, { method: "POST", headers, body, redirect: "manual" });
+    };
+    // A push that moves no refs needs nobody's approval.
+    if (refs.length === 0) return send();
 
     const verdict = await this.#authorize(git.repo, refs);
     if (verdict.state !== "allow") {
       return new Response(`push to ${git.repo} was not approved: ${verdict.reason}\n`, { status: 403 });
     }
     if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
-    // The wait for a person can be long. Whether this task may still be lent a credential for the
-    // repository is asked again now, and the push goes out under that answer, not the one from
-    // before the wait: an operator may have withdrawn the task's access in the meantime.
-    const current = await this.#task.githubToken();
-    if (!current) return new Response(`push to ${git.repo} was approved, but this task is no longer allowed a credential for it\n`, { status: 403 });
-    headers.set("authorization", `Basic ${btoa(`x-access-token:${current}`)}`);
-    return fetch(url, { method: "POST", headers, body, redirect: "manual" });
+    return send();
   }
 
   /**
