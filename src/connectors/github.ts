@@ -19,7 +19,54 @@ const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 // The agent's own handle, whole: "@always-on-agent-staging" is someone else.
 const DEFAULT_HANDLE = "always-on-agent";
 /** Matches a mention of exactly this handle (not a longer one that starts with it), or "/agent". */
-const mentionOf = (handle: string, flags = "i") => new RegExp(`(^|\\s)@${handle.replace(/[^\w-]/g, "")}(?:\\[bot\\])?(?![\\w-])|^\\s*\\/agent(?![\\w-])`, flags);
+const mentionOf = (handle: string, flags = "i") =>
+  new RegExp(`(?<![\\w@/.-])@${handle.replace(/[^\w-]/g, "")}(?:\\[bot\\])?(?![\\w-])|^\\s*\\/agent(?![\\w-])`, flags);
+
+/** A comment's own words: without the lines it quotes from others and without code. */
+function ownWords(body: string): string {
+  return body
+    .replace(/```[\s\S]*?(```|$)/g, " ")
+    .replace(/`[^`\n]*`/g, " ")
+    .split("\n")
+    .filter((line) => !/^\s*>/.test(line))
+    .join("\n");
+}
+
+/** A short fingerprint of a comment's text, to tell two revisions with the same timestamp apart. */
+export function fingerprint(text: string): string {
+  let a = 0xdeadbeef;
+  let b = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 2654435761);
+    b = Math.imul(b ^ c, 1597334677);
+  }
+  a = Math.imul(a ^ (a >>> 16), 2246822507) ^ Math.imul(b ^ (b >>> 13), 3266489909);
+  b = Math.imul(b ^ (b >>> 16), 2246822507) ^ Math.imul(a ^ (a >>> 13), 3266489909);
+  return `${(b >>> 0).toString(16)}${(a >>> 0).toString(16)}:${text.length}`;
+}
+
+/** Where a subject like "github:comment:123" stands on GitHub right now. */
+export type Standing = { revision: number; holder: string; deleted: boolean };
+
+/**
+ * Asks GitHub what a comment says now. Webhooks can lag, so before an approval is acted on the
+ * comment it was read from is looked at again. Returns undefined when this deployment has no
+ * credential for the repository (then it could not have posted the question either).
+ */
+export async function commentStanding(env: Env, scope: Scope, subject: string): Promise<Standing | undefined> {
+  const id = /^github:comment:(\d+)$/.exec(subject)?.[1];
+  if (!id || scope.kind !== "repo") return undefined;
+  const issued = await githubTokenFor(env, scope.tenant, scope.id);
+  if (!issued) return undefined;
+  const response = await fetch(`https://api.github.com/repos/${scope.id}/issues/comments/${id}`, {
+    headers: { authorization: `Bearer ${issued.token}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent" },
+  });
+  if (response.status === 404 || response.status === 410) return { revision: Number.MAX_SAFE_INTEGER, holder: "", deleted: true };
+  if (!response.ok) throw new Error(`GitHub could not be asked what the comment says now (${response.status})`);
+  const comment = (await response.json()) as { body?: string; updated_at?: string; created_at?: string };
+  return { revision: Date.parse(comment.updated_at ?? comment.created_at ?? "") || 0, holder: fingerprint(comment.body ?? ""), deleted: false };
+}
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   // Until the signature has been checked the caller is unknown, so every refusal is the same 401,
@@ -39,13 +86,14 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // An App delivery names its installation and is signed with the App's secret. A webhook set on
   // one repository names only the repository and is signed with that repository's own secret, so
   // knowing one repository's secret is no help in forging events for another.
-  const installation = payload?.installation?.id;
+  const installationId: unknown = payload?.installation?.id;
+  const installation = typeof installationId === "number" || typeof installationId === "string" ? String(installationId) : undefined;
   const repoName: unknown = payload?.repository?.full_name;
   const linkedRepo = typeof repoName === "string" && /^[\w.-]+\/[\w.-]+$/.test(repoName) ? await registry(env).githubRepo(repoName) : null;
   let tenant: string | null;
   let secret: string | null | undefined;
   if (installation) {
-    tenant = await registry(env).tenantForGithubInstallation(String(installation));
+    tenant = await registry(env).tenantForGithubInstallation(installation);
     secret = env.GITHUB_WEBHOOK_SECRET;
     // A repository claimed by one tenant must not arrive through another tenant's installation.
     if (tenant && linkedRepo && linkedRepo.tenant !== tenant) tenant = null;
@@ -63,7 +111,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
 
   // A comment that was edited or deleted: what was said in it before no longer stands, whoever
   // changed it and in whatever order GitHub delivers the events.
-  if (normalized.revise) await brain.revise(normalized.revise.subject, normalized.revise.revision, normalized.revise.deleted);
+  if (normalized.revise) await brain.revise(normalized.revise.subject, normalized.revise.revision, normalized.revise.deleted, normalized.revise.holder);
   const event = normalized.event;
   if (!event) return json({ ignored: "recorded" }, 202);
 
@@ -96,7 +144,7 @@ export function normalize(
   payload: any,
   /** The agent's own account name on GitHub, which is how people address it. */
   handle: string = DEFAULT_HANDLE,
-): { repo: string; event?: InboundEvent; onlyIfQuotes?: string; revise?: { subject: string; revision: number; deleted: boolean } } | undefined {
+): { repo: string; event?: InboundEvent; onlyIfQuotes?: string; revise?: { subject: string; revision: number; deleted: boolean; holder: string } } | undefined {
   const repo: string | undefined = payload.repository?.full_name;
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   const sender = payload.sender ?? {};
@@ -131,31 +179,34 @@ export function normalize(
     const revision = Date.parse(payload.comment.updated_at ?? payload.comment.created_at ?? "") || 0;
     // A deletion says nothing; it only makes what the comment said void. It may be a moderator's
     // doing, so it is never attributed to anyone as a message.
-    if (payload.action === "deleted") return { repo, revise: { subject, revision: Number.MAX_SAFE_INTEGER, deleted: true } };
-    const revise = payload.action === "edited" ? { subject, revision, deleted: false } : undefined;
+    if (payload.action === "deleted") return { repo, revise: { subject, revision: Number.MAX_SAFE_INTEGER, deleted: true, holder: "" } };
+    const body: string = String(payload.comment.body ?? "").slice(0, 70_000);
+    // What the comment says at this revision. Two revisions can carry the same timestamp (GitHub's
+    // are whole seconds); the fingerprint of the text tells them apart.
+    const holder = fingerprint(body);
+    const revise = { subject, revision, deleted: false, holder };
 
-    const body: string = payload.comment.body ?? "";
     // Only the author's own words are the author's message. Someone else editing the comment still
     // voids its earlier text (above), but does not speak for the author.
-    const byAuthor = payload.comment.user?.id === undefined || payload.comment.user.id === sender.id;
+    const byAuthor = payload.comment.user?.id !== undefined && payload.comment.user.id === sender.id;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
     const own = body.includes("<!-- always-on-agent:");
     // Anyone can comment on a public repository. Only people with a standing in it can give the
     // agent work or answer its questions.
     const trusted = TRUSTED_ASSOCIATIONS.has(payload.comment.author_association);
-    if (!byAuthor || own || !trusted || sender.type === "Bot") return revise ? { repo, revise } : undefined;
+    if (!byAuthor || own || !trusted || sender.type === "Bot") return payload.action === "edited" ? { repo, revise } : undefined;
 
     // Comments that do not address the agent are other people's conversation, with one exception:
     // a comment that quotes the code of a question the agent has open in this pull request is a
     // reply to that question, whatever its wording. Whether it does is for the caller to ask the
-    // Brain, which is given the whole text (and, for an edit, what it said before).
-    const mentioned = mentionOf(handle).test(body);
+    // Brain, which is given the whole text. A mention inside a quotation or code is not a mention.
+    const mentioned = mentionOf(handle, "im").test(ownWords(body));
     const number = payload.issue.number;
     return {
       repo,
       revise,
-      ...(mentioned ? {} : { onlyIfQuotes: `${body}\n${payload.action === "edited" ? String(payload.changes?.body?.from ?? "") : ""}` }),
+      ...(mentioned ? {} : { onlyIfQuotes: body }),
       event: {
         ...base,
         source_id: payload.action === "created" ? `comment:${payload.comment.id}` : `comment:${payload.comment.id}:edited:${revision}`,
@@ -164,7 +215,7 @@ export function normalize(
         principal: person(true),
         // The agent's own handle is removed here, where it is known. Any other @handle stays in the
         // text, so "@someone-else approve K7PW" is not read as an approval addressed to this agent.
-        text: `${payload.action === "edited" ? "[edited their earlier comment to] " : ""}${body.replace(mentionOf(handle, "gi"), "$1").trim()}`,
+        text: `${payload.action === "edited" ? "[edited their earlier comment to] " : ""}${body.replace(mentionOf(handle, "gim"), "").trim()}`,
         data: {
           number,
           comment_id: payload.comment.id,
@@ -172,6 +223,7 @@ export function normalize(
           // Which revision of which comment this is, so a later edit or deletion can void it.
           subject,
           revision,
+          holder,
           // Admitted only as a reply to an open question; it is not a request to the agent.
           ...(mentioned ? {} : { reply_only: true }),
         },

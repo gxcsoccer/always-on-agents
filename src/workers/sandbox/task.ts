@@ -118,7 +118,7 @@ export interface TaskState {
   /** How many times the task was restored into a new container. */
   recoveries: number;
   /** For the in-process gate: which question we opened for which of its tool calls. */
-  gate_questions: Record<string, { id: string; command: string }>;
+  gate_questions: Record<string, { id: string; command: string; closed?: boolean }>;
   /** Answers, keyed by question id. Kept here, outside the container, so the guest cannot write one. */
   decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number }>;
   /** Stand-in for the Brain's inbox: everything the container pushed to us. */
@@ -182,6 +182,9 @@ const GRANT_TTL_MS = 2 * 60 * 1_000;
 const PROXY_HOLD_MS = 50 * 60 * 1_000;
 /** The holder polls every two seconds. Silence this long means it is gone. */
 const PROXY_ABANDONED_MS = 60 * 1_000;
+/** The gate waits 55 minutes and polls every two seconds. Past either of these it is not waiting any more. */
+const GATE_HOLD_MS = 57 * 60 * 1_000;
+const GATE_ABANDONED_MS = 5 * 60 * 1_000;
 const MAX_SHOWN_COMMAND = 3_000;
 // The gate waits this long for an answer, then blocks the call.
 const MAX_WAIT_FOR_ANSWER_S = 55 * 60;
@@ -375,18 +378,22 @@ export class TaskSandbox extends DurableObject<Env> {
     if (kind === "decision") {
       const question = callId ? state.gate_questions[callId] : undefined;
       const answer = question && question.command === command ? state.decisions[question.id] : undefined;
-      return answer ? { ok: true, decision: answer.decision, reason: answer.reason } : { ok: true, decision: "pending" };
+      if (answer) return { ok: true, decision: answer.decision, reason: answer.reason };
+      // A question that was withdrawn can no longer be answered; the gate is told so rather than left waiting.
+      if (question?.closed) return { ok: true, decision: "deny", reason: "the question expired without an answer" };
+      // The gate is still there. Noted now and then, so a gate that has gone away is noticed.
+      if (question && state.pending?.source === "gate" && state.pending.id === question.id && Date.now() - (state.pending.polled_at ?? 0) > 20_000) {
+        state.pending.polled_at = Date.now();
+        this.#save(state);
+      }
+      return { ok: true, decision: "pending" };
     }
 
     state.inbox.push({ at: Date.now(), kind, body });
     if (kind === "gate_timeout") {
       // The gate stopped waiting and blocked the call. Its question no longer stands, here or in the Brain.
       const question = callId ? state.gate_questions[callId] : undefined;
-      if (question && state.pending?.source === "gate" && state.pending.id === question.id) {
-        this.#emit(state, "withdrawn", { id: question.id });
-        state.pending = undefined;
-        if (state.phase === "needs_input") state.phase = "running";
-      }
+      if (question) this.#closeGateQuestion(state, question.id);
       this.#save(state);
       this.ctx.waitUntil(this.#flush());
       return { ok: true };
@@ -406,7 +413,7 @@ export class TaskSandbox extends DurableObject<Env> {
       const id = `q-${state.asks}`;
       state.gate_questions[callId] = { id, command };
       state.phase = "needs_input";
-      state.pending = { id, source: "gate", tool_name: request.tool_name, command, asked_at: Date.now() };
+      state.pending = { id, source: "gate", tool_name: request.tool_name, command, asked_at: Date.now(), polled_at: Date.now() };
       // People are shown the whole command or told that they are not; never a silent prefix.
       this.#emit(state, "needs_input", { source: "gate", id, command: command.slice(0, MAX_SHOWN_COMMAND), truncated: command.length > MAX_SHOWN_COMMAND });
     } else if (kind === "progress") {
@@ -587,11 +594,27 @@ export class TaskSandbox extends DurableObject<Env> {
     }
   }
 
+  /** The gate's question no longer stands, here or in the Brain, and can no longer be answered. */
+  #closeGateQuestion(state: TaskState, id: string): void {
+    for (const question of Object.values(state.gate_questions)) if (question.id === id) question.closed = true;
+    if (state.pending?.source === "gate" && state.pending.id === id) {
+      state.inbox.push({ at: Date.now(), kind: "withdrawn", body: { id } });
+      this.#emit(state, "withdrawn", { id });
+      state.pending = undefined;
+      if (state.phase === "needs_input") state.phase = "running";
+    }
+  }
+
   /** A held request whose time is up, or whose handler has stopped checking in, no longer stands. */
   #expireHold(state: TaskState): void {
     const pending = state.pending;
-    if (pending?.source !== "proxy" || !pending.key) return;
     const now = Date.now();
+    // The gate's own notice that it gave up can be lost, so its questions expire here as well.
+    if (pending?.source === "gate" && (now - pending.asked_at > GATE_HOLD_MS || now - (pending.polled_at ?? pending.asked_at) > GATE_ABANDONED_MS)) {
+      this.#closeGateQuestion(state, pending.id);
+      return;
+    }
+    if (pending?.source !== "proxy" || !pending.key) return;
     if (now - pending.asked_at > PROXY_HOLD_MS || now - (pending.polled_at ?? pending.asked_at) > PROXY_ABANDONED_MS) this.#withdraw(state, pending.key);
   }
 

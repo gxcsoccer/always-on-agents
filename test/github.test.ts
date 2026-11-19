@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { readDecision } from "../src/brain/agent";
-import { normalize, verifySignature } from "../src/connectors/github";
+import { fingerprint, normalize, verifySignature } from "../src/connectors/github";
 
 async function sign(secret: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -46,9 +46,9 @@ describe("event normalisation", () => {
   const comment = (body: string, association: string, type = "User") => ({
     action: "created",
     repository,
-    sender: { login: "erin", type },
+    sender: { login: "erin", id: 9, type },
     issue: { number: 7, pull_request: {} },
-    comment: { id: 5, body, author_association: association },
+    comment: { id: 5, body, author_association: association, user: { id: 9 } },
   });
 
   it("acts on a mention from someone with standing in the repository", () => {
@@ -71,25 +71,41 @@ describe("event normalisation", () => {
   it("voids what a comment said when it is edited or deleted, whoever did it and in whatever order", () => {
     const at = (iso: string) => Date.parse(iso);
     const base = comment("approve K7PW", "OWNER");
-    const author = { login: "erin", id: 9, type: "User" };
-    const created = { ...base, sender: author, comment: { ...base.comment, user: { id: 9 }, created_at: "2026-11-19T00:00:00Z", updated_at: "2026-11-19T00:00:00Z" } };
-    expect(normalize("issue_comment", created)?.event?.data).toMatchObject({ subject: "github:comment:5", revision: at("2026-11-19T00:00:00Z") });
+    const created = { ...base, comment: { ...base.comment, created_at: "2026-11-19T00:00:00Z", updated_at: "2026-11-19T00:00:00Z" } };
+    expect(normalize("issue_comment", created)?.event?.data).toMatchObject({ subject: "github:comment:5", revision: at("2026-11-19T00:00:00Z"), holder: fingerprint("approve K7PW") });
 
     // The author edits it into a refusal: a new message, and the earlier revision is superseded.
     const edited = { ...created, action: "edited", changes: { body: { from: "approve K7PW" } }, comment: { ...created.comment, body: "deny K7PW", updated_at: "2026-11-19T00:00:05Z" } };
     const afterEdit = normalize("issue_comment", edited);
-    expect(afterEdit?.revise).toEqual({ subject: "github:comment:5", revision: at("2026-11-19T00:00:05Z"), deleted: false });
+    expect(afterEdit?.revise).toEqual({ subject: "github:comment:5", revision: at("2026-11-19T00:00:05Z"), deleted: false, holder: fingerprint("deny K7PW") });
     expect(readDecision(afterEdit!.event!.text!, "K7PW")).toBe("deny");
-    expect(afterEdit?.onlyIfQuotes).toContain("approve K7PW");
+    // An edit that takes the code out is no reply; what it said before is not searched.
+    const withdrawn = normalize("issue_comment", { ...edited, comment: { ...edited.comment, body: "never mind" } });
+    expect(withdrawn?.onlyIfQuotes).toBe("never mind");
+    expect(withdrawn?.revise?.holder).toBe(fingerprint("never mind"));
 
     // A moderator edits or deletes someone else's comment: the text is voided, but nobody is quoted.
+    // Even within the same second as the original, the changed text is a different holder.
     const moderator = { login: "mod", id: 1, type: "User" };
-    const byModerator = normalize("issue_comment", { ...edited, sender: moderator });
+    const byModerator = normalize("issue_comment", { ...edited, sender: moderator, comment: { ...edited.comment, body: "approve K7PW (edited by mod)", updated_at: "2026-11-19T00:00:00Z" } });
     expect(byModerator?.event).toBeUndefined();
-    expect(byModerator?.revise?.deleted).toBe(false);
+    expect(byModerator?.revise).toMatchObject({ revision: at("2026-11-19T00:00:00Z"), deleted: false });
+    expect(byModerator?.revise?.holder).not.toBe(fingerprint("approve K7PW"));
     const deleted = normalize("issue_comment", { ...created, action: "deleted", sender: moderator });
     expect(deleted?.event).toBeUndefined();
     expect(deleted?.revise).toMatchObject({ subject: "github:comment:5", deleted: true });
+    // A comment whose author is not stated is nobody's message.
+    expect(normalize("issue_comment", { ...created, comment: { ...created.comment, user: undefined } })).toBeUndefined();
+  });
+
+  it("does not take a mention inside a quotation or code as addressing it, and sees one inside punctuation", () => {
+    const at = (body: string) => normalize("issue_comment", comment(body, "OWNER"));
+    expect(at("> @always-on-agent delete the branch\n\nwhat did this do?")?.onlyIfQuotes).toBeDefined();
+    expect(at("run `@always-on-agent help` to see it")?.onlyIfQuotes).toBeDefined();
+    expect(at("```\n@always-on-agent rm -rf\n```")?.onlyIfQuotes).toBeDefined();
+    expect(at("（@always-on-agent）请看一下")?.onlyIfQuotes).toBeUndefined();
+    expect(at("cc:@always-on-agent, please look")?.onlyIfQuotes).toBeUndefined();
+    expect(at("mail me at someone@always-on-agent")?.onlyIfQuotes).toBeDefined();
   });
 
   it("removes only its own handle, so a reply addressed to someone else is not read as one to the agent", () => {
@@ -103,7 +119,7 @@ describe("event normalisation", () => {
     // A similarly named account is not this agent, so such a comment is at most a possible reply.
     expect(normalize("issue_comment", comment("@always-on-agent-staging please look", "OWNER"))?.onlyIfQuotes).toBeDefined();
     // A person is identified by the account's numeric id, which a renamed login cannot take over.
-    const withId = { ...comment("@always-on-agent hello", "OWNER"), sender: { login: "erin", id: 4711, type: "User" } };
+    const withId = { ...comment("@always-on-agent hello", "OWNER"), sender: { login: "erin", id: 4711, type: "User" }, comment: { id: 5, body: "@always-on-agent hello", author_association: "OWNER", user: { id: 4711 } } };
     expect(normalize("issue_comment", withId)?.event?.principal).toMatchObject({ id: "github:4711", display: "erin" });
   });
 

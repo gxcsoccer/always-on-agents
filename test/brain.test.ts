@@ -357,6 +357,8 @@ describe("tasks and approvals", () => {
     await reopen();
     const late = await reply(stub, id, "carol", `deny ${code}`, "deny");
     expect(late).toMatchObject({ ok: true, decision: "allow" });
+    // The approval in force is bob's; carol's refusal is not credited with it.
+    expect(late.decided_by).toBe("bob");
     expect(late.note).toMatch(/already been told to allow/);
   });
 
@@ -374,7 +376,7 @@ describe("tasks and approvals", () => {
   it("does not approve on a comment that was edited or deleted afterwards, in whatever order the news arrives", async () => {
     for (const order of ["delete-last", "delete-first"]) {
       const { stub, id, code } = await taskAwaitingApproval();
-      const approval = message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: `github:comment:${order}`, revision: 100 } });
+      const approval = message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: `github:comment:${order}`, revision: 100, holder: "h1" } });
       if (order === "delete-first") await stub.revise(`github:comment:${order}`, Number.MAX_SAFE_INTEGER, true);
       await stub.ingest(approval);
       if (order === "delete-last") await stub.revise(`github:comment:${order}`, Number.MAX_SAFE_INTEGER, true);
@@ -383,6 +385,28 @@ describe("tasks and approvals", () => {
       expect(toolOutputs().at(-1).error).toMatch(/edited or deleted/);
       expect(await answersSent(id)).toHaveLength(0);
     }
+  });
+
+  it("does not approve on a comment changed within the same second, and approves on one that still stands", async () => {
+    for (const [change, ok] of [["none", true], ["same-second-edit", false]] as const) {
+      const { stub, id, code } = await taskAwaitingApproval();
+      await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: `github:comment:${change}`, revision: 100, holder: "h1" } }));
+      // Someone else's edit carrying the very same timestamp but another text.
+      if (change === "same-second-edit") await stub.revise(`github:comment:${change}`, 100, false, "h2");
+      model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+      await wake(stub);
+      if (ok) expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+      else expect(toolOutputs().at(-1).error).toMatch(/edited or deleted/);
+    }
+  });
+
+  it("stores a very long reply whole, so a refusal at its end still counts", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    await stub.ingest(message(`${"word ".repeat(13_000)} so: deny ${code}`, { user: "carol", session_key: "chat" }));
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toMatch(/refuses/);
   });
 
   it("does not let a reply admitted only for its code change the standing instructions", async () => {

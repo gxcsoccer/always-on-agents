@@ -32,7 +32,7 @@ describe("the GitHub webhook endpoint", () => {
     repository: { full_name: repo },
     sender: { login: "dana", id: 77, type: "User" },
     issue: { number: 3, pull_request: {} },
-    comment: { id, body, author_association: association },
+    comment: { id, body, author_association: association, user: { id: 77 } },
   });
 
   it("accepts an event signed with the repository's own secret and puts it in that tenant's repository scope", async () => {
@@ -92,6 +92,8 @@ describe("the GitHub webhook endpoint", () => {
     // A request with no event header, or a body that is not JSON, is refused like any other.
     expect((await post("/v1/github/webhook", "{}", {})).status).toBe(401);
     expect((await post("/v1/github/webhook", "not json", { "x-github-event": "ping" })).status).toBe(401);
+    // So is one whose fields are of types that cannot be what they claim.
+    expect((await post("/v1/github/webhook", JSON.stringify({ installation: { id: { toString: 1 } } }), { "x-github-event": "ping" })).status).toBe(401);
   });
 });
 

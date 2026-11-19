@@ -76,6 +76,8 @@ wrangler secret put GITHUB_BOT_HANDLE        # App 的 slug，人们用 @它 来
 wrangler deploy
 ```
 
+接飞书时，事件订阅的请求地址要用自定义域名（`wrangler.jsonc` 里的 `routes`）：飞书的服务器访问不到 `*.workers.dev`。
+
 接 GitHub App 时，装好 App 后要把安装登记到租户，之后这个安装发来的 webhook 才会被接受（之前的一律 401，可以在 App 的 Advanced 页重新投递）：
 
 ```bash
@@ -85,6 +87,6 @@ curl -X POST $B/v1/admin/tenants/acme/github-installations -H "authorization: Be
 
 ## 现状
 
-已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书的入站用自己加密签名的请求验证过。
+已在 Cloudflare 上端到端验证：对话、记忆、定时器主动提醒、租户隔离、群聊隔离、派活给沙箱、带确认码的审批、长任务、运行中部署、容器丢失后续跑；GitHub 用一个私有测试仓库和一个真实的 GitHub App 跑通了从 PR 评论派活到批准后 push 的整条链路；飞书用一个真实应用跑通了单聊收发。
 
-还没有和真实系统联调的部分：飞书的真实消息收发，以及豆包（未实现）。详见架构文档的"尚未完成"和"验证过什么"。
+还没有和真实系统联调的部分：飞书的群聊和审批，以及豆包（未实现）。详见架构文档的"尚未完成"和"验证过什么"。

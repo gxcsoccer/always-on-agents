@@ -2,6 +2,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "always-on-agent",
   "main": "src/index.ts",
+  // workers.dev is not reachable from Feishu's servers, so the Worker is also served from a domain of its own.
+  "routes": [{ "pattern": "agent.example.com", "custom_domain": true }],
+  // Declaring a route turns the workers.dev address off unless it is asked for.
+  "workers_dev": true,
   "compatibility_date": "2026-11-01",
   // Files resolves native Linux errno names through node:os.
   "compatibility_flags": ["nodejs_compat"],

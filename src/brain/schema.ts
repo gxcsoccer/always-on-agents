@@ -128,6 +128,8 @@ const MIGRATIONS: string[] = [
    );`,
   // 4: the current revision of things people wrote that can be edited or deleted after the fact.
   `CREATE TABLE revisions (subject TEXT PRIMARY KEY, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);`,
+  // 5: which text holds that revision, so two revisions with the same timestamp are told apart.
+  `ALTER TABLE revisions ADD COLUMN holder TEXT NOT NULL DEFAULT '';`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
