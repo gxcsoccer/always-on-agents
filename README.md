@@ -73,6 +73,7 @@ wrangler secret put GITHUB_APP_ID            # 以下四项：接 GitHub App 时
 wrangler secret put GITHUB_APP_PRIVATE_KEY
 wrangler secret put GITHUB_WEBHOOK_SECRET
 wrangler secret put GITHUB_BOT_HANDLE        # App 的 slug，人们用 @它 来称呼 agent
+wrangler secret put GITHUB_BOT_EMAIL         # 提交用的邮箱：<bot 用户 id>+<slug>[bot]@users.noreply.github.com
 wrangler deploy
 ```
 

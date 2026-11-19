@@ -21,8 +21,17 @@ export interface OutboundMessage {
   created_at?: number;
 }
 
+/**
+ * Where a delivered message now lives, if it is somewhere other people can change it: the subject
+ * names it and the holder is the fingerprint of the text as it was posted.
+ */
+export interface Receipt {
+  subject: string;
+  holder: string;
+}
+
 /** Sends one message. Throwing means "not delivered, try again later". */
-export async function deliver(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<void> {
+export async function deliver(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
   switch (target.connector) {
     case "console":
       // Pull-based: the client reads the outbox through the API, so writing the row was the delivery.

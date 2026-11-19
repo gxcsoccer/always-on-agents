@@ -931,6 +931,10 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   #agentEnv(state: TaskState): Record<string, string> {
+    const handle = this.env.GITHUB_BOT_HANDLE?.replace(/[^\w-]/g, "");
+    const commitName = handle ? `${handle}[bot]` : "always-on-agent";
+    // Without an address of its own, one under a domain that can never belong to anybody.
+    const commitEmail = this.env.GITHUB_BOT_EMAIL || "agent@always-on-agent.invalid";
     return {
       ...TRUST_ENV,
       HOME: "/root",
@@ -944,6 +948,13 @@ export class TaskSandbox extends DurableObject<Env> {
       TASK_PASS: state.token,
       TASK_DIRECTORY,
       GATE_WAIT_SECONDS: String(MAX_WAIT_FOR_ANSWER_S),
+      // Who commits are by. Set here, and in the environment so that it outranks anything the
+      // agent configures for itself: left to choose, it makes up a name and an address, and
+      // GitHub then credits the commit to whichever stranger owns that address.
+      GIT_AUTHOR_NAME: commitName,
+      GIT_AUTHOR_EMAIL: commitEmail,
+      GIT_COMMITTER_NAME: commitName,
+      GIT_COMMITTER_EMAIL: commitEmail,
     };
   }
 

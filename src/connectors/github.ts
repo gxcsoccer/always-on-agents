@@ -13,7 +13,7 @@ import type { Env } from "../env";
 import { type InboundEvent, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import type { OutboundMessage } from "./index";
+import type { OutboundMessage, Receipt } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 // The agent's own handle, whole: "@always-on-agent-staging" is someone else.
@@ -25,10 +25,12 @@ const mentionOf = (handle: string, flags = "i") =>
 /** A comment's own words: without the lines it quotes from others and without code. */
 function ownWords(body: string): string {
   return body
+    .replace(/(^|\n)[ \t]*(```|~~~)[\s\S]*?(\n[ \t]*\2|$)/g, "\n")
     .replace(/```[\s\S]*?(```|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ")
     .split("\n")
-    .filter((line) => !/^\s*>/.test(line))
+    // Quoted lines, and lines indented far enough to be a code block.
+    .filter((line) => !/^\s*>/.test(line) && !/^( {4}|\t)/.test(line))
     .join("\n");
 }
 
@@ -51,14 +53,15 @@ export type Standing = { revision: number; holder: string; deleted: boolean };
 
 /**
  * Asks GitHub what a comment says now. Webhooks can lag, so before an approval is acted on the
- * comment it was read from is looked at again. Returns undefined when this deployment has no
- * credential for the repository (then it could not have posted the question either).
+ * comment it was read from is looked at again. If GitHub cannot be asked, for whatever reason,
+ * this throws: an approval is not acted on unseen. Returns undefined only for a subject that is
+ * not a GitHub comment of this scope.
  */
 export async function commentStanding(env: Env, scope: Scope, subject: string): Promise<Standing | undefined> {
   const id = /^github:comment:(\d+)$/.exec(subject)?.[1];
   if (!id || scope.kind !== "repo") return undefined;
   const issued = await githubTokenFor(env, scope.tenant, scope.id);
-  if (!issued) return undefined;
+  if (!issued) throw new Error("GitHub cannot be asked what the comment says now: this tenant no longer has access to the repository");
   const response = await fetch(`https://api.github.com/repos/${scope.id}/issues/comments/${id}`, {
     headers: { authorization: `Bearer ${issued.token}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent" },
   });
@@ -180,7 +183,7 @@ export function normalize(
     // A deletion says nothing; it only makes what the comment said void. It may be a moderator's
     // doing, so it is never attributed to anyone as a message.
     if (payload.action === "deleted") return { repo, revise: { subject, revision: Number.MAX_SAFE_INTEGER, deleted: true, holder: "" } };
-    const body: string = String(payload.comment.body ?? "").slice(0, 70_000);
+    const body: string = String(payload.comment.body ?? "");
     // What the comment says at this revision. Two revisions can carry the same timestamp (GitHub's
     // are whole seconds); the fingerprint of the text tells them apart.
     const holder = fingerprint(body);
@@ -270,7 +273,7 @@ export async function verifySignature(secret: string, body: string, header: stri
  * hidden marker, and a retry first looks for it: GitHub may have accepted the comment even though
  * we never saw the response.
  */
-export async function deliverGithub(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<void> {
+export async function deliverGithub(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt> {
   const { repo, number } = target.address;
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? "") || !/^\d+$/.test(number ?? "")) throw new Error("bad GitHub address");
   // A repository scope speaks only on its own repository.
@@ -286,22 +289,29 @@ export async function deliverGithub(env: Env, scope: Scope, target: Target, mess
   const marker = `<!-- always-on-agent:${message.idem.replace(/[^\w:.|-]/g, "")} -->`;
   const comments = `https://api.github.com/repos/${repo}/issues/${number}/comments`;
 
+  // A question someone will approve is shown literally. Rendered as Markdown, a branch called
+  // __release__ would appear as "release" in bold, which is not the branch being pushed.
+  const shown = message.idem.startsWith("ask:") ? `<pre>${message.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>` : message.text;
+  const posted = `${shown}\n\n${marker}`;
+
   // Only comments since this message was written can be an earlier attempt at it. The list is
   // oldest-first and paged, so follow it to the end rather than trusting the first page.
   const since = new Date((message.created_at ?? Date.now()) - 60_000).toISOString();
   for (let page = 1; page <= 10; page++) {
     const recent = await fetch(`${comments}?per_page=100&page=${page}&since=${encodeURIComponent(since)}`, { headers });
     if (!recent.ok) throw new Error(`GitHub returned ${recent.status} listing comments`);
-    const batch = (await recent.json()) as { body?: string }[];
-    if (batch.some((comment) => comment.body?.includes(marker))) return;
+    const batch = (await recent.json()) as { id: number; body?: string }[];
+    const earlier = batch.find((comment) => comment.body?.includes(marker));
+    // The receipt is for the text as written here, not as found: if someone already changed the
+    // comment, it must not pass for what the agent said.
+    if (earlier) return { subject: `github:comment:${earlier.id}`, holder: fingerprint(posted) };
     if (batch.length < 100) break;
   }
 
-  // A question someone will approve is shown literally. Rendered as Markdown, a branch called
-  // __release__ would appear as "release" in bold, which is not the branch being pushed.
-  const shown = message.idem.startsWith("ask:") ? `<pre>${message.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>` : message.text;
-  const response = await fetch(comments, { method: "POST", headers, body: JSON.stringify({ body: `${shown}\n\n${marker}` }) });
+  const response = await fetch(comments, { method: "POST", headers, body: JSON.stringify({ body: posted }) });
   if (!response.ok) throw new Error(`GitHub returned ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  const created = (await response.json()) as { id: number };
+  return { subject: `github:comment:${created.id}`, holder: fingerprint(posted) };
 }
 
 function json(data: unknown, status = 200): Response {

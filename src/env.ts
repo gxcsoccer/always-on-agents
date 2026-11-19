@@ -22,6 +22,8 @@ export interface Env {
   GITHUB_APP_PRIVATE_KEY?: string;
   /** The agent's account name on GitHub (an App's bot is `<app-slug>`), used to recognise mentions. */
   GITHUB_BOT_HANDLE?: string;
+  /** The address commits are made under; for an App, `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. */
+  GITHUB_BOT_EMAIL?: string;
   /** A single deployment-wide token, used only when no App is configured. For local development. */
   GITHUB_TOKEN?: string;
 }

@@ -130,6 +130,8 @@ const MIGRATIONS: string[] = [
   `CREATE TABLE revisions (subject TEXT PRIMARY KEY, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);`,
   // 5: which text holds that revision, so two revisions with the same timestamp are told apart.
   `ALTER TABLE revisions ADD COLUMN holder TEXT NOT NULL DEFAULT '';`,
+  // 6: where a delivered message lives and what it said, when others can change it afterwards.
+  `ALTER TABLE outbox ADD COLUMN receipt TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

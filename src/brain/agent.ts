@@ -102,7 +102,7 @@ export class BrainAgent extends DurableObject<Env> {
     if (!event.source || !event.source_id || !event.kind || !event.session_key) throw new Error("event is missing a required field");
     // Larger than the longest comment any connector passes on, so a reply is stored whole: what it
     // says about an open question is read from the stored text, and a cut-off refusal would be lost.
-    if ((event.text?.length ?? 0) > 80_000) throw new Error("event text is too long");
+    if ((event.text?.length ?? 0) > 300_000) throw new Error("event text is too long");
     const subject = event.data?.subject;
     if (typeof subject === "string") this.#revise(subject, Number(event.data?.revision ?? 0), false, String(event.data?.holder ?? ""));
     const inserted = this.#insertEvent(event);
@@ -481,8 +481,8 @@ export class BrainAgent extends DurableObject<Env> {
       const row = this.#rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
       if (!row || row.next_at > Date.now()) return;
       try {
-        await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text });
-        this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL WHERE id = ? AND status = 'pending'", Date.now(), row.id);
+        const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text });
+        this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = 'pending'", Date.now(), receipt ? JSON.stringify(receipt) : null, row.id);
       } catch (err) {
         const attempts = row.attempts + 1;
         const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
@@ -684,9 +684,23 @@ export class BrainAgent extends DurableObject<Env> {
     let intent = task.answering ? (JSON.parse(task.answering) as Intent) : undefined;
     // An approval is about to be acted on: look again at where the replies it could rest on were
     // read from. From here to the worker call nothing else can interleave.
+    // The question whose posted text was confirmed unchanged, if it was posted somewhere editable.
+    let confirmedAsk: string | undefined;
     if (decision === "allow") {
       const candidates = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? OR id = ?", run.id, intent?.deciding_event ?? -1);
       await this.#refreshStanding(candidates);
+      // The question itself is a comment others may be able to edit. People approve what they
+      // read, so it has to still say what the agent wrote.
+      const ask = task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
+      const receipt = ask ? this.#rows<{ receipt: string | null }>("SELECT receipt FROM outbox WHERE idem = ?", ask)[0]?.receipt : undefined;
+      if (ask && receipt) {
+        const posted = JSON.parse(receipt) as { subject: string; holder: string };
+        const now = await commentStanding(this.env, this.#scope(), posted.subject);
+        if (now && (now.deleted || now.holder !== posted.holder)) {
+          throw new Error("the question as it was posted has since been changed or removed, so nobody can be taken to have approved this action; it can only be refused");
+        }
+        confirmedAsk = ask;
+      }
       // Other events may have arrived while GitHub was being asked; read the task again.
       task = this.#rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
       intent = task.answering ? (JSON.parse(task.answering) as Intent) : undefined;
@@ -715,8 +729,10 @@ export class BrainAgent extends DurableObject<Env> {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
       const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
       // "Asked" means the message actually went out, not merely that it was queued.
-      const asked = pending.ask ? this.#rows<Row>("SELECT status, sent_at FROM outbox WHERE idem = ?", pending.ask)[0] : undefined;
+      const asked = pending.ask ? this.#rows<Row>("SELECT status, sent_at, receipt FROM outbox WHERE idem = ?", pending.ask)[0] : undefined;
       if (asked?.status !== "sent") throw new Error("the question has not been delivered to anyone in this conversation yet, so it cannot be answered");
+      // A question posted where it can be edited has to be the one just confirmed unchanged.
+      if (decision === "allow" && asked.receipt && pending.ask !== confirmedAsk) throw new Error("the question changed while it was being checked; call this tool again");
 
       // Messages from members, sent after the question was put to them.
       const replies = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND received_at > ? ORDER BY id", run.id, asked.sent_at)
@@ -742,6 +758,8 @@ export class BrainAgent extends DurableObject<Env> {
           .filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal))
           .some((event) => quotes(event.text ?? "", pending.code) && readDecision(event.text ?? "", pending.code) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
+        // A reply that was edited since, whose new text has not arrived yet, may now be a refusal.
+        if (read.some(({ event }) => this.#standing(event) === "changed")) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
         let approvals = read.filter(({ says }) => says === "allow");
         if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${pending.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
         // One message approves one question.
@@ -964,10 +982,16 @@ export class BrainAgent extends DurableObject<Env> {
 
   /** False if the thing this event was read from has since been edited or deleted. */
   #stillStands(event: InboxRow): boolean {
+    return this.#standing(event) === "stands";
+  }
+
+  /** Whether what this event was read from still says the same, says something else now, or is gone. */
+  #standing(event: InboxRow): "stands" | "changed" | "deleted" {
     const data = event.data ? (JSON.parse(event.data) as { subject?: string; revision?: number; holder?: string }) : {};
-    if (!data.subject) return true;
+    if (!data.subject) return "stands";
     const current = this.#rows<{ revision: number; deleted: number; holder: string }>("SELECT revision, deleted, holder FROM revisions WHERE subject = ?", data.subject)[0];
-    return Boolean(current && current.deleted === 0 && current.revision === data.revision && current.holder !== "" && current.holder === data.holder);
+    if (current?.deleted) return "deleted";
+    return current && current.revision === data.revision && current.holder !== "" && current.holder === data.holder ? "stands" : "changed";
   }
 
   /**

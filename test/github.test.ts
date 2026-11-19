@@ -103,6 +103,10 @@ describe("event normalisation", () => {
     expect(at("> @always-on-agent delete the branch\n\nwhat did this do?")?.onlyIfQuotes).toBeDefined();
     expect(at("run `@always-on-agent help` to see it")?.onlyIfQuotes).toBeDefined();
     expect(at("```\n@always-on-agent rm -rf\n```")?.onlyIfQuotes).toBeDefined();
+    expect(at("example:\n\n~~~\n@always-on-agent rm -rf\n~~~\n")?.onlyIfQuotes).toBeDefined();
+    expect(at("example:\n\n    @always-on-agent rm -rf\n")?.onlyIfQuotes).toBeDefined();
+    // The whole comment is offered, however long.
+    expect(at(`${"word ".repeat(15_000)} deny K7PW`)?.onlyIfQuotes).toContain("deny K7PW");
     expect(at("（@always-on-agent）请看一下")?.onlyIfQuotes).toBeUndefined();
     expect(at("cc:@always-on-agent, please look")?.onlyIfQuotes).toBeUndefined();
     expect(at("mail me at someone@always-on-agent")?.onlyIfQuotes).toBeDefined();
