@@ -28,7 +28,7 @@ src/
 container/              打进沙箱镜像的脚本
 test/                   测试（跑在 Workers 运行时里，模型和沙箱用替身）
 docs/                   架构文档
-spikes/                 早期实验，已冻结，保留作参考
+docs/spikes/            早期实验的记录（代码已归档到 git 历史）
 ```
 
 ## 本地运行
