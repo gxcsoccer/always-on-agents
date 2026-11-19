@@ -8,11 +8,11 @@ You need a Cloudflare account on the Workers Paid plan (Durable Objects and Cont
 
 ```bash
 pnpm install
-wrangler login
-wrangler r2 bucket create always-on-agent-checkpoints
+pnpm exec wrangler login
+pnpm exec wrangler r2 bucket create always-on-agent-checkpoints
 
-wrangler secret put OPENAI_API_KEY
-wrangler secret put ADMIN_KEY          # a long random string
+pnpm exec wrangler secret put OPENAI_API_KEY
+pnpm exec wrangler secret put ADMIN_KEY          # a long random string
 
 pnpm run deploy
 ```
@@ -29,7 +29,7 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 
 | Name | Kind | Purpose |
 |---|---|---|
-| `OPENAI_BASE_URL` | variable | Where model calls go. Any service that speaks the OpenAI Responses API. |
+| `OPENAI_BASE_URL` | variable | Where the Brain's model calls go, and the only origin the sandbox proxy lets model traffic reach. The sandboxed agent itself is started with its built-in OpenAI provider and is not told this address, so for now leave it at OpenAI's API: pointing it elsewhere keeps chat working and breaks sandbox tasks. |
 | `BRAIN_MODEL` | variable | The model the Brain uses. |
 | `WORKER_MODEL` | variable | The model the sandboxed agent uses. It is the only model the sandbox may call. |
 | `OPENAI_API_KEY` | secret, required | The key for that service. It never enters a container; the outbound proxy adds it. |
@@ -51,9 +51,9 @@ Every request carries `authorization: Bearer $ADMIN_KEY`. There is one admin key
 
 | Request | Body | Effect |
 |---|---|---|
-| `POST /v1/admin/tenants` | `{"id","name"}` | Creates a tenant. Returns its API key, once. |
+| `POST /v1/admin/tenants` | `{"id","name"}` | Creates a tenant and returns an API key for it, once. Calling it again for the same tenant issues a further key; earlier keys stay valid. Only a hash of each key is stored. |
 | `POST /v1/admin/tenants/:id/github-installations` | `{"installation_id"}` | Says a GitHub App installation belongs to this tenant. |
-| `POST /v1/admin/tenants/:id/github-repos` | `{"repo":"owner/name"}` | Registers one repository for a per-repository webhook. Returns `webhook_secret`, once. |
+| `POST /v1/admin/tenants/:id/github-repos` | `{"repo":"owner/name"}` | Registers one repository for a per-repository webhook. Returns `webhook_secret`, once. Calling it again for the same repository replaces the secret at once, so the webhook configured with the old one stops being accepted until it is updated. |
 | `POST /v1/admin/tenants/:id/identities` | `{"provider","external_id","user_id"}` | Says an outside account (for GitHub, its numeric id) is this tenant's user. |
 | `POST /v1/admin/tenants/:id/feishu-apps` | `{"app_id","app_secret","bot_open_id","transport", ...}` | Registers or updates a Feishu app. `transport` is `long_connection` or `webhook` (which also needs `encrypt_key`). |
 | `POST /v1/admin/tenants/:id/chat-repos` | `{"chat","repo"}` | Lets tasks from one group chat use one repository. `"repo": null` removes it. |
@@ -118,12 +118,12 @@ These are constants in the code, not configuration.
 | A finished task's container, checkpoints and records | 24 hours |
 | The text of handled events | 30 days (the record itself, without its text, for 365 days so that a late redelivery is still recognised) |
 | Delivered messages and finished timers and tasks | 30 days |
-| A conversation's transcript | 30 days, but never fewer than its latest 200 items |
+| A conversation's transcript | Kept in full while the conversation is in use. Once a conversation has been quiet for 30 days it is cut back to roughly its latest 200 items (the cut lands on a user turn, so slightly fewer may remain). There is no upper limit on how long an active conversation's text is kept. |
 | Audit entries | 365 days |
 
 ## Cost notes
 
-- A Brain is awake only while it handles events; an idle scope costs storage only.
+- A Brain is awake only while it handles events. A scope that has ever received an event also wakes briefly once a day to remove old records; otherwise an idle scope costs storage only.
 - A sandbox task holds a container for as long as it runs.
 - A Feishu app on the long connection keeps one Durable Object awake all the time.
 - Model usage is bounded by the daily budgets above. All tenants share the one model key.

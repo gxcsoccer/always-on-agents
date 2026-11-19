@@ -119,7 +119,7 @@ Things to know:
 
 Feishu calls `$B/v1/feishu/events/<app_id>`. Register the app with `"transport": "webhook"` and an `encrypt_key`; only encrypted and signed deliveries are accepted. Feishu's servers cannot reach `*.workers.dev`, so the Worker needs a domain of its own.
 
-In practice this route is not reliable for card callbacks: Feishu has to answer a button press within three seconds, and the path from Feishu to Cloudflare sometimes takes longer or fails. Use the long connection unless you have a reason not to.
+In practice this route is not reliable for card callbacks: Feishu expects a button press to be answered within three seconds, and the path from Feishu to Cloudflare sometimes takes longer or fails. Use the long connection unless you have a reason not to.
 
 An app is served through one transport only. Switching it re-registers the app with the other value and changes the subscription mode in the developer console.
 

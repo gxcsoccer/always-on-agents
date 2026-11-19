@@ -46,7 +46,7 @@
 
 ## 快速开始
 
-需要 Node 22 或更高版本、pnpm，以及一个兼容 Docker 的运行时（沙箱镜像在本地构建）。Apple 芯片上用 Colima 时要开 Rosetta：
+需要 Node 22.12 或更高版本、pnpm，以及一个兼容 Docker 的运行时（沙箱镜像在本地构建）。Apple 芯片上用 Colima 时要开 Rosetta：
 
 ```bash
 colima start --cpu 4 --memory 6 --vm-type vz --vz-rosetta
@@ -60,14 +60,16 @@ cp .dev.vars.example .dev.vars   # 填 OPENAI_API_KEY 和 ADMIN_KEY
 pnpm dev --port 8797
 ```
 
-建一个租户，然后和 agent 说话：
+另开一个终端，建一个租户，然后和 agent 说话：
 
 ```bash
 B=http://localhost:8797
+ADMIN_KEY=...     # 你写在 .dev.vars 里的那个值
 
-# 返回租户的 API key，只显示这一次。
+# 输出里的 "api_key" 就是租户的 API key，只显示这一次。
 curl -X POST $B/v1/admin/tenants -H "authorization: Bearer $ADMIN_KEY" \
   -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'
+TENANT_KEY=...    # 上面返回的 api_key
 
 curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"text":"30 秒后提醒我喝水"}'

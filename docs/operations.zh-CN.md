@@ -8,11 +8,11 @@
 
 ```bash
 pnpm install
-wrangler login
-wrangler r2 bucket create always-on-agent-checkpoints
+pnpm exec wrangler login
+pnpm exec wrangler r2 bucket create always-on-agent-checkpoints
 
-wrangler secret put OPENAI_API_KEY
-wrangler secret put ADMIN_KEY          # 一个足够长的随机字符串
+pnpm exec wrangler secret put OPENAI_API_KEY
+pnpm exec wrangler secret put ADMIN_KEY          # 一个足够长的随机字符串
 
 pnpm run deploy
 ```
@@ -29,7 +29,7 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 
 | 名称 | 类型 | 用途 |
 |---|---|---|
-| `OPENAI_BASE_URL` | 变量 | 模型请求发往哪里。任何兼容 OpenAI Responses API 的服务都可以 |
+| `OPENAI_BASE_URL` | 变量 | Brain 的模型请求发往哪里，也是沙箱代理唯一放行模型流量的地址。沙箱里的 agent 本身是用它内置的 OpenAI 配置启动的，并不知道这个地址，所以目前请保持为 OpenAI 的接口：改成别处后聊天仍然正常，但沙箱任务会失败 |
 | `BRAIN_MODEL` | 变量 | Brain 使用的模型 |
 | `WORKER_MODEL` | 变量 | 沙箱里的 agent 使用的模型，也是沙箱唯一能调用的模型 |
 | `OPENAI_API_KEY` | 密钥，必填 | 上述服务的密钥。它不会进入容器，由出站代理加上 |
@@ -51,9 +51,9 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 
 | 请求 | 请求体 | 作用 |
 |---|---|---|
-| `POST /v1/admin/tenants` | `{"id","name"}` | 创建租户。返回它的 API key，只显示一次 |
+| `POST /v1/admin/tenants` | `{"id","name"}` | 创建租户并返回一个 API key，只显示一次。对同一个租户再次调用会再签发一个 key，之前的 key 仍然有效。服务端只保存 key 的哈希 |
 | `POST /v1/admin/tenants/:id/github-installations` | `{"installation_id"}` | 声明某次 GitHub App 安装属于这个租户 |
-| `POST /v1/admin/tenants/:id/github-repos` | `{"repo":"owner/name"}` | 为单仓库 webhook 登记一个仓库。返回 `webhook_secret`，只显示一次 |
+| `POST /v1/admin/tenants/:id/github-repos` | `{"repo":"owner/name"}` | 为单仓库 webhook 登记一个仓库。返回 `webhook_secret`，只显示一次。对同一个仓库再次调用会立刻更换 secret，用旧 secret 配置的 webhook 在更新之前将不再被接受 |
 | `POST /v1/admin/tenants/:id/identities` | `{"provider","external_id","user_id"}` | 声明某个外部账号（GitHub 用数字 id）是这个租户的用户 |
 | `POST /v1/admin/tenants/:id/feishu-apps` | `{"app_id","app_secret","bot_open_id","transport", ...}` | 登记或更新一个飞书应用。`transport` 取 `long_connection` 或 `webhook`（后者还需要 `encrypt_key`） |
 | `POST /v1/admin/tenants/:id/chat-repos` | `{"chat","repo"}` | 允许某个群里派出的任务使用某个仓库。`"repo": null` 表示解除 |
@@ -118,12 +118,12 @@ Worker 输出结构化日志（每行一个 JSON 对象），`wrangler.jsonc` �
 | 已结束任务的容器、检查点和记录 | 24 小时 |
 | 已处理事件的正文 | 30 天（去掉正文的记录本身保留 365 天，这样迟到的重复投递仍能被认出来） |
 | 已投递的消息、已结束的定时器和任务 | 30 天 |
-| 对话记录 | 30 天，但每个对话至少保留最近 200 条 |
+| 对话记录 | 对话在使用期间完整保留。一个对话沉寂满 30 天后，会被裁剪到大约最近 200 条（裁剪点落在一条用户发言上，所以实际留下的可能略少）。仍在使用的对话，其文本没有保留时长的上限 |
 | 审计记录 | 365 天 |
 
 ## 关于成本
 
-- Brain 只在处理事件时处于唤醒状态；空闲的作用域只占存储。
+- Brain 只在处理事件时处于唤醒状态。收到过事件的作用域每天还会短暂唤醒一次以清理旧记录；除此之外，空闲的作用域只占存储。
 - 沙箱任务在运行期间一直占用一个容器。
 - 使用长连接的飞书应用，会让一个 Durable Object 一直保持唤醒。
 - 模型用量受上面的每日额度限制。所有租户共用同一个模型密钥。

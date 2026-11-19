@@ -46,7 +46,7 @@ Feishu / GitHub / console / timers / worker reports
 
 ## Quick start
 
-You need Node 22 or later, pnpm, and a Docker-compatible runtime (the sandbox image is built locally). On Apple silicon with Colima, enable Rosetta:
+You need Node 22.12 or later, pnpm, and a Docker-compatible runtime (the sandbox image is built locally). On Apple silicon with Colima, enable Rosetta:
 
 ```bash
 colima start --cpu 4 --memory 6 --vm-type vz --vz-rosetta
@@ -60,14 +60,16 @@ cp .dev.vars.example .dev.vars   # set OPENAI_API_KEY and ADMIN_KEY
 pnpm dev --port 8797
 ```
 
-Create a tenant and talk to the agent:
+In a second terminal, create a tenant and talk to the agent:
 
 ```bash
 B=http://localhost:8797
+ADMIN_KEY=...     # the value you put in .dev.vars
 
-# Returns the tenant's API key. It is shown once.
+# Prints the tenant's API key ("api_key"). It is shown once.
 curl -X POST $B/v1/admin/tenants -H "authorization: Bearer $ADMIN_KEY" \
   -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'
+TENANT_KEY=...    # the api_key from that response
 
 curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"text":"Remind me to drink water in 30 seconds"}'

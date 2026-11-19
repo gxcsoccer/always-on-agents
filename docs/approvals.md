@@ -75,7 +75,7 @@ GitHub comments can be edited and deleted.
 |---|---|
 | An approval counts only while the comment it was read from still says the same thing. Each comment's standing is its timestamp plus a fingerprint of its text; an edit or deletion voids the earlier text in whatever order the notifications arrive. | `#revise`, `#standing` |
 | Before an approval is acted on, the comment is read again from GitHub, because the notification of a change may still be on its way. If GitHub cannot be asked, nothing is approved. | `#refreshStanding`, `commentStanding` |
-| The question the agent posted is checked too: a maintainer can edit other people's comments. A question that was ever edited, even if put back, cannot be approved; the agent asks again. | `#answerTask` |
+| The question the agent posted is checked too: a maintainer can edit other people's comments. A question that was ever edited, even if put back, cannot be approved, only refused. To go ahead, refuse it (or cancel the task) and make the request again, which produces a new question. | `#answerTask` |
 | A mention inside a quotation or code does not address the agent. | `ownWords` in `connectors/github.ts` |
 
 ### Approving for the rest of a task
