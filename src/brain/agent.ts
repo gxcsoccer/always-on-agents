@@ -319,10 +319,11 @@ export class BrainAgent extends DurableObject<Env> {
       // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
       // The tenant's share is reserved before the call and trued up after it, so several scopes
       // admitted at the same moment cannot all slip under the limit together.
+      const reservedOn = today();
       const tenant = await registry(this.env).recordUsage(this.#scope().tenant, MODEL_CALL_RESERVE);
       if (!this.#stillActive(runId)) return;
       if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
-        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE).catch(() => undefined);
+        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
         if (!this.#stillActive(runId)) return;
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
@@ -345,7 +346,7 @@ export class BrainAgent extends DurableObject<Env> {
           tools: TOOLS,
         });
       } catch (err) {
-        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE).catch(() => undefined);
+        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
         return this.#retryLater(runId, err);
       }
       if (!this.#stillActive(runId)) return;
@@ -360,7 +361,7 @@ export class BrainAgent extends DurableObject<Env> {
         this.#setMeta(`tokens:${today()}`, String(this.#tokensToday() + response.usage.total_tokens));
       });
       // After the commit: if this is lost the tenant is under-counted by one call, never blocked.
-      await registry(this.env).adjustUsage(this.#scope().tenant, response.usage.total_tokens - MODEL_CALL_RESERVE).catch(() => undefined);
+      await registry(this.env).adjustUsage(this.#scope().tenant, response.usage.total_tokens - MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
     }
     this.#finish(runId, "done");
   }
@@ -605,7 +606,15 @@ export class BrainAgent extends DurableObject<Env> {
     }
     if (task.status !== "dispatching") return { task_id: task.id, status: task.status };
 
-    if (!(await registry(this.env).acquireTaskSlot(scope.tenant, task.id))) {
+    let slot: boolean;
+    try {
+      slot = await registry(this.env).acquireTaskSlot(scope.tenant, task.id);
+    } catch (err) {
+      // The task must not be left "dispatching": nothing would ever pick it up again.
+      this.#setTask(task.id, "failed", { result: JSON.stringify({ error: `the registry could not be reached: ${String(err).slice(0, 300)}` }) });
+      throw new Error("the sandbox could not be started; try again");
+    }
+    if (!slot) {
       this.#setTask(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
       throw new Error("too many sandboxes are running for this tenant right now; try again later");
     }
@@ -975,10 +984,12 @@ export function readDecision(text: string, code: string): "allow" | "deny" | und
   // An approval is the whole message and nothing else (apart from @-mentions and punctuation):
   // "approve CODE". Anything longer could be saying the opposite ("do not approve CODE").
   // Only mentions at the start are addressing; "@5pm" at the end is a condition, not a name.
-  const bare = text.replace(/^(\s*@[^\s@]+)+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
+  // A mention is a plain handle followed by a space. Anything glued to it ("@agent不要…") is words.
+  const bare = text.replace(/^(\s*@[A-Za-z0-9_.-]+(?=\s))+/, " ").replace(/[\s:：,，.。!！]+/g, " ").trim();
   if (new RegExp(`^(?:approve|同意|批准) ?${code}$`, "i").test(bare)) return "allow";
   // A message that mentions the code together with a refusing or negating word is a refusal.
-  if (/deny|denied|refuse|reject|don'?t|do not|not|never|no\b|stop|cancel|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
+  // English words are matched whole, so "notebook" or "another" is not a refusal.
+  if (/\b(deny|denied|refuse|refused|reject|rejected|don'?t|do not|not|never|no|stop|cancel)\b|拒绝|不同意|不批准|否决|不要|不行|别|取消/i.test(text)) return "deny";
   return undefined;
 }
 

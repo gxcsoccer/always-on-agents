@@ -54,6 +54,14 @@ describe("event normalisation", () => {
     expect(result?.event).toMatchObject({ kind: "message", session_key: "pr:7", principal: { kind: "human", explicit: true } });
   });
 
+  it("accepts a bare reply to an approval question, since that is what the question asks for", () => {
+    expect(normalize("issue_comment", comment("approve K7PW", "OWNER"))?.event).toMatchObject({ kind: "message", text: "approve K7PW", principal: { explicit: true } });
+    expect(normalize("issue_comment", comment("deny K7PW.", "MEMBER"))?.event.text).toBe("deny K7PW.");
+    // Still only from people with standing, and only when that is the whole comment.
+    expect(normalize("issue_comment", comment("approve K7PW", "NONE"))).toBeUndefined();
+    expect(normalize("issue_comment", comment("I would approve K7PW if the tests pass", "OWNER"))).toBeUndefined();
+  });
+
   it("does not read its own comments back as someone's words", () => {
     // Posted by the agent under a member's token, so GitHub reports the member as the author.
     const echoed = comment("@always-on-agent approve ABCD\n\n<!-- always-on-agent:msg:call_1 -->", "MEMBER");

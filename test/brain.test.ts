@@ -281,6 +281,12 @@ describe("tasks and approvals", () => {
     // A trailing "@5pm" is a condition, not a mention to strip.
     expect(readDecision("approve AB12 @5pm", "AB12")).toBeUndefined();
     expect(readDecision("@agent @bot approve AB12", "AB12")).toBe("allow");
+    // Words glued to the mention are words, not part of a name to strip.
+    expect(readDecision("@agent不要 approve AB12", "AB12")).toBe("deny");
+    expect(readDecision("@agent不要批准 AB12", "AB12")).toBe("deny");
+    // "not" inside another word is not a refusal.
+    expect(readDecision("notebook AB12", "AB12")).toBeUndefined();
+    expect(readDecision("another note: AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve AB123", "AB12")).toBeUndefined();
     expect(readDecision("the code is AB12", "AB12")).toBeUndefined();
     expect(readDecision("approve ZZ99", "AB12")).toBeUndefined();

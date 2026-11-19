@@ -57,8 +57,8 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     return json({ ok: true });
   }
   if (path[0] === "tenants" && path[2] === "github-repos" && method === "POST") {
-    await registry(env).linkGithubRepo(String((await body()).repo ?? ""), path[1]);
-    return json({ ok: true });
+    // The secret is returned once, to be set on that repository's webhook.
+    return json({ ok: true, ...(await registry(env).linkGithubRepo(String((await body()).repo ?? ""), path[1])) });
   }
   if (path[0] === "tenants" && path[2] === "feishu-apps" && method === "POST") {
     const app = await body();

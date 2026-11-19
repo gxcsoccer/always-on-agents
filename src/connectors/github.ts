@@ -16,32 +16,41 @@ import { githubTokenFor } from "./github-app";
 import type { OutboundMessage } from "./index";
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+const DECISION_REPLY = /^\s*(approve|deny|同意|批准|拒绝|不同意)[\s:：]*[A-Z0-9]{4}\s*[.!。！]?\s*$/i;
 const MENTION = /(^|\s)@always-on-agent\b|^\s*\/agent\b/i;
 
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
-  if (!env.GITHUB_WEBHOOK_SECRET) return json({ error: "the GitHub connector is not configured" }, 503);
   const raw = await request.text();
-  if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, request.headers.get("x-hub-signature-256")))) {
-    return json({ error: "bad signature" }, 401);
-  }
   const type = request.headers.get("x-github-event");
   if (!type) return json({ error: "missing GitHub headers" }, 400);
-
   let payload: any;
   try {
     payload = JSON.parse(raw);
   } catch {
     return json({ error: "body is not JSON" }, 400);
   }
-  // An App delivery names its installation; a webhook set on one repository names only the repository.
-  const installation = payload.installation?.id;
-  const repoName: unknown = payload.repository?.full_name;
-  const tenant = installation
-    ? await registry(env).tenantForGithubInstallation(String(installation))
-    : typeof repoName === "string"
-      ? await registry(env).tenantForGithubRepo(repoName)
-      : null;
+
+  // Nothing in the body is believed yet; it is only used to pick which secret must have signed it.
+  // An App delivery names its installation and is signed with the App's secret. A webhook set on
+  // one repository names only the repository and is signed with that repository's own secret, so
+  // knowing one repository's secret is no help in forging events for another.
+  const installation = payload?.installation?.id;
+  const repoName: unknown = payload?.repository?.full_name;
+  const linkedRepo = typeof repoName === "string" && /^[\w.-]+\/[\w.-]+$/.test(repoName) ? await registry(env).githubRepo(repoName) : null;
+  let tenant: string | null;
+  let secret: string | null | undefined;
+  if (installation) {
+    tenant = await registry(env).tenantForGithubInstallation(String(installation));
+    secret = env.GITHUB_WEBHOOK_SECRET;
+    // A repository claimed by one tenant must not arrive through another tenant's installation.
+    if (tenant && linkedRepo && linkedRepo.tenant !== tenant) return json({ ignored: "this repository is linked to a different tenant" }, 202);
+  } else {
+    tenant = linkedRepo?.tenant ?? null;
+    secret = linkedRepo?.secret;
+  }
   if (!tenant) return json({ ignored: "this installation or repository is not linked to a tenant" }, 202);
+  if (!secret) return json({ error: "no webhook secret is configured for this source" }, 503);
+  if (!(await verifySignature(secret, raw, request.headers.get("x-hub-signature-256")))) return json({ error: "bad signature" }, 401);
 
   const normalized = normalize(type, payload);
   if (!normalized) return json({ ignored: `nothing to do for ${type}.${payload.action ?? ""}` }, 202);
@@ -96,8 +105,9 @@ export function normalize(type: string, payload: any): { repo: string; event: In
 
   if (type === "issue_comment" && payload.action === "created") {
     const body: string = payload.comment?.body ?? "";
-    // Comments that do not address the agent are other people's conversation.
-    if (!MENTION.test(body) || sender.type === "Bot") return undefined;
+    // Comments that do not address the agent are other people's conversation. A bare reply to an
+    // approval question ("approve K7PW") is addressed to it without saying so.
+    if ((!MENTION.test(body) && !DECISION_REPLY.test(body)) || sender.type === "Bot") return undefined;
     // The agent's own comments carry a marker. When it posts under a person's token they come back
     // looking like that person's words; they are not, and must never be read as a request or a reply.
     if (body.includes("<!-- always-on-agent:")) return undefined;

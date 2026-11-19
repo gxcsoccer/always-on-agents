@@ -49,9 +49,16 @@ export class Registry extends DurableObject<Env> {
         bot_open_id TEXT, token TEXT, token_expires_at INTEGER
       );
       DROP TABLE IF EXISTS github_tokens;
-      CREATE TABLE IF NOT EXISTS github_repos (repo TEXT PRIMARY KEY, tenant TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS github_repos (repo TEXT PRIMARY KEY, tenant TEXT NOT NULL, secret TEXT);
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
+    this.#addColumn("github_repos", "secret TEXT");
+  }
+
+  /** Adds a column to a table made by an earlier deploy. A no-op once it exists. */
+  #addColumn(table: string, column: string): void {
+    const columns = this.ctx.storage.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().map((c) => c.name);
+    if (!columns.includes(column.split(" ")[0])) this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`);
   }
 
   /** Creates the tenant if needed and issues a new API key. The key is returned once and not stored. */
@@ -92,16 +99,22 @@ export class Registry extends DurableObject<Env> {
    * Registers one repository as a tenant's, for a webhook configured on the repository itself
    * rather than through a GitHub App (such webhooks carry no installation id).
    */
-  async linkGithubRepo(repo: string, tenant: string): Promise<void> {
+  async linkGithubRepo(repo: string, tenant: string): Promise<{ webhook_secret: string }> {
     this.#requireTenant(tenant);
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("repo must be owner/name");
-    const owner = this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0]?.tenant;
-    if (owner && owner !== tenant) throw new Error("that repository is registered to another tenant");
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO github_repos (repo, tenant) VALUES (?, ?)", repo.toLowerCase(), tenant);
+    const sql = this.ctx.storage.sql;
+    const existing = sql.exec<{ tenant: string }>("SELECT tenant FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0];
+    if (existing && existing.tenant !== tenant) throw new Error("that repository is registered to another tenant");
+    // Each repository gets its own webhook secret. Whoever configures the hook on one repository
+    // learns only that repository's secret and cannot sign events in another repository's name.
+    const secret = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    sql.exec("INSERT INTO github_repos (repo, tenant, secret) VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET secret = excluded.secret", repo.toLowerCase(), tenant, secret);
+    return { webhook_secret: secret };
   }
 
-  async tenantForGithubRepo(repo: string): Promise<string | null> {
-    return this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0]?.tenant ?? null;
+  async githubRepo(repo: string): Promise<{ tenant: string; secret: string | null } | null> {
+    const row = this.ctx.storage.sql.exec<{ tenant: string; secret: string | null }>("SELECT tenant, secret FROM github_repos WHERE repo = ?", repo.toLowerCase()).toArray()[0];
+    return row ? { tenant: row.tenant, secret: row.secret } : null;
   }
 
   async githubInstallations(tenant: string): Promise<string[]> {
@@ -174,9 +187,9 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Corrects a reservation to what was actually used. May be negative; the total never goes below zero. */
-  async adjustUsage(tenant: string, delta: number): Promise<void> {
-    if (!Number.isFinite(delta) || delta === 0) return;
-    const day = new Date().toISOString().slice(0, 10);
+  async adjustUsage(tenant: string, delta: number, day: string): Promise<void> {
+    // `day` is the day the reservation was made: a call that spans midnight is settled where it was charged.
+    if (!Number.isFinite(delta) || delta === 0 || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
     this.ctx.storage.sql.exec(
       "INSERT INTO tenant_usage (tenant, day, tokens) VALUES (?, ?, MAX(0, ?)) ON CONFLICT(tenant, day) DO UPDATE SET tokens = MAX(0, tokens + ?)",
       tenant,

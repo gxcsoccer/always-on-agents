@@ -462,6 +462,9 @@ export class TaskSandbox extends DurableObject<Env> {
     const state = this.#state();
     const repo = await this.repository();
     if (!state || !repo) return undefined;
+    // A finished task keeps its container for a while, for inspection. Whatever is still running in
+    // it gets no credentials: lending stops when the task does.
+    if (!ACTIVE.has(state.phase) && state.phase !== "starting") return undefined;
     // A task with no Brain is a development probe; it gets the development token or nothing.
     if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY ? undefined : this.env.GITHUB_TOKEN || undefined;
     const [tenant, kind, ...rest] = state.brain.split(":");
@@ -812,7 +815,7 @@ export class TaskSandbox extends DurableObject<Env> {
       expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
       if (expired) state.error = "startup did not finish in time";
     } else if (alive && !running) {
-      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES) {
+      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && !overdue) {
         this.#save(state);
         await this.#recover();
         return;

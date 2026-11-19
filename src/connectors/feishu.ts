@@ -99,10 +99,14 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     } catch {
       return undefined;
     }
-    // Mentions arrive as placeholders (@_user_1); put the names back so the text reads naturally.
+    // Mentions arrive as placeholders (@_user_1). The bot's own is dropped: it only says the message
+    // is for the agent, which the event already records. The others get their names back.
     for (const mention of mentions) {
-      if (typeof mention.key === "string") text = text.split(mention.key).join(`@${String(mention.name ?? "someone").replace(/\s+/g, " ")}`);
+      if (typeof mention.key !== "string") continue;
+      const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
+      text = text.split(mention.key).join(own ? " " : `@${String(mention.name ?? "someone").replace(/\s+/g, " ")}`);
     }
+    text = text.replace(/\s+/g, " ").trim();
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }

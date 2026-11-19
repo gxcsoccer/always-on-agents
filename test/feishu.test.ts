@@ -61,7 +61,8 @@ describe("turning a Feishu message into an event", () => {
 
     const result = normalize(app, envelope({ chat_type: "group", content, mentions: [mentionBot, mentionCarol] }));
     expect(result?.scope).toEqual({ tenant: "acme", kind: "chat", id: "oc_chat" });
-    expect(result?.event.text).toBe("@Agent please help @Carol");
+    // The bot's own mention is dropped, so a reply like "@Agent approve K7PW" reads as "approve K7PW".
+    expect(result?.event.text).toBe("please help @Carol");
     expect(result?.event.session_key).toBe("chat");
     expect(result?.event.reply_to?.address).toMatchObject({ message_id: "om_1" });
 
