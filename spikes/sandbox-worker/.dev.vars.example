@@ -1,4 +1,0 @@
-OPENAI_API_KEY=sk-xxx
-SPIKE_KEY=pick-any-long-random-string
-# Optional: lets the container clone private repositories and push.
-# GITHUB_TOKEN=ghp_xxx
