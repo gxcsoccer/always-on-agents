@@ -60,17 +60,30 @@ export function documentOf(link: string): DocumentRef | undefined {
 }
 
 /**
- * The documents a person linked in what they wrote. Each run of characters that could be a link
- * is taken whole and judged as one link (see documentOf): a Feishu address that is only part of
- * some other link, in its path or its query, is not a link the person gave.
+ * The documents a person linked in what they wrote.
+ *
+ * A link is taken whole, from where it starts to the next whitespace, and judged as one link (see
+ * documentOf). A Feishu address that is only part of some other link, in its path or its query,
+ * is therefore never looked at on its own: nothing after a link has begun can start another.
+ * A link must begin at the start of a word, or right after words in another script or an opening
+ * bracket or quote.
+ *
+ * People write links into sentences without spaces ("看看https://…/docx/X，谢谢"). If the whole run
+ * is not a document link, the part up to the first character outside ASCII is tried instead: that
+ * can only cut the same link shorter. A link this cannot settle is not counted, and the person
+ * can paste it on a line of its own.
  */
 export function documentsIn(text: string): DocumentRef[] {
   const found: DocumentRef[] = [];
-  // Whole runs of what a link can be written with. Whitespace, quotes, brackets and anything
-  // outside ASCII (full-width punctuation, the words around the link) end a run.
-  for (const run of text.match(/[!#-&(-;=?-~]+/g) ?? []) {
+  for (const word of text.split(/\s+/)) {
+    const start = /[A-Za-z][A-Za-z0-9+.-]*:\/\//.exec(word);
+    if (!start) continue;
+    const before = word[start.index - 1];
+    if (before !== undefined && /[!-~]/.test(before) && !"([{<\"'".includes(before)) continue;
+    const whole = word.slice(start.index);
     // Punctuation of the sentence around a link is not part of it.
-    const each = documentOf(run.replace(/^[(\[{]+/, "").replace(/[.,;:!?)\]}]+$/, ""));
+    const trimmed = (link: string) => link.replace(/[.,;:!?)\]}>"'，。；：！？、）】》」』”’]+$/u, "");
+    const each = documentOf(trimmed(whole)) ?? documentOf(trimmed(whole.slice(0, whole.search(/[^\x00-\x7f]/) >>> 0)));
     if (each && !found.some((seen) => seen.kind === each.kind && seen.token === each.token)) found.push(each);
   }
   return found;
@@ -93,7 +106,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   if (!app || app.tenant !== context.scope.tenant || !who.tenant_key) return { error: "this conversation does not come through a Feishu app of this tenant" };
 
   const grant = await grantOf(env, who);
-  const { generation, credential } = await grant.held();
+  const { generation, credential, unreadable } = await grant.held();
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
   const needed = target.kind === "wiki" ? SCOPES : ["docx:document:readonly"];
   // The authorisation was taken away, or replaced, while this read was under way: what the old
@@ -108,7 +121,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     return { authorisation_needed: true, note: `The person has not authorised this, or the authorisation has ended. ${where} Nothing was read.` };
   };
   // Not authorised at all, or for documents and not for wiki pages: ask for what this needs.
-  if (!credential || needed.some((each) => !credential.scope.includes(each))) return invite();
+  // A token that is held but can no longer be read (the key changed, say) is reported as refused,
+  // which forgets exactly that one.
+  if (!credential || needed.some((each) => !credential.scope.includes(each))) return invite(unreadable);
 
   const asPerson = async (path: string) => {
     const response = await fetch(`${API}${path}`, { headers: { authorization: `Bearer ${credential.token}` } });

@@ -100,11 +100,16 @@ export class FeishuGrant extends DurableObject<Env> {
       pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS, delivered: false, attempts: 0, next_attempt_at: now };
       stored.pending = [...stored.pending, pending].slice(-MAX_PENDING);
     }
+    // Written together with the alarm that will deliver it: from here on, an invitation that
+    // exists and has not been delivered is always one that will be tried.
     void this.ctx.storage.put("grant", stored);
+    this.#arm(stored);
     if (pending.delivered) return "already";
     // Not yet time to try again: the alarm has it.
     if (pending.next_attempt_at > now) return "queued";
-    return (await this.#send(pending.nonce)) ? "sent" : "queued";
+    const how = await this.#send(pending.nonce);
+    // Used or taken away while its card was on the way: there is no invitation to speak of.
+    return how === "gone" ? "superseded" : how === "sent" ? "sent" : "queued";
   }
 
   /**
@@ -112,10 +117,11 @@ export class FeishuGrant extends DurableObject<Env> {
    * once however often this runs. Before anything is sent, the next attempt is written down and
    * the alarm set for it: if this stops halfway, the invitation is still tried again.
    */
-  async #send(nonce: string): Promise<boolean> {
+  async #send(nonce: string): Promise<"sent" | "failed" | "gone"> {
     const before = await this.#load();
     const pending = before?.pending.find((each) => each.nonce === nonce);
-    if (!before || !pending || pending.delivered || pending.expires_at <= Date.now()) return false;
+    if (!before || !pending || pending.expires_at <= Date.now()) return "gone";
+    if (pending.delivered) return "sent";
     pending.attempts += 1;
     pending.next_attempt_at = Date.now() + Math.min(60_000, 5_000 * 2 ** (pending.attempts - 1));
     void this.ctx.storage.put("grant", before);
@@ -135,7 +141,8 @@ export class FeishuGrant extends DurableObject<Env> {
       void this.ctx.storage.put("grant", after);
     }
     if (after) this.#arm(after);
-    return sent;
+    if (!same) return "gone";
+    return sent || same.delivered ? "sent" : "failed";
   }
 
   /** Sets the alarm for the earliest invitation still to be delivered, or clears it if there is none. */
@@ -169,16 +176,25 @@ export class FeishuGrant extends DurableObject<Env> {
     return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation };
   }
 
-  /** Keeps the token an authorisation produced, unless the grant has been dropped since it began. */
+  /**
+   * Keeps the token an authorisation produced, unless the grant has been dropped since it began.
+   * Invitations can overlap: one for documents, a later one for wiki pages too, completed in
+   * either order. A token that covers no more than a usable one already held changes nothing, so
+   * finishing the older, narrower invitation last does not take away what the wider one gave.
+   */
   async install(generation: number, token: { access_token: string; expires_at: number; scope: string }): Promise<boolean> {
     const key = await this.#key();
     const current = await this.#load();
     if (!current || current.generation !== generation) return false;
+    // Whether the token held now can still be read, found out before the record is read again.
+    const readable = current.grant && (await this.#readable(current.grant)) ? current.grant.version : undefined;
     // Sealed under a version of its own; awaited before the record is read again below.
     const version = random(16);
     const sealed = await seal(key, token.access_token, version);
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
+    const has = stored.grant && stored.grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS ? stored.grant.scope.split(" ") : undefined;
+    if (has && stored.grant!.version === readable && token.scope.split(" ").every((each) => has.includes(each))) return true;
     stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version };
     void this.ctx.storage.put("grant", stored);
     return true;
@@ -190,16 +206,24 @@ export class FeishuGrant extends DurableObject<Env> {
    * `stands` with that version before relying on anything it fetched, and hands the generation
    * back when asking for an invitation.
    */
-  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] } }> {
+  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] }; unreadable?: string }> {
     const stored = await this.#load();
     const generation = stored?.generation ?? 1;
     if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation };
     try {
       return { generation, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) } };
     } catch {
-      // Sealed under another key, or damaged: as good as not there.
-      return { generation };
+      // Sealed under another key, or damaged. It cannot be used; the caller reports its version
+      // as refused when asking for an invitation, which forgets exactly this one.
+      return { generation, unreadable: stored.grant.version };
     }
+  }
+
+  async #readable(grant: NonNullable<Stored["grant"]>): Promise<boolean> {
+    return open(await this.#key(), grant.sealed, grant.version).then(
+      () => true,
+      () => false,
+    );
   }
 
   /** Whether the token of this version is still the person's grant. */
@@ -208,10 +232,12 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 
   /** Forgets the token and closes every open invitation, including ones already on their way back. */
-  async drop(): Promise<void> {
+  async drop(who: Who): Promise<void> {
     const stored = await this.#load();
-    if (!stored) return;
-    void this.ctx.storage.put("grant", { who: stored.who, generation: stored.generation + 1, pending: [] } satisfies Stored);
+    // Also when nothing is held yet: a request that looked before this and invites after it must
+    // find that something changed.
+    void this.ctx.storage.put("grant", { who: stored?.who ?? who, generation: (stored?.generation ?? 1) + 1, pending: [] } satisfies Stored);
+    void this.ctx.storage.deleteAlarm();
   }
 
   /** For the operator: whether there is a grant, and until when. Never the token. */

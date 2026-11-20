@@ -36,8 +36,9 @@ export const feishuConnector: Connector = {
     if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
     // One person's authorisation to read their documents: whether it stands, and taking it away.
     if (path[0] === "feishu-grants" && path.length === 4 && (method === "GET" || method === "DELETE")) {
-      const grant = await grantOf(env, { app_id: path[1], tenant_key: path[2], open_id: path[3] });
-      if (method === "DELETE") await grant.drop();
+      const who = { app_id: path[1], tenant_key: path[2], open_id: path[3] };
+      const grant = await grantOf(env, who);
+      if (method === "DELETE") await grant.drop(who);
       return json(await grant.status());
     }
     if (path[0] !== "tenants" || path[2] !== "feishu-apps" || method !== "POST") return undefined;

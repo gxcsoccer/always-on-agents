@@ -306,7 +306,7 @@ describe("reading a Feishu document as the person who asked", () => {
     await grant.invite(erin.who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly"], { generation: (await grant.held()).generation });
     const pending = await runInDurableObject(grant, async (_i: unknown, state: DurableObjectState) => (await state.storage.get<any>("grant")).pending[0]);
     const taken = await grant.redeem(pending.nonce);
-    await grant.drop();
+    await grant.drop(erin.who);
     expect(await grant.install(taken!.generation, { access_token: "u-late", expires_at: Date.now() + 3_600_000, scope: "docx:document:readonly" })).toBe(false);
     expect(await (await admin("GET")).json()).toMatchObject({ authorised: false });
   });
@@ -366,7 +366,7 @@ describe("reading a Feishu document as the person who asked", () => {
     // inside the Brain's own object.)
     feishu.duringRead = async () => {
       feishu.duringRead = undefined;
-      await (await grantOf(env as any, hana.who)).drop();
+      await (await grantOf(env as any, hana.who)).drop(hana.who);
     };
     expect((await ask()).error).toMatch(/authorisation changed/);
     expect(JSON.stringify(modelCalls)).not.toContain("Read under the old authorisation");
@@ -461,6 +461,48 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(await (await judy.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly" });
   });
 
+  it("is not narrowed by finishing an older, smaller invitation last", async () => {
+    const lena = someone();
+    feishu.docs.set("DocLena00000000000001", { readers: [lena.openId], text: "Lena's." });
+    feishu.wiki.set("WikiLena0000000000001", { obj_type: "docx", obj_token: "DocLena00000000000001" });
+    model.replies([call("feishu_read_document", { document: link("DocLena00000000000001") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await lena.says(`读一下 ${link("DocLena00000000000001")}`);
+    const forDocuments = invitation(lena.openId);
+    model.replies([call("feishu_read_document", { document: link("WikiLena0000000000001", "wiki") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await lena.says(`读一下 ${link("WikiLena0000000000001", "wiki")}`);
+    const forWiki = invitation(lena.openId);
+    expect(forWiki.searchParams.get("state")).not.toBe(forDocuments.searchParams.get("state"));
+
+    expect((await consent(forWiki, lena)).status).toBe(200);
+    expect((await consent(forDocuments, lena)).status).toBe(200);
+    expect(await (await lena.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly wiki:node:read" });
+    model.replies([call("feishu_read_document", { document: link("WikiLena0000000000001", "wiki") })], [call("send_message", { text: "好的" })], [say("")]);
+    await lena.says(`读一下 ${link("WikiLena0000000000001", "wiki")}`);
+    expect(toolOutputs()[0]).toEqual({ text: "Lena's." });
+  });
+
+  it("invites again when the token it holds can no longer be read", async () => {
+    const mina = someone();
+    feishu.docs.set("DocMina00000000000001", { readers: [mina.openId], text: "Mina's." });
+    await authorised(mina, "DocMina00000000000001");
+    const cards = () => feishu.sent.filter((each) => each.type === "interactive").length;
+    const before = cards();
+    // As after a change of the deployment's key: what is stored no longer opens.
+    await runInDurableObject(await mina.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.sealed = btoa("x".repeat(60));
+      await state.storage.put("grant", stored);
+    });
+    model.replies([call("feishu_read_document", { document: link("DocMina00000000000001") })], [call("send_message", { text: "请重新授权" })], [say("")]);
+    await mina.says(`读一下 ${link("DocMina00000000000001")}`);
+    expect(toolOutputs()[0].authorisation_needed).toBe(true);
+    expect(cards()).toBe(before + 1);
+    expect((await consent(invitation(mina.openId), mina)).status).toBe(200);
+    model.replies([call("feishu_read_document", { document: link("DocMina00000000000001") })], [call("send_message", { text: "好的" })], [say("")]);
+    await mina.says(`读一下 ${link("DocMina00000000000001")}`);
+    expect(toolOutputs()[0]).toEqual({ text: "Mina's." });
+  });
+
   it("keeps the authorisation when Feishu says it does not cover a wiki page", async () => {
     const kate = someone();
     feishu.docs.set("DocKate00000000000001", { readers: [kate.openId], text: "Kate's." });
@@ -524,6 +566,22 @@ describe("the document tool by itself", () => {
       expect(documentsIn(not)).toEqual([]);
       expect(documentOf(not)).toBeUndefined();
     }
+    // A link is taken whole to the next space. Nothing inside or after it starts another, in any
+    // script; and one that cannot be told apart from the words around it is not counted.
+    for (const not of [
+      "https://evil.com/文档/https://x.feishu.cn/docx/DocUnit00000000000001",
+      "https://evil.com/?q=中文https://x.feishu.cn/docx/DocUnit00000000000001",
+      "https://evil.com/it's/https://x.feishu.cn/docx/DocUnit00000000000001",
+      "见https://evil.com/页#https://x.feishu.cn/docx/DocUnit00000000000001",
+      "x:https://x.feishu.cn/docx/DocUnit00000000000001",
+    ]) expect(documentsIn(not)).toEqual([]);
+    expect(documentsIn("请看「https://x.feishu.cn/docx/DocUnit00000000000001」，以及 https://x.feishu.cn/wiki/WikiUnit0000000000001。另外 https://evil.com/页面 和\nhttps://x.feishu.cn/docx/DocUnit00000000000002")).toEqual([
+      { kind: "docx", token: "DocUnit00000000000001" },
+      { kind: "wiki", token: "WikiUnit0000000000001" },
+      { kind: "docx", token: "DocUnit00000000000002" },
+    ]);
+    // Two links run together without a space: the first is counted, the second has to be pasted apart.
+    expect(documentsIn("https://x.feishu.cn/docx/DocUnit00000000000001和https://x.feishu.cn/docx/DocUnit00000000000002")).toEqual([{ kind: "docx", token: "DocUnit00000000000001" }]);
     // The tool's argument is one whole link, not a text to search.
     expect(documentOf("see https://x.feishu.cn/docx/DocUnit00000000000001")).toBeUndefined();
     expect(documentOf("https://X.Feishu.cn/docx/DocUnit00000000000001?a=1#b")).toEqual({ kind: "docx", token: "DocUnit00000000000001" });
@@ -542,9 +600,17 @@ describe("the document tool by itself", () => {
     // A refusal of a token that is no longer the one held.
     expect(await grant.invite(who, redirect, docx, { generation: seen.generation, refused: "an-older-version" })).toBe("superseded");
     // The grant was taken away after the caller looked.
-    await grant.drop();
+    await grant.drop(who);
     expect(await grant.invite(who, redirect, docx, { generation: seen.generation })).toBe("superseded");
     expect(feishu.sent.filter((each) => each.type === "interactive").length).toBe(1);
+
+    // Taken away before anything was ever held: a request that looked earlier still finds a change.
+    const never = { app_id: APP_ID, tenant_key: ORG, open_id: "ou_race_first" };
+    const empty = await grantOf(env as any, never);
+    const looked = await empty.held();
+    await empty.drop(never);
+    expect(await empty.invite(never, redirect, docx, { generation: looked.generation })).toBe("superseded");
+    expect(feishu.sent.filter((each) => each.to === "ou_race_first")).toEqual([]);
   });
 
   it("says so when the deployment is not set up for it, or the app is another tenant's", async () => {
