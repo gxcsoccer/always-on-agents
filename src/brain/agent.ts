@@ -752,13 +752,18 @@ export class BrainAgent extends DurableObject<Env> {
       // The question itself is a comment others may be able to edit. People approve what they
       // read, so it has to still say what the agent wrote.
       const ask = task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
-      const receipt = ask ? this.#rows<{ receipt: string | null }>("SELECT receipt FROM outbox WHERE idem = ?", ask)[0]?.receipt : undefined;
+      const shown = ask ? this.#rows<{ target: string; receipt: string | null; status: string }>("SELECT target, receipt, status FROM outbox WHERE idem = ?", ask)[0] : undefined;
+      const where = shown ? (JSON.parse(shown.target) as Target).connector : "";
+      const receipt = shown?.receipt;
+      // Posted somewhere others can change it, with nothing to say which posted message it is:
+      // there is then no way to know that what people read is what the agent wrote.
+      if (shown?.status === "sent" && !receipt && canRevisit(where)) {
+        throw new Error("the question was posted where it can be changed and cannot be identified there, so nobody can be taken to have approved this action; it can only be refused");
+      }
       if (ask && receipt) {
         const posted = JSON.parse(receipt) as { subject: string; holder: string };
-        const shown = this.#rows<{ target: string }>("SELECT target FROM outbox WHERE idem = ?", ask)[0];
         // Asked of the system the question was posted in. One where nobody else can change the
         // agent's messages has nothing to say here.
-        const where = shown ? (JSON.parse(shown.target) as Target).connector : "";
         const now = await standingOf(this.env, where, this.#scope(), posted.subject);
         // A system where the question can be changed has to recognise the question it was shown in.
         if (!now && canRevisit(where)) throw new Error("the question as it was posted cannot be found where it was shown, so nobody can be taken to have approved this action; it can only be refused");
@@ -1227,8 +1232,8 @@ export class BrainAgent extends DurableObject<Env> {
    */
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
-    // A question ends once. Its card is therefore rewritten once, and cannot be left showing an
-    // ending that a later one was meant to replace.
+    // A question ends once: this record is written once and never replaced. Showing it where the
+    // question was put can be repeated or fail, but always shows this one ending.
     this.#sql.exec("UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND closed IS NULL", JSON.stringify(outcome), ask);
     this.#sql.exec("DELETE FROM unsettled WHERE ask = ?", ask);
     this.#showClosed(ask);

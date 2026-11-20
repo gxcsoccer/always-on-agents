@@ -52,7 +52,11 @@ export interface AdminRequest {
 }
 
 export interface Channel {
-  /** Sends one message. Throwing means "not delivered, try again later"; it must be safe to repeat (see `idem`). */
+  /**
+   * Sends one message. Throwing means "not delivered, try again later"; it must be safe to repeat
+   * (see `idem`). A channel with `standing` must return a Receipt for an approval question: a
+   * question posted where it can be changed, and not identifiable there, cannot be approved.
+   */
   deliver(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void>;
   /**
    * Marks a delivered approval question as closed where it is shown, if the system can: the

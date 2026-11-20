@@ -626,6 +626,15 @@ describe("tasks and approvals", () => {
     });
     expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/cannot be found where it was shown/);
     expect(await answersSent(id)).toHaveLength(0);
+    // Nor when its delivery left nothing to say which posted message it is.
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET receipt = NULL WHERE ask IS NOT NULL");
+    });
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/cannot be identified there/);
+    expect(await answersSent(id)).toHaveLength(0);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET receipt = ? WHERE ask IS NOT NULL", JSON.stringify({ subject: "test:note:unknown-question", holder: "q" }));
+    });
     // Where it is known and unchanged, the same approval goes through.
     notes.set("test:note:unknown-question", { revision: 1, holder: "q", deleted: false, edited: false });
     expect(await reply(stub, id, "bob", `approve ${code}`)).toMatchObject({ ok: true, decision: "allow" });
