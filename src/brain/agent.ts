@@ -82,6 +82,11 @@ interface InboxRow {
   received_at: number;
 }
 
+type Said = { text: string; data: Record<string, unknown> };
+/** How far back a person's earlier messages still count as part of what they are asking now. */
+const RECENT_REQUEST_MS = 10 * 60_000;
+const MAX_RECENT_REQUESTS = 5;
+
 interface RunRow {
   id: string;
   session_id: string;
@@ -490,7 +495,7 @@ export class BrainAgent extends DurableObject<Env> {
    * empty. Anything else and there is no such person. Worked out from the stored events each
    * time it is needed, never remembered.
    */
-  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: { text: string; data: Record<string, unknown> }[] } | undefined {
+  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[] } | undefined {
     const scope = this.#scope();
     if (scope.kind !== "user") return undefined;
     const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
@@ -499,17 +504,28 @@ export class BrainAgent extends DurableObject<Env> {
     const origin = originOf(events[0]);
     if (!origin || toolsOf(source).length === 0) return undefined;
     const conversation = privateSessionKey(source, origin);
-    for (const event of events) {
+    // A request, in the person's own words, made here: through that connector, in that private
+    // conversation, by the person whose scope this is, with that same verified origin.
+    const own = (event: InboxRow): boolean => {
       const principal = JSON.parse(event.principal) as Principal;
-      if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return undefined;
-      if (!this.#isDecider(principal, event.source) || principal.id !== scope.id) return undefined;
+      if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return false;
+      if (!this.#isDecider(principal, event.source) || principal.id !== scope.id) return false;
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      // A request, in the person's own words, made here.
-      if (data.direct !== true || data.card !== undefined || data.question !== undefined || data.reply_only !== undefined || data.routed_from !== undefined) return undefined;
+      if (data.direct !== true || data.card !== undefined || data.question !== undefined || data.reply_only !== undefined || data.routed_from !== undefined) return false;
       const same = originOf(event);
-      if (!same || JSON.stringify(same) !== JSON.stringify(origin)) return undefined;
-    }
-    return { connector: source, person: scope.id, origin, said: events.map((event) => ({ text: event.text ?? "", data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} })) };
+      return same !== undefined && JSON.stringify(same) === JSON.stringify(origin);
+    };
+    if (!events.every(own)) return undefined;
+    const said = (event: InboxRow): Said => ({ text: event.text ?? "", data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} });
+    // What the same person wrote here shortly before, by the same test. People say what they
+    // mean over two messages: a link, then what to do with it. These are their own words as
+    // they arrived, never anything a run wrote or read.
+    const first = events[0];
+    const recent = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND id < ? AND received_at >= ? ORDER BY id DESC LIMIT ?", conversation, source, first.id, first.received_at - RECENT_REQUEST_MS, MAX_RECENT_REQUESTS * 4)
+      .filter(own)
+      .slice(0, MAX_RECENT_REQUESTS)
+      .reverse();
+    return { connector: source, person: scope.id, origin, said: events.map(said), recent: recent.map(said) };
   }
 
   /**
@@ -714,7 +730,7 @@ export class BrainAgent extends DurableObject<Env> {
         this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
         // Which tool and for whom. Not its arguments: they can name what the person is reading.
         this.#audit(acting.person, "tool.used", { tool: name, call: callId });
-        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: acting.said, callId }, args);
+        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId }, args);
       },
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
       sendReview: (callId, summary, commit, comments) => {

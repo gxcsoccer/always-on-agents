@@ -51,6 +51,11 @@ interface Stored {
   generation: number;
   pending: Pending[];
   grant?: { sealed: string; expires_at: number; scope: string; version: string };
+  /**
+   * The earlier message whose link has been read on the strength of a later one, and the tool
+   * call that read it. See `finish`.
+   */
+  answered?: { message: string; by: string };
 }
 
 const AUTHORIZE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize";
@@ -208,17 +213,36 @@ export class FeishuGrant extends DurableObject<Env> {
    * `stands` with that version before relying on anything it fetched, and hands the generation
    * back when asking for an invitation.
    */
-  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] }; unreadable?: string }> {
+  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] }; unreadable?: string; answered?: { message: string; by: string } }> {
     const stored = await this.#load();
     const generation = stored?.generation ?? 1;
-    if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation };
+    const answered = stored?.answered;
+    if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation, answered };
     try {
-      return { generation, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) } };
+      return { generation, answered, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) } };
     } catch {
       // Sealed under another key, or damaged. It cannot be used; the caller reports its version
       // as refused when asking for an invitation, which forgets exactly this one.
-      return { generation, unreadable: stored.grant.version };
+      return { generation, answered, unreadable: stored.grant.version };
     }
+  }
+
+  /**
+   * The last check before text is handed on: whether the token of this version is still the
+   * person's grant ("superseded" if not). If the document was taken from an earlier message of
+   * theirs rather than from the request itself, that message is noted here as answered by this
+   * call, so its link is not read again on the strength of some later message: another call
+   * finds it "taken". The same call asking again, after an interruption lost what it was given,
+   * is let through.
+   */
+  async finish(version: string, carried?: { message: string; by: string }): Promise<"ok" | "superseded" | "taken"> {
+    const stored = await this.#load();
+    if (stored?.grant?.version !== version) return "superseded";
+    if (!carried) return "ok";
+    if (stored.answered?.message === carried.message) return stored.answered.by === carried.by ? "ok" : "taken";
+    stored.answered = carried;
+    void this.ctx.storage.put("grant", stored);
+    return "ok";
   }
 
   /** Whether the token of this version is still the person's grant. */

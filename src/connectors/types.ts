@@ -87,6 +87,13 @@ export interface ToolContext {
    * for, whatever the model was led to ask.
    */
   said: { text: string; data: Record<string, unknown> }[];
+  /**
+   * What the same person wrote in this private conversation shortly before (the last few
+   * messages, within ten minutes), by the same test as `said` and in the same form. A link in
+   * one message and "summarise it" in the next are one request to a person. These are their own
+   * messages as they arrived; nothing a run wrote or read is among them.
+   */
+  recent: { text: string; data: Record<string, unknown> }[];
   /** Names this call; the same on a repeat. */
   callId: string;
 }
