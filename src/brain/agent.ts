@@ -973,6 +973,13 @@ export class BrainAgent extends DurableObject<Env> {
         return { known: true, wake: false, terminal: false };
       }
       if (kind === "needs_input") {
+        // A question from a task that has already ended asks nothing: it is recorded above and goes
+        // no further. Checked before a code is drawn or anything is queued, so no card is sent that
+        // nobody can answer.
+        if (TERMINAL_TASK.has(task.status)) return { known: true, wake: false, terminal: false };
+        // A new question replaces the one before it, which can no longer be answered: say so where
+        // it is shown.
+        if (task.status === "needs_input" && task.pending) this.#closeQuestion((JSON.parse(task.pending) as { ask?: string }).ask, { state: "withdrawn" });
         // The question is put to people by this code, not by the model: what they are shown is
         // exactly what the worker is held on, and the code ties their reply to this one question.
         // No two open questions in this scope share a code, so one reply cannot answer two of them.

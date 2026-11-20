@@ -958,6 +958,21 @@ describe("tasks and approvals", () => {
     expect(state.tasks[0].status).toBe("succeeded");
     expect(state.recent_events.filter((e: any) => e.kind === "worker.result")).toHaveLength(1);
     expect(state.recent_events.filter((e: any) => e.kind === "worker.needs_input")).toHaveLength(1);
+    // The late question was put to nobody: one question was ever asked, the first.
+    expect(state.outbox.filter((m: any) => m.text.includes("needs approval"))).toHaveLength(1);
+  });
+
+  it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {
+    const { stub } = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "b", repository: null })], [say("")]);
+    await stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    const id: string = (await stub.inspect()).tasks[0].id;
+    await stub.taskEvent(id, 1, "result", { text: "done" });
+    await stub.taskEvent(id, 2, "needs_input", ask);
+    const state = await stub.inspect();
+    expect(state.tasks[0].status).toBe("succeeded");
+    expect(state.outbox.filter((m: any) => m.text.includes("needs approval"))).toHaveLength(0);
   });
 
   it("limits how many tasks one scope runs at once", async () => {

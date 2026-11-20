@@ -47,7 +47,7 @@ agent 做的有些事，在有人点头之前不应该发生。这篇文档说�
 | 消息必须来自本作用域的成员，而且是明确对 agent 说的 | `#isDecider` |
 | 在群聊或仓库里，只有发起这个任务的人能批准 | `#answerTask` |
 | 同一批消息里有好几个人提出请求时，任务不记发起人，于是没有人能批准 | `#dispatchTask` |
-| 不是由人发起的任务（比如 CI 失败后自动派出的）不能被批准，只能被拒绝 | `#answerTask` |
+| 在群聊或仓库里，不是由人发起的任务（比如 CI 失败后自动派出的）不能被批准，只能被拒绝。单聊只有一个成员，agent 自己发起的任务（比如定时器触发的）可以由这个成员批准 | `#answerTask` |
 | 问题没能送达任何人时，不能被批准 | `taskEvent`、`#answerTask` |
 | 在仓库里，没有关联到租户用户的 GitHub 账号不算成员；只有 owner、member、collaborator 的评论才会被当作对 agent 的请求 | `#isDecider`、`connectors/github.ts` |
 | 在飞书群里，只认 @ 了本机器人的消息，而且发送者必须属于安装该应用的组织 | `connectors/feishu.ts` |

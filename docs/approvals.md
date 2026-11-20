@@ -47,7 +47,7 @@ In Feishu the question is a card with buttons. Pressing a button is the same as 
 | The message must come from a member of the scope who was addressing the agent. | `#isDecider` |
 | In a group chat or a repository, only the person who requested the task may approve it. | `#answerTask` |
 | If several people asked in the same batch, the task has no requester, and nobody can approve. | `#dispatchTask` |
-| A task not started by a person (one dispatched after a CI failure, say) cannot be approved, only refused. | `#answerTask` |
+| In a group chat or a repository, a task not started by a person (one dispatched after a CI failure, say) cannot be approved, only refused. In a direct chat, where there is one member, that member may approve a task the agent started on its own (after a timer, say). | `#answerTask` |
 | If the question could not be delivered to anyone, it cannot be approved. | `taskEvent`, `#answerTask` |
 | In a repository, a GitHub account that is not linked to a tenant user is not a member. Only comments from an owner, member or collaborator are requests to the agent at all. | `#isDecider`, `connectors/github.ts` |
 | In a Feishu group, only messages that mention this bot count, and the sender must belong to the organisation the app is installed in. | `connectors/feishu.ts` |
