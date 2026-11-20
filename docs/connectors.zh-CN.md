@@ -141,7 +141,7 @@ curl -X POST $B/v1/admin/tenants/acme/chat-repos -H "authorization: Bearer $ADMI
 
 ## 编写一个 connector
 
-一个 connector 就是一个实现了 `Connector` 接口（`src/connectors/types.ts`）的对象，登记在 `src/agent.config.ts` 里。代码的其他地方不会按名字提到任何 connector：路由、管理请求、定时任务、消息投递都通过这个对象找到它。仓库里的三个 connector 都是这样写的，可以直接照着写。
+一个 connector 就是一个实现了 `Connector` 接口（`src/connectors/types.ts`）的对象，登记在 `src/agent.config.ts` 里。路由、管理请求、定时任务、消息投递、消息回读都通过这个对象找到它，而不是按名字。还有两处仍然点名具体系统：connector 的 Durable Object 类要从 `src/index.ts` 导出；任务目前只能指定 GitHub 仓库。仓库里的三个 connector 都是这样写的，可以直接照着写。
 
 ```ts
 export const exampleConnector: Connector = {
@@ -170,6 +170,6 @@ export const exampleConnector: Connector = {
 
 - **谁的话算数。** connector 只负责说明事件是谁引起的。这个人能不能批准动作、能不能被记为任务发起人、能不能改长期指令，由 Brain 决定，而且只对 `src/agent.config.ts` 里 `trusted` 列出的 connector 生效。其他 connector 的事件只提供信息，不能决定任何事。只有当一个 connector 能证明每个事件的来源和引起它的人时，才应该把它列进去。
 - **不是租户用户的账号。** 如果 connector 在自己的系统里认出了一个账号，但它没有关联到租户的用户，就设置 `principal.unlinked`。这样的人不是任何作用域的成员。
-- **会变的消息。** 消息可以被编辑或删除的 connector，要给事件带上 `subject`、`revision` 和 `holder`，并实现 `channel.standing`（向那个系统重新读一遍这条消息）。批准生效之前，Brain 会问它这条消息现在说的是什么。带着 subject、而所属 connector 又没有 `standing` 的消息，不能批准任何事。
+- **会变的消息。** 消息可以被编辑或删除的 connector，要给事件带上 `subject`、`revision` 和 `holder`，并实现 `channel.standing`（向那个系统重新读一遍这条消息）。批准生效之前，Brain 会就批准可能依据的每条成员消息问它：这条消息现在说的是什么。如果 connector 没有 `standing`，或者不认得这条消息，就不会据此批准。agent 自己的提问如果发在别人能编辑的地方，也同样处理。
 
 connector 是编译进 Worker 的第一方代码：每个 connector 都能拿到完整的环境，事件上的来源名字也是它自己写的。`trusted` 名单防的是“无意中依赖了某个 connector”，防不了一个谎报事件来源的 connector，所以审查 connector 要像审查任何持有部署密钥的代码一样。需要自己的 Durable Object 的 connector（比如飞书长连接）还要从 `src/index.ts` 导出这个类，并在 `wrangler.jsonc` 里加一条绑定。

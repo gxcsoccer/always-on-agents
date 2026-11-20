@@ -123,7 +123,7 @@ These are constants in the code, not configuration.
 
 ## Cost notes
 
-- A Brain is awake only while it handles events. A scope that has ever received an event also wakes briefly once a day to remove old records; otherwise an idle scope costs storage only.
+- A Brain is awake only while it handles events. A scope that still holds events also wakes briefly once a day to remove old records, until none are left; otherwise an idle scope costs storage only.
 - A sandbox task holds a container for as long as it runs.
 - A Feishu app on the long connection keeps one Durable Object awake all the time.
 - Model usage is bounded by the daily budgets above. All tenants share the one model key.

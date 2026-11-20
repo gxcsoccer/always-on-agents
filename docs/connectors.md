@@ -140,7 +140,7 @@ The card's fixed text is currently Chinese only.
 
 ## Writing a connector
 
-A connector is one object that implements `Connector` (`src/connectors/types.ts`), listed in `src/agent.config.ts`. Nothing else in the code names a connector: routes, admin requests, scheduled work and delivery all reach it through that object. The three connectors in this repository are written this way and are the examples to copy.
+A connector is one object that implements `Connector` (`src/connectors/types.ts`), listed in `src/agent.config.ts`. Routes, admin requests, scheduled work, delivery and the re-reading of messages all reach it through that object, not by its name. Two things still name a system elsewhere: a connector's Durable Object class is exported from `src/index.ts`, and a task can only be given a GitHub repository to work on. The three connectors in this repository are written this way and are the examples to copy.
 
 ```ts
 export const exampleConnector: Connector = {
@@ -169,6 +169,6 @@ Each part is optional and independent. A connector that only reports events (a C
 
 - **Whose word counts.** A connector says who caused an event. Whether that person can approve an action, be credited with a request, or change standing instructions is decided by the Brain, and only for connectors listed under `trusted` in `src/agent.config.ts`. Events from any other connector inform the agent and decide nothing. List a connector there only if it proves where each event came from and who caused it.
 - **Accounts that are not tenant users.** If the connector identifies an account in its own system that is not linked to a user of the tenant, it sets `principal.unlinked`. Such a person is not a member of any scope.
-- **Messages that can change.** A connector whose messages can be edited or deleted gives its events a `subject`, a `revision` and a `holder`, and implements `channel.standing`, which reads the message again from the system. Before an approval counts, the Brain asks it what the message says now. A message that names a subject from a connector without `standing` cannot approve anything.
+- **Messages that can change.** A connector whose messages can be edited or deleted gives its events a `subject`, a `revision` and a `holder`, and implements `channel.standing`, which reads the message again from the system. Before an approval counts, the Brain asks it what each such message says now, for the messages from members that the approval could rest on. If the connector has no `standing`, or does not recognise the message, nothing is approved on it. The same goes for the agent's own question when it was posted somewhere others can edit it.
 
 Connectors are first-party code compiled into the Worker: each one is handed the whole environment and writes its own name on its events. The `trusted` list guards against a connector being relied on by oversight, not against one that misstates where its events came from, so review a connector as you would any code that holds the deployment's secrets. A connector that needs a Durable Object of its own (as Feishu's long connection does) also needs the class exported from `src/index.ts` and a binding in `wrangler.jsonc`.

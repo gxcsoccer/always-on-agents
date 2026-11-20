@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
 import { MIGRATIONS } from "../src/brain/schema";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
+import { notes } from "./notes";
 
 beforeEach(() => installFakeModel());
 
@@ -600,6 +601,34 @@ describe("tasks and approvals", () => {
     model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
     await wake(stub);
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
+  });
+
+  it("does not approve on an editable reply that its own connector does not recognise", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: "test:note:unknown-reply", revision: 100, holder: "h1" } }));
+    // The place it was written in has no such message when asked.
+    notes.delete("test:note:unknown-reply");
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toMatch(/does not recognise a reply here/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not approve when the question cannot be found where it was shown and could have been changed there", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      // As if the question had been posted somewhere others can edit it, and that place does not know it.
+      state.storage.sql.exec(
+        "UPDATE outbox SET target = ?, receipt = ? WHERE ask IS NOT NULL",
+        JSON.stringify({ connector: "notes", address: {} }),
+        JSON.stringify({ subject: "test:note:unknown-question", holder: "q" }),
+      );
+    });
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/cannot be found where it was shown/);
+    expect(await answersSent(id)).toHaveLength(0);
+    // Where it is known and unchanged, the same approval goes through.
+    notes.set("test:note:unknown-question", { revision: 1, holder: "q", deleted: false, edited: false });
+    expect(await reply(stub, id, "bob", `approve ${code}`)).toMatchObject({ ok: true, decision: "allow" });
   });
 
   it("reads a plain yes or no only from a reply that is tied to the question", () => {

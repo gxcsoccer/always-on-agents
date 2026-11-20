@@ -90,7 +90,7 @@ export interface OutboundMessage {
 }
 
 export interface ApprovalQuestion {
-  /** Names this one question for good. Codes are short and come round again; this does not. */
+  /** Names this one question for good, across scopes. A code is unique only within its scope. */
   id: string;
   code: string;
   /** The task's title. */

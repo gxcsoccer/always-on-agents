@@ -758,7 +758,10 @@ export class BrainAgent extends DurableObject<Env> {
         const shown = this.#rows<{ target: string }>("SELECT target FROM outbox WHERE idem = ?", ask)[0];
         // Asked of the system the question was posted in. One where nobody else can change the
         // agent's messages has nothing to say here.
-        const now = shown ? await standingOf(this.env, (JSON.parse(shown.target) as Target).connector, this.#scope(), posted.subject) : undefined;
+        const where = shown ? (JSON.parse(shown.target) as Target).connector : "";
+        const now = await standingOf(this.env, where, this.#scope(), posted.subject);
+        // A system where the question can be changed has to recognise the question it was shown in.
+        if (!now && canRevisit(where)) throw new Error("the question as it was posted cannot be found where it was shown, so nobody can be taken to have approved this action; it can only be refused");
         // Edited at any time, even if put back since: someone may have read and answered the other wording.
         const touched = this.#rows("SELECT 1 FROM revisions WHERE subject = ?", posted.subject).length > 0;
         if (touched || (now && (now.deleted || now.edited || now.holder !== posted.holder))) {
@@ -1170,11 +1173,6 @@ export class BrainAgent extends DurableObject<Env> {
   }
 
   /**
-   * Records that a question is closed and shows it where the question was put. The outcome is kept
-   * with the question, so it also holds if the question has not been delivered yet: an unsent one
-   * is then not sent at all, and one whose delivery is under way is closed as soon as it lands.
-   */
-  /**
    * Called when a question stops being the one its task is waiting on without an answer to it
    * having been confirmed: a newer question took its place, or the task ended or was cancelled.
    *
@@ -1222,6 +1220,11 @@ export class BrainAgent extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Records that a question is closed and shows it where the question was put. The outcome is kept
+   * with the question, so it also holds if the question has not been delivered yet: an unsent one
+   * is then not sent at all, and one whose delivery is under way is closed as soon as it lands.
+   */
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
     // A question ends once. Its card is therefore rewritten once, and cannot be left showing an
@@ -1286,6 +1289,8 @@ export class BrainAgent extends DurableObject<Env> {
         throw new Error(`a reply here came through "${source}", which cannot confirm what the reply says now, so nothing can be approved on it`);
       }
       const standing = await standingOf(this.env, source, this.#scope(), subject);
+      // Its own connector does not know the message. What it says now is then not known either.
+      if (!standing && deciding.has(subject)) throw new Error(`"${source}" does not recognise a reply here as one of its messages, so what the reply says now cannot be confirmed and nothing can be approved on it`);
       if (standing) this.#revise(subject, standing.revision, standing.deleted, standing.holder);
     }
   }

@@ -1,3 +1,5 @@
+// First: it adds a connector to the configuration, which the modules below read as they load.
+import "./notes";
 import { TaskSandbox } from "../src/workers/sandbox/task";
 import { DurableObject } from "cloudflare:workers";
 
@@ -17,13 +19,13 @@ export class FakeTask extends DurableObject {
   }
   async answer(decision: string, reason: string, questionId?: string, standing = false) {
     this.#record("answer", { decision, reason, questionId, standing });
-    // A test can have the answer take a while to be confirmed, so that other things happen meanwhile.
-    const delay = (this.#policy() as { answerDelayMs?: number }).answerDelayMs;
-    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     // Like the real task: the first answer to a question stands, with the reach it was given.
     const answers = (this.ctx.storage.kv.get("answers") as Record<string, { decision: string; standing: boolean }> | undefined) ?? {};
     answers[questionId ?? ""] ??= { decision, standing: decision === "allow" && standing };
     this.ctx.storage.kv.put("answers", answers);
+    // A test can have the answer take a while to be confirmed once it has taken effect, so that other things happen meanwhile.
+    const delay = (this.#policy() as { answerDelayMs?: number }).answerDelayMs;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     // A test can have the answer take effect and the word of it never get back.
     if ((this.#policy() as { answerUnheard?: boolean }).answerUnheard) throw new Error("connection lost");
     return { ok: true, ...answers[questionId ?? ""] };
