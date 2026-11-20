@@ -34,8 +34,41 @@ export const readDocument: ConnectorTool = {
     "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it in this request (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
   effect: "read",
   parameters: { document: { type: "string" } },
-  run: read,
+  run: reported,
 };
+
+/**
+ * Runs a read and records how it ended, for the operator: one word from a fixed list ("invited"
+ * covers both a card that was sent and one still being retried). What a run read is not kept anywhere, so without this there
+ * is no telling afterwards why a read did not happen. Nothing of the request, the document or
+ * Feishu's answer is logged.
+ */
+async function reported(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
+  try {
+    const result = (await read(context, args)) as { text?: string; authorisation_needed?: boolean; error?: string };
+    const how = result.text !== undefined ? "read" : result.authorisation_needed ? "invited" : (REASONS.find(([, words]) => result.error?.startsWith(words))?.[0] ?? "other");
+    console.log(JSON.stringify({ feishu_read_document: how, app: context.origin.app_id ?? "" }));
+    return result;
+  } catch (err) {
+    // Only that it threw. An error's name and message are whatever their source chose to put there.
+    console.log(JSON.stringify({ feishu_read_document: "threw", app: context.origin.app_id ?? "" }));
+    throw err;
+  }
+}
+
+/** The ways a read is turned down, by how the answer to the model begins. */
+const REASONS: [string, string][] = [
+  ["not_a_link", "that is not a link"],
+  ["not_linked_by_person", "only a document the person linked"],
+  ["no_public_origin", "reading documents is not set up on this deployment (address)"],
+  ["no_grants_key", "reading documents is not set up on this deployment (key)"],
+  ["not_this_tenants_app", "this conversation does not come through"],
+  ["superseded", "the person's authorisation changed"],
+  ["wiki_not_covered", "the person's authorisation does not cover"],
+  ["cannot_open", "the person cannot open"],
+  ["not_a_document", "that wiki page is not a document"],
+  ["feishu_failed", "Feishu could not provide"],
+];
 
 /** A document a link names. */
 export type DocumentRef = { kind: "docx" | "wiki"; token: string };
@@ -105,7 +138,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   if (!linked.some((each) => each?.kind === target.kind && each?.token === target.token)) return { error: "only a document the person linked in this request can be read" };
 
   const redirect = redirectUri(env);
-  if (!redirect || !grantsKey(env)) return { error: "reading documents is not set up on this deployment" };
+  // Which of the two settings is missing or malformed is said apart, so the operator can tell.
+  if (!redirect) return { error: "reading documents is not set up on this deployment (address)" };
+  if (!grantsKey(env)) return { error: "reading documents is not set up on this deployment (key)" };
   const who: Who = { app_id: origin.app_id ?? "", tenant_key: origin.tenant_key ?? "", open_id: context.person };
   const app = await registry(env).feishuApp(who.app_id);
   if (!app || app.tenant !== context.scope.tenant || !who.tenant_key) return { error: "this conversation does not come through a Feishu app of this tenant" };

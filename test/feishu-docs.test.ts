@@ -661,12 +661,34 @@ describe("the document tool by itself", () => {
 
   it("says so when the deployment is not set up for it, or the app is another tenant's", async () => {
     const args = { document: link("DocUnit00000000000001") };
-    expect(await readDocument.run(context({ env: { ...(env as any), GRANTS_KEY: undefined } }), args)).toEqual({ error: "reading documents is not set up on this deployment" });
-    expect(await readDocument.run(context({ env: { ...(env as any), GRANTS_KEY: "short" } }), args)).toEqual({ error: "reading documents is not set up on this deployment" });
-    expect(await readDocument.run(context({ env: { ...(env as any), PUBLIC_ORIGIN: "http://agent.test" } }), args)).toEqual({ error: "reading documents is not set up on this deployment" });
+    expect(await readDocument.run(context({ env: { ...(env as any), GRANTS_KEY: undefined } }), args)).toEqual({ error: "reading documents is not set up on this deployment (key)" });
+    expect(await readDocument.run(context({ env: { ...(env as any), GRANTS_KEY: "short" } }), args)).toEqual({ error: "reading documents is not set up on this deployment (key)" });
+    expect(await readDocument.run(context({ env: { ...(env as any), PUBLIC_ORIGIN: "http://agent.test" } }), args)).toEqual({ error: "reading documents is not set up on this deployment (address)" });
+    expect(await readDocument.run(context({ env: { ...(env as any), PUBLIC_ORIGIN: "https://agent.test/v1/feishu/oauth/callback" } }), args)).toEqual({ error: "reading documents is not set up on this deployment (address)" });
     expect(await readDocument.run(context({ scope: { tenant: "elsewhere", kind: "user", id: "ou_unit" } }), args)).toEqual({ error: "this conversation does not come through a Feishu app of this tenant" });
     expect(await readDocument.run(context({ origin: { app_id: "cli_unknown", tenant_key: ORG } }), args)).toEqual({ error: "this conversation does not come through a Feishu app of this tenant" });
     expect(feishu.sent).toEqual([]);
+  });
+
+  it("records how each read ended, in a fixed word and nothing of the request", async () => {
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((line: unknown) => void lines.push(String(line)));
+    try {
+      await readDocument.run(context({ callId: "call_why1" }), { document: "DocUnit00000000000001" });
+      await readDocument.run(context({ callId: "call_why2" }), { document: link("DocElse00000000000001") });
+      await readDocument.run(context({ callId: "call_why3", env: { ...(env as any), GRANTS_KEY: undefined } }), { document: link("DocUnit00000000000001") });
+      await readDocument.run(context({ callId: "call_why3b", env: { ...(env as any), PUBLIC_ORIGIN: " https://agent.test" } }), { document: link("DocUnit00000000000001") });
+      // One that throws: its error carries words that must not be logged, not even its name.
+      const leaky = Object.assign(new Error("secret words"), { name: "DocUnit00000000000001" });
+      await readDocument.run(context({ callId: "call_why3c", env: { ...(env as any), REGISTRY: { getByName: () => ({ feishuApp: () => Promise.reject(leaky) }) } } }), { document: link("DocUnit00000000000001") }).catch(() => undefined);
+      await readDocument.run(context({ callId: "call_why4", person: "ou_why", scope: { tenant: TENANT, kind: "user", id: "ou_why" } }), { document: link("DocUnit00000000000001") });
+    } finally {
+      log.mockRestore();
+    }
+    const ours = lines.filter((line) => line.includes("feishu_read_document")).map((line) => JSON.parse(line));
+    expect(ours).toEqual(["not_a_link", "not_linked_by_person", "no_grants_key", "no_public_origin", "threw", "invited"].map((how) => ({ feishu_read_document: how, app: APP_ID })));
+    expect(lines.join("\n")).not.toContain("DocUnit00000000000001");
+    expect(lines.join("\n")).not.toContain("secret words");
   });
 
   it("gives a repeat of the same call the same invitation, and cuts a long document", async () => {
