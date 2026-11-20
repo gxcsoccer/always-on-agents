@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
@@ -46,6 +46,8 @@ const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
 const MODEL_CALL_RESERVE = 20_000;
 const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
+/** The longest an outside system's request to wait is honoured for one attempt. */
+const MAX_DEFERRAL_MS = 60 * 60_000;
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How long finished records are kept before housekeeping removes them. */
 const RETAIN_RECORDS_MS = 30 * 86_400_000;
@@ -563,7 +565,10 @@ export class BrainAgent extends DurableObject<Env> {
     } catch (err) {
       const attempts = row.attempts + 1;
       const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
-      this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), String(err).slice(0, 500), row.id);
+      // No sooner than the usual wait, and no sooner than the outside system asked for, within reason.
+      const asked = err instanceof DeliveryDeferred ? Math.min(err.notBefore, Date.now() + MAX_DEFERRAL_MS) : 0;
+      const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), asked);
+      this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, String(err).slice(0, 500), row.id);
       if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
       return false;
     }

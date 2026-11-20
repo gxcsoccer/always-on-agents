@@ -76,6 +76,21 @@ export interface Channel {
   standing?(env: Env, scope: Scope, subject: string): Promise<Standing | undefined>;
 }
 
+/**
+ * Thrown by `deliver` when the outside system said not to try again before a certain time. The
+ * message is retried as after any failure, but no sooner than that.
+ */
+export class DeliveryDeferred extends Error {
+  constructor(
+    message: string,
+    /** In ms since the epoch. */
+    readonly notBefore: number,
+  ) {
+    super(message);
+    this.name = "DeliveryDeferred";
+  }
+}
+
 /** Where a revisable message stands at its source right now. */
 export type Standing = { revision: number; holder: string; deleted: boolean; edited: boolean };
 

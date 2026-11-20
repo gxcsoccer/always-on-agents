@@ -1191,6 +1191,23 @@ describe("tasks and approvals", () => {
     expect(JSON.parse(String(rows[0].review))).toEqual({ summary: "One problem.", comments });
   });
 
+  it("waits at least as long as the outside system asked before delivering again", async () => {
+    const { stub } = brain();
+    (globalThis as any).__notesWaitMs = 120_000;
+    try {
+      model.replies([call("send_message", { text: "hello" })], [say("")]);
+      const before = Date.now();
+      await stub.ingest(message("hi", { reply_to: { connector: "notes", address: {} } }));
+      await wake(stub);
+      const row = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT status, attempts, next_at FROM outbox").one());
+      expect(row).toMatchObject({ status: "pending", attempts: 1 });
+      // The usual first retry is two seconds away; this one is no sooner than was asked.
+      expect(Number(row.next_at)).toBeGreaterThanOrEqual(before + 120_000);
+    } finally {
+      delete (globalThis as any).__notesWaitMs;
+    }
+  });
+
   it("tells the model where a comment was made, which the comment itself does not say", async () => {
     const { stub } = brain("repo");
     model.replies([say("")]);

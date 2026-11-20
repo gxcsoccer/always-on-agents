@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { commentableLines, githubConnector, inert, literal } from "../src/connectors/github";
+import { commentableLines, githubConnector, inert, isOurs } from "../src/connectors/github";
+import { DeliveryDeferred } from "../src/connectors/types";
 import type { CodeReview } from "../src/connectors/types";
 import type { Env } from "../src/env";
 
@@ -9,7 +10,7 @@ const HEAD = "a".repeat(40);
 const PATCH = ["@@ -1,3 +1,4 @@", " one", "-two", "+TWO", "+two and a half", " three", "@@ -10,2 +11,2 @@", " ten", "+eleven"].join("\n");
 
 /** Stands in for GitHub's API for one pull request, and records what was posted. */
-function github(options: { pull?: number; reviews?: any[]; pages?: number; refuse?: unknown } = {}) {
+function github(options: { pull?: number; reviews?: any[]; pages?: number; nextOnly?: boolean; comments?: any[]; refuse?: unknown; refuseHeaders?: Record<string, string>; refuseStatus?: number } = {}) {
   const posted: { url: string; body: any }[] = [];
   const asked: string[] = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -18,7 +19,7 @@ function github(options: { pull?: number; reviews?: any[]; pages?: number; refus
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       posted.push({ url: path, body });
-      if (path === "/pulls/7/reviews" && options.refuse && body.comments.length > 0) return Response.json(options.refuse, { status: 422 });
+      if (path === "/pulls/7/reviews" && options.refuse && (body.comments.length > 0 || options.refuseStatus)) return Response.json(options.refuse, { status: options.refuseStatus ?? 422, headers: options.refuseHeaders });
       return Response.json({ id: 99, body: body.body });
     }
     asked.push(url);
@@ -29,10 +30,11 @@ function github(options: { pull?: number; reviews?: any[]; pages?: number; refus
       // Oldest first: what a test supplies is the newest, on the last page.
       const old = Array.from({ length: 100 }, (_, i) => ({ id: page * 1000 + i, body: "an old review", state: "COMMENTED", submitted_at: "2020-01-01T00:00:00Z" }));
       const batch = page === pages ? (options.reviews ?? []) : old;
-      return Response.json(batch, { headers: pages > 1 ? { link: `<https://api.github.com/x?per_page=100&page=${pages}>; rel="last"` } : {} });
+      const link = options.nextOnly ? (page < pages ? `<https://api.github.com/x?per_page=100&page=${page + 1}>; rel="next"` : "") : pages > 1 ? `<https://api.github.com/x?per_page=100&page=${pages}>; rel="last"` : "";
+      return Response.json(batch, { headers: link ? { link } : {} });
     }
     if (path === "/pulls/7/files") return Response.json([{ filename: "src/a.ts", patch: PATCH }, { filename: "logo.png" }]);
-    if (path === "/issues/7/comments") return Response.json([]);
+    if (path === "/issues/7/comments") return Response.json(options.comments ?? []);
     throw new Error(`unexpected request to ${url}`);
   });
   return Object.assign(posted, { asked });
@@ -127,7 +129,8 @@ describe("a code review on GitHub", () => {
     await send({ summary: review.summary, comments: review.comments });
     expect(posted[0].url).toBe("/issues/7/comments");
     expect(posted[0].body.body).toContain("does not say which commit it is of");
-    expect(posted[0].body.body).toContain("the review in words");
+    expect(posted[0].body.body).toContain("Two problems.");
+    expect(posted[0].body.body).toContain("` src/a.ts:2 `\non a changed line");
   });
 
   it("sends the whole review in the body when GitHub will not take a line", async () => {
@@ -144,23 +147,85 @@ describe("a code review on GitHub", () => {
     expect(posted).toHaveLength(1);
   });
 
-  it("makes what a worker wrote inert: no one is notified and no change is offered", async () => {
+  it("publishes one review once, even if the pull request moves between an attempt and its retry", async () => {
+    const stale = { summary: "No findings.", commit: "b".repeat(40), comments: [] };
+    // Posted as a review while the pull request was at the reviewed commit; it has moved on since.
+    let posted = github({ reviews: [{ id: 41, body: `No findings.\n\n${MARKER}`, state: "COMMENTED", submitted_at: "2026-01-01T00:00:05Z" }] });
+    expect(await send(stale)).toMatchObject({ subject: "github:review:41" });
+    expect(posted).toHaveLength(0);
+    // The other way round: posted as a comment while the pull request was elsewhere; it is back now.
+    posted = github({ comments: [{ id: 42, body: `This review is of commit aaaaaaa…\n\n${MARKER}`, created_at: "2026-01-01T00:00:05Z" }] });
+    expect(await send()).toMatchObject({ subject: "github:comment:42" });
+    expect(posted).toHaveLength(0);
+  });
+
+  it("follows a listing of reviews that only says what comes next, and gives up rather than guess when it is too long", async () => {
+    const earlier = [{ id: 41, body: `Two problems.\n\n${MARKER}`, state: "COMMENTED", submitted_at: "2026-01-01T00:00:05Z" }];
+    let posted = github({ pages: 3, nextOnly: true, reviews: earlier });
+    expect(await send()).toMatchObject({ subject: "github:review:41" });
+    expect(posted).toHaveLength(0);
+    posted = github({ pages: 12, nextOnly: true, reviews: earlier });
+    await expect(send()).rejects.toThrow(/too many reviews/);
+    expect(posted).toHaveLength(0);
+  });
+
+  it("waits as long as GitHub says before trying again, and does not post a second time meanwhile", async () => {
+    for (const refusal of [
+      { refuseStatus: 429, refuse: { message: "rate limited" } },
+      // Even when the refusal reads like one about a line.
+      { refuse: { message: "Unprocessable", errors: ["line must be part of the diff"] } },
+    ]) {
+      const posted = github({ ...refusal, refuseHeaders: { "retry-after": "120" } });
+      const before = Date.now();
+      const error = await send().then(() => undefined, (err) => err);
+      expect(error).toBeInstanceOf(DeliveryDeferred);
+      expect(error.notBefore).toBeGreaterThanOrEqual(before + 120_000);
+      expect(error.notBefore).toBeLessThan(before + 130_000);
+      expect(posted).toHaveLength(1);
+    }
+  });
+
+  it("makes what a worker wrote inert without changing any code in it", async () => {
     const posted = github();
     await send({
-      summary: "Ask @octocat about this.",
+      summary: "Ask @octocat about this. Install with `npm i @scope/pkg`, or mail a@b.co.",
       commit: HEAD,
       comments: [
-        { path: "src/a.ts", line: 2, body: "Use this:\n```suggestion\nrm -rf /\n```" },
-        { path: "odd`name.ts", line: 3, body: "cc @someone" },
+        { path: "src/a.ts", line: 2, body: "Use this:\n```suggestion\nrm -rf /\n```\nor run:\n```sh\nnpm i @scope/pkg\n```" },
+        { path: "odd`name  two spaces.ts", line: 3, body: "cc @some-team/reviewers" },
       ],
     });
-    const sent = JSON.stringify(posted[0].body);
-    expect(sent).not.toMatch(/@octocat|@someone/);
-    expect(sent).not.toContain("```suggestion");
-    expect(inert("email a@b.co, @x")).toBe("email a@\u200bb.co, @\u200bx");
+    const body: string = posted[0].body.body;
+    // In prose a mention is shown as code, where it notifies nobody.
+    expect(body).toContain("Ask `@octocat` about this.");
+    expect(body).toContain("cc `@some-team/reviewers`");
+    // Code is exactly what was written, in a span and in a block; an address is not a mention.
+    expect(body).toContain("`npm i @scope/pkg`, or mail a@b.co.");
+    const inline: string = posted[0].body.comments[0].body;
+    expect(inline).toContain("```sh\nnpm i @scope/pkg\n```");
+    expect(inline).toContain("```text\nrm -rf /\n```");
+    expect(inline).not.toContain("suggestion");
+    expect(JSON.stringify(posted[0].body)).not.toContain("\u200b");
     // A path is shown as it is, whatever it contains.
-    expect(posted[0].body.body).toContain(literal("odd`name.ts:3"));
-    expect(literal("odd`name.ts")).toBe("`` odd`name.ts ``");
+    expect(body).toContain("`` odd`name  two spaces.ts:3 ``");
+    expect(inert("    @indented code stays")).toBe("    @indented code stays");
+  });
+
+  it("shows paths literally in a review posted as a comment too", async () => {
+    const posted = github();
+    await send({ summary: "See @octocat.", commit: "b".repeat(40), comments: [{ path: "a`b.ts", line: 1, body: "x" }] });
+    expect(posted[0].url).toBe("/issues/7/comments");
+    expect(posted[0].body.body).toContain("`` a`b.ts:1 ``");
+    expect(posted[0].body.body).toContain("See `@octocat`.");
+  });
+
+  it("knows its own earlier post by the marker at its end and, where the account is known, by who posted it", () => {
+    const body = `text\n\n${MARKER}\n`;
+    expect(isOurs({ body, user: { login: "Aoa-Agent[bot]" } }, MARKER, "aoa-agent[bot]")).toBe(true);
+    expect(isOurs({ body, user: { login: "someone-else" } }, MARKER, "aoa-agent[bot]")).toBe(false);
+    expect(isOurs({ body: `${MARKER} quoted, then more`, user: { login: "aoa-agent[bot]" } }, MARKER, "aoa-agent[bot]")).toBe(false);
+    // With a plain token the account is not known: the marker alone decides.
+    expect(isOurs({ body, user: { login: "someone-else" } }, MARKER, undefined)).toBe(true);
   });
 
   it("sends the review as an ordinary comment where the conversation is not a pull request", async () => {
@@ -168,6 +233,7 @@ describe("a code review on GitHub", () => {
     expect(await send()).toMatchObject({ subject: "github:comment:99" });
     expect(posted).toHaveLength(1);
     expect(posted[0].url).toBe("/issues/7/comments");
-    expect(posted[0].body.body).toContain("the review in words");
+    // The same review in words, with no note: there is no commit for it to be out of step with.
+    expect(posted[0].body.body.startsWith("Two problems.\n\n` src/a.ts:2 `\non a changed line")).toBe(true);
   });
 });
