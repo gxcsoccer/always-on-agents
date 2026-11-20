@@ -187,10 +187,15 @@ export class FeishuGrant extends DurableObject<Env> {
     // from the read to the write nothing else can run, so the decision below is about the grant
     // as it is at the moment of writing, however many installs overlap.
     const version = random(16);
-    const sealed = await seal(await this.#key(), token.access_token, version);
+    const key = await this.#key();
+    const sealed = await seal(key, token.access_token, version);
+    // A token already held that can no longer be opened (the key changed) is no reason to turn
+    // this one away. Which version that is, is found out here, before the read that decides.
+    const earlier = (await this.#load())?.grant;
+    const unreadable = earlier && !(await open(key, earlier.sealed, earlier.version).then(() => true, () => false)) ? earlier.version : undefined;
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
-    const has = stored.grant && stored.grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS ? stored.grant.scope.split(" ") : undefined;
+    const has = stored.grant && stored.grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
     if (has && token.scope.split(" ").every((each) => has.includes(each))) return true;
     stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version };
     void this.ctx.storage.put("grant", stored);

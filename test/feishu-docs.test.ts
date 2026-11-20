@@ -498,6 +498,29 @@ describe("reading a Feishu document as the person who asked", () => {
     }
   });
 
+  it("keeps a new token when the one it would have deferred to can no longer be read", async () => {
+    const nora = someone();
+    feishu.docs.set("DocNora00000000000001", { readers: [nora.openId], text: "Nora's." });
+    feishu.wiki.set("WikiNora0000000000001", { obj_type: "docx", obj_token: "DocNora00000000000001" });
+    model.replies([call("feishu_read_document", { document: link("DocNora00000000000001") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await nora.says(`读一下 ${link("DocNora00000000000001")}`);
+    const forDocuments = invitation(nora.openId);
+    model.replies([call("feishu_read_document", { document: link("WikiNora0000000000001", "wiki") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await nora.says(`读一下 ${link("WikiNora0000000000001", "wiki")}`);
+    expect((await consent(invitation(nora.openId), nora)).status).toBe(200);
+    // The key changes; then the older, narrower card is used.
+    await runInDurableObject(await nora.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.sealed = btoa("x".repeat(60));
+      await state.storage.put("grant", stored);
+    });
+    expect((await consent(forDocuments, nora)).status).toBe(200);
+    expect((await (await nora.grant()).held()).credential).toMatchObject({ scope: ["docx:document:readonly"] });
+    model.replies([call("feishu_read_document", { document: link("DocNora00000000000001") })], [call("send_message", { text: "好的" })], [say("")]);
+    await nora.says(`读一下 ${link("DocNora00000000000001")}`);
+    expect(toolOutputs()[0]).toEqual({ text: "Nora's." });
+  });
+
   it("invites again when the token it holds can no longer be read", async () => {
     const mina = someone();
     feishu.docs.set("DocMina00000000000001", { readers: [mina.openId], text: "Mina's." });
@@ -600,6 +623,9 @@ describe("the document tool by itself", () => {
     // Words in another script followed by more of a link: not cut short into a different document.
     for (const not of ["https://x.feishu.cn/docx/DocUnit00000000000001中文/edit", "https://x.feishu.cn/docx/DocUnit00000000000001，x?a=1", "https://x.feishu.cn/docx/DocUnit00000000000001页#h"]) expect(documentsIn(not)).toEqual([]);
     expect(documentsIn("看看https://x.feishu.cn/docx/DocUnit00000000000001，谢谢。Thanks")).toEqual([{ kind: "docx", token: "DocUnit00000000000001" }]);
+    expect(documentsIn("（见https://x.feishu.cn/wiki/WikiUnit0000000000001）。")).toEqual([{ kind: "wiki", token: "WikiUnit0000000000001" }]);
+    // Words written straight onto the end could be part of the path, in any script: not counted.
+    for (const not of ["https://x.feishu.cn/docx/DocUnit00000000000001谢谢", "https://x.feishu.cn/docx/DocUnit00000000000001のメモ", "https://x.feishu.cn/docx/DocUnit00000000000001é", "https://x.feishu.cn/docx/DocUnit00000000000001文档，谢谢", "https://x.feishu.cn/docx/DocUnit00000000000001—x"]) expect(documentsIn(not)).toEqual([]);
     // Two links run together without a space cannot be told apart: neither counts, and they have to be pasted apart.
     expect(documentsIn("https://x.feishu.cn/docx/DocUnit00000000000001和https://x.feishu.cn/docx/DocUnit00000000000002")).toEqual([]);
     // The tool's argument is one whole link, not a text to search.
