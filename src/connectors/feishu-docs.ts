@@ -25,8 +25,8 @@ const TOKEN = "https://accounts.feishu.cn/oauth/v3/token";
 export const MAX_DOCUMENT_TEXT = 40_000;
 /** Feishu's codes for "this user token is no good": invalid, expired, or lacking what the person must grant. */
 const REAUTHORISE = new Set([99991668, 99991677, 99991679]);
-/** Feishu's code for asking, at the exchange, for something the person did not grant. */
-const NOT_GRANTED = 20068;
+/** Feishu's code for "the person has not granted the permission this call needs". */
+const NOT_COVERED = 99991679;
 
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
@@ -41,22 +41,45 @@ export const readDocument: ConnectorTool = {
 export type DocumentRef = { kind: "docx" | "wiki"; token: string };
 
 /**
- * The documents linked in a text: https links on Feishu's document hosts, to a docx or a wiki
- * page. Only the path is ever used; nothing is fetched from the link's host.
+ * The document one whole link names, if it is a link to one: https, on one of Feishu's document
+ * hosts, with a path that is a docx or a wiki page and nothing more. The link is parsed as a URL
+ * and judged by its own scheme, host and path; a query or fragment on it does not matter, and
+ * nothing inside them is looked at. Nothing is ever fetched from the link's host.
+ */
+export function documentOf(link: string): DocumentRef | undefined {
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.port) return undefined;
+  if (!/^(?:[a-z0-9-]+\.)+(?:feishu\.cn|larkoffice\.com)$/.test(url.hostname)) return undefined;
+  const found = /^\/(docx|wiki)\/([A-Za-z0-9]{10,64})\/?$/.exec(url.pathname);
+  return found ? { kind: found[1] as "docx" | "wiki", token: found[2] } : undefined;
+}
+
+/**
+ * The documents a person linked in what they wrote. Each run of characters that could be a link
+ * is taken whole and judged as one link (see documentOf): a Feishu address that is only part of
+ * some other link, in its path or its query, is not a link the person gave.
  */
 export function documentsIn(text: string): DocumentRef[] {
   const found: DocumentRef[] = [];
-  for (const each of text.matchAll(/https:\/\/(?:[A-Za-z0-9-]+\.)+(?:feishu\.cn|larkoffice\.com)\/(docx|wiki)\/([A-Za-z0-9]{10,64})(?![A-Za-z0-9_-])/g)) {
-    if (!found.some((seen) => seen.kind === each[1] && seen.token === each[2])) found.push({ kind: each[1] as "docx" | "wiki", token: each[2] });
+  // Whole runs of what a link can be written with. Whitespace, quotes, brackets and anything
+  // outside ASCII (full-width punctuation, the words around the link) end a run.
+  for (const run of text.match(/[!#-&(-;=?-~]+/g) ?? []) {
+    // Punctuation of the sentence around a link is not part of it.
+    const each = documentOf(run.replace(/^[(\[{]+/, "").replace(/[.,;:!?)\]}]+$/, ""));
+    if (each && !found.some((seen) => seen.kind === each.kind && seen.token === each.token)) found.push(each);
   }
   return found;
 }
 
 async function read(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
   const { env, origin } = context;
-  const asked = documentsIn(String(args.document ?? "").trim());
-  if (asked.length !== 1) return { error: "that is not one link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
-  const target = asked[0];
+  const target = documentOf(String(args.document ?? "").trim());
+  if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
   // The document is the person's choice: a link they themselves put in this request, as the
   // connector found it in what they wrote. Text the agent has read cannot send it elsewhere, and
   // neither can a word in their message that merely looks like a document's id.
@@ -70,28 +93,35 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   if (!app || app.tenant !== context.scope.tenant || !who.tenant_key) return { error: "this conversation does not come through a Feishu app of this tenant" };
 
   const grant = await grantOf(env, who);
-  // The invitation is the grant's own to send, to this person and nobody else. Its link is never
-  // part of what the model is given.
-  const invite = async () => {
-    const how = await grant.invite(who, redirect);
-    const where = how === "queued" ? "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. If none arrives, they can ask again." : "An invitation to authorise is in this chat, sent to them directly. Tell them to use it and then ask again.";
-    return { authorisation_needed: true, note: `The person has not authorised reading their documents, or the authorisation has ended. ${where} Nothing was read.` };
-  };
-  const credential = await grant.credential();
-  if (!credential) return invite();
+  const { generation, credential } = await grant.held();
+  // What this request needs the person to have allowed: documents, and wiki pages only for one.
+  const needed = target.kind === "wiki" ? SCOPES : ["docx:document:readonly"];
   // The authorisation was taken away, or replaced, while this read was under way: what the old
   // token fetched is not handed on, and this read does not ask for a new one.
   const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
+  // The invitation is the grant's own to send, to this person and nobody else, and only if the
+  // grant is still as this read saw it. Its link is never part of what the model is given.
+  const invite = async (refused?: string) => {
+    const how = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
+    if (how === "superseded") return superseded;
+    const where = how === "queued" ? "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. If none arrives, they can ask again." : "An invitation to authorise is in this chat, sent to them directly. Tell them to use it and then ask again.";
+    return { authorisation_needed: true, note: `The person has not authorised this, or the authorisation has ended. ${where} Nothing was read.` };
+  };
+  // Not authorised at all, or for documents and not for wiki pages: ask for what this needs.
+  if (!credential || needed.some((each) => !credential.scope.includes(each))) return invite();
 
   const asPerson = async (path: string) => {
     const response = await fetch(`${API}${path}`, { headers: { authorization: `Bearer ${credential.token}` } });
     const body = (await response.json().catch(() => ({}))) as { code?: number; data?: any };
     return { status: response.status, code: body.code, data: body.data };
   };
-  const failed = async (result: { status: number; code?: number }) => {
+  const failed = async (result: { status: number; code?: number }, step: "wiki" | "docx") => {
+    // Feishu says the token does not cover looking up wiki pages. That is about this one
+    // operation: the token still reads documents, and is kept.
+    if (step === "wiki" && result.code === NOT_COVERED) return (await grant.stands(credential.version)) ? { error: "the person's authorisation does not cover this wiki page; ask them for the document's own link (…/docx/…)" } : superseded;
     // The token is no longer good: forget that token, and only that one, and ask again. A document
     // the person may not open says nothing about the authorisation, which is kept.
-    if (result.status === 401 || REAUTHORISE.has(result.code ?? 0)) return (await grant.dropIf(credential.version)) ? invite() : superseded;
+    if (result.status === 401 || REAUTHORISE.has(result.code ?? 0)) return invite(credential.version);
     if (!(await grant.stands(credential.version))) return superseded;
     if (result.status === 403 || result.status === 404) return { error: "the person cannot open this document, or it does not exist" };
     return { error: `Feishu could not provide the document (status ${result.status}, code ${result.code ?? "none"})` };
@@ -99,17 +129,15 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
 
   let documentId = target.token;
   if (target.kind === "wiki") {
-    // What the person allowed may cover documents and not wiki pages. That is no fault of the grant.
-    if (!credential.scope.includes("wiki:node:read")) return { error: "the person's authorisation covers documents but not wiki pages; ask them for the document's own link (…/docx/…)" };
     const node = await asPerson(`/wiki/v2/spaces/get_node?token=${encodeURIComponent(target.token)}`);
-    if (node.status !== 200 || node.code !== 0) return failed(node);
+    if (node.status !== 200 || node.code !== 0) return failed(node, "wiki");
     if (!(await grant.stands(credential.version))) return superseded;
     const found = node.data?.node;
     if (found?.obj_type !== "docx" || typeof found.obj_token !== "string" || !/^[A-Za-z0-9]{10,64}$/.test(found.obj_token)) return { error: "that wiki page is not a document; only documents can be read" };
     documentId = found.obj_token;
   }
   const raw = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/raw_content`);
-  if (raw.status !== 200 || raw.code !== 0) return failed(raw);
+  if (raw.status !== 200 || raw.code !== 0) return failed(raw, "docx");
   // Asked last of all, just before the text is handed on.
   if (!(await grant.stands(credential.version))) return superseded;
   const text = String(raw.data?.content ?? "");
@@ -146,24 +174,20 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   };
   const app = await registry(env).feishuApp(who.app_id);
   if (!app) return refused("unknown_app");
-  // Only what reading documents needs is asked for, whatever else this person has allowed the app
-  // before: Feishu's consent is cumulative, and a token for all of it is not ours to hold. If the
-  // person did not allow wiki pages, documents alone will do.
-  const exchangeFor = async (scope: string[]) => {
-    const response = await fetch(TOKEN, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: scope.join(" ") }),
-    });
-    return { ok: response.ok, ...((await response.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string }) };
-  };
-  let issued = await exchangeFor(SCOPES);
-  if (issued.code === NOT_GRANTED) issued = await exchangeFor(["docx:document:readonly"]);
-  if (!issued.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed");
+  // Only what the invitation asked the person for is asked of Feishu, whatever else they have
+  // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
+  // to hold. The code is used once.
+  const exchange = await fetch(TOKEN, {
+    method: "POST",
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
+  });
+  const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string };
+  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed");
   const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
-  if (!granted.includes("docx:document:readonly")) return refused("scope_missing");
-  // The token must be for reading documents and nothing more. One that reaches further is not kept.
-  if (granted.some((each) => !SCOPES.includes(each))) return refused("scope_too_wide");
+  if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
+  // The token must be for what was asked and nothing more. One that reaches further is not kept.
+  if (granted.some((each) => !invitation.scope.includes(each))) return refused("scope_too_wide");
 
   // Whose token is it? The answer must be the person the invitation was sent to, in the same
   // organisation. Anyone else who opened the link and consented gets nothing installed.

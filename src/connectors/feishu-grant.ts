@@ -40,6 +40,10 @@ interface Pending {
   /** Whether Feishu has confirmed that the card reached the person's chat. */
   delivered: boolean;
   attempts: number;
+  /** No attempt to deliver it is made before this. */
+  next_attempt_at: number;
+  /** What the person is asked to allow, and all the token will be asked for. */
+  scope: string[];
 }
 
 interface Stored {
@@ -50,8 +54,14 @@ interface Stored {
 }
 
 const AUTHORIZE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize";
-/** What the person is asked to allow: reading documents, and finding which document a wiki page is. */
+/** Everything a person is ever asked to allow: reading documents, and finding which document a wiki page is. */
 export const SCOPES = ["docx:document:readonly", "wiki:node:read"];
+/** What the caller knew of the grant when it decided an invitation was needed. */
+export interface Seen {
+  generation: number;
+  /** The version of the token Feishu has just refused, if that is why. */
+  refused?: string;
+}
 /** How long an invitation to authorise can be used. Feishu's own code lasts five minutes after consent. */
 const INVITATION_TTL_MS = 10 * 60_000;
 /** An invitation with less time left than this is not offered again; a new one is made. */
@@ -62,65 +72,93 @@ const EXPIRY_MARGIN_MS = 60_000;
 
 export class FeishuGrant extends DurableObject<Env> {
   /**
-   * Makes sure this person has a usable invitation to authorise in their chat. One that was
-   * delivered and still has time left is not sent again. "queued" means it could not be delivered
-   * just now and is being retried.
+   * Makes sure this person has a usable invitation to authorise `scope` in their chat, provided the
+   * grant is still as the caller saw it. If it has been dropped, replaced or installed in the
+   * meantime, nothing is sent: "superseded". A token the caller reports as refused is forgotten
+   * here, in the same step, and only if it is still the one held.
+   *
+   * An invitation that was delivered and still has time left is not sent again. "queued" means it
+   * has not been delivered yet and is being retried.
    */
-  async invite(who: Who, redirect: string): Promise<"sent" | "already" | "queued"> {
+  async invite(who: Who, redirect: string, scope: string[], seen: Seen): Promise<"sent" | "already" | "queued" | "superseded"> {
+    if (scope.length === 0 || scope.some((each) => !SCOPES.includes(each))) throw new Error("not a scope this connector asks for");
     const fresh = { nonce: random(32), verifier: random(48) };
     // Nothing is awaited between reading the record and writing it back, so two calls cannot interleave.
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [] };
     if (JSON.stringify(stored.who) !== JSON.stringify(who)) throw new Error("this authorisation belongs to someone else");
     const now = Date.now();
+    if (stored.generation !== seen.generation) return "superseded";
+    if (seen.refused !== undefined) {
+      if (stored.grant?.version !== seen.refused) return "superseded";
+      delete stored.grant;
+    }
+    // Someone has authorised since the caller looked: there is nothing to ask for.
+    if (stored.grant && stored.grant.expires_at - now >= EXPIRY_MARGIN_MS && scope.every((each) => stored.grant!.scope.split(" ").includes(each))) return "superseded";
     stored.pending = stored.pending.filter((each) => each.expires_at > now);
-    let pending = stored.pending.find((each) => each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS);
-    if (pending?.delivered) return "already";
+    let pending = stored.pending.find((each) => each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS && scope.every((wanted) => each.scope.includes(wanted)));
     if (!pending) {
-      pending = { ...fresh, redirect, expires_at: now + INVITATION_TTL_MS, delivered: false, attempts: 0 };
+      pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS, delivered: false, attempts: 0, next_attempt_at: now };
       stored.pending = [...stored.pending, pending].slice(-MAX_PENDING);
     }
     void this.ctx.storage.put("grant", stored);
+    if (pending.delivered) return "already";
+    // Not yet time to try again: the alarm has it.
+    if (pending.next_attempt_at > now) return "queued";
     return (await this.#send(pending.nonce)) ? "sent" : "queued";
   }
 
   /**
    * Sends one invitation's card. The message is named after the invitation, so Feishu shows it
-   * once however often this runs. A failure is retried from the alarm until the invitation expires.
+   * once however often this runs. Before anything is sent, the next attempt is written down and
+   * the alarm set for it: if this stops halfway, the invitation is still tried again.
    */
   async #send(nonce: string): Promise<boolean> {
     const before = await this.#load();
     const pending = before?.pending.find((each) => each.nonce === nonce);
     if (!before || !pending || pending.delivered || pending.expires_at <= Date.now()) return false;
+    pending.attempts += 1;
+    pending.next_attempt_at = Date.now() + Math.min(60_000, 5_000 * 2 ** (pending.attempts - 1));
+    void this.ctx.storage.put("grant", before);
+    this.#arm(before);
     const { who } = before;
     const state = `${await grantName(who)}.${pending.nonce}`;
-    const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: who.app_id, response_type: "code", redirect_uri: pending.redirect, scope: SCOPES.join(" "), state, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
+    const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: who.app_id, response_type: "code", redirect_uri: pending.redirect, scope: pending.scope.join(" "), state, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
     const sent = await sendToPerson(this.env, who.app_id, who.open_id, `invite:${pending.nonce}`, { card: invitationCard(url) }).then(
       () => true,
       () => false,
     );
+    // It may have been used, dropped or delivered by another attempt while this one was out.
     const after = await this.#load();
     const same = after?.pending.find((each) => each.nonce === nonce);
-    if (!after || !same) return sent;
-    if (sent) same.delivered = true;
-    else {
-      same.attempts += 1;
-      void this.ctx.storage.setAlarm(Date.now() + Math.min(60_000, 5_000 * 2 ** (same.attempts - 1)));
+    if (after && same && sent && !same.delivered) {
+      same.delivered = true;
+      void this.ctx.storage.put("grant", after);
     }
-    void this.ctx.storage.put("grant", after);
+    if (after) this.#arm(after);
     return sent;
+  }
+
+  /** Sets the alarm for the earliest invitation still to be delivered, or clears it if there is none. */
+  #arm(stored: Stored): void {
+    const due = stored.pending.filter((each) => !each.delivered && each.expires_at > Date.now()).map((each) => each.next_attempt_at);
+    if (due.length === 0) void this.ctx.storage.deleteAlarm();
+    else void this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(...due)));
   }
 
   /** Tries again to deliver invitations that have not reached the person and can still be used. */
   async alarm(): Promise<void> {
     const stored = await this.#load();
-    for (const each of stored?.pending ?? []) if (!each.delivered && each.expires_at > Date.now()) await this.#send(each.nonce);
+    if (!stored) return;
+    for (const each of stored.pending) if (!each.delivered && each.expires_at > Date.now() && each.next_attempt_at <= Date.now()) await this.#send(each.nonce);
+    const after = await this.#load();
+    if (after) this.#arm(after);
   }
 
   /**
    * Takes an invitation out of the record, once: what came back from Feishu names it by its nonce.
    * Returns nothing for one that is unknown, used, expired, or from before the grant was dropped.
    */
-  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; generation: number } | null> {
+  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number } | null> {
     const stored = await this.#load();
     if (!stored) return null;
     const found = stored.pending.find((each) => each.nonce === nonce);
@@ -128,7 +166,7 @@ export class FeishuGrant extends DurableObject<Env> {
     stored.pending = stored.pending.filter((each) => each !== found);
     void this.ctx.storage.put("grant", stored);
     if (found.expires_at <= Date.now()) return null;
-    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, generation: stored.generation };
+    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation };
   }
 
   /** Keeps the token an authorisation produced, unless the grant has been dropped since it began. */
@@ -147,36 +185,26 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 
   /**
-   * The person's token, if they have authorised and it has not expired, with what it covers and
-   * the version it is. Whoever uses it asks `stands` with that version before relying on anything
-   * the token fetched.
+   * How the grant stands: its generation, and the person's token if they have authorised and it
+   * has not expired, with what it covers and the version it is. Whoever uses the token asks
+   * `stands` with that version before relying on anything it fetched, and hands the generation
+   * back when asking for an invitation.
    */
-  async credential(): Promise<{ token: string; version: string; scope: string[] } | null> {
+  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] } }> {
     const stored = await this.#load();
-    if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return null;
+    const generation = stored?.generation ?? 1;
+    if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation };
     try {
-      return { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) };
+      return { generation, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) } };
     } catch {
       // Sealed under another key, or damaged: as good as not there.
-      return null;
+      return { generation };
     }
   }
 
   /** Whether the token of this version is still the person's grant. */
   async stands(version: string): Promise<boolean> {
     return (await this.#load())?.grant?.version === version;
-  }
-
-  /**
-   * Forgets the token of this version, because Feishu refused it. Does nothing, and says so, if
-   * another token or none has taken its place since: an old read's failure says nothing about that.
-   */
-  async dropIf(version: string): Promise<boolean> {
-    const stored = await this.#load();
-    if (!stored?.grant || stored.grant.version !== version) return false;
-    delete stored.grant;
-    void this.ctx.storage.put("grant", stored);
-    return true;
   }
 
   /** Forgets the token and closes every open invitation, including ones already on their way back. */
