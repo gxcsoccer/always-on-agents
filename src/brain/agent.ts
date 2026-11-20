@@ -920,11 +920,13 @@ export class BrainAgent extends DurableObject<Env> {
     // have taken its place while the answer was on its way.
     const answeredAsk = intent.ask ?? (askedAs.id === intent.pending_id ? askedAs.ask : undefined);
     this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", ...(forTheTask === undefined ? {} : { standing: forTheTask }) });
-    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
+    // Said whichever answer is in force, so that it can be told to the people here.
+    const reach = forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {};
+    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...reach };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
     this.#audit(intent.decided_by, "task.answer_too_late", { task_id: taskId, question: intent.pending_id, wanted: intent.decision, in_force: decided, in_force_by: earlier ?? null });
-    return { ok: true, task_id: taskId, decision: decided, ...(earlier ? { decided_by: earlier } : {}), note: `the worker had already been told to ${decided}; ${intent.decided_by}'s "${intent.decision}" came too late to change that` };
+    return { ok: true, task_id: taskId, decision: decided, ...(earlier ? { decided_by: earlier } : {}), ...reach, note: `the worker had already been told to ${decided}; ${intent.decided_by}'s "${intent.decision}" came too late to change that` };
   }
 
   async #cancelTask(sessionKey: string, taskId: string): Promise<unknown> {

@@ -674,7 +674,7 @@ describe("tasks and approvals", () => {
     await task(unheard.id).configure({ answerUnheard: true });
     expect((await reply(unheard.stub, unheard.id, "bob", `approve all ${unheard.code}`)).error).toMatch(/connection lost/);
     await task(unheard.id).configure({});
-    expect(await reply(unheard.stub, unheard.id, "carol", `deny ${unheard.code}`, "deny")).toMatchObject({ decision: "allow", note: expect.stringMatching(/too late/) });
+    expect(await reply(unheard.stub, unheard.id, "carol", `deny ${unheard.code}`, "deny")).toMatchObject({ decision: "allow", standing: expect.stringMatching(/will not ask again/), note: expect.stringMatching(/too late/) });
     expect(await closures(unheard.stub)).toEqual([{ state: "approved", standing: true }]);
 
     // A command question has no "rest of the task": the words approve it, once.
