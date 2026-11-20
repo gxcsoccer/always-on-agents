@@ -400,6 +400,27 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaB0000000000001"]);
   });
 
+  it("lets the same call finish again after an interruption, and no other call take the same link", async () => {
+    const who = { app_id: APP_ID, tenant_key: ORG, open_id: "ou_retry" };
+    feishu.docs.set("DocRetry0000000000001", { readers: ["ou_retry"], text: "Retry." });
+    const recent = [{ text: link("DocRetry0000000000001"), data: { message_id: "om_retry_1", documents: [{ kind: "docx", token: "DocRetry0000000000001" }] } }];
+    const run = (callId: string) => readDocument.run({ env: env as any, scope: { tenant: TENANT, kind: "user", id: "ou_retry" }, person: "ou_retry", origin: { app_id: APP_ID, tenant_key: ORG }, said: [{ text: "总结", data: {} }], recent, callId }, { document: link("DocRetry0000000000001") }) as Promise<any>;
+    expect((await run("call_r0")).authorisation_needed).toBe(true);
+    expect((await consent(invitation("ou_retry"), { openId: "ou_retry" })).status).toBe(200);
+
+    // The call reads; what it was given is lost; the Brain runs the same call again.
+    expect(await run("call_r1")).toEqual({ text: "Retry." });
+    expect(await run("call_r1")).toEqual({ text: "Retry." });
+    // Any other call on the strength of that same earlier message is turned away.
+    expect((await run("call_r2")).error).toMatch(/already been read/);
+
+    // Two calls that both looked before either finished: one of them gets the text.
+    const grant = await grantOf(env as any, who);
+    const version = (await grant.held()).credential!.version;
+    expect(await Promise.all([grant.finish(version, { message: "om_retry_2", by: "a" }), grant.finish(version, { message: "om_retry_2", by: "b" })])).toEqual(["ok", "taken"]);
+    expect(await grant.finish("another-version", { message: "om_retry_3", by: "a" })).toBe("superseded");
+  });
+
   it("keeps the link waiting across the round trip to authorise", async () => {
     const pia = someone();
     feishu.docs.set("DocPia000000000000001", { readers: [pia.openId], text: "Pia's." });

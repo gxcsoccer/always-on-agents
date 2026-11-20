@@ -163,7 +163,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
 
   const grant = await grantOf(env, who);
   const { generation, credential, unreadable, answered } = await grant.held();
-  if (carriedFrom !== undefined && answered === carriedFrom) return { error: "the document the person linked earlier has already been read for them once; for more, ask them to send the link again with what they want" };
+  const alreadyRead = { error: "the document the person linked earlier has already been read for them once; for more, ask them to send the link again with what they want" };
+  // By another call, that is. This same call may be running again after an interruption.
+  if (carriedFrom !== undefined && answered?.message === carriedFrom && answered.by !== context.callId) return alreadyRead;
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
   const needed = target.kind === "wiki" ? SCOPES : ["docx:document:readonly"];
   // The authorisation was taken away, or replaced, while this read was under way: what the old
@@ -212,7 +214,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   if (raw.status !== 200 || raw.code !== 0) return failed(raw, "docx");
   // Asked last of all, just before the text is handed on. A link taken from an earlier message
   // is used up here.
-  if (!(await grant.finish(credential.version, carriedFrom))) return superseded;
+  const end = await grant.finish(credential.version, carriedFrom === undefined ? undefined : { message: carriedFrom, by: context.callId });
+  if (end !== "ok") return end === "taken" ? alreadyRead : superseded;
   const text = String(raw.data?.content ?? "");
   return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
 }
