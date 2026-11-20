@@ -51,7 +51,18 @@ describe("turning a Feishu message into an event", () => {
   it("puts a direct message in the sender's own scope", () => {
     const result = normalize(app, envelope({ chat_type: "p2p" }));
     expect(result?.scope).toEqual({ tenant: "acme", kind: "user", id: "ou_alice" });
-    expect(result?.event).toMatchObject({ source: "feishu", source_id: "om_1", session_key: "dm", text: "hello", principal: { kind: "human", id: "ou_alice", explicit: true } });
+    expect(result?.event).toMatchObject({ source: "feishu", source_id: "om_1", text: "hello", principal: { kind: "human", id: "ou_alice", explicit: true } });
+    // A direct chat is that person's private conversation through this app and organisation,
+    // and what they write there is an ordinary request in their own words.
+    const origin = result?.event.data?.origin as Record<string, string>;
+    expect(origin).toMatchObject({ app_id: "cli_test" });
+    expect(origin.tenant_key).toBeTruthy();
+    expect(result?.event.session_key).toBe(`private:feishu:app_id=cli_test,tenant_key=${origin.tenant_key}`);
+    expect(result?.event.data?.direct).toBe(true);
+    // In a group it is neither.
+    const group = normalize(app, envelope({ chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }], content: JSON.stringify({ text: "@_user_1 hello" }) }));
+    expect(group?.event.session_key).toBe("chat");
+    expect(group?.event.data?.direct).toBeUndefined();
     expect(result?.event.reply_to).toEqual({ connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_chat" } });
   });
 

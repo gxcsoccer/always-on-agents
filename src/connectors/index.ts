@@ -6,6 +6,7 @@
  * connector is, in `./types`.
  */
 import config from "../agent.config";
+import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";
 import type { ApprovalQuestion, Connector, ConnectorTool, OutboundMessage, Outcome, Receipt, Standing } from "./types";
@@ -15,10 +16,13 @@ export { DeliveryDeferred } from "./types";
 
 const RESERVED = new Set(["admin", "worker", "timer", "system"]);
 const byName = new Map<string, Connector>();
+const toolNames = new Set<string>();
 for (const connector of config.connectors) {
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(connector.name) || RESERVED.has(connector.name)) throw new Error(`"${connector.name}" cannot be a connector's name`);
   if (byName.has(connector.name)) throw new Error(`two connectors are named "${connector.name}"`);
   for (const tool of connector.tools ?? []) {
+    if (toolNames.has(tool.name) || TOOLS.some((own) => own.name === tool.name)) throw new Error(`two tools are named "${tool.name}"`);
+    toolNames.add(tool.name);
     if (!tool.name.startsWith(`${connector.name.replace(/-/g, "_")}_`) || !/^[a-z][a-z0-9_]{2,63}$/.test(tool.name)) throw new Error(`tool "${tool.name}" must be named ${connector.name}_…`);
   }
   byName.set(connector.name, connector);

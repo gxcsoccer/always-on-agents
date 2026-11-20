@@ -19,7 +19,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
-import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
+import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, privateSessionKey, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
@@ -59,8 +59,9 @@ const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
-const READ_OUTSIDE = "this run has read text from outside through a tool, so memory and standing instructions cannot be changed in it; if the person wants something remembered, they can ask again in a new message";
-const OUTSIDE_REMOVED = "what this tool returned was removed when that run ended; call the tool again if it is needed";
+const READ_OUTSIDE = "this run has read text from outside through a tool, so it can only answer the person: it cannot change memory or standing instructions, set timers, or start tasks. If the person wants one of those, they can ask for it in a new message";
+const OUTSIDE_REMOVED = "[In this turn you answered using a tool that read text from outside. What it returned, and what you said and did with it, are not kept here. Call the tool again if the content is needed. The tool calls were:]";
+const ERROR_WITHHELD = "failed after reading outside text; the details are not kept";
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
 const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
@@ -432,6 +433,8 @@ export class BrainAgent extends DurableObject<Env> {
   #abandon(runId: string, reason: string): void {
     const run = this.#rows<RunRow>("SELECT * FROM runs WHERE id = ?", runId)[0];
     if (!run) return;
+    // Looked at before the run's record is cleared.
+    const outside = this.#sawOutside(runId);
     this.ctx.storage.transactionSync(() => {
       // Close any open tool call so the transcript stays well-formed for the next run.
       for (const call of danglingCalls(this.#transcript(run.session_id))) {
@@ -442,7 +445,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#notify(`abandoned:${runId}`, run.session_id, runId, "Something went wrong on my side and I could not finish handling that. Please try again.");
       this.#finish(runId, "failed", reason);
     });
-    this.#log("run_abandoned", { run: runId, reason: reason.slice(0, 300) });
+    this.#log("run_abandoned", { run: runId, reason: outside ? ERROR_WITHHELD : reason.slice(0, 300) });
   }
 
   #finish(runId: string, status: "done" | "failed", error?: string): void {
@@ -451,11 +454,11 @@ export class BrainAgent extends DurableObject<Env> {
       if (!run || run.status !== "running") return;
       const now = Date.now();
       this.#sql.exec("UPDATE inbox SET status = ? WHERE run_id = ? AND status = 'claimed'", status === "done" ? "done" : "dead", runId);
-      this.#sql.exec("UPDATE runs SET status = ?, ended_at = ?, retry_at = NULL, error = ? WHERE id = ?", status, now, error?.slice(0, 1_000) ?? null, runId);
+      // An error can quote what the model was sent. From a run that read outside text, only the fact is kept.
+      const said = error === undefined ? null : this.#sawOutside(runId) ? ERROR_WITHHELD : error.slice(0, 1_000);
+      this.#sql.exec("UPDATE runs SET status = ?, ended_at = ?, retry_at = NULL, error = ? WHERE id = ?", status, now, said, runId);
       this.#sql.exec("UPDATE sessions SET updated_at = ? WHERE id = ?", now, run.session_id);
-      // What a connector's tool brought in from outside was for this run. It is not kept: a later
-      // run sees that it was read, and reads it again if it needs it.
-      this.#sql.exec("UPDATE items SET item = json_set(item, '$.output', ?), outside = 2 WHERE run_id = ? AND outside = 1", JSON.stringify({ removed: OUTSIDE_REMOVED }), runId);
+      this.#forgetOutside(run);
       if (this.#meta("active_run") === runId) this.#sql.exec("DELETE FROM meta WHERE key = 'active_run'");
     });
   }
@@ -474,11 +477,13 @@ export class BrainAgent extends DurableObject<Env> {
 
   /**
    * Whose authority a connector's tools would carry in this run, if anyone's. There is such a
-   * person only when it is beyond doubt: this is that person's own private conversation, and
-   * everything that started the run is a message of theirs, addressed to the agent, through one
-   * connector the deployment trusts, with one and the same verified origin. Anything else in the
-   * batch (another person, a timer, a worker's report, a message from elsewhere) and there is
-   * none. Worked out from the stored events each time it is needed, never remembered.
+   * person only when it is beyond doubt. This is that person's own scope and their private
+   * conversation through one connector. Everything that started the run is an ordinary message
+   * they wrote to the agent there: not a button press, not a reply to a question, not something
+   * routed from elsewhere, not a timer or a worker's report. Every one came through that
+   * connector, which the deployment trusts, with one and the same verified origin, none of it
+   * empty. Anything else and there is no such person. Worked out from the stored events each
+   * time it is needed, never remembered.
    */
   #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string> } | undefined {
     const scope = this.#scope();
@@ -486,14 +491,43 @@ export class BrainAgent extends DurableObject<Env> {
     const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
     if (events.length === 0) return undefined;
     const source = events[0].source;
-    const origin = JSON.stringify(originOf(events[0]));
+    const origin = originOf(events[0]);
+    if (!origin || toolsOf(source).length === 0) return undefined;
+    const conversation = privateSessionKey(source, origin);
     for (const event of events) {
       const principal = JSON.parse(event.principal) as Principal;
-      if (event.kind !== "message" || event.source !== source || !this.#isDecider(principal, event.source)) return undefined;
-      // The conversation is this person's own, and so is every word in the batch.
-      if (principal.id !== scope.id || JSON.stringify(originOf(event)) !== origin) return undefined;
+      if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return undefined;
+      if (!this.#isDecider(principal, event.source) || principal.id !== scope.id) return undefined;
+      const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
+      // A request, in the person's own words, made here.
+      if (data.direct !== true || data.card !== undefined || data.question !== undefined || data.reply_only !== undefined || data.routed_from !== undefined) return undefined;
+      const same = originOf(event);
+      if (!same || JSON.stringify(same) !== JSON.stringify(origin)) return undefined;
     }
-    return { connector: source, person: scope.id, origin: JSON.parse(origin) as Record<string, string> };
+    return { connector: source, person: scope.id, origin };
+  }
+
+  /**
+   * Ends what a run that read outside text leaves behind. Text a connector's tool brought in was
+   * for that run, and so is everything the run went on to say or do with it: the model's own
+   * words about a document carry the document. So the run's whole record, apart from what the
+   * person wrote, is replaced by one note saying which tools were used. A later run sees that
+   * something was read and reads it again if it needs it; it is not handed the content, in the
+   * original or retold. Messages the run wrote are blanked once delivered.
+   */
+  #forgetOutside(run: RunRow): void {
+    const outputs = this.#rows<{ item: string }>("SELECT item FROM items WHERE run_id = ? AND outside = 1", run.id);
+    if (outputs.length === 0) return;
+    const read = new Set(outputs.map((row) => (JSON.parse(row.item) as Item).call_id));
+    const calls = this.#rows<{ item: string }>("SELECT item FROM items WHERE run_id = ? AND is_user = 0 ORDER BY seq", run.id)
+      .map((row) => JSON.parse(row.item) as Item)
+      .filter((item) => item.type === "function_call" && read.has(item.call_id))
+      .map((item) => `${item.name} ${String(item.arguments ?? "").slice(0, 300)}`);
+    this.#sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
+    this.#append(run.session_id, run.id, { role: "assistant", content: `${OUTSIDE_REMOVED}\n${calls.join("\n")}` });
+    this.#sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
+    this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+    this.#sql.exec("UPDATE outbox SET text = '' WHERE run_id = ? AND status = 'sent'", run.id);
   }
 
   /** Whether this run has been given text from outside by a connector's tool. */
@@ -607,6 +641,8 @@ export class BrainAgent extends DurableObject<Env> {
       const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
+      // Written in a run that read outside text: once it has reached the person, it is not kept.
+      this.#sql.exec("UPDATE outbox SET text = '' WHERE id = ? AND private = 1 AND status = 'sent'", row.id);
       // It may have been closed while it was on its way.
       if (row.ask) this.#showClosed(row.idem);
       return true;
@@ -639,7 +675,8 @@ export class BrainAgent extends DurableObject<Env> {
         if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
         // Whatever comes back is from outside, including an error that quotes something.
         this.#outside.add(callId);
-        this.#audit(acting.person, "tool.used", { tool: name, args: JSON.stringify(args).slice(0, 500) });
+        // Which tool and for whom. Not its arguments: they can name what the person is reading.
+        this.#audit(acting.person, "tool.used", { tool: name, call: callId });
         return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, callId }, args);
       },
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
@@ -676,6 +713,7 @@ export class BrainAgent extends DurableObject<Env> {
       },
 
       setTimer: (callId, delaySeconds, note, repeat) => {
+        if (this.#sawOutside(run.id)) throw new Error(READ_OUTSIDE);
         if (delaySeconds < 5 || delaySeconds > 366 * 86_400) throw new Error("delay_seconds must be between 5 and one year");
         if (repeat !== null && repeat < 60) throw new Error("repeat_every_seconds must be at least 60");
         const id = `tmr_${callId.replace(/[^A-Za-z0-9]/g, "").slice(-24)}`;
@@ -700,7 +738,10 @@ export class BrainAgent extends DurableObject<Env> {
         return { ok: true, cancelled: active };
       },
 
-      dispatchTask: (callId, title, brief, repository) => this.#dispatchTask(run, session.session_key, callId, title, brief, repository),
+      dispatchTask: async (callId, title, brief, repository) => {
+        if (this.#sawOutside(run.id)) throw new Error(READ_OUTSIDE);
+        return this.#dispatchTask(run, session.session_key, callId, title, brief, repository);
+      },
       taskStatus: (taskId) => this.#taskStatus(taskId),
       answerTask: (callId, taskId, decision, reason) => this.#answerTask(run, session.session_key, callId, taskId, decision, reason),
       cancelTask: (taskId) => this.#cancelTask(session.session_key, taskId),
@@ -1468,15 +1509,16 @@ function today(): string {
 }
 
 /** Function calls in the transcript that have no output yet. */
-/** What a connector verified about where an event came from. */
-function originOf(event: InboxRow): Record<string, string> {
+/**
+ * What a connector verified about where an event came from, with its keys in order. Undefined
+ * unless it is a set of named, non-empty strings: an origin with a gap in it identifies nothing.
+ */
+function originOf(event: InboxRow): Record<string, string> | undefined {
   const origin = event.data ? (JSON.parse(event.data) as { origin?: unknown }).origin : undefined;
-  if (!origin || typeof origin !== "object") return {};
-  return Object.fromEntries(
-    Object.entries(origin as Record<string, unknown>)
-      .filter(([, value]) => typeof value === "string")
-      .sort(([a], [b]) => a.localeCompare(b)),
-  ) as Record<string, string>;
+  if (!origin || typeof origin !== "object" || Array.isArray(origin)) return undefined;
+  const entries = Object.entries(origin as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0 || entries.some(([key, value]) => key === "" || typeof value !== "string" || value === "" || value === "undefined")) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 function danglingCalls(items: Item[]): ToolCall[] {

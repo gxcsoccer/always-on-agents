@@ -155,9 +155,14 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE unsettled (ask TEXT PRIMARY KEY, task_id TEXT NOT NULL, question_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL);`,
   // 14: a code review's parts, for connectors that can attach comments to lines.
   `ALTER TABLE outbox ADD COLUMN review TEXT;`,
-  // 15: marks what a connector tool returned: 1 while the text is kept (its run is under way),
-  // 2 once the run has ended and the text has been removed.
+  // 15: 1 on what a connector tool returned, while its run is under way; 2 on the note that
+  // replaces everything such a run produced, once the run has ended.
   `ALTER TABLE items ADD COLUMN outside INTEGER NOT NULL DEFAULT 0;`,
+  // 16: a message written in a run that read outside text is blanked once it has been delivered.
+  `ALTER TABLE outbox ADD COLUMN private INTEGER NOT NULL DEFAULT 0;`,
+  // 17, 18: the lookups made for every run and every tool call.
+  `CREATE INDEX items_outside ON items (run_id) WHERE outside = 1;`,
+  `CREATE INDEX inbox_run ON inbox (run_id, id);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
