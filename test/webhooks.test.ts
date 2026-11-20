@@ -65,6 +65,22 @@ describe("the GitHub webhook endpoint", () => {
     expect((await brainFor(`${b}:repo:${b}/demo`).inspect()).inbox.pending).toBe(0);
   });
 
+  it("keeps user ids free of ':' from now on, and leaves links made before that as they are", async () => {
+    const t = await tenant();
+    // Called inside the object: a rejection carried back over RPC is reported as unhandled here.
+    const refusal = await runInDurableObject(registry(), (instance: any) => instance.linkIdentity(t, "github", "5", "github:someone").then(() => "linked", String));
+    expect(refusal).toMatch(/cannot contain ':'/);
+    // Ids that were always fine stay fine, whatever else is in them.
+    await registry().linkIdentity(t, "github", "6", "member@example.test");
+    await registry().linkIdentity(t, "github", "6", "member@example.test");
+    // A link made before the rule can be made again unchanged.
+    await runInDurableObject(registry(), (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT INTO identities (tenant, provider, external_id, user_id) VALUES (?, 'github', '7', 'github:old')", t);
+    });
+    await registry().linkIdentity(t, "github", "7", "github:old");
+    expect(await registry().resolveIdentity(t, "github", "7")).toBe("github:old");
+  });
+
   it("links a person by account id and lets them answer an open question without a mention", async () => {
     const t = await tenant();
     const repo = `${t}/demo`;

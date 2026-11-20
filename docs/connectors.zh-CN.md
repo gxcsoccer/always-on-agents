@@ -77,7 +77,7 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 ```
 
 没有关联的账号仍然会被识别出来，但不算作用域的成员：它不能批准任何东西。
-`user_id` 只能包含字母、数字、`.`、`_` 和 `-`。
+`user_id` 不能包含 `:`。
 
 ## 飞书
 

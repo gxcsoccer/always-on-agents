@@ -122,7 +122,7 @@ export interface TaskState {
   /** For the in-process gate: which question we opened for which of its tool calls. */
   gate_questions: Record<string, { id: string; command: string; closed?: boolean }>;
   /** Answers, keyed by question id. Kept here, outside the container, so the guest cannot write one. */
-  decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number }>;
+  decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number; standing?: boolean }>;
   /** Stand-in for the Brain's inbox: everything the container pushed to us. */
   inbox: InboxItem[];
   /** What each alarm tick saw, to show the keep-alive actually held. */
@@ -467,6 +467,7 @@ export class TaskSandbox extends DurableObject<Env> {
       // repository go through without asking. Never a deletion, and never anything else.
       if (decision === "allow" && standing && state.pending.resource && standingEligible(state.pending.refs ?? [])) {
         state.standing = [...(state.standing ?? []), { resource: state.pending.resource, refs: (state.pending.refs ?? []).map((r) => r.ref) }];
+        state.decisions[state.pending.id].standing = true;
       }
     }
     state.inbox.push({ at: Date.now(), kind: "answered", body: { decision, reason, tool_use_id: state.pending.id } });
@@ -474,6 +475,15 @@ export class TaskSandbox extends DurableObject<Env> {
     state.phase = "running";
     this.#save(state);
     return { ok: true, decision };
+  }
+
+  /**
+   * The decision this task holds on a question, if one was ever recorded: what the guest was told,
+   * whether or not whoever sent it heard back. Reads only.
+   */
+  async decisionOn(questionId: string): Promise<{ decision: "allow" | "deny"; standing: boolean } | null> {
+    const held = this.#state()?.decisions[questionId];
+    return held ? { decision: held.decision, standing: held.standing === true } : null;
   }
 
   /** Whether the task is still entitled to reach the outside world. */

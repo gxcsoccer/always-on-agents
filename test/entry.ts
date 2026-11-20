@@ -24,14 +24,20 @@ export class FakeTask extends DurableObject {
     const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
     answers[questionId ?? ""] ??= decision;
     this.ctx.storage.kv.put("answers", answers);
+    // A test can have the answer take effect and the word of it never get back.
+    if ((this.#policy() as { answerUnheard?: boolean }).answerUnheard) throw new Error("connection lost");
     return { ok: true, decision: answers[questionId ?? ""] };
+  }
+  async decisionOn(questionId: string) {
+    const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
+    return answers[questionId] ? { decision: answers[questionId], standing: false } : null;
   }
   async cancel() {
     this.#record("cancel", {});
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { answerDelayMs?: number; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {

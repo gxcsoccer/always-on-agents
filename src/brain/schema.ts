@@ -150,6 +150,9 @@ export const MIGRATIONS: string[] = [
   // old test was case-sensitive and LIKE is not.
   `UPDATE inbox SET principal = json_set(principal, '$.unlinked', json('true'))
      WHERE source = 'github' AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') GLOB 'github:*';`,
+  // 13: questions that stopped being waited on while an answer to them was unconfirmed. How each
+  // ended is asked of the worker rather than guessed.
+  `CREATE TABLE unsettled (ask TEXT PRIMARY KEY, task_id TEXT NOT NULL, question_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

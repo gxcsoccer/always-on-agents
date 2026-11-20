@@ -52,6 +52,8 @@ const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
+/** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
+const SETTLE_ATTEMPTS = 12;
 const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
 
 type Row = Record<string, any>;
@@ -160,6 +162,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#fireTimers(Date.now());
       this.#housekeeping(Date.now());
       await this.#flushOutbox();
+      await this.#settleQuestions();
       // A few runs per wake-up at most, so one busy scope cannot hold an invocation forever.
       for (let i = 0; i < 3; i++) {
         const runId = this.#claim();
@@ -192,6 +195,8 @@ export class BrainAgent extends DurableObject<Env> {
     if (outbox != null) candidates.push(outbox);
     const reconciling = this.#rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM outbox WHERE status = 'reconciling'")[0]?.next_at;
     if (reconciling != null) candidates.push(reconciling);
+    const unsettled = this.#rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM unsettled")[0]?.next_at;
+    if (unsettled != null) candidates.push(unsettled);
     // Housekeeping is work too: a scope that has gone quiet still has old records to remove.
     const housekeeping = Number(this.#meta("housekeeping_at") ?? 0);
     if (housekeeping > 0 && this.#rows("SELECT 1 FROM inbox LIMIT 1").length > 0) candidates.push(housekeeping);
@@ -908,8 +913,7 @@ export class BrainAgent extends DurableObject<Env> {
     const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
     const forTheTask = decided === "allow" && intent.decision === "allow" && intent.standing === true;
     // The question that was answered, which need not be the one open now: a newer question may
-    // have taken its place while the answer was on its way, and marked it as no longer standing.
-    // What the worker actually did with it is the truth, and is shown instead.
+    // have taken its place while the answer was on its way.
     const answeredAsk = intent.ask ?? (askedAs.id === intent.pending_id ? askedAs.ask : undefined);
     this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
     if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
@@ -926,8 +930,8 @@ export class BrainAgent extends DurableObject<Env> {
     if (TERMINAL_TASK.has(task.status)) return { ok: true, task_id: taskId, status: task.status };
     await this.env.TASKS.getByName(taskId).cancel();
     // A question still open when the task is cancelled has nothing left to answer.
-    const open = this.#rows<{ pending: string | null }>("SELECT pending FROM tasks WHERE id = ? AND status = 'needs_input'", taskId)[0]?.pending;
-    if (this.#setTask(taskId, "cancelled", {}) && open) this.#closeQuestion((JSON.parse(open) as { ask?: string }).ask, { state: "withdrawn" });
+    const open = this.#rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+    if (this.#setTask(taskId, "cancelled", {}) && open) this.#setAside(open);
     this.#audit("(agent)", "task.cancelled", { task_id: taskId });
     await registry(this.env).releaseTaskSlot(taskId);
     return { ok: true, task_id: taskId, status: "cancelled" };
@@ -985,9 +989,8 @@ export class BrainAgent extends DurableObject<Env> {
         // no further. Checked before a code is drawn or anything is queued, so no card is sent that
         // nobody can answer.
         if (TERMINAL_TASK.has(task.status)) return { known: true, wake: false, terminal: false };
-        // A new question replaces the one before it, which can no longer be answered: say so where
-        // it is shown.
-        if (task.status === "needs_input" && task.pending) this.#closeQuestion((JSON.parse(task.pending) as { ask?: string }).ask, { state: "withdrawn" });
+        // A new question replaces the one before it, which can no longer be answered.
+        this.#setAside(task);
         // The question is put to people by this code, not by the model: what they are shown is
         // exactly what the worker is held on, and the code ties their reply to this one question.
         // No two open questions in this scope share a code, so one reply cannot answer two of them.
@@ -1025,9 +1028,8 @@ export class BrainAgent extends DurableObject<Env> {
       else if (kind === "result" || kind === "failed" || kind === "lost") {
         // A task that ends while a question of its is still open leaves nothing to answer: the
         // question is closed where it is shown, so nobody presses a button that does nothing.
-        const open = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
         applied = kind === "result" ? this.#setTask(taskId, "succeeded", { result: JSON.stringify(body) }) : this.#setTask(taskId, kind, { result: JSON.stringify(body) });
-        if (applied) this.#closeQuestion(open, { state: "withdrawn" });
+        if (applied) this.#setAside(task);
       }
       else return { known: true, wake: false, terminal: false };
       if (!applied) return { known: true, wake: false, terminal: false };
@@ -1166,16 +1168,51 @@ export class BrainAgent extends DurableObject<Env> {
    * with the question, so it also holds if the question has not been delivered yet: an unsent one
    * is then not sent at all, and one whose delivery is under way is closed as soon as it lands.
    */
+  /**
+   * Called when a question stops being the one its task is waiting on without an answer to it
+   * having been confirmed: a newer question took its place, or the task ended or was cancelled.
+   *
+   * If no answer was ever sent for it, nothing was decided and it is closed as withdrawn. If one
+   * was sent, the worker may hold a decision the Brain never heard back about; how the question
+   * ended is then not guessed but asked of the worker (see #settleQuestions).
+   */
+  #setAside(task: Row): void {
+    if (task.status !== "needs_input" || !task.pending) return;
+    const pending = JSON.parse(task.pending) as { id?: string; ask?: string };
+    if (!pending.ask) return;
+    const sent = task.answering ? (JSON.parse(task.answering) as { pending_id?: string }).pending_id === pending.id : false;
+    if (!sent || !pending.id) return this.#closeQuestion(pending.ask, { state: "withdrawn" });
+    this.#sql.exec("INSERT OR IGNORE INTO unsettled (ask, task_id, question_id, next_at) VALUES (?, ?, ?, ?)", pending.ask, task.id, pending.id, Date.now());
+  }
+
+  /**
+   * Finds out from the worker how each set-aside question ended, and closes it as that. The
+   * worker's record of a decision is the truth: it is what the guest was told. If the worker
+   * cannot be reached the question stays as it is and is asked about again later.
+   */
+  async #settleQuestions(): Promise<void> {
+    for (const row of this.#rows<{ ask: string; task_id: string; question_id: string; attempts: number }>("SELECT * FROM unsettled WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
+      try {
+        const held = await this.env.TASKS.getByName(row.task_id).decisionOn(row.question_id);
+        this.#closeQuestion(row.ask, held ? { state: held.decision === "allow" ? "approved" : "refused", standing: held.decision === "allow" && held.standing } : { state: "withdrawn" });
+      } catch (err) {
+        if (row.attempts >= SETTLE_ATTEMPTS) {
+          // Left showing as it was: saying how it ended would be a guess.
+          this.#log("question_unsettled", { task: row.task_id, question: row.question_id, error: String(err).slice(0, 300) });
+          this.#sql.exec("DELETE FROM unsettled WHERE ask = ?", row.ask);
+        } else {
+          this.#sql.exec("UPDATE unsettled SET attempts = attempts + 1, next_at = ? WHERE ask = ?", Date.now() + Math.min(30_000 * 2 ** row.attempts, 3_600_000), row.ask);
+        }
+      }
+    }
+  }
+
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
-    // The first ending stands, except that a decision replaces "withdrawn": a question can be set
-    // aside before it is learnt that the worker had already been given an answer to it.
-    this.#sql.exec(
-      "UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND (closed IS NULL OR (? AND json_extract(closed, '$.state') = 'withdrawn'))",
-      JSON.stringify(outcome),
-      ask,
-      outcome.state === "withdrawn" ? 0 : 1,
-    );
+    // A question ends once. Its card is therefore rewritten once, and cannot be left showing an
+    // ending that a later one was meant to replace.
+    this.#sql.exec("UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND closed IS NULL", JSON.stringify(outcome), ask);
+    this.#sql.exec("DELETE FROM unsettled WHERE ask = ?", ask);
     this.#showClosed(ask);
   }
 

@@ -76,7 +76,7 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
   -H 'content-type: application/json' -d '{"provider":"github","external_id":"583231","user_id":"alice"}'
 ```
 
-An unlinked account is still identified, but is not a member of the scope: it cannot approve anything. A `user_id` may contain letters, digits, `.`, `_` and `-` only.
+An unlinked account is still identified, but is not a member of the scope: it cannot approve anything. A `user_id` cannot contain `:`.
 
 ## Feishu / Lark
 

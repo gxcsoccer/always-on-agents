@@ -783,6 +783,7 @@ describe("tasks and approvals", () => {
       const sql = state.storage.sql;
       // Put the store back to how version 9 left it, with two questions waiting to go out.
       sql.exec("ALTER TABLE outbox DROP COLUMN started");
+      sql.exec("DROP TABLE unsettled");
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
@@ -1025,20 +1026,54 @@ describe("tasks and approvals", () => {
   it("shows what was decided on a question that a newer one replaced before the answer was confirmed", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await task(id).configure({ answerDelayMs: 1_500 });
-    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "ok" })], [say("")]);
+    // One run passes the answer on; another wakes for the second question and has nothing to add.
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "ok" })], [say("")], [say("")]);
+    const callsBefore = modelCalls.length;
     // Left to its own alarm this time, so that something else can reach the Brain while it works.
     await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
     // The worker has the answer, and puts its next question before the Brain hears that it landed.
     await vi.waitFor(async () => expect(await answersSent(id)).toHaveLength(1), { timeout: 8_000, interval: 50 });
     await stub.taskEvent(id, 2, "needs_input", { ...ask, id: "q-2" });
-    expect(await closures(stub)).toEqual([{ state: "withdrawn" }, null]);
+    // Nothing is said about the first question until it is known how it ended.
+    expect(await closures(stub)).toEqual([null, null]);
 
-    // Once the answer is confirmed, the first card says what happened to it, not that it was set
-    // aside. The second question is still open.
+    // Then the first card says what happened to it. The second question is still open.
     await vi.waitFor(async () => expect((await closures(stub))[0]).toMatchObject({ state: "approved" }), { timeout: 8_000, interval: 50 });
     expect((await closures(stub))[1]).toBeNull();
     expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
-  }, 20_000);
+    // Let the run finish here: left going, it would take the next test's model replies.
+    await vi.waitFor(() => expect(modelCalls.length).toBe(callsBefore + 3), { timeout: 8_000, interval: 50 });
+    await vi.waitFor(async () => expect((await stub.inspect()).runs.every((run: any) => run.status !== "running")).toBe(true), { timeout: 8_000, interval: 50 });
+  }, 30_000);
+
+  it("learns from the worker how a question ended when the answer took effect and word of it was lost", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    const output = await reply(stub, id, "carol", `deny ${code}`, "deny");
+    expect(output.error).toMatch(/connection lost/);
+    expect(await closures(stub)).toEqual([null]);
+
+    // The worker, which did hear, moves on to its next question.
+    await task(id).configure({});
+    await stub.taskEvent(id, 2, "needs_input", { ...ask, id: "q-2" });
+    model.replies([say("")]);
+    await wake(stub);
+    // Nobody answered the first question again; its card says what the worker was told.
+    expect(await closures(stub)).toEqual([{ state: "refused", standing: false }, null]);
+    expect(await answersSent(id)).toHaveLength(1);
+  });
+
+  it("closes each question once, so its card is never rewritten with an older ending", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    await reply(stub, id, "carol", `deny ${code}`, "deny");
+    // The task ends with the answer unconfirmed: not "withdrawn" now and "refused" later, but one ending.
+    await stub.taskEvent(id, 2, "failed", { error: "refused" });
+    expect(await closures(stub)).toEqual([null]);
+    model.replies([say("")]);
+    await wake(stub);
+    expect(await closures(stub)).toEqual([{ state: "refused", standing: false }]);
+  });
 
   it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {
     const { stub } = brain("chat");

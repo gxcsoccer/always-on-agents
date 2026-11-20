@@ -174,7 +174,9 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   if (event.principal.kind === "human") {
     const accountId = event.principal.id.replace(/^github:/, "");
     const user = await registry(env).resolveIdentity(tenant, "github", accountId);
-    if (user) event.principal = { ...event.principal, id: user, unlinked: undefined };
+    // A user id of the form "github:…", which can no longer be given, was never counted as a
+    // member in a repository. It still is not.
+    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined };
   }
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.
