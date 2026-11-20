@@ -15,6 +15,7 @@ export interface ToolCall {
 
 export interface ToolHost {
   sendMessage(callId: string, text: string): unknown;
+  sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
   memoryRead(path: string): unknown;
   memoryWrite(path: string, content: string): unknown;
@@ -28,6 +29,9 @@ export interface ToolHost {
   cancelTask(taskId: string): Promise<unknown>;
 }
 
+/** The longest message the Brain can send. */
+export const MAX_MESSAGE_TEXT = 8_000;
+const MAX_REVIEW_COMMENTS = 30;
 const string = { type: "string" } as const;
 const nullable = (type: string) => ({ type: [type, "null"] });
 
@@ -46,6 +50,28 @@ export const TOOLS: ToolDefinition[] = [
     "send_message",
     "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
     { text: string },
+  ),
+  tool(
+    "send_review",
+    "Post a code review on the pull request this conversation is about: a summary, and comments attached to lines of the change. Use it instead of send_message when findings point at particular lines. It comments only; it neither approves nor requests changes. Where comments cannot be attached to lines, the same review is sent as one message.",
+    {
+      summary: { type: "string", description: "The verdict and anything not tied to a line, including what was and was not checked." },
+      commit: { ...nullable("string"), description: "The full SHA of the commit that was reviewed, or null if you do not know it. Without it no comment is attached to a line." },
+      comments: {
+        type: "array",
+        description: "One per finding that points at a line. Empty if there are none.",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "File path from the repository root." },
+            line: { type: "integer", description: "Line number in the new version of the file. It must be a line the change touches or shows." },
+            body: { type: "string", description: "What is wrong and what would go wrong because of it." },
+          },
+          required: ["path", "line", "body"],
+          additionalProperties: false,
+        },
+      },
+    },
   ),
   tool("memory_list", "List the files in your long-term memory.", {}),
   tool("memory_read", "Read one memory file.", { path: string }),
@@ -102,7 +128,19 @@ export async function executeTool(host: ToolHost, call: ToolCall): Promise<strin
 function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
   switch (call.name) {
     case "send_message":
-      return host.sendMessage(call.call_id, text(a.text, "text", 8_000));
+      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT));
+    case "send_review": {
+      if (!Array.isArray(a.comments) || a.comments.length > MAX_REVIEW_COMMENTS) throw new Error(`comments must be a list of at most ${MAX_REVIEW_COMMENTS}`);
+      const comments = a.comments.map((c: Record<string, unknown>, i: number) => ({
+        path: text(c?.path, `comments[${i}].path`, 300),
+        line: integer(c?.line, `comments[${i}].line`),
+        body: text(c?.body, `comments[${i}].body`, 2_000),
+      }));
+      if (comments.some((c) => c.line < 1 || !/^[^\s\\][^\n\\]*$/.test(c.path) || c.path.startsWith("/") || c.path.split("/").includes(".."))) throw new Error("each comment needs a path inside the repository and a line number of at least 1");
+      const commit = a.commit == null ? null : text(a.commit, "commit", 40);
+      if (commit !== null && !/^[0-9a-f]{40}$/.test(commit)) throw new Error("commit must be a full 40-character SHA, or null");
+      return host.sendReview(call.call_id, text(a.summary, "summary", 4_000), commit, comments);
+    }
     case "memory_list":
       return host.memoryList();
     case "memory_read":

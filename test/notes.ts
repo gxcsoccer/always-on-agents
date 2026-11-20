@@ -7,7 +7,7 @@
  * (see `message` in helpers.ts); one that wants the place to have forgotten a message deletes it.
  */
 import config from "../src/agent.config";
-import type { Standing } from "../src/connectors/types";
+import { DeliveryDeferred, type Standing } from "../src/connectors/types";
 
 export const notes: Map<string, Standing> = ((globalThis as any).__notes ??= new Map());
 
@@ -15,7 +15,11 @@ if (!config.connectors.some((connector) => connector.name === "notes")) {
   config.connectors.push({
     name: "notes",
     channel: {
-      async deliver() {},
+      async deliver() {
+        // A test can have the place ask not to be tried again for a while.
+        const wait = (globalThis as any).__notesWaitMs as number | undefined;
+        if (wait) throw new DeliveryDeferred("asked to wait", Date.now() + wait);
+      },
       async standing(_env, _scope, subject) {
         return notes.get(subject);
       },

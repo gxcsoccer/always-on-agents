@@ -78,6 +78,18 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 
 An unlinked account is still identified, but is not a member of the scope: it cannot approve anything. A `user_id` cannot contain `:`.
 
+### Reviewing a pull request
+
+Ask in a comment on the pull request: `@your-bot-handle review this`. The agent gives the work to a sandboxed worker, which reads the change and reports back; the agent then posts one review.
+
+- The review's summary is its body, and each finding is a comment on the line it is about. A finding on a line the pull request neither changes nor shows is kept in the body with its file and line, because GitHub accepts comments only on lines of the diff.
+- A review is posted as a review only when it is known to be of the pull request's current commit. If the pull request has moved on, or the review does not say which commit it is of, it is posted as an ordinary comment that says so, with its findings listed with file and line: a verdict on one commit is never shown as a verdict on another.
+- What the worker found is posted inert: a mention in its prose is shown as code and notifies nobody, and a suggestion block becomes an ordinary code block that offers no change to apply. Code in it is left exactly as written. Links in it are still links.
+- A review is published once. Before posting, the agent looks for an earlier attempt both among the pull request's reviews and among its comments, and posts nothing if it cannot tell. If GitHub asks it to wait, it waits at least that long.
+- The agent only comments. It neither approves nor requests changes; that is left to people.
+- The worker reads; it cannot download packages, so it runs only what works with the sandbox image and the repository. The review says what was and was not checked.
+- Posting needs the App's **Pull requests: read and write** permission. A review is not an approval of anything in the sense of [Approvals](approvals.md), and gives the worker no credential to push.
+
 ## Feishu / Lark
 
 The agent is a bot in direct chats and group chats. A direct chat is one scope per user (`tenant:user:<open_id>`); a group is one scope (`tenant:chat:<chat_id>`). In a group it hears only messages that mention it. A topic thread is a conversation of its own; an ordinary reply is not.

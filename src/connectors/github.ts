@@ -13,7 +13,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import type { Connector, OutboundMessage, Receipt, Standing } from "./types";
+import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 export const githubConnector: Connector = {
   name: "github",
@@ -79,6 +79,222 @@ function ownWords(body: string): string {
   }
   // Code spans, which may run over several lines.
   return kept.join("\n").replace(/(`+)[\s\S]*?\1/g, " ");
+}
+
+/**
+ * The lines of each file that a comment can be attached to: those the pull request adds or shows
+ * as context, numbered as in the new version of the file. GitHub refuses a comment anywhere else,
+ * and with it the whole review. Only the files in `wanted` are looked at, when it is given.
+ */
+export function commentableLines(files: { filename?: string; patch?: string }[], wanted?: Set<string>): Map<string, Set<number>> {
+  const lines = new Map<string, Set<number>>();
+  for (const file of files) {
+    if (!file.filename || !file.patch || (wanted && !wanted.has(file.filename))) continue;
+    const set = new Set<number>();
+    let at = 0;
+    for (const line of file.patch.split("\n")) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hunk) at = Number(hunk[1]);
+      else if (at > 0 && (line.startsWith("+") || line.startsWith(" "))) set.add(at++);
+    }
+    lines.set(file.filename, set);
+  }
+  return lines;
+}
+
+/**
+ * Makes text that came from a worker safe to post under the agent's name. A finding is evidence
+ * copied from an unattended process, so it must not act on anyone: a mention would notify a
+ * person, and a suggestion block would offer them a change to apply.
+ *
+ * Code is left exactly as it is, in fenced blocks, indented blocks and code spans alike: a
+ * command someone copies must be the command that was written, and nothing in code notifies
+ * anyone. In prose, a mention is put in a code span, where it is plainly visible and inert. A
+ * suggestion block becomes an ordinary code block.
+ */
+export function inert(text: string): string {
+  const out: string[] = [];
+  let fence: { char: string; length: number } | undefined;
+  let prose: string[] = [];
+  const flush = () => {
+    if (prose.length === 0) return;
+    // Code spans may run over several lines; everything between them is prose.
+    out.push(prose.join("\n").replace(/(`+)[\s\S]*?\1|(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (match, span, name) => (span ? match : `\`@${name}\``)));
+    prose = [];
+  };
+  for (const line of text.split("\n")) {
+    const opener = /^([ \t>]*)(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (opener && opener[2][0] === fence.char && opener[2].length >= fence.length && opener[3].trim() === "") fence = undefined;
+      out.push(line);
+    } else if (opener) {
+      flush();
+      fence = { char: opener[2][0], length: opener[2].length };
+      out.push(/^\s*suggestion\b/i.test(opener[3]) ? `${opener[1]}${opener[2]}text` : line);
+    } else if (/^( {4}|\t)/.test(line)) {
+      // Indented far enough to be a code block.
+      flush();
+      out.push(line);
+    } else prose.push(line);
+  }
+  flush();
+  return out.join("\n");
+}
+
+/** A path shown literally, whatever characters it holds, spaces included. */
+export function literal(path: string): string {
+  const fence = "`".repeat(Math.max(0, ...[...path.matchAll(/`+/g)].map((run) => run[0].length)) + 1);
+  return `${fence} ${path.replace(/[\r\n\t]/g, " ")} ${fence}`;
+}
+
+/**
+ * The account this deployment posts as, where that is known: an App's bot. With a plain token, or
+ * an App whose handle is not configured, it is not known, and an earlier post is then recognised
+ * by its marker alone.
+ */
+function self(env: Env): string | undefined {
+  return env.GITHUB_APP_ID && env.GITHUB_BOT_HANDLE ? `${env.GITHUB_BOT_HANDLE}[bot]`.toLowerCase() : undefined;
+}
+
+/**
+ * Whether something found on GitHub is this agent's own earlier post of the message with this
+ * marker: it ends in the marker and, where the posting account is known, was posted by it.
+ * Someone else's text that merely quotes the marker is not.
+ */
+export function isOurs(found: { body?: string; user?: { login?: string } }, marker: string, own: string | undefined): boolean {
+  if (!found.body?.trimEnd().endsWith(marker)) return false;
+  return own === undefined || found.user?.login?.toLowerCase() === own;
+}
+
+/** Throws for a response that was not a success, carrying GitHub's own word on when to try again. */
+async function refused(response: Response, doing: string): Promise<never> {
+  const text = await response.text().catch(() => "");
+  const said = `GitHub returned ${response.status} ${doing}: ${text.slice(0, 200)}`;
+  const after = Number(response.headers.get("retry-after"));
+  const reset = response.headers.get("x-ratelimit-remaining") === "0" ? Number(response.headers.get("x-ratelimit-reset")) * 1_000 : NaN;
+  // GitHub's own time where it gives one. Throttled without one (a secondary rate limit), its
+  // guidance is to wait at least a minute. An ordinary refusal, such as a missing permission, is
+  // not slowed down.
+  const throttled = response.status === 429 || (response.status === 403 && /secondary rate limit|abuse detection/i.test(text));
+  const notBefore =
+    Number.isFinite(after) && after > 0 ? Date.now() + after * 1_000 : Number.isFinite(reset) && reset > Date.now() ? reset : throttled ? Date.now() + SECONDARY_LIMIT_WAIT_MS : undefined;
+  throw notBefore ? new DeliveryDeferred(said, notBefore) : new Error(said);
+}
+
+/** Whether GitHub asked for the next request to wait. */
+function mustWait(response: Response): boolean {
+  return response.headers.has("retry-after") || response.headers.get("x-ratelimit-remaining") === "0" || response.status === 429;
+}
+
+const SECONDARY_LIMIT_WAIT_MS = 60_000;
+type Headers = Record<string, string>;
+const SEARCH_PAGES = 10;
+
+/**
+ * An earlier attempt at this message posted as a pull request review, if one got through. Reviews
+ * are listed oldest first and cannot be asked for by time, so they are read from the newest back
+ * to before the message was written. If that cannot be finished, this throws: not knowing whether
+ * something is already there is no reason to post it again.
+ */
+async function earlierReview(headers: Headers, pull: string, marker: string, since: number, own: string | undefined): Promise<Receipt | undefined> {
+  type Listed = { id: number; body?: string; state?: string; submitted_at?: string; user?: { login?: string } };
+  const read = async (page: number) => {
+    const listed = await fetch(`${pull}/reviews?per_page=100&page=${page}`, { headers });
+    if (!listed.ok) await refused(listed, "listing reviews");
+    return { batch: (await listed.json()) as Listed[], link: listed.headers.get("link") ?? "" };
+  };
+  // A draft nobody can see yet is not a published review.
+  const ours = (batch: Listed[]): Receipt | undefined => {
+    const found = batch.find((each) => each.state !== "PENDING" && isOurs(each, marker, own));
+    return found && { subject: `github:review:${found.id}`, holder: fingerprint(found.body ?? ""), posted_at: Date.parse(found.submitted_at ?? "") || undefined };
+  };
+  const first = await read(1);
+  const last = Number(/[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(first.link)?.[1] ?? NaN);
+  if (Number.isFinite(last)) {
+    for (let page = last, pages = 0; page >= 1; page--, pages++) {
+      if (pages >= SEARCH_PAGES) throw new Error("too many reviews on this pull request to tell whether this one was already posted");
+      const { batch } = page === 1 ? first : await read(page);
+      const found = ours(batch);
+      if (found) return found;
+      if (batch.some((each) => (Date.parse(each.submitted_at ?? "") || Infinity) < since)) return undefined;
+    }
+    return undefined;
+  }
+  // No "last" link: one page, or a listing that only says what comes next. Follow it to the end.
+  let current = first;
+  for (let page = 1; ; page++) {
+    const found = ours(current.batch);
+    if (found) return found;
+    if (!/rel="next"/.test(current.link)) return undefined;
+    if (page >= SEARCH_PAGES) throw new Error("too many reviews on this pull request to tell whether this one was already posted");
+    current = await read(page + 1);
+  }
+}
+
+/** An earlier attempt at this message posted as an ordinary comment, if one got through. */
+async function earlierComment(headers: Headers, comments: string, marker: string, since: number, own: string | undefined): Promise<{ id: number; body?: string; created_at?: string } | undefined> {
+  // Only comments since the message was written can be an earlier attempt at it. The list is
+  // oldest first and paged, so it is followed to its end; if it has no end within the budget, the
+  // answer is not known and nothing is posted.
+  for (let page = 1; ; page++) {
+    if (page > SEARCH_PAGES) throw new Error("too many comments here to tell whether this one was already posted");
+    const recent = await fetch(`${comments}?per_page=100&page=${page}&since=${encodeURIComponent(new Date(since).toISOString())}`, { headers });
+    if (!recent.ok) await refused(recent, "listing comments");
+    const batch = (await recent.json()) as { id: number; body?: string; created_at?: string; user?: { login?: string } }[];
+    const found = batch.find((comment) => isOurs(comment, marker, own));
+    if (found) return found;
+    if (batch.length < 100) return undefined;
+  }
+}
+
+/**
+ * Posts a review of the pull request's current head: the summary as its body, each comment on
+ * its line. It only comments; approving or requesting changes is left to people.
+ *
+ * A comment on a line the change neither touches nor shows is kept, in the body, with its file
+ * and line: GitHub accepts comments only on lines of the diff.
+ */
+async function postReview(headers: Headers, pull: string, head: string, review: CodeReview, marker: string): Promise<Receipt> {
+  // Which of the lines asked for can take a comment. Pages are read as they come and only the
+  // files in question are looked at; a pull request can list up to 3,000 files.
+  const wanted = new Set(review.comments.map((c) => c.path));
+  const lines = new Map<string, Set<number>>();
+  for (let page = 1; wanted.size > 0 && page <= 30; page++) {
+    const listed = await fetch(`${pull}/files?per_page=100&page=${page}`, { headers });
+    if (!listed.ok) await refused(listed, "listing the changed files");
+    const batch = (await listed.json()) as { filename?: string; patch?: string }[];
+    for (const [path, set] of commentableLines(batch, wanted)) lines.set(path, set);
+    if (batch.length < 100) break;
+  }
+  const placed = review.comments.filter((c) => lines.get(c.path)?.has(c.line));
+  const body = (attached: typeof placed) => {
+    const rest = review.comments.filter((c) => !attached.includes(c));
+    return [inert(review.summary), `Reviewed at ${head.slice(0, 7)}.`, ...(rest.length > 0 ? ["Not on a line this pull request changes or shows:", ...rest.map(inWords)] : []), marker].join("\n\n");
+  };
+  const post = (attached: typeof placed) =>
+    fetch(`${pull}/reviews`, {
+      method: "POST",
+      headers,
+      // The commit is named, so the comments stay on the revision that was reviewed even if the
+      // pull request moves between reading it and posting.
+      body: JSON.stringify({ commit_id: head, event: "COMMENT", body: body(attached), comments: attached.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: inert(c.body) })) }),
+    });
+  let response = await post(placed);
+  // GitHub would not take one of the lines after all: the same review, all in the body. Only for
+  // that, and never when it asked for a pause. Any other refusal is not answered by posting again;
+  // it is left to the next attempt, which first looks for what is already there.
+  if (response.status === 422 && placed.length > 0 && !mustWait(response)) {
+    const errors = JSON.stringify(((await response.clone().json().catch(() => ({}))) as { errors?: unknown }).errors ?? "");
+    if (/\b(line|position|diff|path|hunk)\b/i.test(errors)) response = await post([]);
+  }
+  if (!response.ok) await refused(response, "posting the review");
+  const created = (await response.json()) as { id: number; body?: string };
+  return { subject: `github:review:${created.id}`, holder: fingerprint(created.body ?? "") };
+}
+
+/** One comment of a review, in words: where it is about, shown literally, then what it says. */
+function inWords(comment: CodeReview["comments"][number]): string {
+  return `${literal(`${comment.path}:${comment.line}`)}\n${inert(comment.body)}`;
 }
 
 /** A short fingerprint of a comment's text, to tell two revisions with the same timestamp apart. */
@@ -343,28 +559,57 @@ export async function deliverGithub(env: Env, scope: Scope, target: Target, mess
   };
   const marker = `<!-- always-on-agent:${message.idem.replace(/[^\w:.|-]/g, "")} -->`;
   const comments = `https://api.github.com/repos/${repo}/issues/${number}/comments`;
+  const pull = `https://api.github.com/repos/${repo}/pulls/${number}`;
+  const own = self(env);
+  const since = (message.created_at ?? Date.now()) - 60_000;
 
-  // A question someone will approve is shown literally. Rendered as Markdown, a branch called
-  // __release__ would appear as "release" in bold, which is not the branch being pushed.
-  const shown = message.idem.startsWith("ask:") ? `<pre>${message.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>` : message.text;
-  const posted = `${shown}\n\n${marker}`;
-
-  // Only comments since this message was written can be an earlier attempt at it. The list is
-  // oldest-first and paged, so follow it to the end rather than trusting the first page.
-  const since = new Date((message.created_at ?? Date.now()) - 60_000).toISOString();
-  for (let page = 1; page <= 10; page++) {
-    const recent = await fetch(`${comments}?per_page=100&page=${page}&since=${encodeURIComponent(since)}`, { headers });
-    if (!recent.ok) throw new Error(`GitHub returned ${recent.status} listing comments`);
-    const batch = (await recent.json()) as { id: number; body?: string; created_at?: string }[];
-    const earlier = batch.find((comment) => comment.body?.includes(marker));
-    // The receipt is for the text as written here, not as found: if someone already changed the
-    // comment, it must not pass for what the agent said.
-    if (earlier) return { subject: `github:comment:${earlier.id}`, holder: fingerprint(posted), posted_at: Date.parse(earlier.created_at ?? "") || undefined };
-    if (batch.length < 100) break;
+  // A review can go out in one of two forms, and which one depends on where the pull request is
+  // at the moment of sending. So an earlier attempt is looked for in both places before anything
+  // is posted: the pull request may have moved between that attempt and this one.
+  let head: string | undefined;
+  if (message.review) {
+    const found = await fetch(pull, { headers });
+    if (found.ok) {
+      head = ((await found.json()) as { head?: { sha?: string } }).head?.sha;
+      if (!head) throw new Error("GitHub did not say which commit the pull request is at");
+      const earlier = await earlierReview(headers, pull, marker, since, own);
+      if (earlier) return earlier;
+    } else if (found.status !== 404) await refused(found, "reading the pull request");
   }
 
+  let shown: string;
+  if (message.idem.startsWith("ask:")) {
+    // A question someone will approve is shown literally. Rendered as Markdown, a branch called
+    // __release__ would appear as "release" in bold, which is not the branch being pushed.
+    shown = `<pre>${message.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`;
+  } else if (message.review) {
+    // A review in words: what a worker found, made inert. Where this is a pull request and the
+    // review is not known to be of its current head, a note says which commit it covers: a
+    // verdict on one commit must not be read as a verdict on another.
+    const review = message.review;
+    const note =
+      head === undefined || review.commit === head
+        ? []
+        : [
+            review.commit
+              ? `This review is of commit ${review.commit.slice(0, 7)}. The pull request has since moved to ${head.slice(0, 7)}, which this review does not cover.`
+              : `This review does not say which commit it is of. The pull request is now at ${head.slice(0, 7)}, which it may not cover.`,
+          ];
+    shown = [...note, inert(review.summary), ...review.comments.map(inWords)].join("\n\n");
+  } else shown = message.text;
+  const posted = `${shown}\n\n${marker}`;
+
+  const earlier = await earlierComment(headers, comments, marker, since, own);
+  // For a question, the receipt is for the text as written here, not as found: if someone already
+  // changed the comment, it must not pass for what the agent said.
+  if (earlier) return { subject: `github:comment:${earlier.id}`, holder: fingerprint(message.review ? (earlier.body ?? "") : posted), posted_at: Date.parse(earlier.created_at ?? "") || undefined };
+
+  // Only a review known to be of the pull request's current head is posted as a review, with its
+  // comments on the lines they are about. A line number means nothing against another revision.
+  if (message.review && head !== undefined && message.review.commit === head) return postReview(headers, pull, head, message.review, marker);
+
   const response = await fetch(comments, { method: "POST", headers, body: JSON.stringify({ body: posted }) });
-  if (!response.ok) throw new Error(`GitHub returned ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  if (!response.ok) await refused(response, "posting the comment");
   const created = (await response.json()) as { id: number };
   return { subject: `github:comment:${created.id}`, holder: fingerprint(posted) };
 }

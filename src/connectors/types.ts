@@ -76,6 +76,21 @@ export interface Channel {
   standing?(env: Env, scope: Scope, subject: string): Promise<Standing | undefined>;
 }
 
+/**
+ * Thrown by `deliver` when the outside system said not to try again before a certain time. The
+ * message is retried as after any failure, but no sooner than that.
+ */
+export class DeliveryDeferred extends Error {
+  constructor(
+    message: string,
+    /** In ms since the epoch. */
+    readonly notBefore: number,
+  ) {
+    super(message);
+    this.name = "DeliveryDeferred";
+  }
+}
+
 /** Where a revisable message stands at its source right now. */
 export type Standing = { revision: number; holder: string; deleted: boolean; edited: boolean };
 
@@ -91,6 +106,19 @@ export interface OutboundMessage {
    * can show something better than text (buttons, say) builds it from this.
    */
   ask?: ApprovalQuestion;
+  /**
+   * Set when the message is a code review. `text` says the same in words (the summary, then each
+   * comment with its file and line); a connector that can attach comments to lines builds them
+   * from this.
+   */
+  review?: CodeReview;
+}
+
+export interface CodeReview {
+  summary: string;
+  /** The commit that was reviewed, if known. Lines are only meaningful against it. */
+  commit?: string;
+  comments: { path: string; line: number; body: string }[];
 }
 
 export interface ApprovalQuestion {
