@@ -10,10 +10,31 @@
  * never be treated as that person's instruction or consent.
  */
 import type { Env } from "../env";
-import { type InboundEvent, type Principal, type Scope, type Target, scopeName } from "../events";
+import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import type { OutboundMessage, Receipt } from "./index";
+import type { Connector, OutboundMessage, Receipt, Standing } from "./types";
+
+export const githubConnector: Connector = {
+  name: "github",
+  async http(request, env, path) {
+    if (path.length === 1 && path[0] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
+    return json({ error: "not found" }, 404);
+  },
+  async admin({ method, path, body }, env) {
+    if (path[0] !== "tenants" || path.length !== 3 || method !== "POST") return undefined;
+    if (path[2] === "github-installations") {
+      await registry(env).linkGithubInstallation(String((await body()).installation_id ?? ""), path[1]);
+      return json({ ok: true });
+    }
+    if (path[2] === "github-repos") {
+      // The secret is returned once, to be set on that repository's webhook.
+      return json({ ok: true, ...(await registry(env).linkGithubRepo(String((await body()).repo ?? ""), path[1])) });
+    }
+    return undefined;
+  },
+  channel: { deliver: deliverGithub, standing: commentStanding },
+};
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 // The agent's own handle, whole: "@always-on-agent-staging" is someone else.
@@ -74,17 +95,11 @@ export function fingerprint(text: string): string {
   return `${(b >>> 0).toString(16)}${(a >>> 0).toString(16)}:${text.length}`;
 }
 
-/** The holder recorded for a revision whose text is not a message to the agent. */
-export const NOT_FOR_THE_AGENT = "-";
-
-/** Where a subject like "github:comment:123" stands on GitHub right now. */
-export type Standing = { revision: number; holder: string; deleted: boolean; edited: boolean };
-
 /**
  * Asks GitHub what a comment says now. Webhooks can lag, so before an approval is acted on the
  * comment it was read from is looked at again. If GitHub cannot be asked, for whatever reason,
  * this throws: an approval is not acted on unseen. Returns undefined only for a subject that is
- * not a GitHub comment of this scope.
+ * not a GitHub comment of this scope. A subject looks like "github:comment:123".
  */
 export async function commentStanding(env: Env, scope: Scope, subject: string): Promise<Standing | undefined> {
   const id = /^github:comment:(\d+)$/.exec(subject)?.[1];
@@ -159,7 +174,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   if (event.principal.kind === "human") {
     const accountId = event.principal.id.replace(/^github:/, "");
     const user = await registry(env).resolveIdentity(tenant, "github", accountId);
-    if (user) event.principal.id = user;
+    if (user) event.principal = { ...event.principal, id: user, unlinked: undefined };
   }
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.
@@ -192,7 +207,8 @@ export function normalize(
   const person = (explicit: boolean): Principal =>
     sender.type === "Bot"
       ? { kind: "automation", id: account, display: sender.login, explicit: false }
-      : { kind: "human", id: account, display: sender.login, explicit };
+      : // Not a tenant user until the account is found to be linked to one (see handleGithubWebhook).
+        { kind: "human", id: account, display: sender.login, explicit, unlinked: true };
   const replyTo = (number: number): Target => ({ connector: "github", address: { repo, number: String(number) } });
 
   if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize"].includes(payload.action)) {

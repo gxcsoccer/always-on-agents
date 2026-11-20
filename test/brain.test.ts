@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
+import { MIGRATIONS } from "../src/brain/schema";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
 
 beforeEach(() => installFakeModel());
@@ -196,9 +197,35 @@ describe("timers and memory", () => {
   it("does not count an unlinked GitHub account as a member of a repository", async () => {
     const { stub } = brain("repo");
     model.replies([call("memory_write", { path: "instructions.md", content: "x" })], [say("")]);
-    await stub.ingest(message("@always-on-agent remember: x", { session_key: "pr:9", principal: { kind: "human", id: "github:outsider", explicit: true } }));
+    await stub.ingest(message("@always-on-agent remember: x", { session_key: "pr:9", source: "github", principal: { kind: "human", id: "github:outsider", explicit: true, unlinked: true } }));
     await wake(stub);
     expect(toolOutputs()[0].error).toBeDefined();
+  });
+
+  it("marks stored events from unlinked accounts when the marker is introduced", async () => {
+    const { stub } = brain("repo");
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const insert = (source: string, sourceId: string, principal: object) =>
+        state.storage.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, received_at) VALUES (?, ?, 'message', 'pr:1', ?, 1)", source, sourceId, JSON.stringify(principal));
+      insert("github", "old-outsider", { kind: "human", id: "github:42", explicit: true });
+      insert("github", "old-member", { kind: "human", id: "alice", explicit: true });
+      insert("github", "old-ci", { kind: "automation", id: "github:ci", explicit: false });
+      state.storage.sql.exec(MIGRATIONS[11]);
+      const unlinked = (sourceId: string) => state.storage.sql.exec("SELECT json_extract(principal, '$.unlinked') AS u FROM inbox WHERE source_id = ?", sourceId).one().u;
+      expect(unlinked("old-outsider")).toBe(1);
+      expect(unlinked("old-member")).toBeNull();
+      expect(unlinked("old-ci")).toBeNull();
+    });
+  });
+
+  it("does not take the word of a connector the deployment does not trust for who is speaking", async () => {
+    const { stub } = brain("chat");
+    model.replies([call("memory_write", { path: "instructions.md", content: "x" })], [say("")]);
+    // Everything about it says "a member, addressing you"; only where it came from differs.
+    await stub.ingest(message("remember: x", { source: "newsfeed", session_key: "chat", principal: { kind: "human", id: "alice", explicit: true } }));
+    await wake(stub);
+    expect(toolOutputs()[0].error).toMatch(/started solely by a person/);
+    expect(await stub.readMemory("instructions.md")).toBeNull();
   });
 
   it("rejects memory paths that are not plain markdown files", async () => {
@@ -371,6 +398,21 @@ describe("tasks and approvals", () => {
     const output = await reply(stub, id, "bob", "wait, actually hold on");
     expect(output.error).toBeDefined();
     expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
+  });
+
+  it("does not approve on the word of a connector the deployment does not trust", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    const output = await reply(stub, id, "bob", `approve ${code}`, "allow", { source: "newsfeed" });
+    expect(output.error).toMatch(/nobody here has answered/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not approve on a message that can change when its connector cannot say what it says now", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // The console delivers messages and has no way to be asked about one again.
+    const output = await reply(stub, id, "bob", `approve ${code}`, "allow", { source: "console", data: { subject: "console:note:1", revision: 1, holder: "h" } });
+    expect(output.error).toMatch(/cannot confirm what the reply says now/);
+    expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("does not approve on a comment that was edited or deleted afterwards, in whatever order the news arrives", async () => {

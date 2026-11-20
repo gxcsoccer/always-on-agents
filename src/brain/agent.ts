@@ -17,10 +17,9 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type Outcome, type Receipt, amend, deliver } from "../connectors";
-import { NOT_FOR_THE_AGENT, commentStanding } from "../connectors/github";
+import { type ApprovalQuestion, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
 import type { Env } from "../env";
-import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
+import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
@@ -750,7 +749,10 @@ export class BrainAgent extends DurableObject<Env> {
       const receipt = ask ? this.#rows<{ receipt: string | null }>("SELECT receipt FROM outbox WHERE idem = ?", ask)[0]?.receipt : undefined;
       if (ask && receipt) {
         const posted = JSON.parse(receipt) as { subject: string; holder: string };
-        const now = await commentStanding(this.env, this.#scope(), posted.subject);
+        const shown = this.#rows<{ target: string }>("SELECT target FROM outbox WHERE idem = ?", ask)[0];
+        // Asked of the system the question was posted in. One where nobody else can change the
+        // agent's messages has nothing to say here.
+        const now = shown ? await standingOf(this.env, (JSON.parse(shown.target) as Target).connector, this.#scope(), posted.subject) : undefined;
         // Edited at any time, even if put back since: someone may have read and answered the other wording.
         const touched = this.#rows("SELECT 1 FROM revisions WHERE subject = ?", posted.subject).length > 0;
         if (touched || (now && (now.deleted || now.edited || now.holder !== posted.holder))) {
@@ -779,7 +781,7 @@ export class BrainAgent extends DurableObject<Env> {
       // Everything else members have said in this conversation since the task began, whenever it
       // arrived: a later word from the approver, or anything about this question that is not an approval.
       const later = this.#reconcile(
-        this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+        this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal, event.source)),
       );
       const against =
         later.unresolved ||
@@ -813,7 +815,7 @@ export class BrainAgent extends DurableObject<Env> {
       const received = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND status != 'pending' AND received_at > ? ORDER BY id", sessionKey, asked.sent_at));
       const replies = received.events
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
-        .filter(({ principal }) => this.#isDecider(principal));
+        .filter(({ event, principal }) => this.#isDecider(principal, event.source));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
 
       // What each reply says about this question, read from its own words. The model proposes a
@@ -837,7 +839,7 @@ export class BrainAgent extends DurableObject<Env> {
         // A refusal from any member wins over an approval, whichever came first. That includes one
         // that arrived after this run started and is still waiting in the inbox.
         const queued = this.#reconcile(
-          this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+          this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal, event.source)),
         );
         const waiting = queued.events.some((event) => about(event) && (tied(event) || quotes(event.text ?? "", pending.code)) && says(event) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
@@ -1051,7 +1053,9 @@ export class BrainAgent extends DurableObject<Env> {
    * belong here. In a repository, an account that is not linked to a tenant user is an outsider.
    */
   #deciders(runId: string): Principal[] {
-    return this.#runPrincipals(runId).filter((p) => this.#isDecider(p));
+    return this.#runSpeakers(runId)
+      .filter(({ principal, source }) => this.#isDecider(principal, source))
+      .map(({ principal }) => principal);
   }
 
   /**
@@ -1060,21 +1064,27 @@ export class BrainAgent extends DurableObject<Env> {
    * same batch, the model may be acting on that text rather than on the member's words.
    */
   #instructionEditors(runId: string): string[] {
-    const principals = this.#runPrincipals(runId);
+    const speakers = this.#runSpeakers(runId);
+    const principals = speakers.map(({ principal }) => principal);
     // A comment that was only let in as a reply to an approval question is not a request either.
     const replyOnly = this.#rows<{ data: string | null }>("SELECT data FROM inbox WHERE run_id = ?", runId).some((row) => row.data && JSON.parse(row.data).reply_only === true);
-    if (principals.length === 0 || replyOnly || !principals.every((p) => this.#isDecider(p))) {
+    if (principals.length === 0 || replyOnly || !speakers.every(({ principal, source }) => this.#isDecider(principal, source))) {
       throw new Error("instructions.md can only be changed in a run started solely by a person's request");
     }
     return [...new Set(principals.map((p) => p.id))];
   }
 
-  #isDecider(principal: Principal): boolean {
-    return principal.kind === "human" && principal.explicit && !(this.#scope().kind === "repo" && principal.id.startsWith("github:"));
+  /**
+   * Whether this person's word counts here: a person who deliberately addressed the agent, who is
+   * a user of the tenant, and whose identity was established by a connector the deployment trusts
+   * to establish it. What a connector outside that list says about who spoke is not relied on.
+   */
+  #isDecider(principal: Principal, source: string): boolean {
+    return principal.kind === "human" && principal.explicit && principal.unlinked !== true && trusts(source);
   }
 
-  #runPrincipals(runId: string): Principal[] {
-    return this.#rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? ORDER BY id", runId).map((r) => JSON.parse(r.principal) as Principal);
+  #runSpeakers(runId: string): { principal: Principal; source: string }[] {
+    return this.#rows<{ principal: string; source: string }>("SELECT principal, source FROM inbox WHERE run_id = ? ORDER BY id", runId).map((r) => ({ principal: JSON.parse(r.principal) as Principal, source: r.source }));
   }
 
   // ------------------------------------------------------------------ reads for connectors and admins
@@ -1194,13 +1204,16 @@ export class BrainAgent extends DurableObject<Env> {
    * that a comment was edited or deleted can still be on its way when the approval is acted on.
    */
   async #refreshStanding(events: InboxRow[]): Promise<void> {
-    const subjects = new Set<string>();
+    const subjects = new Map<string, string>();
     for (const event of events) {
       const subject = event.data ? (JSON.parse(event.data) as { subject?: string }).subject : undefined;
-      if (subject) subjects.add(subject);
+      if (subject) subjects.set(subject, event.source);
     }
-    for (const subject of subjects) {
-      const standing = subject.startsWith("github:comment:") ? await commentStanding(this.env, this.#scope(), subject) : undefined;
+    for (const [subject, source] of subjects) {
+      // A message that can change, from a connector that cannot say what it says now, cannot be
+      // relied on for an approval.
+      if (!canRevisit(source)) throw new Error(`a reply here came through "${source}", which cannot confirm what the reply says now, so nothing can be approved on it`);
+      const standing = await standingOf(this.env, source, this.#scope(), subject);
       if (standing) this.#revise(subject, standing.revision, standing.deleted, standing.holder);
     }
   }

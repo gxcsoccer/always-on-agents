@@ -54,7 +54,9 @@ let eventCounter = 0;
 export function message(text: string, overrides: Partial<InboundEvent> & { user?: string } = {}): InboundEvent {
   const { user = "alice", ...rest } = overrides;
   return {
-    source: "test",
+    // A message that names a subject is one its source may change afterwards. Of the connectors
+    // here only GitHub's can be asked again what such a message says, so it stands in for them.
+    source: rest.data?.subject ? "github" : "console",
     source_id: `e${++eventCounter}`,
     kind: "message",
     session_key: "dm",

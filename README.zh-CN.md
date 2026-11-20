@@ -89,6 +89,7 @@ curl $B/v1/admin/scopes/acme:user:alice -H "authorization: Bearer $ADMIN_KEY"
 src/
   index.ts              入口 Worker：鉴权和路由，本身不存状态
   events.ts             作用域、事件、身份的定义
+  agent.config.ts       这个部署启用哪些 connector，信任哪些
   registry.ts           租户、密钥、应用登记（一个 Durable Object）
   brain/                Brain：每个作用域一个 Durable Object
     agent.ts              收件箱、定时器、run 循环、任务、发件箱
@@ -97,6 +98,7 @@ src/
     prompt.ts             系统提示词
   model/openai.ts       模型客户端
   connectors/           每个外部系统一个：验证、识别身份、投递
+    types.ts              connector 接口的定义
     console.ts            HTTP 通道，用于开发和验证
     github.ts             GitHub webhook 和评论
     github-app.ts         按安装、按仓库签发令牌

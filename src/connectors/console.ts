@@ -12,6 +12,21 @@
  */
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, scopeName } from "../events";
+import { registry } from "../registry";
+import type { Connector } from "./types";
+
+export const consoleConnector: Connector = {
+  name: "console",
+  async http(request, env, path) {
+    const tenant = await registry(env).authenticate(request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "");
+    if (!tenant) return json({ error: "missing or unknown API key" }, 401);
+    return handleConsole(request, env, tenant, path);
+  },
+  channel: {
+    // Pull-based: the client reads the outbox through the API, so writing the row was the delivery.
+    async deliver() {},
+  },
+};
 
 const ID = /^[A-Za-z0-9._-]{1,64}$/;
 

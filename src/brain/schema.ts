@@ -112,7 +112,7 @@ CREATE INDEX IF NOT EXISTS outbox_status ON outbox (status, next_at);
  * Later changes, applied in order and recorded, so a Brain created by an older deploy catches up
  * the first time it wakes. Never edit an entry that has shipped; add a new one.
  */
-const MIGRATIONS: string[] = [
+export const MIGRATIONS: string[] = [
   // 1: mark user turns so the transcript window can be cut at a turn boundary without parsing JSON.
   `ALTER TABLE items ADD COLUMN is_user INTEGER NOT NULL DEFAULT 0;
    UPDATE items SET is_user = 1 WHERE json_extract(item, '$.role') = 'user';`,
@@ -145,6 +145,10 @@ const MIGRATIONS: string[] = [
   // recording). They are all taken as begun: the cost of being wrong is one redundant delivery
   // under the same id, against a card left open.
   `UPDATE outbox SET started = 1 WHERE status = 'pending' AND ask IS NOT NULL;`,
+  // 12: an account that is not linked to a tenant user used to be recognised by the form of its
+  // id; it is now marked as such by the connector. Mark the ones already stored.
+  `UPDATE inbox SET principal = json_set(principal, '$.unlinked', json('true'))
+     WHERE source = 'github' AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') LIKE 'github:%';`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

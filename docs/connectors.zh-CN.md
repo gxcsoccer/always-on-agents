@@ -140,9 +140,35 @@ curl -X POST $B/v1/admin/tenants/acme/chat-repos -H "authorization: Bearer $ADMI
 
 ## 编写一个 connector
 
-connector 是 `src/connectors/` 下的一个模块，包含：
+一个 connector 就是一个实现了 `Connector` 接口（`src/connectors/types.ts`）的对象，登记在 `src/agent.config.ts` 里。代码的其他地方不会按名字提到任何 connector：路由、管理请求、定时任务、消息投递都通过这个对象找到它。仓库里的三个 connector 都是这样写的，可以直接照着写。
 
-- 一个入站处理函数：**先**验证请求的真实性，再相信其中的任何内容；然后构造一个 `InboundEvent`（见 `src/events.ts`），其中 `source_id` 要稳定以便去重，`principal` 说明是谁引起的、是不是在对 agent 说话；
-- 一个投递函数：登记在 `src/connectors/index.ts` 里，发送一条消息，并且可以安全重试（使用消息的 `idem` 键）。
+```ts
+export const exampleConnector: Connector = {
+  name: "example",
+  // /v1/example/… 下的请求
+  async http(request, env, path, ingress) { /* 验证，构造事件，交给 Brain */ },
+  // 可选：/v1/admin/… 下用于配置它的运维请求
+  async admin({ method, path, body }, env) { /* 不是自己的请求就返回 undefined */ },
+  // 可选：每分钟调用一次
+  async scheduled(env) {},
+  // 可选：投递 agent 的消息
+  channel: { deliver, amend, standing },
+};
+```
 
-授权只看 principal，从不看消息文本。如果外部系统允许人们编辑或删除自己说过的话，就给事件带上 `subject`、`revision` 和 `holder`，使被改过的消息不能再决定任何事（参考 `src/connectors/github.ts`）。
+每一部分都是可选的，互不依赖。只上报事件的 connector（比如 CI 通知）只需要 `http`。
+
+| 部分 | 必须做到 |
+|---|---|
+| `http` | **先**验证请求，再相信其中的内容。构造 `InboundEvent`（`src/events.ts`）：`source` 填 connector 的名字，`source_id` 要稳定（用于去重），`principal` 说明是谁引起的、是否在对 agent 说话 |
+| `channel.deliver` | 发送一条消息，没送达就抛错。它会被重试，所以要用消息的 `idem` 避免重复发送 |
+| `channel.amend` | 可选。把已送达的审批提问显示为已关闭 |
+| `channel.standing` | 如果那个系统里的人可以编辑或删除自己说过的话，就必须实现。见下文 |
+
+### 不管 connector 怎么说，都由核心决定的事
+
+- **谁的话算数。** connector 只负责说明事件是谁引起的。这个人能不能批准动作、能不能被记为任务发起人、能不能改长期指令，由 Brain 决定，而且只对 `src/agent.config.ts` 里 `trusted` 列出的 connector 生效。其他 connector 的事件只提供信息，不能决定任何事。只有当一个 connector 能证明每个事件的来源和引起它的人时，才应该把它列进去。
+- **不是租户用户的账号。** 如果 connector 在自己的系统里认出了一个账号，但它没有关联到租户的用户，就设置 `principal.unlinked`。这样的人不是任何作用域的成员。
+- **会变的消息。** 消息可以被编辑或删除的 connector，要给事件带上 `subject`、`revision` 和 `holder`，并实现 `channel.standing`（向那个系统重新读一遍这条消息）。批准生效之前，Brain 会问它这条消息现在说的是什么。带着 subject、而所属 connector 又没有 `standing` 的消息，不能批准任何事。
+
+connector 是编译进 Worker 的。需要自己的 Durable Object 的 connector（比如飞书长连接）还要从 `src/index.ts` 导出这个类，并在 `wrangler.jsonc` 里加一条绑定。

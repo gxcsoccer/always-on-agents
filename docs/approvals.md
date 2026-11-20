@@ -44,7 +44,7 @@ In Feishu the question is a card with buttons. Pressing a button is the same as 
 
 | Rule | Enforced in |
 |---|---|
-| The message must come from a member of the scope who was addressing the agent. | `#isDecider` |
+| The message must come from a member of the scope who was addressing the agent, through a connector the deployment trusts to say who is speaking (`trusted` in `src/agent.config.ts`). What any other connector reports decides nothing. | `#isDecider` |
 | In a group chat or a repository, only the person who requested the task may approve it. | `#answerTask` |
 | If several people asked in the same batch, the task has no requester, and nobody can approve. | `#dispatchTask` |
 | In a group chat or a repository, a task not started by a person (one dispatched after a CI failure, say) cannot be approved, only refused. In a direct chat, where there is one member, that member may approve a task the agent started on its own (after a timer, say). | `#answerTask` |
@@ -74,7 +74,7 @@ GitHub comments can be edited and deleted.
 | Rule | Enforced in |
 |---|---|
 | An approval counts only while the comment it was read from still says the same thing. Each comment's standing is its timestamp plus a fingerprint of its text; an edit or deletion voids the earlier text in whatever order the notifications arrive. | `#revise`, `#standing` |
-| Before an approval is acted on, the comment is read again from GitHub, because the notification of a change may still be on its way. If GitHub cannot be asked, nothing is approved. | `#refreshStanding`, `commentStanding` |
+| Before an approval is acted on, the comment is read again from GitHub, because the notification of a change may still be on its way. If GitHub cannot be asked, nothing is approved. The same holds for any connector whose messages can change: one that cannot be asked what a message says now cannot carry an approval. | `#refreshStanding`, the connector's `standing` |
 | The question the agent posted is checked too: a maintainer can edit other people's comments. A question that was ever edited, even if put back, cannot be approved, only refused. To go ahead, refuse it (or cancel the task) and make the request again, which produces a new question. | `#answerTask` |
 | A mention inside a quotation or code does not address the agent. | `ownWords` in `connectors/github.ts` |
 

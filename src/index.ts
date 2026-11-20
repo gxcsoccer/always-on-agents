@@ -3,9 +3,7 @@
  * request belongs to, and hands it to that scope's Brain. It holds no state and does no work itself,
  * so it can answer webhooks quickly.
  */
-import { handleConsole } from "./connectors/console";
-import { handleFeishuWebhook } from "./connectors/feishu";
-import { handleGithubWebhook } from "./connectors/github";
+import { connector, connectors } from "./connectors";
 import type { Env } from "./env";
 import { registry } from "./registry";
 
@@ -23,38 +21,24 @@ export default {
       if (url.pathname === "/healthz") return json({ ok: true });
       if (path[0] !== "v1") return json({ error: "not found" }, 404);
 
-      if (path[1] === "github" && path[2] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
-
-      if (path[1] === "feishu" && path[2] === "events" && path[3] && request.method === "POST") return handleFeishuWebhook(request, env, path[3], (work) => ctx.waitUntil(work));
-
-      if (path[1] === "console") {
-        const tenant = await registry(env).authenticate(bearer(request));
-        if (!tenant) return json({ error: "missing or unknown API key" }, 401);
-        return handleConsole(request, env, tenant, path.slice(2));
-      }
-
       if (path[1] === "admin") {
         if (!env.ADMIN_KEY || !(await sameSecret(bearer(request), env.ADMIN_KEY))) return json({ error: "missing or wrong admin key" }, 401);
         return admin(request, env, path.slice(2), url);
       }
+      // Everything else under /v1/<name>/ belongs to the connector of that name.
+      const owner = connector(path[1] ?? "");
+      if (owner?.http) return await owner.http(request, env, path.slice(2), { defer: (work) => ctx.waitUntil(work) });
       return json({ error: "not found" }, 404);
     } catch (err) {
       console.log(JSON.stringify({ request_failed: String(err), path: url.pathname }));
       return json({ error: err instanceof Error ? err.message : String(err) }, 500);
     }
   },
-  /**
-   * Every minute: make sure each long connection's watchdog is running. The watchdog rearms
-   * itself; this is for the case where it could not, such as an object that failed to start.
-   */
+  /** Every minute: each connector's own upkeep. One failing does not stop the others. */
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      (async () => {
-        for (const appId of await registry(env).feishuLongConnectionApps()) {
-          await env.FEISHU_LINKS.getByName(appId).ensure(appId).catch((err) => console.log(JSON.stringify({ feishu_link_not_ensured: String(err).slice(0, 300), app: appId })));
-        }
-      })(),
-    );
+    for (const each of connectors) {
+      if (each.scheduled) ctx.waitUntil(each.scheduled(env).catch((err) => console.log(JSON.stringify({ scheduled_failed: String(err).slice(0, 300), connector: each.name }))));
+    }
   },
 } satisfies ExportedHandler<Env>;
 
@@ -65,33 +49,6 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
   if (path[0] === "tenants" && path.length === 1 && method === "POST") {
     const { id, name } = await body();
     return json(await registry(env).createTenant(String(id ?? ""), String(name ?? id ?? "")), 201);
-  }
-  if (path[0] === "tenants" && path[2] === "github-installations" && method === "POST") {
-    await registry(env).linkGithubInstallation(String((await body()).installation_id ?? ""), path[1]);
-    return json({ ok: true });
-  }
-  if (path[0] === "tenants" && path[2] === "github-repos" && method === "POST") {
-    // The secret is returned once, to be set on that repository's webhook.
-    return json({ ok: true, ...(await registry(env).linkGithubRepo(String((await body()).repo ?? ""), path[1])) });
-  }
-  if (path[0] === "tenants" && path[2] === "feishu-apps" && method === "POST") {
-    const app = await body();
-    await registry(env).setFeishuApp(path[1], {
-      app_id: String(app.app_id ?? ""),
-      app_secret: String(app.app_secret ?? ""),
-      encrypt_key: app.encrypt_key ? String(app.encrypt_key) : undefined,
-      verification_token: app.verification_token ? String(app.verification_token) : undefined,
-      bot_open_id: app.bot_open_id ? String(app.bot_open_id) : undefined,
-      transport: app.transport === undefined ? undefined : app.transport,
-    });
-    // Over the long connection there is nothing for Feishu to call; we connect to it instead.
-    if (app.transport === "long_connection") {
-      return json({ ok: true, transport: "long_connection", link: await env.FEISHU_LINKS.getByName(String(app.app_id)).ensure(String(app.app_id), true) });
-    }
-    return json({ ok: true, webhook: `${url.origin}/v1/feishu/events/${app.app_id}` });
-  }
-  if (path[0] === "feishu-links" && path[1] && method === "GET") {
-    return json(await env.FEISHU_LINKS.getByName(path[1]).status());
   }
   if (path[0] === "tenants" && path[2] === "chat-repos" && method === "POST") {
     const { chat, repo } = await body();
@@ -118,6 +75,11 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     if (path[2] === "files" && method === "GET" && (path[3] === "events" || path[3] === "hooks" || path[3] === "stderr")) {
       return new Response(await task.readFiles(path[3]), { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
+  }
+  // Setting up a connector is that connector's own business.
+  for (const each of connectors) {
+    const response = await each.admin?.({ method, path, url, body }, env);
+    if (response) return response;
   }
   return json({ error: "not found" }, 404);
 }

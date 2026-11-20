@@ -140,9 +140,35 @@ The card's fixed text is currently Chinese only.
 
 ## Writing a connector
 
-A connector is a module in `src/connectors/` with:
+A connector is one object that implements `Connector` (`src/connectors/types.ts`), listed in `src/agent.config.ts`. Nothing else in the code names a connector: routes, admin requests, scheduled work and delivery all reach it through that object. The three connectors in this repository are written this way and are the examples to copy.
 
-- an inbound handler that authenticates the request **before** believing anything in it, and builds an `InboundEvent` (`src/events.ts`) with a stable `source_id` for de-duplication and a `principal` that says who caused it and whether they were addressing the agent;
-- a delivery function, registered in `src/connectors/index.ts`, that sends one message and is safe to retry (use the message's `idem` key).
+```ts
+export const exampleConnector: Connector = {
+  name: "example",
+  // Requests under /v1/example/…
+  async http(request, env, path, ingress) { /* verify, build events, hand them to the Brain */ },
+  // Optional: operator requests under /v1/admin/… that set it up
+  async admin({ method, path, body }, env) { /* return undefined for requests that are not yours */ },
+  // Optional: called every minute
+  async scheduled(env) {},
+  // Optional: delivering the agent's messages
+  channel: { deliver, amend, standing },
+};
+```
 
-Authorization is decided on the principal, never on message text. If people can edit or delete what they said in the outside system, give events a `subject`, a `revision` and a `holder` so that a changed message cannot decide anything (see `src/connectors/github.ts`).
+Each part is optional and independent. A connector that only reports events (a CI notifier, say) has `http` and nothing else.
+
+| Part | What it must do |
+|---|---|
+| `http` | Authenticate the request **before** believing anything in it. Build an `InboundEvent` (`src/events.ts`) with `source` set to the connector's name, a stable `source_id` for de-duplication, and a `principal` that says who caused it and whether they were addressing the agent. |
+| `channel.deliver` | Send one message. Throw if it was not delivered. It will be retried, so use the message's `idem` key to avoid sending twice. |
+| `channel.amend` | Optional. Show a delivered approval question as closed. |
+| `channel.standing` | Required if people can edit or delete what they said in that system. See below. |
+
+### What the core decides, whatever a connector says
+
+- **Whose word counts.** A connector says who caused an event. Whether that person can approve an action, be credited with a request, or change standing instructions is decided by the Brain, and only for connectors listed under `trusted` in `src/agent.config.ts`. Events from any other connector inform the agent and decide nothing. List a connector there only if it proves where each event came from and who caused it.
+- **Accounts that are not tenant users.** If the connector identifies an account in its own system that is not linked to a user of the tenant, it sets `principal.unlinked`. Such a person is not a member of any scope.
+- **Messages that can change.** A connector whose messages can be edited or deleted gives its events a `subject`, a `revision` and a `holder`, and implements `channel.standing`, which reads the message again from the system. Before an approval counts, the Brain asks it what the message says now. A message that names a subject from a connector without `standing` cannot approve anything.
+
+Connectors are compiled into the Worker. A connector that needs a Durable Object of its own (as Feishu's long connection does) also needs the class exported from `src/index.ts` and a binding in `wrangler.jsonc`.

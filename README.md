@@ -89,6 +89,7 @@ To deploy, and to connect GitHub or Feishu, see [Operations](docs/operations.md)
 src/
   index.ts              ingress Worker: authentication and routing, no state
   events.ts             scopes, events and principals
+  agent.config.ts       which connectors this deployment runs, and which are trusted
   registry.ts           tenants, keys, app registrations (one Durable Object)
   brain/                the Brain: one Durable Object per scope
     agent.ts              inbox, timers, the run loop, tasks, outbox
@@ -97,6 +98,7 @@ src/
     prompt.ts             the system prompt
   model/openai.ts       model client
   connectors/           one per outside system: verify, identify, deliver
+    types.ts              what a connector is
     console.ts            HTTP channel for development and checks
     github.ts             GitHub webhooks and comments
     github-app.ts         tokens per installation and repository
