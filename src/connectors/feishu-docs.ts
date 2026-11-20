@@ -31,7 +31,7 @@ const NOT_COVERED = 99991679;
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
   description:
-    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it in this request (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
+    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request, or in their last few messages in this chat within about ten minutes, can be read; for an older link, ask them to send it again. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
   effect: "read",
   parameters: { document: { type: "string" } },
   run: reported,
@@ -129,11 +129,11 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const { env, origin } = context;
   const target = documentOf(String(args.document ?? "").trim());
   if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
-  // The document is the person's choice: a link they themselves put in this request, as the
-  // connector found it in what they wrote. Text the agent has read cannot send it elsewhere, and
+  // The document is the person's choice: a link they themselves put in this request, or in what
+  // they wrote here just before it, as the connector found it in their own messages. Text the agent has read cannot send it elsewhere, and
   // neither can a word in their message that merely looks like a document's id.
-  const linked = context.said.flatMap((message) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]) : []));
-  if (!linked.some((each) => each?.kind === target.kind && each?.token === target.token)) return { error: "only a document the person linked in this request can be read" };
+  const linked = [...context.said, ...context.recent].flatMap((message) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]) : []));
+  if (!linked.some((each) => each?.kind === target.kind && each?.token === target.token)) return { error: "only a document the person linked in this request, or in their last few messages here, can be read" };
 
   const redirect = redirectUri(env);
   if (!redirect || !grantsKey(env)) return { error: "reading documents is not set up on this deployment" };

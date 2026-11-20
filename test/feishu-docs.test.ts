@@ -318,7 +318,7 @@ describe("reading a Feishu document as the person who asked", () => {
     feishu.wiki.set("DocFrank0000000000001", { obj_type: "docx", obj_token: "DocOther0000000000001" });
     await authorised(frank, "DocFrank0000000000001");
     feishu.reads.length = 0;
-    const refused = { error: "only a document the person linked in this request can be read" };
+    const refused = { error: "only a document the person linked in this request, or in their last few messages here, can be read" };
 
     // The document tells the model to go and read another one.
     model.replies([call("feishu_read_document", { document: link("DocFrank0000000000001") })], [call("feishu_read_document", { document: link("DocOther0000000000001") })], [call("send_message", { text: "好的" })], [say("")]);
@@ -347,6 +347,38 @@ describe("reading a Feishu document as the person who asked", () => {
     ]);
     expect(toolOutputs().slice(0, 5)).toEqual([refused, refused, refused, refused, refused]);
     expect(feishu.reads).toEqual([]);
+  });
+
+  it("reads a document linked in the message before, and not one linked long ago or by anyone else", async () => {
+    const olga = someone();
+    feishu.docs.set("DocOlga00000000000001", { readers: [olga.openId], text: "Olga's." });
+    feishu.docs.set("DocOld000000000000001", { readers: [olga.openId], text: "old" });
+    await authorised(olga, "DocOlga00000000000001");
+    feishu.reads.length = 0;
+
+    // A link, and then what to do with it.
+    model.replies([say("你希望我做什么？")]);
+    await olga.says(link("DocOlga00000000000001"));
+    model.replies([call("feishu_read_document", { document: link("DocOlga00000000000001") })], [call("send_message", { text: "好的" })], [say("")]);
+    await olga.says("总结");
+    expect(toolOutputs()[0]).toEqual({ text: "Olga's." });
+
+    // A link from longer ago than that no longer counts.
+    model.replies([say("你希望我做什么？")]);
+    await olga.says(link("DocOld000000000000001"));
+    await runInDurableObject(olga.stub, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE inbox SET received_at = received_at - 11 * 60000 WHERE text LIKE '%DocOld000000000000001%'"));
+    model.replies([call("feishu_read_document", { document: link("DocOld000000000000001") })], [call("send_message", { text: "请再发一次" })], [say("")]);
+    await olga.says("总结");
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked/);
+
+    // What the agent itself said, or read, is not among the person's messages.
+    feishu.docs.set("DocTold00000000000001", { readers: [olga.openId], text: "told" });
+    model.replies([call("send_message", { text: `看看 ${link("DocTold00000000000001")}` })], [say("")]);
+    await olga.says("你有什么推荐的文档？");
+    model.replies([call("feishu_read_document", { document: link("DocTold00000000000001") })], [call("send_message", { text: "不行" })], [say("")]);
+    await olga.says("读一下你推荐的");
+    expect(toolOutputs().find((each: any) => each.error)?.error).toMatch(/only a document the person linked/);
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocOlga00000000000001/raw_content"]);
   });
 
   it("does not hand on what was read under an authorisation that has since been taken away or replaced", async () => {
@@ -576,7 +608,7 @@ describe("reading a Feishu document as the person who asked", () => {
 });
 
 describe("the document tool by itself", () => {
-  const context = (overrides: Record<string, unknown> = {}) => ({ env: env as any, scope: { tenant: TENANT, kind: "user" as const, id: "ou_unit" }, person: "ou_unit", origin: { app_id: APP_ID, tenant_key: ORG }, said: [{ text: link("DocUnit00000000000001"), data: { documents: [{ kind: "docx", token: "DocUnit00000000000001" }] } }], callId: "call_unit", ...overrides });
+  const context = (overrides: Record<string, unknown> = {}) => ({ env: env as any, scope: { tenant: TENANT, kind: "user" as const, id: "ou_unit" }, person: "ou_unit", origin: { app_id: APP_ID, tenant_key: ORG }, said: [{ text: link("DocUnit00000000000001"), data: { documents: [{ kind: "docx", token: "DocUnit00000000000001" }] } }], recent: [], callId: "call_unit", ...overrides });
 
   it("finds the documents linked in a text, and nothing that only resembles one", () => {
     expect(documentsIn("see https://x.feishu.cn/docx/DocUnit00000000000001, and (https://a.b.larkoffice.com/wiki/WikiUnit0000000000001?from=home#part). 再看https://x.feishu.cn/docx/DocUnit00000000000002/，谢谢 twice https://x.feishu.cn/docx/DocUnit00000000000001#h")).toEqual([
