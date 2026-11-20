@@ -669,6 +669,22 @@ describe("the document tool by itself", () => {
     expect(feishu.sent).toEqual([]);
   });
 
+  it("records how each read ended, in a fixed word and nothing of the request", async () => {
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((line: unknown) => void lines.push(String(line)));
+    try {
+      await readDocument.run(context({ callId: "call_why1" }), { document: "DocUnit00000000000001" });
+      await readDocument.run(context({ callId: "call_why2" }), { document: link("DocElse00000000000001") });
+      await readDocument.run(context({ callId: "call_why3", env: { ...(env as any), GRANTS_KEY: undefined } }), { document: link("DocUnit00000000000001") });
+      await readDocument.run(context({ callId: "call_why4", person: "ou_why", scope: { tenant: TENANT, kind: "user", id: "ou_why" } }), { document: link("DocUnit00000000000001") });
+    } finally {
+      log.mockRestore();
+    }
+    const ours = lines.filter((line) => line.includes("feishu_read_document")).map((line) => JSON.parse(line));
+    expect(ours).toEqual(["not_a_link", "not_linked_by_person", "not_set_up", "invited"].map((how) => ({ feishu_read_document: how, app: APP_ID })));
+    expect(lines.join("\n")).not.toContain("DocUnit00000000000001");
+  });
+
   it("gives a repeat of the same call the same invitation, and cuts a long document", async () => {
     const args = { document: link("DocUnit00000000000001") };
     await readDocument.run(context(), args);
