@@ -20,15 +20,16 @@ import { API, sendToPerson } from "./feishu-api";
 import { SCOPES, type Who, grantName, grantOf, grantsKey } from "./feishu-grant";
 import type { ConnectorTool, ToolContext } from "./types";
 
+/** Feishu's token endpoint. It checks the PKCE verifier against the challenge sent at authorisation. */
+const TOKEN = "https://accounts.feishu.cn/oauth/v3/token";
 /**
- * Feishu's token endpoint, the one its own authorisation page says to pair with PKCE. The newer
- * one (accounts.feishu.cn/oauth/v3/token) turned down our verifier with 20049 against the real
- * service, for a challenge computed as RFC 7636 says; Feishu's notes say that endpoint refuses a
- * verifier when it holds no challenge for the code, and that this one does not. Request and
- * response are otherwise the same. The exchange still needs the app's secret, and the token is
- * still kept only if it is the invited person's.
+ * Feishu's older token endpoint, used only for an app the operator has switched to it (see
+ * `oauth_v2` in the registry). Feishu's authorisation page says to pair PKCE with this one for
+ * now; its notes also say this one does not refuse a verifier when no challenge is held for the
+ * code. So on this endpoint a successful exchange does not show that the verifier was checked.
+ * Request and response are the same.
  */
-const TOKEN = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
+const TOKEN_V2 = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
 /** How much of a document one read returns. */
 export const MAX_DOCUMENT_TEXT = 40_000;
 /** Feishu's codes for "this user token is no good": invalid, expired, or lacking what the person must grant. */
@@ -251,12 +252,12 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   const code = url.searchParams.get("code") ?? "";
   if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
 
-  const refused = (why: string, answer?: { status: number; code?: unknown }) => {
+  const refused = (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
     // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
     // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
     // sent is logged.
     const code = answer && typeof answer.code === "number" && Number.isInteger(answer.code) ? answer.code : undefined;
-    console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}) } : {}) }));
+    console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}), ...(answer.endpoint ? { endpoint: answer.endpoint } : {}) } : {}) }));
     return page("授权没有成功", "请回到飞书，重新向我发起请求。如果一直不成功，请联系管理员。", 400);
   };
   const app = await registry(env).feishuApp(who.app_id);
@@ -264,13 +265,14 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   // Only what the invitation asked the person for is asked of Feishu, whatever else they have
   // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
   // to hold. The code is used once.
-  const exchange = await fetch(TOKEN, {
+  // One endpoint per code, chosen by the app's setting; never one after the other.
+  const exchange = await fetch(app.oauth_v2 ? TOKEN_V2 : TOKEN, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
   });
   const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string };
-  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed", { status: exchange.status, code: issued.code });
+  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed", { status: exchange.status, code: issued.code, endpoint: app.oauth_v2 ? "v2" : "v3" });
   const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
   if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
   // The token must be for what was asked and nothing more. One that reaches further is not kept.

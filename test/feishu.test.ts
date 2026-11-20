@@ -5,7 +5,7 @@ import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
 const Q = "ask:11111111-2222-3333-4444-555555555555:1";
-const app: FeishuApp = { app_id: "cli_test", tenant: "acme", app_secret: "s", encrypt_key: "k", verification_token: "v", bot_open_id: "ou_bot", token: null, token_expires_at: null, transport: "webhook" };
+const app: FeishuApp = { app_id: "cli_test", tenant: "acme", app_secret: "s", encrypt_key: "k", verification_token: "v", bot_open_id: "ou_bot", token: null, token_expires_at: null, transport: "webhook", oauth_v2: 0 };
 
 async function sha256Hex(text: string) {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));

@@ -19,6 +19,11 @@ export interface FeishuApp {
   token_expires_at: number | null;
   /** How this app's events reach us: Feishu calls our webhook, or we hold a connection open to Feishu. */
   transport: "webhook" | "long_connection";
+  /**
+   * 1 if a person's authorisation code for this app is exchanged at Feishu's older token endpoint.
+   * Off unless an operator turns it on for this app. See TOKEN_V2 in connectors/feishu-docs.ts.
+   */
+  oauth_v2: number;
 }
 
 export interface Tenant {
@@ -57,6 +62,7 @@ export class Registry extends DurableObject<Env> {
     `);
     this.#addColumn("github_repos", "secret TEXT");
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
+    this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
   }
 
   /** Adds a column to a table made by an earlier deploy. A no-op once it exists. */
@@ -156,6 +162,14 @@ export class Registry extends DurableObject<Env> {
   async feishuApp(appId: string): Promise<FeishuApp | null> {
     const row = this.ctx.storage.sql.exec("SELECT * FROM feishu_apps WHERE app_id = ?", appId).toArray()[0] as unknown as FeishuApp | undefined;
     return row ? { ...row } : null;
+  }
+
+  /** Chooses, for one registered app, which of Feishu's token endpoints authorisation codes are exchanged at. */
+  async setFeishuOauthEndpoint(appId: string, endpoint: "v2" | "v3"): Promise<boolean> {
+    if (endpoint !== "v2" && endpoint !== "v3") throw new Error("token_endpoint must be v2 or v3");
+    if (!(await this.feishuApp(appId))) return false;
+    this.ctx.storage.sql.exec("UPDATE feishu_apps SET oauth_v2 = ? WHERE app_id = ?", endpoint === "v2" ? 1 : 0, appId);
+    return true;
   }
 
   /** The apps whose events arrive over a connection we hold open. */
