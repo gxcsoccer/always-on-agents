@@ -152,7 +152,10 @@ Tasks started in that group can then clone and push to that repository (pushes s
 In a direct chat, a person can give the agent a link to a Feishu document (`…/docx/…`, or a `…/wiki/…` page that is a document) and ask about it. The agent reads it **as that person**, with their own access, through the tool `feishu_read_document`. What the person cannot open, the agent cannot open for them; what the bot could open plays no part.
 
 - **The person authorises once, in Feishu.** The first time, the bot sends them a card with a link to Feishu's consent page (OAuth with PKCE). The link works once, for ten minutes, and only for them: when Feishu sends their browser back, the token is kept only if Feishu says it belongs to the very person the card was sent to, in the same organisation. They then ask again.
-- **Only a document the person named in the request itself is read.** Text the agent has read cannot send it to another document.
+- **Only a document the person linked in the request itself is read.** The link must be in their message as plain text (`https://….feishu.cn/docx/…` or `…/wiki/…`; `larkoffice.com` too). The connector records the links when the message arrives, from what the person typed. Text the agent has read cannot send it to another document, and neither can a word that merely looks like a document's id, or the name of someone mentioned.
+- **The invitation is the connector's own to send.** It is a fixed card, to that one person. It is sent once however often it is asked for, retried for a few minutes if Feishu does not take it, and replaced by a new one once it is nearly spent. Its link is never given to the model.
+- **The token is for reading documents and nothing else**, whatever else the person has allowed the app before: only those permissions are asked for when the token is issued, and a token that reaches further is not kept. If the person allowed documents but not wiki pages, documents can be read and the agent says so about wiki pages.
+- **An authorisation taken away or replaced during a read stops that read.** What the earlier token fetched is not handed on, and that read neither removes the newer authorisation nor asks for another.
 - **The token is stored sealed**, in an object of its own per person and app, with a key derived from the `GRANTS_KEY` secret. It is never shown to the model, logged, or returned by any endpoint.
 - **A document the person may not open leaves the authorisation as it is.** A token Feishu no longer honours is forgotten and the person is invited again.
 - Everything in [Tools](#tools) applies: direct chats only, and a run that has read a document can only reply to that person.
@@ -204,7 +207,7 @@ Each part is optional and independent. A connector that only reports events (a C
 
 ### Tools
 
-A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else. `context.said` is what that person wrote in the messages that started the run, so a tool can hold a call to what they themselves asked for.
+A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else. `context.said` is that person's messages that started the run, each with its text and the `data` the connector attached, so a tool can hold a call to what they themselves asked for. A tool that cannot act because the person has not authorised it may have its connector send that person, and only them, the connector's own fixed invitation; nothing else is sent on a tool's account.
 
 The core decides when a connector's tools exist at all, and for whom:
 

@@ -55,6 +55,10 @@ export interface Connector {
  * conversation's record, leaving a note that something was read.
  *
  * A tool call may be repeated after an interruption, so a tool must be safe to run twice.
+ *
+ * A tool that cannot act yet because the person has not authorised it may have its connector send
+ * that person, and only them, the connector's own fixed invitation to do so. Nothing else is sent
+ * on a tool's account: what the agent says goes through the Brain.
  */
 export interface ConnectorTool {
   name: string;
@@ -78,10 +82,11 @@ export interface ToolContext {
   /** What the connector verified about where that person's messages came from. */
   origin: Record<string, string>;
   /**
-   * What the person wrote in the messages that started this run, one entry per message. A tool
-   * can hold a call to what the person themselves asked for, whatever the model was led to ask.
+   * The person's messages that started this run, as the connector handed them over: the text, and
+   * the `data` the connector attached. A tool can hold a call to what the person themselves asked
+   * for, whatever the model was led to ask.
    */
-  said: string[];
+  said: { text: string; data: Record<string, unknown> }[];
   /** Names this call; the same on a repeat. */
   callId: string;
 }

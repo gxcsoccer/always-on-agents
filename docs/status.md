@@ -17,7 +17,7 @@ This is young software. It runs on Cloudflare and has been exercised against rea
 - the webhook handlers end to end with real encryption and signatures;
 - the Feishu long connection against a stand-in that lives in its own Durable Object: connect, ping, an event and its acknowledgement, a card press and its answer, a message in several frames, refusals and back-off;
 - the task object's own bookkeeping for held questions and standing approvals;
-- reading a Feishu document as a person, against a stand-in for Feishu: the invitation, the consent coming back, another account or organisation completing it, a link used twice, declined, forged or too old, an authorisation taken away while one is on its way back, a document the person may not open, a token Feishu stopped honouring, and a document that tells the agent to read another.
+- reading a Feishu document as a person, against a stand-in for Feishu: the invitation, the consent coming back, another account or organisation completing it, a link used twice, declined, forged or too old, an authorisation taken away while one is on its way back, a document the person may not open, a token Feishu stopped honouring, a document that tells the agent to read another, an authorisation taken away or replaced while a read is under way, an invitation Feishu did not take at first, and a person who had allowed the app more, or less, than reading needs.
 
 ### On Cloudflare, by hand
 

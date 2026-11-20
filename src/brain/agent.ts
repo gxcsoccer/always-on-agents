@@ -490,7 +490,7 @@ export class BrainAgent extends DurableObject<Env> {
    * empty. Anything else and there is no such person. Worked out from the stored events each
    * time it is needed, never remembered.
    */
-  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: string[] } | undefined {
+  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: { text: string; data: Record<string, unknown> }[] } | undefined {
     const scope = this.#scope();
     if (scope.kind !== "user") return undefined;
     const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
@@ -509,7 +509,7 @@ export class BrainAgent extends DurableObject<Env> {
       const same = originOf(event);
       if (!same || JSON.stringify(same) !== JSON.stringify(origin)) return undefined;
     }
-    return { connector: source, person: scope.id, origin, said: events.map((event) => event.text ?? "") };
+    return { connector: source, person: scope.id, origin, said: events.map((event) => ({ text: event.text ?? "", data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} })) };
   }
 
   /**

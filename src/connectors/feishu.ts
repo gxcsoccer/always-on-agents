@@ -20,7 +20,7 @@ import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken } from "./feishu-api";
-import { handleOauthCallback, readDocument } from "./feishu-docs";
+import { type DocumentRef, documentsIn, handleOauthCallback, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
 import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
 
@@ -230,12 +230,16 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   }
 
   let text = "";
+  // The documents the person linked, taken from what they typed before anything is put into it:
+  // a mentioned person's display name is theirs to choose, and is not the sender's word.
+  let documents: DocumentRef[] = [];
   if (message.message_type === "text") {
     try {
       text = String(JSON.parse(message.content).text ?? "");
     } catch {
       return undefined;
     }
+    documents = documentsIn(text);
     // Mentions arrive as placeholders (@_user_1). They are replaced in a single pass over the
     // original text, so nothing inserted for one mention can be rewritten while handling another.
     // The bot's own is dropped: it only says the message is for the agent, which the event already
@@ -276,6 +280,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         origin: { app_id: app.app_id, tenant_key: String(sender.tenant_key) },
         // An ordinary message written to the agent in a direct chat.
         ...(group ? {} : { direct: true }),
+        // Which documents this message links to, for a tool that reads what the person pointed at.
+        ...(documents.length ? { documents } : {}),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,
