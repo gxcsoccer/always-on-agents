@@ -54,6 +54,8 @@ describe("event normalisation", () => {
   it("acts on a mention from someone with standing in the repository", () => {
     const result = normalize("issue_comment", comment("@always-on-agent please fix the tests", "MEMBER"));
     expect(result?.event).toMatchObject({ kind: "message", session_key: "pr:7", principal: { kind: "human", explicit: true } });
+    // The comment does not say where it was made; the event does.
+    expect(result?.event?.data?.where).toMatch(/^pull request #7 of [\w.-]+\/[\w.-]+$/);
     expect(result?.onlyIfQuotes).toBeUndefined();
   });
 

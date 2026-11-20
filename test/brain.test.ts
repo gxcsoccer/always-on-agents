@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
 import { MIGRATIONS } from "../src/brain/schema";
+import { MAX_RESULT_TEXT, clipResult } from "../src/workers/sandbox/result";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
 import { notes } from "./notes";
 
@@ -1132,6 +1133,46 @@ describe("tasks and approvals", () => {
     model.replies([say("")]);
     await wake(stub);
     expect(await closures(stub)).toEqual([{ state: "unknown" }]);
+  });
+
+  it("passes a worker's answer on whole up to the limit, and marks a longer one as cut", async () => {
+    const marker = "was cut off here";
+    const fits = "x".repeat(MAX_RESULT_TEXT);
+    expect(clipResult(fits)).toBe(fits);
+    const cut = clipResult(`${fits}y`);
+    expect(cut.length).toBeLessThanOrEqual(MAX_RESULT_TEXT);
+    expect(cut.split(marker)).toHaveLength(2);
+    // Applied where the answer is made and again where it is read: the second time changes nothing.
+    expect(clipResult(cut)).toBe(cut);
+
+    // What the model is shown keeps the mark, including for an answer that arrives uncut and too long.
+    const { stub } = brain("chat");
+    model.replies([call("dispatch_task", { title: "t", brief: "b", repository: null })], [say("")]);
+    await stub.ingest(message("@agent do it", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    const id: string = (await stub.inspect()).tasks[0].id;
+    const raw = `${"z".repeat(MAX_RESULT_TEXT)} the end`;
+    await stub.taskEvent(id, 1, "result", { text: raw });
+    // The whole of what the worker said can be sent on as one message, and nothing longer can.
+    model.replies([call("send_message", { text: cut })], [call("send_message", { text: `${fits}!` })], [say("")]);
+    const before = modelCalls.length;
+    await wake(stub);
+    // The first request after the result: what the model is shown of it, before anything it says.
+    const shown = modelCalls[before].input.filter((item: any) => item.role === "user").map((item: any) => JSON.stringify(item.content)).join("\n");
+    expect(shown).toContain(JSON.stringify(clipResult(raw)).slice(1, -1));
+    expect(shown.split(marker)).toHaveLength(2);
+    expect(shown).not.toContain("the end");
+    const outputs = toolOutputs();
+    expect(outputs.at(-2)).not.toHaveProperty("error");
+    expect(outputs.at(-1).error).toMatch(/too long|at most|8000|8,000/);
+  });
+
+  it("tells the model where a comment was made, which the comment itself does not say", async () => {
+    const { stub } = brain("repo");
+    model.replies([say("")]);
+    await stub.ingest(message("review this", { session_key: "pr:7", data: { where: "pull request #7 of acme/demo" } }));
+    await wake(stub);
+    expect(JSON.stringify(modelCalls.at(-1)!.input)).toContain("in pull request #7 of acme/demo: review this");
   });
 
   it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {

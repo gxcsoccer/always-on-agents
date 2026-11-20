@@ -71,7 +71,7 @@ export const TOOLS: ToolDefinition[] = [
     "Hand a piece of work to a coding agent that runs in its own sandbox: it can run shell commands, write code and use git. Use it for anything that takes more than a moment. You are told when it finishes, fails or needs approval; do not wait for it.",
     {
       title: { type: "string", description: "A few words, shown to people." },
-      brief: { type: "string", description: "Everything the worker needs. It knows nothing about this conversation." },
+      brief: { type: "string", description: "Everything the worker needs. It knows nothing about this conversation. It cannot message anyone or post anywhere: say what you want back in its final answer." },
       repository: { ...nullable("string"), description: "An https://github.com/... URL to clone first, or null." },
     },
   ),

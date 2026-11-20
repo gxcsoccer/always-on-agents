@@ -71,6 +71,11 @@ export interface InboundEvent {
   session_key: string;
   principal: Principal;
   text?: string;
+  /**
+   * Free for the connector, with a few fields the Brain reads. One of them is `where`: a few words
+   * on where the event happened ("pull request #3 of owner/name"), from what the connector verified,
+   * shown to the model beside the event's text.
+   */
   data?: Record<string, unknown>;
   reply_to?: Target;
 }
