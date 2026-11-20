@@ -31,7 +31,7 @@ const NOT_COVERED = 99991679;
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
   description:
-    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request, or in their last few messages in this chat within about ten minutes, can be read; for an older link, ask them to send it again. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
+    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If this request has no link, it can be about the one document they linked just before (within about ten minutes), once; if they linked several, or you are not sure which they mean, ask them to send the link together with what they want. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
   effect: "read",
   parameters: { document: { type: "string" } },
   run: reported,
@@ -60,6 +60,9 @@ async function reported(context: ToolContext, args: Record<string, unknown>): Pr
 const REASONS: [string, string][] = [
   ["not_a_link", "that is not a link"],
   ["not_linked_by_person", "only a document the person linked"],
+  ["no_link", "the person has not linked a document"],
+  ["several_links", "the person linked several documents"],
+  ["already_read", "the document the person linked earlier has already been read"],
   ["no_public_origin", "reading documents is not set up on this deployment (address)"],
   ["no_grants_key", "reading documents is not set up on this deployment (key)"],
   ["not_this_tenants_app", "this conversation does not come through"],
@@ -131,11 +134,24 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const { env, origin } = context;
   const target = documentOf(String(args.document ?? "").trim());
   if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
-  // The document is the person's choice: a link they themselves put in this request, or in what
-  // they wrote here just before it, as the connector found it in their own messages. Text the agent has read cannot send it elsewhere, and
-  // neither can a word in their message that merely looks like a document's id.
-  const linked = [...context.said, ...context.recent].flatMap((message) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]) : []));
-  if (!linked.some((each) => each?.kind === target.kind && each?.token === target.token)) return { error: "only a document the person linked in this request, or in their last few messages here, can be read" };
+  // The document is the person's choice, and what they chose now. If this request links
+  // documents, those are the choice, whatever they linked before. If it links none, it can only
+  // be about the one document they linked last ("summarise it" after a link): there must be
+  // exactly one, and it must not have been read on that footing already. Text the agent has read
+  // cannot widen any of this, and neither can a word that merely looks like a document's id.
+  const documents = (message: { data: Record<string, unknown> }) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]).filter(Boolean) : []);
+  const now = context.said.flatMap(documents);
+  let chosen = now;
+  let carriedFrom: string | undefined;
+  if (now.length === 0) {
+    const last = [...context.recent].reverse().find((message) => documents(message).length > 0);
+    const id = typeof last?.data.message_id === "string" ? last.data.message_id : "";
+    if (!last || !id) return { error: "the person has not linked a document in this request or just before it; ask them to send the link" };
+    if (documents(last).length > 1) return { error: "the person linked several documents and this request does not say which; ask them to send the one they mean together with what they want" };
+    chosen = documents(last);
+    carriedFrom = id;
+  }
+  if (!chosen.some((each) => each.kind === target.kind && each.token === target.token)) return { error: "only a document the person linked in this request can be read (or, if this request links none, the one they linked just before)" };
 
   const redirect = redirectUri(env);
   // Which of the two settings is missing or malformed is said apart, so the operator can tell.
@@ -146,7 +162,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   if (!app || app.tenant !== context.scope.tenant || !who.tenant_key) return { error: "this conversation does not come through a Feishu app of this tenant" };
 
   const grant = await grantOf(env, who);
-  const { generation, credential, unreadable } = await grant.held();
+  const { generation, credential, unreadable, answered } = await grant.held();
+  if (carriedFrom !== undefined && answered === carriedFrom) return { error: "the document the person linked earlier has already been read for them once; for more, ask them to send the link again with what they want" };
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
   const needed = target.kind === "wiki" ? SCOPES : ["docx:document:readonly"];
   // The authorisation was taken away, or replaced, while this read was under way: what the old
@@ -193,8 +210,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   }
   const raw = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/raw_content`);
   if (raw.status !== 200 || raw.code !== 0) return failed(raw, "docx");
-  // Asked last of all, just before the text is handed on.
-  if (!(await grant.stands(credential.version))) return superseded;
+  // Asked last of all, just before the text is handed on. A link taken from an earlier message
+  // is used up here.
+  if (!(await grant.finish(credential.version, carriedFrom))) return superseded;
   const text = String(raw.data?.content ?? "");
   return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
 }
