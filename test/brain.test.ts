@@ -1211,6 +1211,27 @@ describe("tasks and approvals", () => {
     }
   });
 
+  it("gives a message up, and does not send it early, when asked to wait longer than a message is held for", async () => {
+    const day = 24 * 60 * 60_000;
+    for (const [wait, status] of [[day - 60_000, "pending"], [day + 1_000, "dead"], [25 * 60 * 60_000, "dead"]] as const) {
+      const { stub } = brain();
+      (globalThis as any).__notesWaitMs = wait;
+      try {
+        model.replies([call("send_message", { text: "hello" })], [say("")]);
+        const before = Date.now();
+        await stub.ingest(message("hi", { reply_to: { connector: "notes", address: {} } }));
+        await wake(stub);
+        const row = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT status, attempts, next_at, error FROM outbox").one());
+        expect(row).toMatchObject({ status, attempts: 1 });
+        // Whichever way it ended, it is never down to be sent before the time that was asked for.
+        expect(Number(row.next_at)).toBeGreaterThanOrEqual(before + wait);
+        if (status === "dead") expect(String(row.error)).toMatch(/longer than a message is held for/);
+      } finally {
+        delete (globalThis as any).__notesWaitMs;
+      }
+    }
+  });
+
   it("tells the model where a comment was made, which the comment itself does not say", async () => {
     const { stub } = brain("repo");
     model.replies([say("")]);

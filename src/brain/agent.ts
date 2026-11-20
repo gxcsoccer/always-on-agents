@@ -47,8 +47,9 @@ const DAILY_TOKEN_BUDGET = 2_000_000;
 const MODEL_CALL_RESERVE = 20_000;
 const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
 /**
- * A bound on an outside system's request to wait, so that a mistaken or hostile value cannot park
- * a message for good. Far longer than any wait such a system really asks for.
+ * The longest an outside system's request to wait is waited out. The queue delivers in order, so a
+ * message that waits holds back those behind it; one asked to wait longer than this is given up
+ * as undeliverable rather than sent early or held indefinitely.
  */
 const MAX_DEFERRAL_MS = 24 * 60 * 60_000;
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
@@ -567,12 +568,15 @@ export class BrainAgent extends DurableObject<Env> {
       return true;
     } catch (err) {
       const attempts = row.attempts + 1;
-      const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
-      // No sooner than the usual wait, and no sooner than the outside system asked for. Its time
-      // is kept as given; only one so far off that it cannot be meant is held to the limit.
-      const asked = err instanceof DeliveryDeferred && Number.isFinite(err.notBefore) ? Math.min(err.notBefore, Date.now() + MAX_DEFERRAL_MS) : 0;
-      const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), asked);
-      this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, String(err).slice(0, 500), row.id);
+      // The outside system may have said not to try again before a certain time. That time is
+      // kept exactly: the message is not sent sooner. One too far off to wait for, in a queue
+      // that delivers in order, ends here as undeliverable instead, and is not sent again.
+      const notBefore = err instanceof DeliveryDeferred && Number.isFinite(err.notBefore) ? err.notBefore : 0;
+      const tooFar = notBefore > Date.now() + MAX_DEFERRAL_MS;
+      const dead = tooFar || attempts > OUTBOX_RETRY_DELAYS_MS.length;
+      const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), notBefore);
+      const why = `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
+      this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, why, row.id);
       if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
       return false;
     }
