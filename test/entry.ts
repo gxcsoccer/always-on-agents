@@ -20,24 +20,26 @@ export class FakeTask extends DurableObject {
     // A test can have the answer take a while to be confirmed, so that other things happen meanwhile.
     const delay = (this.#policy() as { answerDelayMs?: number }).answerDelayMs;
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-    // Like the real task: the first answer to a question stands.
-    const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
-    answers[questionId ?? ""] ??= decision;
+    // Like the real task: the first answer to a question stands, with the reach it was given.
+    const answers = (this.ctx.storage.kv.get("answers") as Record<string, { decision: string; standing: boolean }> | undefined) ?? {};
+    answers[questionId ?? ""] ??= { decision, standing: decision === "allow" && standing };
     this.ctx.storage.kv.put("answers", answers);
     // A test can have the answer take effect and the word of it never get back.
     if ((this.#policy() as { answerUnheard?: boolean }).answerUnheard) throw new Error("connection lost");
-    return { ok: true, decision: answers[questionId ?? ""] };
+    return { ok: true, ...answers[questionId ?? ""] };
   }
   async decisionOn(questionId: string) {
-    const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
-    return answers[questionId] ? { decision: answers[questionId], standing: false } : null;
+    // A test can have the task's records be gone, as they are some time after a task ends.
+    if ((this.#policy() as { forgotten?: boolean }).forgotten) return { state: "unknown" };
+    const answers = (this.ctx.storage.kv.get("answers") as Record<string, { decision: string; standing: boolean }> | undefined) ?? {};
+    return answers[questionId] ? { state: "decided", ...answers[questionId] } : { state: "undecided" };
   }
   async cancel() {
     this.#record("cancel", {});
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {

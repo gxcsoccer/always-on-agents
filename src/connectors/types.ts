@@ -119,4 +119,8 @@ export interface Receipt {
 }
 
 /** How an approval question ended. */
-export type Outcome = { state: "approved" | "refused"; by?: string; standing?: boolean } | { state: "withdrawn" };
+export type Outcome =
+  | { state: "approved" | "refused"; by?: string; standing?: boolean }
+  | { state: "withdrawn" }
+  /** An answer was sent and it can no longer be found out whether it took effect. */
+  | { state: "unknown" };

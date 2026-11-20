@@ -22,6 +22,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
+import type { QuestionFate } from "../workers/sandbox/task";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
@@ -911,11 +912,14 @@ export class BrainAgent extends DurableObject<Env> {
       intent.pending_id,
     );
     const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
-    const forTheTask = decided === "allow" && intent.decision === "allow" && intent.standing === true;
+    // Whether the approval reaches the rest of the task is what the worker recorded, not what was
+    // asked for just now: the decision in force may be an earlier one. A worker record that does
+    // not say is not taken to say no.
+    const forTheTask = decided === "allow" ? answered.standing : false;
     // The question that was answered, which need not be the one open now: a newer question may
     // have taken its place while the answer was on its way.
     const answeredAsk = intent.ask ?? (askedAs.id === intent.pending_id ? askedAs.ask : undefined);
-    this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
+    this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", ...(forTheTask === undefined ? {} : { standing: forTheTask }) });
     if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
@@ -1188,21 +1192,30 @@ export class BrainAgent extends DurableObject<Env> {
   /**
    * Finds out from the worker how each set-aside question ended, and closes it as that. The
    * worker's record of a decision is the truth: it is what the guest was told. If the worker
-   * cannot be reached the question stays as it is and is asked about again later.
+   * cannot be reached, or still has the question open, it is asked again later.
    */
   async #settleQuestions(): Promise<void> {
     for (const row of this.#rows<{ ask: string; task_id: string; question_id: string; attempts: number }>("SELECT * FROM unsettled WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
+      let fate: QuestionFate | { state: "unreachable"; error: string };
       try {
-        const held = await this.env.TASKS.getByName(row.task_id).decisionOn(row.question_id);
-        this.#closeQuestion(row.ask, held ? { state: held.decision === "allow" ? "approved" : "refused", standing: held.decision === "allow" && held.standing } : { state: "withdrawn" });
+        fate = await this.env.TASKS.getByName(row.task_id).decisionOn(row.question_id);
       } catch (err) {
-        if (row.attempts >= SETTLE_ATTEMPTS) {
-          // Left showing as it was: saying how it ended would be a guess.
-          this.#log("question_unsettled", { task: row.task_id, question: row.question_id, error: String(err).slice(0, 300) });
-          this.#sql.exec("DELETE FROM unsettled WHERE ask = ?", row.ask);
-        } else {
-          this.#sql.exec("UPDATE unsettled SET attempts = attempts + 1, next_at = ? WHERE ask = ?", Date.now() + Math.min(30_000 * 2 ** row.attempts, 3_600_000), row.ask);
-        }
+        fate = { state: "unreachable", error: String(err).slice(0, 300) };
+      }
+      if (fate.state === "decided") {
+        const standing = fate.decision === "allow" ? fate.standing : false;
+        this.#closeQuestion(row.ask, { state: fate.decision === "allow" ? "approved" : "refused", ...(standing === undefined ? {} : { standing }) });
+      } else if (fate.state === "undecided") {
+        // The worker's records are whole and hold no answer: the one that was sent never took effect.
+        this.#closeQuestion(row.ask, { state: "withdrawn" });
+      } else if (fate.state === "unknown" || row.attempts + 1 >= SETTLE_ATTEMPTS) {
+        // Not to be found out any more. The question is closed as exactly that, never as a guess.
+        this.#log("question_unsettled", { task: row.task_id, question: row.question_id, why: fate.state, ...("error" in fate ? { error: fate.error } : {}) });
+        this.#audit("(system)", "task.answer_unverified", { task_id: row.task_id, question: row.question_id, why: fate.state });
+        this.#closeQuestion(row.ask, { state: "unknown" });
+      } else {
+        // Still being waited on, or the worker could not be asked: look again later.
+        this.#sql.exec("UPDATE unsettled SET attempts = attempts + 1, next_at = ? WHERE ask = ?", Date.now() + Math.min(30_000 * 2 ** row.attempts, 3_600_000), row.ask);
       }
     }
   }

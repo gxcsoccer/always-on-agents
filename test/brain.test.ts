@@ -668,6 +668,15 @@ describe("tasks and approvals", () => {
     expect(await reply(always.stub, always.id, "bob", `approve all ${always.code}`)).toHaveProperty("standing");
     expect((await answersSent(always.id)).at(-1)).toMatchObject({ decision: "allow", standing: true });
 
+    // How far an approval reaches is what the worker recorded, not what the latest message asked
+    // for: here the approval for the whole task took effect unheard, and a refusal came too late.
+    const unheard = await waitingOnPush();
+    await task(unheard.id).configure({ answerUnheard: true });
+    expect((await reply(unheard.stub, unheard.id, "bob", `approve all ${unheard.code}`)).error).toMatch(/connection lost/);
+    await task(unheard.id).configure({});
+    expect(await reply(unheard.stub, unheard.id, "carol", `deny ${unheard.code}`, "deny")).toMatchObject({ decision: "allow", note: expect.stringMatching(/too late/) });
+    expect(await closures(unheard.stub)).toEqual([{ state: "approved", standing: true }]);
+
     // A command question has no "rest of the task": the words approve it, once.
     const command = await taskAwaitingApproval();
     await reply(command.stub, command.id, "bob", `approve all ${command.code}`);
@@ -1073,6 +1082,18 @@ describe("tasks and approvals", () => {
     model.replies([say("")]);
     await wake(stub);
     expect(await closures(stub)).toEqual([{ state: "refused", standing: false }]);
+  });
+
+  it("says a question's outcome cannot be verified when the worker's records are gone, rather than guess", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    await reply(stub, id, "carol", `deny ${code}`, "deny");
+    await stub.taskEvent(id, 2, "failed", { error: "refused" });
+    // By the time the Brain asks, the task's records have been removed.
+    await task(id).configure({ forgotten: true });
+    model.replies([say("")]);
+    await wake(stub);
+    expect(await closures(stub)).toEqual([{ state: "unknown" }]);
   });
 
   it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {
