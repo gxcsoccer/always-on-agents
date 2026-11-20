@@ -481,6 +481,23 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(toolOutputs()[0]).toEqual({ text: "Lena's." });
   });
 
+  it("ends with the wider authorisation whichever of two overlapping installs lands first", async () => {
+    const redirect = "https://agent.test/v1/feishu/oauth/callback";
+    for (let round = 0; round < 6; round++) {
+      const who = { app_id: APP_ID, tenant_key: ORG, open_id: `ou_overlap${round}` };
+      // Two handles on the same object, as two callbacks arriving at once would have.
+      const [one, two] = [await grantOf(env as any, who), await grantOf(env as any, who)];
+      const { generation } = await one.held();
+      expect(await one.invite(who, redirect, ["docx:document:readonly"], { generation })).toBe("sent");
+      const narrow = { access_token: "u-narrow", expires_at: Date.now() + 3_600_000, scope: "docx:document:readonly" };
+      const wide = { access_token: "u-wide", expires_at: Date.now() + 3_600_000, scope: "docx:document:readonly wiki:node:read" };
+      const both = round % 2 ? [one.install(generation, narrow), two.install(generation, wide)] : [two.install(generation, wide), one.install(generation, narrow)];
+      expect(await Promise.all(both)).toEqual([true, true]);
+      const held = await one.held();
+      expect(held.credential).toMatchObject({ token: "u-wide", scope: ["docx:document:readonly", "wiki:node:read"] });
+    }
+  });
+
   it("invites again when the token it holds can no longer be read", async () => {
     const mina = someone();
     feishu.docs.set("DocMina00000000000001", { readers: [mina.openId], text: "Mina's." });
@@ -580,8 +597,11 @@ describe("the document tool by itself", () => {
       { kind: "wiki", token: "WikiUnit0000000000001" },
       { kind: "docx", token: "DocUnit00000000000002" },
     ]);
-    // Two links run together without a space: the first is counted, the second has to be pasted apart.
-    expect(documentsIn("https://x.feishu.cn/docx/DocUnit00000000000001和https://x.feishu.cn/docx/DocUnit00000000000002")).toEqual([{ kind: "docx", token: "DocUnit00000000000001" }]);
+    // Words in another script followed by more of a link: not cut short into a different document.
+    for (const not of ["https://x.feishu.cn/docx/DocUnit00000000000001中文/edit", "https://x.feishu.cn/docx/DocUnit00000000000001，x?a=1", "https://x.feishu.cn/docx/DocUnit00000000000001页#h"]) expect(documentsIn(not)).toEqual([]);
+    expect(documentsIn("看看https://x.feishu.cn/docx/DocUnit00000000000001，谢谢。Thanks")).toEqual([{ kind: "docx", token: "DocUnit00000000000001" }]);
+    // Two links run together without a space cannot be told apart: neither counts, and they have to be pasted apart.
+    expect(documentsIn("https://x.feishu.cn/docx/DocUnit00000000000001和https://x.feishu.cn/docx/DocUnit00000000000002")).toEqual([]);
     // The tool's argument is one whole link, not a text to search.
     expect(documentOf("see https://x.feishu.cn/docx/DocUnit00000000000001")).toBeUndefined();
     expect(documentOf("https://X.Feishu.cn/docx/DocUnit00000000000001?a=1#b")).toEqual({ kind: "docx", token: "DocUnit00000000000001" });

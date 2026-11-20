@@ -183,18 +183,15 @@ export class FeishuGrant extends DurableObject<Env> {
    * finishing the older, narrower invitation last does not take away what the wider one gave.
    */
   async install(generation: number, token: { access_token: string; expires_at: number; scope: string }): Promise<boolean> {
-    const key = await this.#key();
-    const current = await this.#load();
-    if (!current || current.generation !== generation) return false;
-    // Whether the token held now can still be read, found out before the record is read again.
-    const readable = current.grant && (await this.#readable(current.grant)) ? current.grant.version : undefined;
-    // Sealed under a version of its own; awaited before the record is read again below.
+    // Sealed under a version of its own. All that is awaited comes before the record is read:
+    // from the read to the write nothing else can run, so the decision below is about the grant
+    // as it is at the moment of writing, however many installs overlap.
     const version = random(16);
-    const sealed = await seal(key, token.access_token, version);
+    const sealed = await seal(await this.#key(), token.access_token, version);
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
     const has = stored.grant && stored.grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS ? stored.grant.scope.split(" ") : undefined;
-    if (has && stored.grant!.version === readable && token.scope.split(" ").every((each) => has.includes(each))) return true;
+    if (has && token.scope.split(" ").every((each) => has.includes(each))) return true;
     stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version };
     void this.ctx.storage.put("grant", stored);
     return true;
@@ -217,13 +214,6 @@ export class FeishuGrant extends DurableObject<Env> {
       // as refused when asking for an invitation, which forgets exactly this one.
       return { generation, unreadable: stored.grant.version };
     }
-  }
-
-  async #readable(grant: NonNullable<Stored["grant"]>): Promise<boolean> {
-    return open(await this.#key(), grant.sealed, grant.version).then(
-      () => true,
-      () => false,
-    );
   }
 
   /** Whether the token of this version is still the person's grant. */

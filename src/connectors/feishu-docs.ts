@@ -69,9 +69,9 @@ export function documentOf(link: string): DocumentRef | undefined {
  * bracket or quote.
  *
  * People write links into sentences without spaces ("看看https://…/docx/X，谢谢"). If the whole run
- * is not a document link, the part up to the first character outside ASCII is tried instead: that
- * can only cut the same link shorter. A link this cannot settle is not counted, and the person
- * can paste it on a line of its own.
+ * is not a document link, the part up to the first character outside ASCII is tried instead, and
+ * only when what follows is plainly the rest of the sentence: no further path, query or address.
+ * A link this cannot settle is not counted, and the person can paste it on a line of its own.
  */
 export function documentsIn(text: string): DocumentRef[] {
   const found: DocumentRef[] = [];
@@ -83,7 +83,10 @@ export function documentsIn(text: string): DocumentRef[] {
     const whole = word.slice(start.index);
     // Punctuation of the sentence around a link is not part of it.
     const trimmed = (link: string) => link.replace(/[.,;:!?)\]}>"'，。；：！？、）】》」』”’]+$/u, "");
-    const each = documentOf(trimmed(whole)) ?? documentOf(trimmed(whole.slice(0, whole.search(/[^\x00-\x7f]/) >>> 0)));
+    // Cut short only where the sentence plainly carries on: nothing after the cut may look like
+    // more of a link (a further path, a query, another address).
+    const cut = whole.search(/[^\x00-\x7f]/);
+    const each = documentOf(trimmed(whole)) ?? (cut > 0 && !/[/?#@%&=:\\]/.test(whole.slice(cut)) ? documentOf(trimmed(whole.slice(0, cut))) : undefined);
     if (each && !found.some((seen) => seen.kind === each.kind && seen.token === each.token)) found.push(each);
   }
   return found;
