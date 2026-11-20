@@ -140,6 +140,9 @@ describe("turning a Feishu message into an event", () => {
     expect(closed.elements.some((e: any) => e.tag === "action")).toBe(false);
     expect(closed.header.title.content).toContain("已批准");
     // Too long to show: there is nothing to press but "refuse".
+    const unverified = JSON.stringify(approvalCard({ id: Q, code: "K7PW", title: "t", kind: "command", detail: "rm -r x", can_approve: true }, "chat", { state: "unknown" }));
+    expect(unverified).toContain("结果无法核实");
+    expect(unverified).not.toContain('"tag":"button"');
     const refuseOnly = approvalCard({ id: Q, code: "K7PW", title: "t", kind: "push", detail: "…", can_approve: false }, "user") as any;
     expect(refuseOnly.elements.find((e: any) => e.tag === "action").actions.map((b: any) => b.value.decision)).toEqual(["deny"]);
   });

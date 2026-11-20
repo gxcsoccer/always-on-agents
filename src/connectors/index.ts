@@ -1,82 +1,60 @@
 /**
- * Connectors: one per external system. A connector owns three things for its system:
- *   - inbound:  verify a request really came from the system, and turn it into an inbox event
- *   - identity: say who caused the event and whether they were deliberately addressing the agent
- *   - outbound: deliver a message to an address in that system
+ * The connectors this deployment runs, and the only place the rest of the code reaches them.
  *
- * The Brain never talks to an external system directly. It reads events and writes outbox rows;
- * connectors do the rest.
+ * The Brain never talks to an outside system directly. It reads events and writes outbox rows;
+ * connectors do the rest. Which connectors exist is decided in `src/agent.config.ts`; what a
+ * connector is, in `./types`.
  */
+import config from "../agent.config";
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";
-import { amendFeishu, deliverFeishu } from "./feishu";
-import { deliverGithub } from "./github";
+import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt, Standing } from "./types";
 
-export interface OutboundMessage {
-  id: number;
-  /** Stable across retries, so a connector can avoid sending the same message twice. */
-  idem: string;
-  text: string;
-  /** When the message was written, in ms. */
-  created_at?: number;
-  /**
-   * Set when the message is an approval question. `text` says the same in words; a connector that
-   * can show something better than text (buttons, say) builds it from this.
-   */
-  ask?: ApprovalQuestion;
+export type * from "./types";
+
+const RESERVED = new Set(["admin", "worker", "timer", "system"]);
+const byName = new Map<string, Connector>();
+for (const connector of config.connectors) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(connector.name) || RESERVED.has(connector.name)) throw new Error(`"${connector.name}" cannot be a connector's name`);
+  if (byName.has(connector.name)) throw new Error(`two connectors are named "${connector.name}"`);
+  byName.set(connector.name, connector);
 }
+for (const name of config.trusted) if (!byName.has(name)) throw new Error(`trusted connector "${name}" is not one of the connectors`);
+const trusted = new Set<string>(config.trusted);
 
-export interface ApprovalQuestion {
-  /** Names this one question for good. Codes are short and come round again; this does not. */
-  id: string;
-  code: string;
-  /** The task's title. */
-  title: string;
-  kind: "command" | "push";
-  /** The command, or what would be pushed where. Shown literally. */
-  detail: string;
-  /** False when the action is too long to show in full: it can then only be refused. */
-  can_approve: boolean;
-  /** For a push: where to, and which refs would move from which commit to which. */
-  resource?: string;
-  refs?: { ref: string; old: string; new: string }[];
-  /** Whether the person may also approve the same kind of action for the rest of the task. */
-  standing_offered?: boolean;
+export const connectors: readonly Connector[] = [...byName.values()];
+
+export function connector(name: string): Connector | undefined {
+  return byName.get(name);
 }
 
 /**
- * Where a delivered message now lives, if it is somewhere other people can change it: the subject
- * names it and the holder is the fingerprint of the text as it was posted.
+ * Whether what this source says about who spoke is believed when it matters: for approvals, for
+ * crediting a request to a person, for changes to standing instructions. Decided by the deployment,
+ * never by the connector itself.
  */
-export interface Receipt {
-  subject: string;
-  holder: string;
-  /** When it was actually posted, if that was on an earlier attempt than the one that confirmed it. */
-  posted_at?: number;
-}
-
-/** How an approval question ended. */
-export type Outcome = { state: "approved" | "refused"; by?: string; standing?: boolean } | { state: "withdrawn" };
-
-/**
- * Marks a delivered approval question as closed where it is shown, if the connector can: the
- * question stops inviting an answer and says how it ended. Best effort; nothing depends on it.
- */
-export async function amend(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void> {
-  if (target.connector === "feishu") await amendFeishu(env, target, receipt, ask, outcome);
+export function trusts(source: string): boolean {
+  return trusted.has(source);
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */
 export async function deliver(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
-  switch (target.connector) {
-    case "console":
-      // Pull-based: the client reads the outbox through the API, so writing the row was the delivery.
-      return;
-    case "github":
-      return deliverGithub(env, scope, target, message);
-    case "feishu":
-      return deliverFeishu(env, scope, target, message);
-    default:
-      throw new Error(`no connector named "${target.connector}"`);
-  }
+  const channel = byName.get(target.connector)?.channel;
+  if (!channel) throw new Error(`no connector named "${target.connector}" delivers messages`);
+  return channel.deliver(env, scope, target, message);
+}
+
+/** Shows a delivered approval question as closed, where the connector can. */
+export async function amend(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void> {
+  await byName.get(target.connector)?.channel?.amend?.(env, target, receipt, ask, outcome);
+}
+
+/** Whether messages from this connector can be asked about again after the fact. */
+export function canRevisit(name: string): boolean {
+  return byName.get(name)?.channel?.standing !== undefined;
+}
+
+/** What a revisable message says at its source now. Throws if the source cannot be asked. */
+export async function standingOf(env: Env, name: string, scope: Scope, subject: string): Promise<Standing | undefined> {
+  return byName.get(name)?.channel?.standing?.(env, scope, subject);
 }

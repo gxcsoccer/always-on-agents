@@ -17,12 +17,12 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type Outcome, type Receipt, amend, deliver } from "../connectors";
-import { NOT_FOR_THE_AGENT, commentStanding } from "../connectors/github";
+import { type ApprovalQuestion, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
 import type { Env } from "../env";
-import { type InboundEvent, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
+import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
+import type { QuestionFate } from "../workers/sandbox/task";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
@@ -53,6 +53,8 @@ const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
+/** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
+const SETTLE_ATTEMPTS = 12;
 const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
 
 type Row = Record<string, any>;
@@ -161,6 +163,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#fireTimers(Date.now());
       this.#housekeeping(Date.now());
       await this.#flushOutbox();
+      await this.#settleQuestions();
       // A few runs per wake-up at most, so one busy scope cannot hold an invocation forever.
       for (let i = 0; i < 3; i++) {
         const runId = this.#claim();
@@ -193,6 +196,8 @@ export class BrainAgent extends DurableObject<Env> {
     if (outbox != null) candidates.push(outbox);
     const reconciling = this.#rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM outbox WHERE status = 'reconciling'")[0]?.next_at;
     if (reconciling != null) candidates.push(reconciling);
+    const unsettled = this.#rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM unsettled")[0]?.next_at;
+    if (unsettled != null) candidates.push(unsettled);
     // Housekeeping is work too: a scope that has gone quiet still has old records to remove.
     const housekeeping = Number(this.#meta("housekeeping_at") ?? 0);
     if (housekeeping > 0 && this.#rows("SELECT 1 FROM inbox LIMIT 1").length > 0) candidates.push(housekeeping);
@@ -734,7 +739,7 @@ export class BrainAgent extends DurableObject<Env> {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be answered there");
 
-    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; standing?: boolean; before?: { decision: "allow" | "deny"; decided_by: string } };
+    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; ask?: string; standing?: boolean; before?: { decision: "allow" | "deny"; decided_by: string } };
     let intent = task.answering ? (JSON.parse(task.answering) as Intent) : undefined;
     // An approval is about to be acted on: look again at where the replies it could rest on were
     // read from. From here to the worker call nothing else can interleave.
@@ -747,10 +752,21 @@ export class BrainAgent extends DurableObject<Env> {
       // The question itself is a comment others may be able to edit. People approve what they
       // read, so it has to still say what the agent wrote.
       const ask = task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
-      const receipt = ask ? this.#rows<{ receipt: string | null }>("SELECT receipt FROM outbox WHERE idem = ?", ask)[0]?.receipt : undefined;
+      const shown = ask ? this.#rows<{ target: string; receipt: string | null; status: string }>("SELECT target, receipt, status FROM outbox WHERE idem = ?", ask)[0] : undefined;
+      const where = shown ? (JSON.parse(shown.target) as Target).connector : "";
+      const receipt = shown?.receipt;
+      // Posted somewhere others can change it, with nothing to say which posted message it is:
+      // there is then no way to know that what people read is what the agent wrote.
+      if (shown?.status === "sent" && !receipt && canRevisit(where)) {
+        throw new Error("the question was posted where it can be changed and cannot be identified there, so nobody can be taken to have approved this action; it can only be refused");
+      }
       if (ask && receipt) {
         const posted = JSON.parse(receipt) as { subject: string; holder: string };
-        const now = await commentStanding(this.env, this.#scope(), posted.subject);
+        // Asked of the system the question was posted in. One where nobody else can change the
+        // agent's messages has nothing to say here.
+        const now = await standingOf(this.env, where, this.#scope(), posted.subject);
+        // A system where the question can be changed has to recognise the question it was shown in.
+        if (!now && canRevisit(where)) throw new Error("the question as it was posted cannot be found where it was shown, so nobody can be taken to have approved this action; it can only be refused");
         // Edited at any time, even if put back since: someone may have read and answered the other wording.
         const touched = this.#rows("SELECT 1 FROM revisions WHERE subject = ?", posted.subject).length > 0;
         if (touched || (now && (now.deleted || now.edited || now.holder !== posted.holder))) {
@@ -779,7 +795,7 @@ export class BrainAgent extends DurableObject<Env> {
       // Everything else members have said in this conversation since the task began, whenever it
       // arrived: a later word from the approver, or anything about this question that is not an approval.
       const later = this.#reconcile(
-        this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+        this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal, event.source)),
       );
       const against =
         later.unresolved ||
@@ -813,7 +829,7 @@ export class BrainAgent extends DurableObject<Env> {
       const received = this.#reconcile(this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND status != 'pending' AND received_at > ? ORDER BY id", sessionKey, asked.sent_at));
       const replies = received.events
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
-        .filter(({ principal }) => this.#isDecider(principal));
+        .filter(({ event, principal }) => this.#isDecider(principal, event.source));
       if (replies.length === 0) throw new Error("nobody here has answered the question yet; wait for a reply");
 
       // What each reply says about this question, read from its own words. The model proposes a
@@ -837,7 +853,7 @@ export class BrainAgent extends DurableObject<Env> {
         // A refusal from any member wins over an approval, whichever came first. That includes one
         // that arrived after this run started and is still waiting in the inbox.
         const queued = this.#reconcile(
-          this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal)),
+          this.#rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND received_at > ?", sessionKey, asked.sent_at).filter((event) => this.#isDecider(JSON.parse(event.principal) as Principal, event.source)),
         );
         const waiting = queued.events.some((event) => about(event) && (tied(event) || quotes(event.text ?? "", pending.code)) && says(event) !== "allow");
         if (waiting || read.some(({ says }) => says === "deny")) throw new Error("a reply refuses this; pass on a denial, not an approval");
@@ -886,7 +902,7 @@ export class BrainAgent extends DurableObject<Env> {
       // only for pushes that update branches, which is also the only kind it is offered for.
       const asksAbout = pending as { source?: string; refs?: RefUpdate[] };
       const standing = decision === "allow" && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
-      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
+      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(pending.ask ? { ask: pending.ask } : {}), ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
       this.#audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id, ...(standing ? { standing: true } : {}) });
@@ -904,13 +920,21 @@ export class BrainAgent extends DurableObject<Env> {
       intent.pending_id,
     );
     const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
-    const forTheTask = decided === "allow" && intent.decision === "allow" && intent.standing === true;
-    if (askedAs.id === intent.pending_id) this.#closeQuestion(askedAs.ask, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
-    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
+    // Whether the approval reaches the rest of the task is what the worker recorded, not what was
+    // asked for just now: the decision in force may be an earlier one. A worker record that does
+    // not say is not taken to say no.
+    const forTheTask = decided === "allow" ? answered.standing : false;
+    // The question that was answered, which need not be the one open now: a newer question may
+    // have taken its place while the answer was on its way.
+    const answeredAsk = intent.ask ?? (askedAs.id === intent.pending_id ? askedAs.ask : undefined);
+    this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", ...(forTheTask === undefined ? {} : { standing: forTheTask }) });
+    // Said whichever answer is in force, so that it can be told to the people here.
+    const reach = forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {};
+    if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...reach };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
     this.#audit(intent.decided_by, "task.answer_too_late", { task_id: taskId, question: intent.pending_id, wanted: intent.decision, in_force: decided, in_force_by: earlier ?? null });
-    return { ok: true, task_id: taskId, decision: decided, ...(earlier ? { decided_by: earlier } : {}), note: `the worker had already been told to ${decided}; ${intent.decided_by}'s "${intent.decision}" came too late to change that` };
+    return { ok: true, task_id: taskId, decision: decided, ...(earlier ? { decided_by: earlier } : {}), ...reach, note: `the worker had already been told to ${decided}; ${intent.decided_by}'s "${intent.decision}" came too late to change that` };
   }
 
   async #cancelTask(sessionKey: string, taskId: string): Promise<unknown> {
@@ -919,7 +943,9 @@ export class BrainAgent extends DurableObject<Env> {
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be cancelled there");
     if (TERMINAL_TASK.has(task.status)) return { ok: true, task_id: taskId, status: task.status };
     await this.env.TASKS.getByName(taskId).cancel();
-    this.#setTask(taskId, "cancelled", {});
+    // A question still open when the task is cancelled has nothing left to answer.
+    const open = this.#rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+    if (this.#setTask(taskId, "cancelled", {}) && open) this.#setAside(open);
     this.#audit("(agent)", "task.cancelled", { task_id: taskId });
     await registry(this.env).releaseTaskSlot(taskId);
     return { ok: true, task_id: taskId, status: "cancelled" };
@@ -973,6 +999,12 @@ export class BrainAgent extends DurableObject<Env> {
         return { known: true, wake: false, terminal: false };
       }
       if (kind === "needs_input") {
+        // A question from a task that has already ended asks nothing: it is recorded above and goes
+        // no further. Checked before a code is drawn or anything is queued, so no card is sent that
+        // nobody can answer.
+        if (TERMINAL_TASK.has(task.status)) return { known: true, wake: false, terminal: false };
+        // A new question replaces the one before it, which can no longer be answered.
+        this.#setAside(task);
         // The question is put to people by this code, not by the model: what they are shown is
         // exactly what the worker is held on, and the code ties their reply to this one question.
         // No two open questions in this scope share a code, so one reply cannot answer two of them.
@@ -1010,9 +1042,8 @@ export class BrainAgent extends DurableObject<Env> {
       else if (kind === "result" || kind === "failed" || kind === "lost") {
         // A task that ends while a question of its is still open leaves nothing to answer: the
         // question is closed where it is shown, so nobody presses a button that does nothing.
-        const open = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
         applied = kind === "result" ? this.#setTask(taskId, "succeeded", { result: JSON.stringify(body) }) : this.#setTask(taskId, kind, { result: JSON.stringify(body) });
-        if (applied) this.#closeQuestion(open, { state: "withdrawn" });
+        if (applied) this.#setAside(task);
       }
       else return { known: true, wake: false, terminal: false };
       if (!applied) return { known: true, wake: false, terminal: false };
@@ -1044,7 +1075,9 @@ export class BrainAgent extends DurableObject<Env> {
    * belong here. In a repository, an account that is not linked to a tenant user is an outsider.
    */
   #deciders(runId: string): Principal[] {
-    return this.#runPrincipals(runId).filter((p) => this.#isDecider(p));
+    return this.#runSpeakers(runId)
+      .filter(({ principal, source }) => this.#isDecider(principal, source))
+      .map(({ principal }) => principal);
   }
 
   /**
@@ -1053,21 +1086,27 @@ export class BrainAgent extends DurableObject<Env> {
    * same batch, the model may be acting on that text rather than on the member's words.
    */
   #instructionEditors(runId: string): string[] {
-    const principals = this.#runPrincipals(runId);
+    const speakers = this.#runSpeakers(runId);
+    const principals = speakers.map(({ principal }) => principal);
     // A comment that was only let in as a reply to an approval question is not a request either.
     const replyOnly = this.#rows<{ data: string | null }>("SELECT data FROM inbox WHERE run_id = ?", runId).some((row) => row.data && JSON.parse(row.data).reply_only === true);
-    if (principals.length === 0 || replyOnly || !principals.every((p) => this.#isDecider(p))) {
+    if (principals.length === 0 || replyOnly || !speakers.every(({ principal, source }) => this.#isDecider(principal, source))) {
       throw new Error("instructions.md can only be changed in a run started solely by a person's request");
     }
     return [...new Set(principals.map((p) => p.id))];
   }
 
-  #isDecider(principal: Principal): boolean {
-    return principal.kind === "human" && principal.explicit && !(this.#scope().kind === "repo" && principal.id.startsWith("github:"));
+  /**
+   * Whether this person's word counts here: a person who deliberately addressed the agent, who is
+   * a user of the tenant, and whose identity was established by a connector the deployment trusts
+   * to establish it. What a connector outside that list says about who spoke is not relied on.
+   */
+  #isDecider(principal: Principal, source: string): boolean {
+    return principal.kind === "human" && principal.explicit && principal.unlinked !== true && trusts(source);
   }
 
-  #runPrincipals(runId: string): Principal[] {
-    return this.#rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? ORDER BY id", runId).map((r) => JSON.parse(r.principal) as Principal);
+  #runSpeakers(runId: string): { principal: Principal; source: string }[] {
+    return this.#rows<{ principal: string; source: string }>("SELECT principal, source FROM inbox WHERE run_id = ? ORDER BY id", runId).map((r) => ({ principal: JSON.parse(r.principal) as Principal, source: r.source }));
   }
 
   // ------------------------------------------------------------------ reads for connectors and admins
@@ -1139,13 +1178,64 @@ export class BrainAgent extends DurableObject<Env> {
   }
 
   /**
+   * Called when a question stops being the one its task is waiting on without an answer to it
+   * having been confirmed: a newer question took its place, or the task ended or was cancelled.
+   *
+   * If no answer was ever sent for it, nothing was decided and it is closed as withdrawn. If one
+   * was sent, the worker may hold a decision the Brain never heard back about; how the question
+   * ended is then not guessed but asked of the worker (see #settleQuestions).
+   */
+  #setAside(task: Row): void {
+    if (task.status !== "needs_input" || !task.pending) return;
+    const pending = JSON.parse(task.pending) as { id?: string; ask?: string };
+    if (!pending.ask) return;
+    const sent = task.answering ? (JSON.parse(task.answering) as { pending_id?: string }).pending_id === pending.id : false;
+    if (!sent || !pending.id) return this.#closeQuestion(pending.ask, { state: "withdrawn" });
+    this.#sql.exec("INSERT OR IGNORE INTO unsettled (ask, task_id, question_id, next_at) VALUES (?, ?, ?, ?)", pending.ask, task.id, pending.id, Date.now());
+  }
+
+  /**
+   * Finds out from the worker how each set-aside question ended, and closes it as that. The
+   * worker's record of a decision is the truth: it is what the guest was told. If the worker
+   * cannot be reached, or still has the question open, it is asked again later.
+   */
+  async #settleQuestions(): Promise<void> {
+    for (const row of this.#rows<{ ask: string; task_id: string; question_id: string; attempts: number }>("SELECT * FROM unsettled WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
+      let fate: QuestionFate | { state: "unreachable"; error: string };
+      try {
+        fate = await this.env.TASKS.getByName(row.task_id).decisionOn(row.question_id);
+      } catch (err) {
+        fate = { state: "unreachable", error: String(err).slice(0, 300) };
+      }
+      if (fate.state === "decided") {
+        const standing = fate.decision === "allow" ? fate.standing : false;
+        this.#closeQuestion(row.ask, { state: fate.decision === "allow" ? "approved" : "refused", ...(standing === undefined ? {} : { standing }) });
+      } else if (fate.state === "undecided") {
+        // The worker's records are whole and hold no answer: the one that was sent never took effect.
+        this.#closeQuestion(row.ask, { state: "withdrawn" });
+      } else if (fate.state === "unknown" || row.attempts + 1 >= SETTLE_ATTEMPTS) {
+        // Not to be found out any more. The question is closed as exactly that, never as a guess.
+        this.#log("question_unsettled", { task: row.task_id, question: row.question_id, why: fate.state, ...("error" in fate ? { error: fate.error } : {}) });
+        this.#audit("(system)", "task.answer_unverified", { task_id: row.task_id, question: row.question_id, why: fate.state });
+        this.#closeQuestion(row.ask, { state: "unknown" });
+      } else {
+        // Still being waited on, or the worker could not be asked: look again later.
+        this.#sql.exec("UPDATE unsettled SET attempts = attempts + 1, next_at = ? WHERE ask = ?", Date.now() + Math.min(30_000 * 2 ** row.attempts, 3_600_000), row.ask);
+      }
+    }
+  }
+
+  /**
    * Records that a question is closed and shows it where the question was put. The outcome is kept
    * with the question, so it also holds if the question has not been delivered yet: an unsent one
    * is then not sent at all, and one whose delivery is under way is closed as soon as it lands.
    */
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
+    // A question ends once: this record is written once and never replaced. Showing it where the
+    // question was put can be repeated or fail, but always shows this one ending.
     this.#sql.exec("UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND closed IS NULL", JSON.stringify(outcome), ask);
+    this.#sql.exec("DELETE FROM unsettled WHERE ask = ?", ask);
     this.#showClosed(ask);
   }
 
@@ -1187,13 +1277,25 @@ export class BrainAgent extends DurableObject<Env> {
    * that a comment was edited or deleted can still be on its way when the approval is acted on.
    */
   async #refreshStanding(events: InboxRow[]): Promise<void> {
-    const subjects = new Set<string>();
+    const subjects = new Map<string, string>();
+    const deciding = new Set<string>();
     for (const event of events) {
       const subject = event.data ? (JSON.parse(event.data) as { subject?: string }).subject : undefined;
-      if (subject) subjects.add(subject);
+      if (!subject) continue;
+      subjects.set(subject, event.source);
+      if (this.#isDecider(JSON.parse(event.principal) as Principal, event.source)) deciding.add(subject);
     }
-    for (const subject of subjects) {
-      const standing = subject.startsWith("github:comment:") ? await commentStanding(this.env, this.#scope(), subject) : undefined;
+    for (const [subject, source] of subjects) {
+      // A message that can change, from a connector that cannot say what it says now, cannot be
+      // relied on for an approval.
+      // Only where it could decide something: a notification nobody's approval rests on is left alone.
+      if (!canRevisit(source)) {
+        if (!deciding.has(subject)) continue;
+        throw new Error(`a reply here came through "${source}", which cannot confirm what the reply says now, so nothing can be approved on it`);
+      }
+      const standing = await standingOf(this.env, source, this.#scope(), subject);
+      // Its own connector does not know the message. What it says now is then not known either.
+      if (!standing && deciding.has(subject)) throw new Error(`"${source}" does not recognise a reply here as one of its messages, so what the reply says now cannot be confirmed and nothing can be approved on it`);
       if (standing) this.#revise(subject, standing.revision, standing.deleted, standing.holder);
     }
   }

@@ -19,7 +19,44 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import type { ApprovalQuestion, OutboundMessage, Outcome, Receipt } from "./index";
+import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
+
+export const feishuConnector: Connector = {
+  name: "feishu",
+  async http(request, env, path, ingress) {
+    if (path[0] === "events" && path[1] && request.method === "POST") return handleFeishuWebhook(request, env, path[1], (work) => ingress.defer(work));
+    return json({ error: "not found" }, 404);
+  },
+  async admin({ method, path, url, body }, env) {
+    if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
+    if (path[0] !== "tenants" || path[2] !== "feishu-apps" || method !== "POST") return undefined;
+    const app = await body();
+    await registry(env).setFeishuApp(path[1], {
+      app_id: String(app.app_id ?? ""),
+      app_secret: String(app.app_secret ?? ""),
+      encrypt_key: app.encrypt_key ? String(app.encrypt_key) : undefined,
+      verification_token: app.verification_token ? String(app.verification_token) : undefined,
+      bot_open_id: app.bot_open_id ? String(app.bot_open_id) : undefined,
+      transport: app.transport === undefined ? undefined : app.transport,
+    });
+    // Over the long connection there is nothing for Feishu to call; we connect to it instead.
+    if (app.transport === "long_connection") {
+      return json({ ok: true, transport: "long_connection", link: await env.FEISHU_LINKS.getByName(String(app.app_id)).ensure(String(app.app_id), true) });
+    }
+    return json({ ok: true, webhook: `${url.origin}/v1/feishu/events/${app.app_id}` });
+  },
+  /**
+   * Makes sure each long connection's watchdog is running. The watchdog rearms itself; this is for
+   * the case where it could not, such as an object that failed to start.
+   */
+  async scheduled(env) {
+    for (const appId of await registry(env).feishuLongConnectionApps()) {
+      await env.FEISHU_LINKS.getByName(appId).ensure(appId).catch((err) => console.log(JSON.stringify({ feishu_link_not_ensured: String(err).slice(0, 300), app: appId })));
+    }
+  },
+  // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
+  channel: { deliver: deliverFeishu, amend: amendFeishu },
+};
 
 const API = "https://open.feishu.cn/open-apis";
 /** Feishu signs with a timestamp; anything much older is a replay. */
@@ -343,8 +380,8 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
   ];
   // Closed: it says how it ended, and there is nothing left to press.
   if (outcome) {
-    const ended = { approved: ["green", "已批准"], refused: ["red", "已拒绝"], withdrawn: ["grey", "已失效"] }[outcome.state];
-    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : outcome.state === "approved" && outcome.standing ? "已批准。这个任务之后推送同样的分支不会再问，包括改写该分支历史的推送。" : `${ended[1]}。`;
+    const ended = { approved: ["green", "已批准"], refused: ["red", "已拒绝"], withdrawn: ["grey", "已失效"], unknown: ["grey", "结果无法核实"] }[outcome.state];
+    const note = outcome.state === "withdrawn" ? "这个请求已经不再等待答复。" : outcome.state === "unknown" ? "已经有人作答，但无法确认这个答复是否生效。这个请求不再等待答复。" : outcome.state === "approved" && outcome.standing ? "已批准。这个任务之后推送同样的分支不会再问，包括改写该分支历史的推送。" : `${ended[1]}。`;
     return { config: { wide_screen_mode: true, update_multi: true }, header: { template: ended[0], title: plain(`${ended[1]} · ${ask.code}`) }, elements: [...about, { tag: "note", elements: [plain(note)] }] };
   }
   return {

@@ -122,13 +122,15 @@ export interface TaskState {
   /** For the in-process gate: which question we opened for which of its tool calls. */
   gate_questions: Record<string, { id: string; command: string; closed?: boolean }>;
   /** Answers, keyed by question id. Kept here, outside the container, so the guest cannot write one. */
-  decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number }>;
+  decisions: Record<string, { decision: "allow" | "deny"; reason: string; at: number; standing?: boolean }>;
   /** Stand-in for the Brain's inbox: everything the container pushed to us. */
   inbox: InboxItem[];
   /** What each alarm tick saw, to show the keep-alive actually held. */
   checks: { at: number; phase: Phase; container_running: boolean }[];
   error?: string;
 }
+
+export type QuestionFate = { state: "decided"; decision: "allow" | "deny"; standing?: boolean } | { state: "pending" | "undecided" | "unknown" };
 
 export interface StartInput {
   /** Scope name of the Brain to report to. Without it the task runs but reports to nobody. */
@@ -435,13 +437,13 @@ export class TaskSandbox extends DurableObject<Env> {
    * Answers the call the gate is holding. The answer is stored here and handed to the gate when it
    * next polls; nothing is written into the container. No awaits, so this cannot interleave.
    */
-  async answer(decision: "allow" | "deny", reason: string, questionId?: string, standing = false): Promise<{ ok: true; decision: "allow" | "deny" } | { ok: false; error: string }> {
+  async answer(decision: "allow" | "deny", reason: string, questionId?: string, standing = false): Promise<{ ok: true; decision: "allow" | "deny"; standing?: boolean } | { ok: false; error: string }> {
     const state = this.#state();
     if (!state) return { ok: false, error: "no such task" };
     if (decision !== "allow" && decision !== "deny") return { ok: false, error: "decision must be allow or deny" };
     // A question is answered once. Answering it again returns the answer it already has, which the
     // guest may have acted on; it cannot be changed after the fact.
-    if (questionId !== undefined && state.decisions[questionId]) return { ok: true, decision: state.decisions[questionId].decision };
+    if (questionId !== undefined && state.decisions[questionId]) return { ok: true, decision: state.decisions[questionId].decision, standing: state.decisions[questionId].standing };
     this.#expireHold(state);
     if (state.phase !== "needs_input" || !state.pending) {
       this.#save(state);
@@ -451,7 +453,10 @@ export class TaskSandbox extends DurableObject<Env> {
     if (questionId !== undefined && questionId !== state.pending.id) {
       return { ok: false, error: "that question is no longer pending" };
     }
-    state.decisions[state.pending.id] = { decision, reason, at: Date.now() };
+    // What is kept here is what took effect, and is what every later report of this decision says:
+    // `standing` is true only if the approval was in fact extended to the rest of the task.
+    const kept: TaskState["decisions"][string] = { decision, reason, at: Date.now(), standing: false };
+    state.decisions[state.pending.id] = kept;
     if (state.pending.source === "proxy") {
       // For the one request being held: same repository, same refs, same commits. Short-lived, and
       // removed the moment the proxy collects it.
@@ -467,13 +472,30 @@ export class TaskSandbox extends DurableObject<Env> {
       // repository go through without asking. Never a deletion, and never anything else.
       if (decision === "allow" && standing && state.pending.resource && standingEligible(state.pending.refs ?? [])) {
         state.standing = [...(state.standing ?? []), { resource: state.pending.resource, refs: (state.pending.refs ?? []).map((r) => r.ref) }];
+        kept.standing = true;
       }
     }
     state.inbox.push({ at: Date.now(), kind: "answered", body: { decision, reason, tool_use_id: state.pending.id } });
     state.pending = undefined;
     state.phase = "running";
     this.#save(state);
-    return { ok: true, decision };
+    return { ok: true, decision, standing: kept.standing };
+  }
+
+  /**
+   * What became of a question, for someone who sent an answer and never heard back. Reads only.
+   *   decided:   an answer was recorded; this is what the guest was told. `standing` is absent on
+   *              a record made before it was kept.
+   *   pending:   the question is still the one being waited on.
+   *   undecided: the task has moved past the question and no answer to it was ever recorded.
+   *   unknown:   this task's records are gone (they are removed some time after it ends).
+   */
+  async decisionOn(questionId: string): Promise<QuestionFate> {
+    const state = this.#state();
+    if (!state) return { state: "unknown" };
+    const held = state.decisions[questionId];
+    if (held) return { state: "decided", decision: held.decision, standing: held.standing };
+    return state.pending?.id === questionId ? { state: "pending" } : { state: "undecided" };
   }
 
   /** Whether the task is still entitled to reach the outside world. */

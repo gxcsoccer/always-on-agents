@@ -46,7 +46,7 @@ Feishu / GitHub / console / timers / worker reports
 
 ## Quick start
 
-You need Node 22 or later, pnpm, and a Docker-compatible runtime (the sandbox image is built locally). On Apple silicon with Colima, enable Rosetta:
+You need Node 22.12 or later, pnpm, and a Docker-compatible runtime (the sandbox image is built locally). On Apple silicon with Colima, enable Rosetta:
 
 ```bash
 colima start --cpu 4 --memory 6 --vm-type vz --vz-rosetta
@@ -60,14 +60,16 @@ cp .dev.vars.example .dev.vars   # set OPENAI_API_KEY and ADMIN_KEY
 pnpm dev --port 8797
 ```
 
-Create a tenant and talk to the agent:
+In a second terminal, create a tenant and talk to the agent:
 
 ```bash
 B=http://localhost:8797
+ADMIN_KEY=...     # the value you put in .dev.vars
 
-# Returns the tenant's API key. It is shown once.
+# Prints the tenant's API key ("api_key"). It is shown once.
 curl -X POST $B/v1/admin/tenants -H "authorization: Bearer $ADMIN_KEY" \
   -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'
+TENANT_KEY=...    # the api_key from that response
 
 curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"text":"Remind me to drink water in 30 seconds"}'
@@ -87,6 +89,7 @@ To deploy, and to connect GitHub or Feishu, see [Operations](docs/operations.md)
 src/
   index.ts              ingress Worker: authentication and routing, no state
   events.ts             scopes, events and principals
+  agent.config.ts       which connectors this deployment runs, and which are trusted
   registry.ts           tenants, keys, app registrations (one Durable Object)
   brain/                the Brain: one Durable Object per scope
     agent.ts              inbox, timers, the run loop, tasks, outbox
@@ -95,6 +98,7 @@ src/
     prompt.ts             the system prompt
   model/openai.ts       model client
   connectors/           one per outside system: verify, identify, deliver
+    types.ts              what a connector is
     console.ts            HTTP channel for development and checks
     github.ts             GitHub webhooks and comments
     github-app.ts         tokens per installation and repository

@@ -1,9 +1,10 @@
+// First: it adds a connector to the configuration, which the modules below read as they load.
+import "./notes";
 import { TaskSandbox } from "../src/workers/sandbox/task";
 import { DurableObject } from "cloudflare:workers";
 
-import { handleFeishuWebhook } from "../src/connectors/feishu";
-import { handleGithubWebhook } from "../src/connectors/github";
 import type { Env } from "../src/env";
+import production from "../src/index";
 
 export { BrainAgent } from "../src/brain/agent";
 export { FeishuLink } from "../src/connectors/feishu-link";
@@ -18,18 +19,29 @@ export class FakeTask extends DurableObject {
   }
   async answer(decision: string, reason: string, questionId?: string, standing = false) {
     this.#record("answer", { decision, reason, questionId, standing });
-    // Like the real task: the first answer to a question stands.
-    const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
-    answers[questionId ?? ""] ??= decision;
+    // Like the real task: the first answer to a question stands, with the reach it was given.
+    const answers = (this.ctx.storage.kv.get("answers") as Record<string, { decision: string; standing: boolean }> | undefined) ?? {};
+    answers[questionId ?? ""] ??= { decision, standing: decision === "allow" && standing };
     this.ctx.storage.kv.put("answers", answers);
-    return { ok: true, decision: answers[questionId ?? ""] };
+    // A test can have the answer take a while to be confirmed once it has taken effect, so that other things happen meanwhile.
+    const delay = (this.#policy() as { answerDelayMs?: number }).answerDelayMs;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    // A test can have the answer take effect and the word of it never get back.
+    if ((this.#policy() as { answerUnheard?: boolean }).answerUnheard) throw new Error("connection lost");
+    return { ok: true, ...answers[questionId ?? ""] };
+  }
+  async decisionOn(questionId: string) {
+    // A test can have the task's records be gone, as they are some time after a task ends.
+    if ((this.#policy() as { forgotten?: boolean }).forgotten) return { state: "unknown" };
+    const answers = (this.ctx.storage.kv.get("answers") as Record<string, { decision: string; standing: boolean }> | undefined) ?? {};
+    return answers[questionId] ? { state: "decided", ...answers[questionId] } : { state: "undecided" };
   }
   async cancel() {
     this.#record("cancel", {});
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
@@ -83,13 +95,10 @@ export class FakeTask extends DurableObject {
   }
 }
 
-/** Routes the two webhook endpoints to the real handlers, as the production entry does. */
+/** The production entry itself: requests are routed to connectors exactly as they are when deployed. */
 export default {
-  async fetch(request: Request, env: Env) {
-    const path = new URL(request.url).pathname.split("/").filter(Boolean);
-    if (path[1] === "github" && path[2] === "webhook") return handleGithubWebhook(request, env);
-    if (path[1] === "feishu" && path[2] === "events" && path[3]) return handleFeishuWebhook(request, env, path[3]);
-    return new Response("test worker");
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return production.fetch(request, env, ctx);
   },
 };
 

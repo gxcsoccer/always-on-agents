@@ -7,6 +7,7 @@ import { env } from "cloudflare:workers";
 import { vi } from "vitest";
 
 import type { InboundEvent } from "../src/events";
+import { notes } from "./notes";
 
 type Output = Record<string, unknown>;
 
@@ -53,8 +54,14 @@ export const say = (text: string): Output => ({ type: "message", role: "assistan
 let eventCounter = 0;
 export function message(text: string, overrides: Partial<InboundEvent> & { user?: string } = {}): InboundEvent {
   const { user = "alice", ...rest } = overrides;
+  // A message that names a subject is one that can be edited where it was written. It comes from
+  // the test connector that can be asked about it again, which is told what the message says.
+  const said = rest.data as { subject?: string; revision?: number; holder?: string } | undefined;
+  if (said?.subject && rest.source === undefined && (notes.get(said.subject)?.revision ?? -1) <= (said.revision ?? 0)) {
+    notes.set(said.subject, { revision: said.revision ?? 0, holder: said.holder ?? "", deleted: false, edited: false });
+  }
   return {
-    source: "test",
+    source: said?.subject ? "notes" : "console",
     source_id: `e${++eventCounter}`,
     kind: "message",
     session_key: "dm",

@@ -41,7 +41,18 @@ export interface Principal {
    * command. False for things that merely happened, such as a CI run or a push.
    */
   explicit: boolean;
+  /**
+   * True when the connector identified an account in its own system but that account is not linked
+   * to a user of the tenant. Such a person is known by name and is not a member of any scope.
+   */
+  unlinked?: boolean;
 }
+
+/**
+ * For a connector whose messages can be edited: the `holder` it reports for a revision whose text
+ * is no longer a message to the agent. It voids the earlier text, and no new message follows it.
+ */
+export const NOT_FOR_THE_AGENT = "-";
 
 /** Where a reply should go. Interpreted by the connector named in it. */
 export interface Target {

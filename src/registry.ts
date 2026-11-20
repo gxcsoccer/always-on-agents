@@ -170,6 +170,9 @@ export class Registry extends DurableObject<Env> {
   /** Records that an external account (e.g. a GitHub login) is this tenant's user. */
   async linkIdentity(tenant: string, provider: string, externalId: string, userId: string): Promise<void> {
     this.#requireTenant(tenant);
+    // "<system>:<account>" is how an account that is not linked to anyone is named, so no user is.
+    // A link that already exists may be made again as it is, whatever it looks like.
+    if (userId.includes(":") && (await this.resolveIdentity(tenant, provider, externalId)) !== userId) throw new Error("user_id cannot contain ':'");
     this.ctx.storage.sql.exec(
       "INSERT INTO identities (tenant, provider, external_id, user_id) VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET user_id = excluded.user_id",
       tenant,

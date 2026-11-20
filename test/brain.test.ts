@@ -3,7 +3,9 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
+import { MIGRATIONS } from "../src/brain/schema";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
+import { notes } from "./notes";
 
 beforeEach(() => installFakeModel());
 
@@ -196,9 +198,38 @@ describe("timers and memory", () => {
   it("does not count an unlinked GitHub account as a member of a repository", async () => {
     const { stub } = brain("repo");
     model.replies([call("memory_write", { path: "instructions.md", content: "x" })], [say("")]);
-    await stub.ingest(message("@always-on-agent remember: x", { session_key: "pr:9", principal: { kind: "human", id: "github:outsider", explicit: true } }));
+    await stub.ingest(message("@always-on-agent remember: x", { session_key: "pr:9", source: "github", principal: { kind: "human", id: "github:outsider", explicit: true, unlinked: true } }));
     await wake(stub);
     expect(toolOutputs()[0].error).toBeDefined();
+  });
+
+  it("marks stored events from unlinked accounts when the marker is introduced", async () => {
+    const { stub } = brain("repo");
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const insert = (source: string, sourceId: string, principal: object) =>
+        state.storage.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, received_at) VALUES (?, ?, 'message', 'pr:1', ?, 1)", source, sourceId, JSON.stringify(principal));
+      insert("github", "old-outsider", { kind: "human", id: "github:42", explicit: true });
+      insert("github", "old-member", { kind: "human", id: "alice", explicit: true });
+      insert("github", "old-ci", { kind: "automation", id: "github:ci", explicit: false });
+      // The old test was case-sensitive: this was a member then and is one now.
+      insert("github", "old-mixed-case", { kind: "human", id: "GitHub:member", explicit: true });
+      state.storage.sql.exec(MIGRATIONS[11]);
+      const unlinked = (sourceId: string) => state.storage.sql.exec("SELECT json_extract(principal, '$.unlinked') AS u FROM inbox WHERE source_id = ?", sourceId).one().u;
+      expect(unlinked("old-outsider")).toBe(1);
+      expect(unlinked("old-member")).toBeNull();
+      expect(unlinked("old-ci")).toBeNull();
+      expect(unlinked("old-mixed-case")).toBeNull();
+    });
+  });
+
+  it("does not take the word of a connector the deployment does not trust for who is speaking", async () => {
+    const { stub } = brain("chat");
+    model.replies([call("memory_write", { path: "instructions.md", content: "x" })], [say("")]);
+    // Everything about it says "a member, addressing you"; only where it came from differs.
+    await stub.ingest(message("remember: x", { source: "newsfeed", session_key: "chat", principal: { kind: "human", id: "alice", explicit: true } }));
+    await wake(stub);
+    expect(toolOutputs()[0].error).toMatch(/started solely by a person/);
+    expect(await stub.readMemory("instructions.md")).toBeNull();
   });
 
   it("rejects memory paths that are not plain markdown files", async () => {
@@ -237,6 +268,12 @@ describe("tasks and approvals", () => {
     await wake(stub);
     return toolOutputs().at(-1);
   }
+
+  /** How each approval question here ended, oldest first; null while it is open. */
+  const closures = (stub: any) =>
+    runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) =>
+      state.storage.sql.exec("SELECT closed FROM outbox WHERE ask IS NOT NULL ORDER BY id").toArray().map((row: any) => (row.closed ? JSON.parse(row.closed) : null)),
+    );
 
   const answersSent = async (id: string) => (await task(id).calls()).filter((c: any) => c.method === "answer").map((c: any) => c.args);
 
@@ -371,6 +408,21 @@ describe("tasks and approvals", () => {
     const output = await reply(stub, id, "bob", "wait, actually hold on");
     expect(output.error).toBeDefined();
     expect((await answersSent(id)).map((a: any) => a.decision)).toEqual(["allow"]);
+  });
+
+  it("does not approve on the word of a connector the deployment does not trust", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    const output = await reply(stub, id, "bob", `approve ${code}`, "allow", { source: "newsfeed" });
+    expect(output.error).toMatch(/nobody here has answered/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not approve on a message that can change when its connector cannot say what it says now", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // The console delivers messages and has no way to be asked about one again.
+    const output = await reply(stub, id, "bob", `approve ${code}`, "allow", { source: "console", data: { subject: "console:note:1", revision: 1, holder: "h" } });
+    expect(output.error).toMatch(/cannot confirm what the reply says now/);
+    expect(await answersSent(id)).toHaveLength(0);
   });
 
   it("does not approve on a comment that was edited or deleted afterwards, in whatever order the news arrives", async () => {
@@ -551,6 +603,43 @@ describe("tasks and approvals", () => {
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
   });
 
+  it("does not approve on an editable reply that its own connector does not recognise", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { subject: "test:note:unknown-reply", revision: 100, holder: "h1" } }));
+    // The place it was written in has no such message when asked.
+    notes.delete("test:note:unknown-reply");
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toMatch(/does not recognise a reply here/);
+    expect(await answersSent(id)).toHaveLength(0);
+  });
+
+  it("does not approve when the question cannot be found where it was shown and could have been changed there", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      // As if the question had been posted somewhere others can edit it, and that place does not know it.
+      state.storage.sql.exec(
+        "UPDATE outbox SET target = ?, receipt = ? WHERE ask IS NOT NULL",
+        JSON.stringify({ connector: "notes", address: {} }),
+        JSON.stringify({ subject: "test:note:unknown-question", holder: "q" }),
+      );
+    });
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/cannot be found where it was shown/);
+    expect(await answersSent(id)).toHaveLength(0);
+    // Nor when its delivery left nothing to say which posted message it is.
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET receipt = NULL WHERE ask IS NOT NULL");
+    });
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/cannot be identified there/);
+    expect(await answersSent(id)).toHaveLength(0);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE outbox SET receipt = ? WHERE ask IS NOT NULL", JSON.stringify({ subject: "test:note:unknown-question", holder: "q" }));
+    });
+    // Where it is known and unchanged, the same approval goes through.
+    notes.set("test:note:unknown-question", { revision: 1, holder: "q", deleted: false, edited: false });
+    expect(await reply(stub, id, "bob", `approve ${code}`)).toMatchObject({ ok: true, decision: "allow" });
+  });
+
   it("reads a plain yes or no only from a reply that is tied to the question", () => {
     for (const yes of ["可以", "好的", "批准", "OK", "yes", "同意。", "approve K7PW"]) expect(readTiedDecision(yes, "K7PW")).toBe("allow");
     for (const no of ["不可以", "不行", "先别", "等一下", "no", "wait", "don't", "deny K7PW", "可以，但是别删 main"]) expect(readTiedDecision(no, "K7PW")).toBe("deny");
@@ -616,6 +705,15 @@ describe("tasks and approvals", () => {
     const always = await waitingOnPush();
     expect(await reply(always.stub, always.id, "bob", `approve all ${always.code}`)).toHaveProperty("standing");
     expect((await answersSent(always.id)).at(-1)).toMatchObject({ decision: "allow", standing: true });
+
+    // How far an approval reaches is what the worker recorded, not what the latest message asked
+    // for: here the approval for the whole task took effect unheard, and a refusal came too late.
+    const unheard = await waitingOnPush();
+    await task(unheard.id).configure({ answerUnheard: true });
+    expect((await reply(unheard.stub, unheard.id, "bob", `approve all ${unheard.code}`)).error).toMatch(/connection lost/);
+    await task(unheard.id).configure({});
+    expect(await reply(unheard.stub, unheard.id, "carol", `deny ${unheard.code}`, "deny")).toMatchObject({ decision: "allow", standing: expect.stringMatching(/will not ask again/), note: expect.stringMatching(/too late/) });
+    expect(await closures(unheard.stub)).toEqual([{ state: "approved", standing: true }]);
 
     // A command question has no "rest of the task": the words approve it, once.
     const command = await taskAwaitingApproval();
@@ -732,6 +830,7 @@ describe("tasks and approvals", () => {
       const sql = state.storage.sql;
       // Put the store back to how version 9 left it, with two questions waiting to go out.
       sql.exec("ALTER TABLE outbox DROP COLUMN started");
+      sql.exec("DROP TABLE unsettled");
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
@@ -958,6 +1057,94 @@ describe("tasks and approvals", () => {
     expect(state.tasks[0].status).toBe("succeeded");
     expect(state.recent_events.filter((e: any) => e.kind === "worker.result")).toHaveLength(1);
     expect(state.recent_events.filter((e: any) => e.kind === "worker.needs_input")).toHaveLength(1);
+    // The late question was put to nobody: one question was ever asked, the first.
+    expect(state.outbox.filter((m: any) => m.text.includes("needs approval"))).toHaveLength(1);
+  });
+
+  it("closes an open question when its task is cancelled", async () => {
+    const { stub, id } = await taskAwaitingApproval();
+    model.replies([call("cancel_task", { task_id: id })], [say("")]);
+    await stub.ingest(message("@agent never mind", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    expect((await stub.inspect()).tasks[0].status).toBe("cancelled");
+    expect(await closures(stub)).toEqual([{ state: "withdrawn" }]);
+  });
+
+  it("shows what was decided on a question that a newer one replaced before the answer was confirmed", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerDelayMs: 1_500 });
+    // One run passes the answer on; another wakes for the second question and has nothing to add.
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "ok" })], [say("")], [say("")]);
+    const callsBefore = modelCalls.length;
+    // Left to its own alarm this time, so that something else can reach the Brain while it works.
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    // The worker has the answer, and puts its next question before the Brain hears that it landed.
+    await vi.waitFor(async () => expect(await answersSent(id)).toHaveLength(1), { timeout: 8_000, interval: 50 });
+    await stub.taskEvent(id, 2, "needs_input", { ...ask, id: "q-2" });
+    // Nothing is said about the first question until it is known how it ended.
+    expect(await closures(stub)).toEqual([null, null]);
+
+    // Then the first card says what happened to it. The second question is still open.
+    await vi.waitFor(async () => expect((await closures(stub))[0]).toMatchObject({ state: "approved" }), { timeout: 8_000, interval: 50 });
+    expect((await closures(stub))[1]).toBeNull();
+    expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
+    // Let the run finish here: left going, it would take the next test's model replies.
+    await vi.waitFor(() => expect(modelCalls.length).toBe(callsBefore + 3), { timeout: 8_000, interval: 50 });
+    await vi.waitFor(async () => expect((await stub.inspect()).runs.every((run: any) => run.status !== "running")).toBe(true), { timeout: 8_000, interval: 50 });
+  }, 30_000);
+
+  it("learns from the worker how a question ended when the answer took effect and word of it was lost", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    const output = await reply(stub, id, "carol", `deny ${code}`, "deny");
+    expect(output.error).toMatch(/connection lost/);
+    expect(await closures(stub)).toEqual([null]);
+
+    // The worker, which did hear, moves on to its next question.
+    await task(id).configure({});
+    await stub.taskEvent(id, 2, "needs_input", { ...ask, id: "q-2" });
+    model.replies([say("")]);
+    await wake(stub);
+    // Nobody answered the first question again; its card says what the worker was told.
+    expect(await closures(stub)).toEqual([{ state: "refused", standing: false }, null]);
+    expect(await answersSent(id)).toHaveLength(1);
+  });
+
+  it("closes each question once, so its card is never rewritten with an older ending", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    await reply(stub, id, "carol", `deny ${code}`, "deny");
+    // The task ends with the answer unconfirmed: not "withdrawn" now and "refused" later, but one ending.
+    await stub.taskEvent(id, 2, "failed", { error: "refused" });
+    expect(await closures(stub)).toEqual([null]);
+    model.replies([say("")]);
+    await wake(stub);
+    expect(await closures(stub)).toEqual([{ state: "refused", standing: false }]);
+  });
+
+  it("says a question's outcome cannot be verified when the worker's records are gone, rather than guess", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    await reply(stub, id, "carol", `deny ${code}`, "deny");
+    await stub.taskEvent(id, 2, "failed", { error: "refused" });
+    // By the time the Brain asks, the task's records have been removed.
+    await task(id).configure({ forgotten: true });
+    model.replies([say("")]);
+    await wake(stub);
+    expect(await closures(stub)).toEqual([{ state: "unknown" }]);
+  });
+
+  it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {
+    const { stub } = brain("chat");
+    model.replies([call("dispatch_task", { title: "cleanup", brief: "b", repository: null })], [say("")]);
+    await stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    const id: string = (await stub.inspect()).tasks[0].id;
+    await stub.taskEvent(id, 1, "result", { text: "done" });
+    await stub.taskEvent(id, 2, "needs_input", ask);
+    const state = await stub.inspect();
+    expect(state.tasks[0].status).toBe("succeeded");
+    expect(state.outbox.filter((m: any) => m.text.includes("needs approval"))).toHaveLength(0);
   });
 
   it("limits how many tasks one scope runs at once", async () => {

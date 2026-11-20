@@ -43,8 +43,8 @@ Roughly in order of importance.
 8. **Observability is logs and per-scope health figures.** There is no alerting.
 9. **Long conversations are truncated**, not summarised, and memory is not tidied offline.
 10. **The admin API has one key**, with no roles and no per-tenant administration.
-11. **Tenant API keys and Feishu app secrets are stored in the Registry Durable Object**, relying on the platform's encryption at rest.
-12. **All tenants share one model key.**
+11. **Feishu app secrets and per-repository webhook secrets are stored as they are in the Registry Durable Object**, relying on the platform's encryption at rest. (Tenant API keys are not: only their hashes are kept.)
+12. **All tenants share one model key, and the sandboxed agent only talks to OpenAI's API.** `OPENAI_BASE_URL` redirects the Brain but not the agent in the sandbox.
 13. **The sandbox task's state is read and written as a whole.** The known overwrites are handled; it has not been systematically changed to per-field updates.
 14. **Other worker types are not implemented.** Notes on one that was researched are in [docs/research](research/).
 

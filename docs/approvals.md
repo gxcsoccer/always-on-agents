@@ -44,10 +44,10 @@ In Feishu the question is a card with buttons. Pressing a button is the same as 
 
 | Rule | Enforced in |
 |---|---|
-| The message must come from a member of the scope who was addressing the agent. | `#isDecider` |
+| The message must come from a member of the scope who was addressing the agent, through a connector the deployment trusts to say who is speaking (`trusted` in `src/agent.config.ts`). What any other connector reports decides nothing. | `#isDecider` |
 | In a group chat or a repository, only the person who requested the task may approve it. | `#answerTask` |
 | If several people asked in the same batch, the task has no requester, and nobody can approve. | `#dispatchTask` |
-| A task not started by a person (one dispatched after a CI failure, say) cannot be approved, only refused. | `#answerTask` |
+| In a group chat or a repository, a task not started by a person (one dispatched after a CI failure, say) cannot be approved, only refused. In a direct chat, where there is one member, that member may approve a task the agent started on its own (after a timer, say). | `#answerTask` |
 | If the question could not be delivered to anyone, it cannot be approved. | `taskEvent`, `#answerTask` |
 | In a repository, a GitHub account that is not linked to a tenant user is not a member. Only comments from an owner, member or collaborator are requests to the agent at all. | `#isDecider`, `connectors/github.ts` |
 | In a Feishu group, only messages that mention this bot count, and the sender must belong to the organisation the app is installed in. | `connectors/feishu.ts` |
@@ -74,8 +74,8 @@ GitHub comments can be edited and deleted.
 | Rule | Enforced in |
 |---|---|
 | An approval counts only while the comment it was read from still says the same thing. Each comment's standing is its timestamp plus a fingerprint of its text; an edit or deletion voids the earlier text in whatever order the notifications arrive. | `#revise`, `#standing` |
-| Before an approval is acted on, the comment is read again from GitHub, because the notification of a change may still be on its way. If GitHub cannot be asked, nothing is approved. | `#refreshStanding`, `commentStanding` |
-| The question the agent posted is checked too: a maintainer can edit other people's comments. A question that was ever edited, even if put back, cannot be approved; the agent asks again. | `#answerTask` |
+| Before an approval is acted on, the comment is read again from GitHub, because the notification of a change may still be on its way. If GitHub cannot be asked, nothing is approved. The same holds for any connector whose messages can change: if it cannot be asked what a member's message says now, or does not recognise the message, nothing is approved on that message. | `#refreshStanding`, the connector's `standing` |
+| The question the agent posted is checked too: a maintainer can edit other people's comments. A question that was ever edited, even if put back, cannot be approved, only refused. To go ahead, refuse it (or cancel the task) and make the request again, which produces a new question. | `#answerTask` |
 | A mention inside a quotation or code does not address the agent. | `ownWords` in `connectors/github.ts` |
 
 ### Approving for the rest of a task
@@ -87,6 +87,17 @@ An approver can approve a push **and later pushes of the same branches in the sa
 | It has to be said by the approver, in their own message (`approve all CODE`) or with the card's button. The model cannot add it. | `wantsStanding`, `#answerTask` |
 | It is offered, recorded and used only for pushes that update or create branches. A push that includes a tag or a deletion is approved once, whatever was pressed. | `standingEligible` |
 | It covers the same repository and the same branches, in that task only. It does cover a later push that rewrites the branch's history; the card says so before it is given. | `TaskSandbox.authorize` |
+
+### How a question ends
+
+| Rule | Enforced in |
+|---|---|
+| A question ends once: approved, refused, withdrawn, or outcome unknown. That ending is recorded with the question and does not change. | `#closeQuestion` |
+| A question that stops being waited on (a newer one took its place, or the task ended or was cancelled) is withdrawn if no answer was ever sent for it. If one was sent and never confirmed, the worker is asked what it recorded, and the question ends as that. | `#setAside`, `#settleQuestions`, `TaskSandbox.decisionOn` |
+| If that can no longer be found out (the task's records are gone, or the worker stays unreachable), the question ends as **outcome unknown** and `task.answer_unverified` is written to the audit table. It is never shown as withdrawn on a guess. | `#settleQuestions` |
+| Whether an approval covers the rest of the task is what the worker recorded with the decision, not what the latest message asked for. | `TaskSandbox.answer`, `#answerTask` |
+
+Showing the ending where the question was put (rewriting a Feishu card) is best effort: it can fail or be repeated, and nothing depends on it. The record is the ending.
 
 ### Other protections
 

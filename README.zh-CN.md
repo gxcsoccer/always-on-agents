@@ -46,7 +46,7 @@
 
 ## 快速开始
 
-需要 Node 22 或更高版本、pnpm，以及一个兼容 Docker 的运行时（沙箱镜像在本地构建）。Apple 芯片上用 Colima 时要开 Rosetta：
+需要 Node 22.12 或更高版本、pnpm，以及一个兼容 Docker 的运行时（沙箱镜像在本地构建）。Apple 芯片上用 Colima 时要开 Rosetta：
 
 ```bash
 colima start --cpu 4 --memory 6 --vm-type vz --vz-rosetta
@@ -60,14 +60,16 @@ cp .dev.vars.example .dev.vars   # 填 OPENAI_API_KEY 和 ADMIN_KEY
 pnpm dev --port 8797
 ```
 
-建一个租户，然后和 agent 说话：
+另开一个终端，建一个租户，然后和 agent 说话：
 
 ```bash
 B=http://localhost:8797
+ADMIN_KEY=...     # 你写在 .dev.vars 里的那个值
 
-# 返回租户的 API key，只显示这一次。
+# 输出里的 "api_key" 就是租户的 API key，只显示这一次。
 curl -X POST $B/v1/admin/tenants -H "authorization: Bearer $ADMIN_KEY" \
   -H 'content-type: application/json' -d '{"id":"acme","name":"Acme"}'
+TENANT_KEY=...    # 上面返回的 api_key
 
 curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"text":"30 秒后提醒我喝水"}'
@@ -87,6 +89,7 @@ curl $B/v1/admin/scopes/acme:user:alice -H "authorization: Bearer $ADMIN_KEY"
 src/
   index.ts              入口 Worker：鉴权和路由，本身不存状态
   events.ts             作用域、事件、身份的定义
+  agent.config.ts       这个部署启用哪些 connector，信任哪些
   registry.ts           租户、密钥、应用登记（一个 Durable Object）
   brain/                Brain：每个作用域一个 Durable Object
     agent.ts              收件箱、定时器、run 循环、任务、发件箱
@@ -95,6 +98,7 @@ src/
     prompt.ts             系统提示词
   model/openai.ts       模型客户端
   connectors/           每个外部系统一个：验证、识别身份、投递
+    types.ts              connector 接口的定义
     console.ts            HTTP 通道，用于开发和验证
     github.ts             GitHub webhook 和评论
     github-app.ts         按安装、按仓库签发令牌
