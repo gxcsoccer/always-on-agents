@@ -1151,12 +1151,16 @@ describe("tasks and approvals", () => {
     await stub.ingest(message("@agent do it", { user: "bob", session_key: "chat" }));
     await wake(stub);
     const id: string = (await stub.inspect()).tasks[0].id;
-    await stub.taskEvent(id, 1, "result", { text: `${"z".repeat(MAX_RESULT_TEXT)} the end` });
+    const raw = `${"z".repeat(MAX_RESULT_TEXT)} the end`;
+    await stub.taskEvent(id, 1, "result", { text: raw });
     // The whole of what the worker said can be sent on as one message, and nothing longer can.
     model.replies([call("send_message", { text: cut })], [call("send_message", { text: `${fits}!` })], [say("")]);
+    const before = modelCalls.length;
     await wake(stub);
-    const shown = JSON.stringify(modelCalls.at(-1)!.input);
-    expect(shown).toContain(marker);
+    // The first request after the result: what the model is shown of it, before anything it says.
+    const shown = modelCalls[before].input.filter((item: any) => item.role === "user").map((item: any) => JSON.stringify(item.content)).join("\n");
+    expect(shown).toContain(JSON.stringify(clipResult(raw)).slice(1, -1));
+    expect(shown.split(marker)).toHaveLength(2);
     expect(shown).not.toContain("the end");
     const outputs = toolOutputs();
     expect(outputs.at(-2)).not.toHaveProperty("error");
