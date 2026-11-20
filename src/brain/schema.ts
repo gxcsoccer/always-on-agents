@@ -155,6 +155,9 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE unsettled (ask TEXT PRIMARY KEY, task_id TEXT NOT NULL, question_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL);`,
   // 14: a code review's parts, for connectors that can attach comments to lines.
   `ALTER TABLE outbox ADD COLUMN review TEXT;`,
+  // 15: marks what a connector tool returned: 1 while the text is kept (its run is under way),
+  // 2 once the run has ended and the text has been removed.
+  `ALTER TABLE items ADD COLUMN outside INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -188,7 +188,7 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
       principal: { kind: "human", id: openId, explicit: true },
       text: `${value.decision === "approve_all" ? "approve all" : value.decision} ${value.code}`,
       // Which question's card was pressed. The press answers that question and no other.
-      data: { chat_id: chatId, card: true, route_by_code: true, question: value.q },
+      data: { chat_id: chatId, card: true, route_by_code: true, question: value.q, origin: { app_id: app.app_id, tenant_key: String(operator.tenant_key) } },
       reply_to: { connector: "feishu", address: { app_id: app.app_id, chat_id: chatId } },
     },
   };
@@ -257,6 +257,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       principal: { kind: "human", id: openId, explicit: true },
       text,
       data: {
+        // Which app received it and which organisation the sender belongs to, both as Feishu
+        // stated them in the verified event.
+        origin: { app_id: app.app_id, tenant_key: String(sender.tenant_key) },
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,

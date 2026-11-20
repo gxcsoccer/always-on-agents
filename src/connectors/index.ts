@@ -8,7 +8,7 @@
 import config from "../agent.config";
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";
-import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt, Standing } from "./types";
+import type { ApprovalQuestion, Connector, ConnectorTool, OutboundMessage, Outcome, Receipt, Standing } from "./types";
 
 export type * from "./types";
 export { DeliveryDeferred } from "./types";
@@ -18,6 +18,9 @@ const byName = new Map<string, Connector>();
 for (const connector of config.connectors) {
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(connector.name) || RESERVED.has(connector.name)) throw new Error(`"${connector.name}" cannot be a connector's name`);
   if (byName.has(connector.name)) throw new Error(`two connectors are named "${connector.name}"`);
+  for (const tool of connector.tools ?? []) {
+    if (!tool.name.startsWith(`${connector.name.replace(/-/g, "_")}_`) || !/^[a-z][a-z0-9_]{2,63}$/.test(tool.name)) throw new Error(`tool "${tool.name}" must be named ${connector.name}_…`);
+  }
   byName.set(connector.name, connector);
 }
 for (const name of config.trusted) if (!byName.has(name)) throw new Error(`trusted connector "${name}" is not one of the connectors`);
@@ -36,6 +39,11 @@ export function connector(name: string): Connector | undefined {
  */
 export function trusts(source: string): boolean {
   return trusted.has(source);
+}
+
+/** The tools a connector offers, if any. Whether they are offered in a given run is the Brain's decision. */
+export function toolsOf(name: string): ConnectorTool[] {
+  return byName.get(name)?.tools ?? [];
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */

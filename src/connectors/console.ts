@@ -44,7 +44,7 @@ export async function handleConsole(request: Request, env: Env, tenant: string, 
     const wait = Math.min(Number(url.searchParams.get("wait") ?? 0), 25);
     const deadline = Date.now() + wait * 1_000;
     for (;;) {
-      const messages = await brain.outboxSince(after);
+      const messages = await brain.outboxSince("console", after);
       if (messages.length > 0 || Date.now() >= deadline) return json({ messages });
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     }

@@ -98,7 +98,7 @@ describe("the GitHub webhook endpoint", () => {
     expect(state.tasks[0]).toMatchObject({ status: "running", requested_by: "dana" });
 
     await brain.taskEvent(state.tasks[0].id, 1, "needs_input", { source: "gate", id: "q-1", command: "rm -rf x" });
-    const code = (await brain.outboxSince(0)).find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
+    const code = (await brain.outboxSince("github", 0)).find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
     // Now the same kind of unaddressed comment is a reply, because it quotes the open question's code.
     expect(await (await deliver(webhook_secret, "issue_comment", comment(repo, 3, `no ${code}`))).json()).toMatchObject({ accepted: true });
     // And one from somebody without standing in the repository still is not.

@@ -19,7 +19,8 @@ curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENAN
 curl -X POST $B/v1/console/chats/team/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"user":"bob","text":"@agent summarise this thread"}'
 
-# Read what the agent said. `after` is the last message id seen; `wait` long-polls up to 25 seconds.
+# Read what the agent said to the console. `after` is the last message id seen; `wait` long-polls up to 25 seconds.
+# Messages the agent sent through another connector (to a Feishu chat, say) are not returned here.
 curl "$B/v1/console/users/alice/messages?after=0&wait=25" -H "authorization: Bearer $TENANT_KEY"
 ```
 
@@ -165,6 +166,8 @@ export const exampleConnector: Connector = {
   async scheduled(env) {},
   // Optional: delivering the agent's messages
   channel: { deliver, amend, standing },
+  // Optional: things the agent can do in that system for one person
+  tools: [{ name: "example_read", description, parameters, run }],
 };
 ```
 
@@ -176,6 +179,18 @@ Each part is optional and independent. A connector that only reports events (a C
 | `channel.deliver` | Send one message. Throw if it was not delivered. It will be retried, so use the message's `idem` key to avoid sending twice. |
 | `channel.amend` | Optional. Show a delivered approval question as closed. |
 | `channel.standing` | Required if people can edit or delete what they said in that system. See below. |
+
+### Tools
+
+A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, parameters, run(context, args) }`, named `<connector name>_…`. `context.person` is who the call is for; the tool must act as that person and nobody else.
+
+The core decides when a connector's tools exist at all, and for whom:
+
+- **Only where it is beyond doubt whose authority a call carries.** Tools are offered in a person's own private conversation, in a run started by nothing but that person's own messages to the agent, all through this connector, all with the same verified `origin` (set `data.origin` on events to what you verified about where they came from, such as the app and the organisation). Another person's message in the batch, a timer, a worker's report, a message through another connector: any of these and the tools are not there. In a group or a repository they never are.
+- **Arguments cannot choose the person.** `context.person` comes from the stored events, worked out again at each call.
+- **What a tool returns is outside text.** In a run that has used a connector's tool, memory and standing instructions cannot be changed. When the run ends, what the tool returned is removed from the conversation's record and replaced by a note that it was read; a later run calls the tool again if it needs the text.
+- **Every call is audited** (`tool.used`, with the person and the arguments).
+- A call may be repeated after an interruption, so a tool must be safe to run twice.
 
 ### What the core decides, whatever a connector says
 

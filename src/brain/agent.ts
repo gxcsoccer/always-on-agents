@@ -17,16 +17,16 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
-import { type Item, ModelError, messageText, respond } from "../model/openai";
+import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
-import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, executeTool } from "./tools";
+import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, describeTool, executeTool } from "./tools";
 
 /** Events arriving within this window are answered in one run. */
 const BATCH_WINDOW_MS = 2_000;
@@ -59,6 +59,8 @@ const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
+const READ_OUTSIDE = "this run has read text from outside through a tool, so memory and standing instructions cannot be changed in it; if the person wants something remembered, they can ask again in a new message";
+const OUTSIDE_REMOVED = "what this tool returned was removed when that run ended; call the tool again if it is needed";
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
 const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
@@ -89,6 +91,8 @@ interface RunRow {
 
 export class BrainAgent extends DurableObject<Env> {
   readonly #sql: SqlStorage;
+  /** Calls in this invocation whose result came from a connector's tool, until they are recorded. */
+  readonly #outside = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -348,8 +352,9 @@ export class BrainAgent extends DurableObject<Env> {
       if (dangling.length > 0) {
         for (const call of dangling) {
           const output = await executeTool(this.#toolHost(run), call);
+          const outside = this.#outside.delete(call.call_id);
           if (!this.#stillActive(runId)) return;
-          this.#append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output });
+          this.#append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output }, outside);
         }
         continue;
       }
@@ -386,7 +391,7 @@ export class BrainAgent extends DurableObject<Env> {
           model: this.env.BRAIN_MODEL,
           instructions: this.#instructions(),
           input: items,
-          tools: TOOLS,
+          tools: this.#toolsFor(runId),
         });
       } catch (err) {
         await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
@@ -448,19 +453,52 @@ export class BrainAgent extends DurableObject<Env> {
       this.#sql.exec("UPDATE inbox SET status = ? WHERE run_id = ? AND status = 'claimed'", status === "done" ? "done" : "dead", runId);
       this.#sql.exec("UPDATE runs SET status = ?, ended_at = ?, retry_at = NULL, error = ? WHERE id = ?", status, now, error?.slice(0, 1_000) ?? null, runId);
       this.#sql.exec("UPDATE sessions SET updated_at = ? WHERE id = ?", now, run.session_id);
+      // What a connector's tool brought in from outside was for this run. It is not kept: a later
+      // run sees that it was read, and reads it again if it needs it.
+      this.#sql.exec("UPDATE items SET item = json_set(item, '$.output', ?), outside = 2 WHERE run_id = ? AND outside = 1", JSON.stringify({ removed: OUTSIDE_REMOVED }), runId);
       if (this.#meta("active_run") === runId) this.#sql.exec("DELETE FROM meta WHERE key = 'active_run'");
     });
   }
 
-  #append(sessionId: string, runId: string, item: Item): void {
+  #append(sessionId: string, runId: string, item: Item, outside = false): void {
     this.#sql.exec(
-      "INSERT INTO items (session_id, seq, run_id, is_user, item) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM items WHERE session_id = ?), ?, ?, ?)",
+      "INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM items WHERE session_id = ?), ?, ?, ?, ?)",
       sessionId,
       sessionId,
       runId,
       item.role === "user" ? 1 : 0,
       JSON.stringify(item),
+      outside ? 1 : 0,
     );
+  }
+
+  /**
+   * Whose authority a connector's tools would carry in this run, if anyone's. There is such a
+   * person only when it is beyond doubt: this is that person's own private conversation, and
+   * everything that started the run is a message of theirs, addressed to the agent, through one
+   * connector the deployment trusts, with one and the same verified origin. Anything else in the
+   * batch (another person, a timer, a worker's report, a message from elsewhere) and there is
+   * none. Worked out from the stored events each time it is needed, never remembered.
+   */
+  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string> } | undefined {
+    const scope = this.#scope();
+    if (scope.kind !== "user") return undefined;
+    const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
+    if (events.length === 0) return undefined;
+    const source = events[0].source;
+    const origin = JSON.stringify(originOf(events[0]));
+    for (const event of events) {
+      const principal = JSON.parse(event.principal) as Principal;
+      if (event.kind !== "message" || event.source !== source || !this.#isDecider(principal, event.source)) return undefined;
+      // The conversation is this person's own, and so is every word in the batch.
+      if (principal.id !== scope.id || JSON.stringify(originOf(event)) !== origin) return undefined;
+    }
+    return { connector: source, person: scope.id, origin: JSON.parse(origin) as Record<string, string> };
+  }
+
+  /** Whether this run has been given text from outside by a connector's tool. */
+  #sawOutside(runId: string): boolean {
+    return this.#outside.size > 0 || this.#rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", runId).length > 0;
   }
 
   /**
@@ -477,6 +515,12 @@ export class BrainAgent extends DurableObject<Env> {
       this.#rows<{ seq: number }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq ??
       floor;
     return this.#rows<{ item: string }>("SELECT item FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, start).map((r) => JSON.parse(r.item) as Item);
+  }
+
+  /** The Brain's own tools, and a connector's where this run acts for one person through it. */
+  #toolsFor(runId: string): ToolDefinition[] {
+    const acting = this.#actingFor(runId);
+    return acting ? [...TOOLS, ...toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, each.parameters))] : TOOLS;
   }
 
   #instructions(): string {
@@ -588,6 +632,16 @@ export class BrainAgent extends DurableObject<Env> {
     const session = this.#rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#sql;
     return {
+      connectorTool: async (callId, name, args) => {
+        // Decided afresh at the moment of use, from what is stored: also after an interruption.
+        const acting = this.#actingFor(run.id);
+        const found = acting && toolsOf(acting.connector).find((each) => each.name === name);
+        if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
+        // Whatever comes back is from outside, including an error that quotes something.
+        this.#outside.add(callId);
+        this.#audit(acting.person, "tool.used", { tool: name, args: JSON.stringify(args).slice(0, 500) });
+        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, callId }, args);
+      },
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
       sendReview: (callId, summary, commit, comments) => {
         // The same review in words, for wherever comments cannot be attached to lines.
@@ -603,6 +657,7 @@ export class BrainAgent extends DurableObject<Env> {
         return { path, content: row.content };
       },
       memoryWrite: (path, content) => {
+        if (this.#sawOutside(run.id)) throw new Error(READ_OUTSIDE);
         if (!MEMORY_PATH.test(path) || path.includes("..")) throw new Error("path must look like notes/topic.md: lowercase letters, digits, - _ /");
         // instructions.md is read as instructions in every later run, so only a person who is a
         // member here may cause it to change. Text from a PR, a CI log or a worker cannot.
@@ -613,6 +668,7 @@ export class BrainAgent extends DurableObject<Env> {
         return { ok: true, path };
       },
       memoryDelete: (path) => {
+        if (this.#sawOutside(run.id)) throw new Error(READ_OUTSIDE);
         if (path === "instructions.md") this.#audit(this.#instructionEditors(run.id).join(","), "instructions.deleted", {});
         const existed = this.#rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
         sql.exec("DELETE FROM memory WHERE path = ?", path);
@@ -1334,10 +1390,19 @@ export class BrainAgent extends DurableObject<Env> {
     if (!this.#meta("default_target")) this.#setMeta("default_target", JSON.stringify(target));
   }
 
-  /** Messages written since `afterId`, for connectors whose clients pull instead of being pushed to. */
-  async outboxSince(afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
+  /**
+   * Messages written since `afterId` and addressed to the named connector, for one whose clients
+   * pull instead of being pushed to. A message addressed anywhere else is not theirs to read: what
+   * the agent says to someone in another system stays in that system.
+   */
+  async outboxSince(connector: string, afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
     // A question withdrawn before it went out was never said to anyone, on any channel.
-    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status NOT IN ('withdrawn', 'reconciling') AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
+    return this.#rows(
+      "SELECT id, text, status, created_at FROM outbox WHERE id > ? AND json_extract(target, '$.connector') = ? AND status NOT IN ('withdrawn', 'reconciling') AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?",
+      afterId,
+      connector,
+      Math.min(limit, 200),
+    );
   }
 
   async inspect(): Promise<Record<string, unknown>> {
@@ -1403,6 +1468,17 @@ function today(): string {
 }
 
 /** Function calls in the transcript that have no output yet. */
+/** What a connector verified about where an event came from. */
+function originOf(event: InboxRow): Record<string, string> {
+  const origin = event.data ? (JSON.parse(event.data) as { origin?: unknown }).origin : undefined;
+  if (!origin || typeof origin !== "object") return {};
+  return Object.fromEntries(
+    Object.entries(origin as Record<string, unknown>)
+      .filter(([, value]) => typeof value === "string")
+      .sort(([a], [b]) => a.localeCompare(b)),
+  ) as Record<string, string>;
+}
+
 function danglingCalls(items: Item[]): ToolCall[] {
   const answered = new Set(items.filter((i) => i.type === "function_call_output").map((i) => i.call_id));
   return items.filter((i) => i.type === "function_call" && !answered.has(i.call_id)).map((i) => ({ call_id: i.call_id, name: i.name, arguments: i.arguments ?? "{}" }));

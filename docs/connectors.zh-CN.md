@@ -20,6 +20,7 @@ curl -X POST $B/v1/console/chats/team/messages -H "authorization: Bearer $TENANT
   -H 'content-type: application/json' -d '{"user":"bob","text":"@agent 总结一下这个话题"}'
 
 # 读取 agent 说了什么。`after` 是已读到的最后一条消息的编号；`wait` 表示长轮询，最多 25 秒。
+# agent 经由其他 connector 发出的消息（比如发到飞书单聊的）不会在这里返回。
 curl "$B/v1/console/users/alice/messages?after=0&wait=25" -H "authorization: Bearer $TENANT_KEY"
 ```
 
@@ -166,6 +167,8 @@ export const exampleConnector: Connector = {
   async scheduled(env) {},
   // 可选：投递 agent 的消息
   channel: { deliver, amend, standing },
+  // 可选：agent 可以替某一个人在那个系统里做的事
+  tools: [{ name: "example_read", description, parameters, run }],
 };
 ```
 
@@ -177,6 +180,18 @@ export const exampleConnector: Connector = {
 | `channel.deliver` | 发送一条消息，没送达就抛错。它会被重试，所以要用消息的 `idem` 避免重复发送 |
 | `channel.amend` | 可选。把已送达的审批提问显示为已关闭 |
 | `channel.standing` | 如果那个系统里的人可以编辑或删除自己说过的话，就必须实现。见下文 |
+
+### 工具
+
+connector 可以给 agent 提供工具：agent 可以替某一个人在外部系统里做的事，比如以这个人的身份读一篇文档。一个工具是 `{ name, description, parameters, run(context, args) }`，名字是 `<connector 名>_…`。`context.person` 是这次调用替谁做；工具必须以这个人的身份行事，不能是别人。
+
+connector 的工具什么时候存在、替谁存在，由核心决定：
+
+- **只在“这次调用代表谁”毫无疑问的地方提供。** 必须是某个人自己的私有对话，而且触发这次运行的全部是这个人自己发给 agent 的消息，都经由这个 connector 到达，并且经过核实的 `origin` 完全相同（在事件的 `data.origin` 里写上你核实过的来源，比如哪个应用、哪个组织）。这一批里只要有别人的消息、定时器、worker 的回报，或经由其他 connector 来的消息，工具就不存在。在群和仓库里永远不存在。
+- **参数选不了人。** `context.person` 来自已存储的事件，每次调用时重新推导。
+- **工具返回的是外部文本。** 一次运行只要用过 connector 的工具，就不能再修改记忆和长期指令。运行结束时，工具返回的内容会从对话记录里移除，只留下一条“读过”的说明；后面的运行需要这段文本时再调用一次工具。
+- **每次调用都写审计**（`tool.used`，记录是谁、参数是什么）。
+- 调用可能在中断后重复执行，所以工具必须可以安全地执行两次。
 
 ### 不管 connector 怎么说，都由核心决定的事
 

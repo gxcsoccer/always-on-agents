@@ -14,6 +14,8 @@ export interface ToolCall {
 }
 
 export interface ToolHost {
+  /** A tool that is not one of the Brain's own: a connector's, if this run may use it. */
+  connectorTool(callId: string, name: string, args: Record<string, unknown>): Promise<unknown>;
   sendMessage(callId: string, text: string): unknown;
   sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
@@ -43,6 +45,11 @@ function tool(name: string, description: string, properties: Record<string, unkn
     strict: true,
     parameters: { type: "object", properties, required: Object.keys(properties), additionalProperties: false },
   };
+}
+
+/** A connector's tool, as the model is told about it. */
+export function describeTool(name: string, description: string, properties: Record<string, unknown>): ToolDefinition {
+  return tool(name, description, properties);
 }
 
 export const TOOLS: ToolDefinition[] = [
@@ -165,7 +172,7 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
     case "cancel_task":
       return host.cancelTask(text(a.task_id, "task_id", 64));
     default:
-      throw new Error(`unknown tool: ${call.name}`);
+      return host.connectorTool(call.call_id, call.name, a);
   }
 }
 
