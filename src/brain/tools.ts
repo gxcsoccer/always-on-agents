@@ -56,7 +56,7 @@ export const TOOLS: ToolDefinition[] = [
     "Post a code review on the pull request this conversation is about: a summary, and comments attached to lines of the change. Use it instead of send_message when findings point at particular lines. It comments only; it neither approves nor requests changes. Where comments cannot be attached to lines, the same review is sent as one message.",
     {
       summary: { type: "string", description: "The verdict and anything not tied to a line, including what was and was not checked." },
-      commit: { ...nullable("string"), description: "The full SHA of the commit that was reviewed, or null if you do not know it." },
+      commit: { ...nullable("string"), description: "The full SHA of the commit that was reviewed, or null if you do not know it. Without it no comment is attached to a line." },
       comments: {
         type: "array",
         description: "One per finding that points at a line. Empty if there are none.",

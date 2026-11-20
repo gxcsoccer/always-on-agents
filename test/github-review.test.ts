@@ -83,6 +83,14 @@ describe("a code review on GitHub", () => {
     expect(posted[0].body.body).toContain("on a changed line");
   });
 
+  it("attaches nothing to lines when the review does not say which commit it is of", async () => {
+    const posted = github();
+    await send({ summary: review.summary, comments: review.comments });
+    expect(posted[0].body.comments).toEqual([]);
+    expect(posted[0].body.body).toContain("does not say which commit");
+    expect(posted[0].body.body).toContain("on a changed line");
+  });
+
   it("sends the whole review in the body when GitHub refuses the lines", async () => {
     const posted = github({ refuseInline: true });
     await send();

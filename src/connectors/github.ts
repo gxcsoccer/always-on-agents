@@ -107,8 +107,9 @@ export function commentableLines(files: { filename?: string; patch?: string }[])
  * comments; approving or requesting changes is left to people. Returns undefined when the
  * conversation is not a pull request.
  *
- * A comment is attached to a line only if the review is of the pull request's current head and
- * the line is one the change touches or shows. Any other comment is kept, in the body, with its
+ * A comment is attached to a line only if the review is known to be of the pull request's current
+ * head and the line is one the change touches or shows. A review that does not say which commit
+ * it is of is not assumed to be of the head: a line number means nothing against another revision. Any other comment is kept, in the body, with its
  * file and line: a review is never dropped, or a comment put on the wrong line, for that.
  */
 async function deliverReview(headers: Record<string, string>, repo: string, number: string, review: CodeReview, marker: string): Promise<Receipt | undefined> {
@@ -119,7 +120,8 @@ async function deliverReview(headers: Record<string, string>, repo: string, numb
   const head = ((await found.json()) as { head?: { sha?: string } }).head?.sha;
   if (!head) throw new Error("GitHub did not say which commit the pull request is at");
 
-  // An earlier attempt at this same review, if it got through.
+  // An earlier attempt at this same review, if it got through. The list is oldest first and cannot
+  // be narrowed by time; past a thousand reviews on one pull request a retry could post again.
   for (let page = 1; page <= 10; page++) {
     const listed = await fetch(`${pull}/reviews?per_page=100&page=${page}`, { headers });
     if (!listed.ok) throw new Error(`GitHub returned ${listed.status} listing reviews`);
@@ -129,9 +131,9 @@ async function deliverReview(headers: Record<string, string>, repo: string, numb
     if (batch.length < 100) break;
   }
 
-  const moved = review.commit !== undefined && review.commit !== head;
+  const current = review.commit === head;
   let lines = new Map<string, Set<number>>();
-  if (!moved && review.comments.length > 0) {
+  if (current && review.comments.length > 0) {
     const files: { filename?: string; patch?: string }[] = [];
     for (let page = 1; page <= 30; page++) {
       const listed = await fetch(`${pull}/files?per_page=100&page=${page}`, { headers });
@@ -145,7 +147,11 @@ async function deliverReview(headers: Record<string, string>, repo: string, numb
   const placed = review.comments.filter((c) => lines.get(c.path)?.has(c.line));
   const body = (attached: typeof placed) => {
     const rest = review.comments.filter((c) => !attached.includes(c));
-    const why = moved ? `This review is of ${review.commit!.slice(0, 7)}; the pull request has moved to ${head.slice(0, 7)} since, so its comments are listed here rather than attached to lines.` : "Not on a line this pull request changes or shows:";
+    const why = current
+      ? "Not on a line this pull request changes or shows:"
+      : review.commit
+        ? `This review is of ${review.commit.slice(0, 7)}; the pull request has moved to ${head.slice(0, 7)} since, so its comments are listed here rather than attached to lines.`
+        : "The review does not say which commit it is of, so its comments are listed here rather than attached to lines:";
     return [review.summary, ...(rest.length > 0 ? [why, ...rest.map((c) => `\`${c.path}:${c.line}\`\n${c.body}`)] : []), marker].join("\n\n");
   };
   const post = (attached: typeof placed) =>
