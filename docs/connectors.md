@@ -151,7 +151,7 @@ Tasks started in that group can then clone and push to that repository (pushes s
 
 In a direct chat, a person can give the agent a link to a Feishu document (`…/docx/…`, or a `…/wiki/…` page that is a document) and ask about it. The agent reads it **as that person**, with their own access, through the tool `feishu_read_document`. What the person cannot open, the agent cannot open for them; what the bot could open plays no part.
 
-- **The person authorises once, in Feishu.** The first time, the bot sends them a card with a link to Feishu's consent page (OAuth with PKCE). The link works once, for ten minutes, and only for them: when Feishu sends their browser back, the token is kept only if Feishu says it belongs to the very person the card was sent to, in the same organisation. They then ask again.
+- **The person authorises once, in Feishu.** The first time, the bot sends them a card with a link to Feishu's consent page (OAuth authorisation code, with a PKCE challenge sent along; see the note on the token endpoint below). The link works once, for ten minutes, and only for them: when Feishu sends their browser back, the token is kept only if Feishu says it belongs to the very person the card was sent to, in the same organisation. They then ask again.
 - **Only a document the person linked themselves is read, and the one they mean now.** If the request links documents, those are it, whatever was linked before. If it links none ("summarise it" after a link), it is taken to be about the one document in the last message of theirs that had a link, within ten minutes and their last five messages; that works once, and also carries across the round trip to authorise. If that message linked several, the agent asks which. What the agent said or read is never among the person's messages. The link must be in their message as plain text (`https://….feishu.cn/docx/…` or `…/wiki/…`; `larkoffice.com` too). The connector records the links when the message arrives, from what the person typed: each is taken whole, up to the next space, and judged by its own host and path, so a Feishu address carried inside some other link does not count. A link followed directly by sentence punctuation is still found, and so is one with words right before it; words written straight onto its end could be part of its address, so then it is not counted; where it cannot be told where a link ends (two links run together without a space, say), it is not counted and has to be pasted apart. Text the agent has read cannot send it to another document, and neither can a word that merely looks like a document's id, or the name of someone mentioned.
 - **The invitation is the connector's own to send.** It is a fixed card, to that one person. It is sent once however often it is asked for, retried for a few minutes if Feishu does not take it, and replaced by a new one once it is nearly spent. Its link is never given to the model.
 - **The token is for reading documents and nothing else**, whatever else the person has allowed the app before: only what the invitation asked for is requested when the token is issued, and a token that reaches further is not kept. A document link asks for documents; a wiki link asks for wiki pages as well, and only then. If that is not given, what the person had allowed before stays as it was.
@@ -169,6 +169,15 @@ To set it up:
 # Does this person's authorisation stand? DELETE takes it away, including one still being given.
 curl $B/v1/admin/feishu-grants/cli_xxx/<tenant_key>/<open_id> -H "authorization: Bearer $ADMIN_KEY"
 ```
+
+**The token endpoint.** The authorisation code is exchanged at Feishu's current endpoint (`accounts.feishu.cn/oauth/v3/token`), which checks the PKCE verifier. Against one real app that endpoint refused a correctly formed verifier (error 20049, logged as `feishu_authorisation_refused` with `code` and `endpoint`). Feishu's authorisation page says to pair PKCE with its older endpoint for now, so an operator can switch one app to it:
+
+```bash
+curl -X POST $B/v1/admin/feishu-apps/cli_xxx/oauth -H "authorization: Bearer $ADMIN_KEY" \
+  -H 'content-type: application/json' -d '{"token_endpoint":"v2"}'   # "v3" to switch back
+```
+
+Know what that gives up: Feishu's notes say the older endpoint does not refuse a verifier when it holds no challenge for the code, so a successful exchange there does not show that PKCE was checked. What still stands is the app's secret at the exchange, the single-use state bound to the invited person, the identity check and the exact-scope check. It is off unless turned on, per app.
 
 For now an authorisation lasts as long as the token Feishu issues, about two hours; after that the person is invited again.
 

@@ -12,7 +12,7 @@ import { call, installFakeModel, model, modelCalls, say, wake } from "./helpers"
 const TENANT = "docs";
 const APP_ID = "cli_docs";
 const ORG = "org_1";
-const APP: FeishuApp = { app_id: APP_ID, tenant: TENANT, app_secret: "app-secret", encrypt_key: null, verification_token: null, bot_open_id: "ou_bot", token: null, token_expires_at: null, transport: "long_connection" };
+const APP: FeishuApp = { app_id: APP_ID, tenant: TENANT, app_secret: "app-secret", encrypt_key: null, verification_token: null, bot_open_id: "ou_bot", token: null, token_expires_at: null, transport: "long_connection", oauth_v2: 0 };
 
 /** Feishu, as far as these tests need it. */
 const feishu = {
@@ -25,6 +25,8 @@ const feishu = {
   consented: new Map<string, string[]>(),
   /** How many of the bot's next messages Feishu fails to take. */
   failSends: 0,
+  /** Every token exchange: which endpoint, for which app. */
+  exchanges: [] as { endpoint: string; app: string }[],
   /** How often the bot tried to send a card. */
   sendAttempts: 0,
   /** Feishu says the token does not cover looking up wiki pages. */
@@ -49,6 +51,7 @@ function installFakeFeishu() {
   feishu.reads.length = 0;
   feishu.consented.clear();
   feishu.failSends = 0;
+  feishu.exchanges.length = 0;
   feishu.sendAttempts = 0;
   feishu.wikiNotCovered = false;
   feishu.duringRead = undefined;
@@ -67,7 +70,9 @@ function installFakeFeishu() {
       if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id, type: body.msg_type, content: JSON.parse(body.content), uuid: body.uuid });
       return Response.json({ code: 0, data: { message_id: "om_1" } });
     }
-    if (url.host === "accounts.feishu.cn" && url.pathname === "/oauth/v3/token") {
+    const tokenEndpoint = url.host === "accounts.feishu.cn" && url.pathname === "/oauth/v3/token" ? "v3" : url.host === "open.feishu.cn" && url.pathname === "/open-apis/authen/v2/oauth/token" ? "v2" : undefined;
+    if (tokenEndpoint) {
+      feishu.exchanges.push({ endpoint: tokenEndpoint, app: body.client_id });
       const consent = feishu.codes.get(body.code);
       // A code can be offered once, whatever comes of it.
       feishu.codes.delete(body.code);
@@ -550,9 +555,39 @@ describe("reading a Feishu document as the person who asked", () => {
     } finally {
       log.mockRestore();
     }
-    expect(lines.filter((line) => line.includes("feishu_authorisation_refused")).map((line) => JSON.parse(line))).toEqual([{ feishu_authorisation_refused: "exchange_failed", app: APP_ID, status: 400, code: 20068 }]);
+    expect(lines.filter((line) => line.includes("feishu_authorisation_refused")).map((line) => JSON.parse(line))).toEqual([{ feishu_authorisation_refused: "exchange_failed", app: APP_ID, status: 400, code: 20068, endpoint: "v3" }]);
     expect(feishu.tokens.size).toBe(issued);
     expect(await (await judy.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly" });
+  });
+
+  it("exchanges at the newer endpoint unless the operator has switched that one app to the older", async () => {
+    const admin = (app: string, token_endpoint: unknown) =>
+      (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${app}/oauth`, { method: "POST", headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, body: JSON.stringify({ token_endpoint }) })) as Promise<Response>;
+    const registry = (env as any).REGISTRY.getByName("global");
+    await registry.setFeishuApp(TENANT, { app_id: "cli_other", app_secret: "other-secret", transport: "long_connection" });
+    const quinn = someone();
+    feishu.docs.set("DocQuinn000000000001", { readers: [quinn.openId], text: "Quinn's." });
+    const authorise = async () => {
+      await (await quinn.grant()).drop(quinn.who);
+      await authorised(quinn, "DocQuinn000000000001");
+      return feishu.exchanges.at(-1);
+    };
+    try {
+      expect(await authorise()).toEqual({ endpoint: "v3", app: APP_ID });
+      expect((await admin("cli_unknown", "v2")).status).toBe(404);
+      expect((await admin(APP_ID, "v1")).status).toBe(400);
+      expect(await (await admin(APP_ID, "v2")).json()).toEqual({ ok: true, token_endpoint: "v2" });
+      expect(await authorise()).toEqual({ endpoint: "v2", app: APP_ID });
+      // Only that app, and it survives the app being registered again.
+      expect((await registry.feishuApp("cli_other")).oauth_v2).toBe(0);
+      await registry.setFeishuApp(TENANT, { app_id: APP_ID, app_secret: "app-secret", bot_open_id: "ou_bot", transport: "long_connection" });
+      expect(await authorise()).toEqual({ endpoint: "v2", app: APP_ID });
+      // One exchange per authorisation, at one endpoint.
+      expect(feishu.exchanges.length).toBe(3);
+    } finally {
+      await admin(APP_ID, "v3");
+    }
+    expect(await authorise()).toEqual({ endpoint: "v3", app: APP_ID });
   });
 
   it("is not narrowed by finishing an older, smaller invitation last", async () => {
