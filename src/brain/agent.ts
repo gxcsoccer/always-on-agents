@@ -22,7 +22,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
-import type { QuestionFate } from "../workers/sandbox/task";
+import { MAX_RESULT_TEXT, type QuestionFate } from "../workers/sandbox/task";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
@@ -1480,7 +1480,7 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
     const told = body.delivered ? `The people here have already been asked by the system, with the code ${body.code}. Do not ask again. When one of them replies, pass their decision on with answer_task.` : "The question could not be delivered to anyone here.";
     return `${head} is paused and needs approval to ${what} ${told}`;
   }
-  if (kind === "result") return `${head} finished. The worker's own summary (unverified): ${String(body.text ?? "").slice(0, 3_000)}`;
+  if (kind === "result") return `${head} finished. The worker's own summary (unverified): ${String(body.text ?? "").slice(0, MAX_RESULT_TEXT)}`;
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
   return `${head} was lost: its sandbox stopped and could not be restored.`;
 }
