@@ -9,6 +9,7 @@ import { registry } from "./registry";
 
 export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
+export { FeishuGrant } from "./connectors/feishu-grant";
 export { FeishuLink } from "./connectors/feishu-link";
 export { Outbound } from "./workers/sandbox/outbound";
 export { DirectoryBackupGateway, TaskSandbox } from "./workers/sandbox/task";

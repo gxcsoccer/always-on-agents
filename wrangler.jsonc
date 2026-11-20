@@ -18,14 +18,16 @@
     "WORKER_MODEL": "gpt-6-sol"
   },
   // Secrets (wrangler secret put / .dev.vars): OPENAI_API_KEY, ADMIN_KEY,
-  // optional GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN
+  // optional GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN; for reading people's Feishu documents:
+  // PUBLIC_ORIGIN (https://your.domain) and GRANTS_KEY (32+ random characters)
   "r2_buckets": [{ "binding": "CHECKPOINTS", "bucket_name": "always-on-agent-checkpoints" }],
   "durable_objects": {
     "bindings": [
       { "name": "BRAIN", "class_name": "BrainAgent" },
       { "name": "TASKS", "class_name": "TaskSandbox" },
       { "name": "REGISTRY", "class_name": "Registry" },
-      { "name": "FEISHU_LINKS", "class_name": "FeishuLink" }
+      { "name": "FEISHU_LINKS", "class_name": "FeishuLink" },
+      { "name": "FEISHU_GRANTS", "class_name": "FeishuGrant" }
     ]
   },
   "containers": [
@@ -41,7 +43,8 @@
     "BrainAgent": { "type": "durable-object", "storage": "sqlite" },
     "TaskSandbox": { "type": "durable-object", "storage": "sqlite" },
     "Registry": { "type": "durable-object", "storage": "sqlite" },
-    "FeishuLink": { "type": "durable-object", "storage": "sqlite" }
+    "FeishuLink": { "type": "durable-object", "storage": "sqlite" },
+    "FeishuGrant": { "type": "durable-object", "storage": "sqlite" }
   },
   // The backstop for Feishu long connections; see `scheduled` in src/index.ts.
   "triggers": { "crons": ["* * * * *"] },

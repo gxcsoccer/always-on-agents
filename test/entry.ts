@@ -7,6 +7,7 @@ import type { Env } from "../src/env";
 import production from "../src/index";
 
 export { BrainAgent } from "../src/brain/agent";
+export { FeishuGrant } from "../src/connectors/feishu-grant";
 export { FeishuLink } from "../src/connectors/feishu-link";
 export { Registry } from "../src/registry";
 export { Outbound } from "../src/workers/sandbox/outbound";

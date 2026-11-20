@@ -148,6 +148,28 @@ curl -X POST $B/v1/admin/tenants/acme/chat-repos -H "authorization: Bearer $ADMI
 
 之后在这个群里派出的任务就能克隆并推送到那个仓库（推送仍然需要批准）。传 `"repo": null` 可以解除绑定，立即生效，对正在运行的任务也一样。单聊不能绑定。
 
+### 读取某个人的文档
+
+在单聊里，一个人可以把飞书文档的链接（`…/docx/…`，或者本身是文档的 `…/wiki/…` 页面）发给 agent 并就它提问。agent **以这个人的身份**、用这个人自己的权限去读，用的工具是 `feishu_read_document`。这个人打不开的，agent 也替他打不开；机器人自己能打开什么，与此无关。
+
+- **这个人在飞书里授权一次。** 第一次时，机器人给他发一张卡片，上面是飞书授权页的链接（OAuth + PKCE）。链接只能用一次，10 分钟内有效，而且只对他本人有效：飞书把浏览器送回来时，只有飞书确认这个令牌属于收到卡片的那个人、且在同一个组织内，令牌才会被保存。之后他把请求再发一次即可。
+- **只读这个人在本次请求里亲自提到的文档。** agent 读到的文字无法把它引到另一篇文档上。
+- **令牌加密保存**，每个人、每个应用各有一个独立的对象，密钥由 `GRANTS_KEY` 这个密钥派生。令牌不会给模型看，不会写进日志，任何接口也不会返回它。
+- **这个人无权打开某篇文档，不影响他的授权。** 飞书不再认可的令牌会被丢弃，并重新邀请他授权。
+- [工具](#工具)一节的规则全部适用：只在单聊里提供；读过文档的那次运行只能回复这个人。
+
+开通步骤：
+
+1. 在开发者后台，为应用开通**用户身份**权限 `docx:document:readonly` 和 `wiki:node:read`；在安全设置里登记重定向 URL `https://<你的域名>/v1/feishu/oauth/callback`；发布一个版本。要授权的人必须在应用的可用范围内。
+2. 给 Worker 设置两个密钥：`PUBLIC_ORIGIN`（`https://<你的域名>`）和 `GRANTS_KEY`（32 个以上的随机字符，比如 `openssl rand -base64 48` 的输出）。
+
+```bash
+# 这个人的授权还在吗？DELETE 会收回它，包括还在进行中的授权。
+curl $B/v1/admin/feishu-grants/cli_xxx/<tenant_key>/<open_id> -H "authorization: Bearer $ADMIN_KEY"
+```
+
+目前一次授权的有效期就是飞书签发的令牌的有效期，大约两小时；过期后会重新邀请授权。
+
 ### 语言
 
 卡片上的固定文字目前只有中文。
@@ -183,7 +205,7 @@ export const exampleConnector: Connector = {
 
 ### 工具
 
-connector 可以给 agent 提供工具：agent 可以替某一个人在外部系统里做的事，比如以这个人的身份读一篇文档。一个工具是 `{ name, description, effect: "read", parameters, run(context, args) }`，名字是 `<connector 名>_…`。目前只有只读的工具。`context.person` 是这次调用替谁做；工具必须以这个人的身份行事，不能是别人。
+connector 可以给 agent 提供工具：agent 可以替某一个人在外部系统里做的事，比如以这个人的身份读一篇文档。一个工具是 `{ name, description, effect: "read", parameters, run(context, args) }`，名字是 `<connector 名>_…`。目前只有只读的工具。`context.person` 是这次调用替谁做；工具必须以这个人的身份行事，不能是别人。`context.said` 是这个人在触发这次运行的消息里写的原话，工具可以据此只做他本人要求的事。
 
 connector 的工具什么时候存在、替谁存在，由核心决定：
 

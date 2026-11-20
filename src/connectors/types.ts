@@ -77,6 +77,11 @@ export interface ToolContext {
   person: string;
   /** What the connector verified about where that person's messages came from. */
   origin: Record<string, string>;
+  /**
+   * What the person wrote in the messages that started this run, one entry per message. A tool
+   * can hold a call to what the person themselves asked for, whatever the model was led to ask.
+   */
+  said: string[];
   /** Names this call; the same on a repeat. */
   callId: string;
 }

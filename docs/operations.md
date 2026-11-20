@@ -39,6 +39,8 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `GITHUB_BOT_HANDLE` | secret | The agent's account name on GitHub (an App's slug). How people address it. |
 | `GITHUB_BOT_EMAIL` | secret | The address sandbox commits are made under. |
 | `GITHUB_TOKEN` | secret | One token for every repository, used only when no App is configured. Local development only. |
+| `PUBLIC_ORIGIN` | secret or variable | Where the deployment is reached from outside, such as `https://agent.example.com`. Needed for reading people's Feishu documents: it is where Feishu sends them back after they authorise. |
+| `GRANTS_KEY` | secret | Seals the tokens people's authorisations produce. 32 or more random characters. Changing it makes every stored authorisation unreadable, and people are invited to authorise again. |
 | `GATE_HOLD_PATTERN` | secret or variable | Optional regular expression for shell commands inside the sandbox that a person must approve. Default: none. |
 
 The sandboxed coding agent and its version are fixed in the `Dockerfile`.
@@ -69,6 +71,7 @@ Every request carries `authorization: Bearer $ADMIN_KEY`. There is one admin key
 | `POST /v1/admin/tasks/:id/probe` | Runs checks inside the task's container (what it can reach, what it holds). |
 | `POST /v1/admin/tasks/:id/kill-container` | Destroys the container, to exercise recovery. |
 | `GET /v1/admin/feishu-links/:app_id` | The state of a Feishu long connection. |
+| `GET`, `DELETE /v1/admin/feishu-grants/:app_id/:tenant_key/:open_id` | Whether one person's authorisation to read their documents stands; `DELETE` takes it away. Never returns a token. |
 
 ### Other endpoints
 
@@ -77,6 +80,7 @@ Every request carries `authorization: Bearer $ADMIN_KEY`. There is one admin key
 | `GET /healthz` | Liveness. |
 | `POST /v1/github/webhook` | GitHub deliveries. |
 | `POST /v1/feishu/events/:app_id` | Feishu deliveries (webhook transport). |
+| `GET /v1/feishu/oauth/callback` | Where Feishu sends a person's browser after they authorise reading their documents. |
 | `/v1/console/...` | The console connector; authenticated with a tenant API key. See [Connectors](connectors.md). |
 
 ## Watching it

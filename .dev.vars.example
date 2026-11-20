@@ -17,3 +17,7 @@ ADMIN_KEY=change-me
 
 # Optional: a regular expression for shell commands inside the sandbox that a person must approve.
 # GATE_HOLD_PATTERN=\\brm\\s+-[a-z]*r
+
+# Reading people's Feishu documents with their own authorisation.
+# PUBLIC_ORIGIN=https://agent.example.com
+# GRANTS_KEY=at-least-32-random-characters

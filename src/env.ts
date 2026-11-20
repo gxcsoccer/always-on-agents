@@ -1,5 +1,6 @@
 import type { BrainAgent } from "./brain/agent";
 import type { Registry } from "./registry";
+import type { FeishuGrant } from "./connectors/feishu-grant";
 import type { FeishuLink } from "./connectors/feishu-link";
 import type { TaskSandbox } from "./workers/sandbox/task";
 
@@ -8,6 +9,7 @@ export interface Env {
   TASKS: DurableObjectNamespace<TaskSandbox>;
   REGISTRY: DurableObjectNamespace<Registry>;
   FEISHU_LINKS: DurableObjectNamespace<FeishuLink>;
+  FEISHU_GRANTS: DurableObjectNamespace<FeishuGrant>;
   CHECKPOINTS: R2Bucket;
 
   /** Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host. */
@@ -28,6 +30,13 @@ export interface Env {
   GITHUB_BOT_EMAIL?: string;
   /** Optional: a regular expression for shell commands inside the sandbox that a person must approve. Default: none. */
   GATE_HOLD_PATTERN?: string;
+  /**
+   * Where this deployment is reached from outside, such as https://agent.example.com. Needed for
+   * anything that sends a person's browser back here, such as authorising access to their documents.
+   */
+  PUBLIC_ORIGIN?: string;
+  /** Seals the tokens people's authorisations produce. At least 32 characters; keep it out of storage. */
+  GRANTS_KEY?: string;
   /** A single deployment-wide token, used only when no App is configured. For local development. */
   GITHUB_TOKEN?: string;
 }

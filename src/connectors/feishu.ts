@@ -19,16 +19,27 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
+import { API, hex, tenantAccessToken } from "./feishu-api";
+import { handleOauthCallback, readDocument } from "./feishu-docs";
+import { grantOf } from "./feishu-grant";
 import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
   async http(request, env, path, ingress) {
     if (path[0] === "events" && path[1] && request.method === "POST") return handleFeishuWebhook(request, env, path[1], (work) => ingress.defer(work));
+    // Where Feishu sends a person back to after they authorise reading their documents.
+    if (path[0] === "oauth" && path[1] === "callback" && path.length === 2 && request.method === "GET") return handleOauthCallback(request, env, (work) => ingress.defer(work));
     return json({ error: "not found" }, 404);
   },
   async admin({ method, path, url, body }, env) {
     if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
+    // One person's authorisation to read their documents: whether it stands, and taking it away.
+    if (path[0] === "feishu-grants" && path.length === 4 && (method === "GET" || method === "DELETE")) {
+      const grant = await grantOf(env, { app_id: path[1], tenant_key: path[2], open_id: path[3] });
+      if (method === "DELETE") await grant.drop();
+      return json(await grant.status());
+    }
     if (path[0] !== "tenants" || path[2] !== "feishu-apps" || method !== "POST") return undefined;
     const app = await body();
     await registry(env).setFeishuApp(path[1], {
@@ -56,9 +67,9 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   channel: { deliver: deliverFeishu, amend: amendFeishu },
+  tools: [readDocument],
 };
 
-const API = "https://open.feishu.cn/open-apis";
 /** Feishu signs with a timestamp; anything much older is a replay. */
 /** How long a card press may take to be filed before Feishu's three-second limit forces an answer. */
 const PRESS_FILING_BUDGET_MS = 2_000;
@@ -413,27 +424,6 @@ export function approvalCard(ask: NonNullable<OutboundMessage["ask"]>, to: "chat
       { tag: "note", elements: [plain(`${to === "chat" ? "也可以先 @我，再输入" : "也可以输入"}${ask.can_approve ? `「批准 ${ask.code}」或` : ""}「拒绝 ${ask.code}」`)] },
     ],
   };
-}
-
-/** The app's tenant_access_token, cached in the registry until shortly before it expires. */
-async function tenantAccessToken(env: Env, appId: string): Promise<string> {
-  const app = await registry(env).feishuApp(appId);
-  if (!app) throw new Error("unknown Feishu app");
-  if (app.token && app.token_expires_at && app.token_expires_at - Date.now() > 5 * 60_000) return app.token;
-  const response = await fetch(`${API}/auth/v3/tenant_access_token/internal`, {
-    method: "POST",
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ app_id: app.app_id, app_secret: app.app_secret }),
-  });
-  const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
-  if (!response.ok || result.code !== 0 || !result.tenant_access_token) throw new Error(`Feishu token request failed: ${response.status} code ${result.code} ${String(result.msg).slice(0, 200)}`);
-  await registry(env).saveFeishuToken(appId, result.tenant_access_token, Date.now() + (result.expire ?? 0) * 1_000);
-  return result.tenant_access_token;
-}
-
-async function hex(text: string): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
-  return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function json(data: unknown, status = 200): Response {
