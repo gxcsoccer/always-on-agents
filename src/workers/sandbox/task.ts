@@ -25,6 +25,7 @@ import { githubTokenFor } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
 import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
+import { MAX_RESULT_TEXT, type QuestionFate, clipResult } from "./result";
 
 // Lets the container upload and download one checkpoint object in R2, and nothing else.
 export { DirectoryBackupGateway } from "@cloudflare/sandbox";
@@ -130,7 +131,6 @@ export interface TaskState {
   error?: string;
 }
 
-export type QuestionFate = { state: "decided"; decision: "allow" | "deny"; standing?: boolean } | { state: "pending" | "undecided" | "unknown" };
 
 export interface StartInput {
   /** Scope name of the Brain to report to. Without it the task runs but reports to nobody. */
@@ -190,13 +190,6 @@ const PROXY_ABANDONED_MS = 60 * 1_000;
 const GATE_HOLD_MS = 57 * 60 * 1_000;
 const GATE_ABANDONED_MS = 5 * 60 * 1_000;
 const MAX_SHOWN_COMMAND = 3_000;
-/**
- * How much of a worker's final answer is kept and passed to the Brain. The same as the longest
- * message the Brain can send, so an answer that fits can be passed on whole. A longer one is cut
- * and says so; the worker is told the limit.
- */
-export const MAX_RESULT_TEXT = 8_000;
-const CUT_OFF = "\n[The worker's answer was longer than this and was cut off here.]";
 // The gate waits this long for an answer, then blocks the call.
 const MAX_WAIT_FOR_ANSWER_S = 55 * 60;
 const CA_PATH = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
@@ -220,8 +213,8 @@ printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
-Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Keep it under 6,000 characters: anything much longer is cut off.
-The network reaches the model and this task's git repository only. Nothing can be downloaded from package registries such as npm or PyPI. You can still run whatever works with the tools in this sandbox and the files in the repository; if a check needs a download, say that it could not be run instead of trying.
+Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Aim for under 6,000 characters, most important first: beyond ${MAX_RESULT_TEXT.toLocaleString("en-US")} it is cut off.
+Use git on the repository you were given. Package registries such as npm and PyPI are unavailable, and so are GitHub's comment and pull request APIs. You can still run whatever works with the tools in this sandbox and the files in the repository; if a check needs a download, say that it could not be run instead of trying.
 After each meaningful step, run the shell command: report progress "<one sentence on what you just finished>"
 Some commands pause until a person approves them; that is expected, just wait. A git push in particular is held until someone approves it, which can take up to an hour: run it with a timeout of at least 3600 seconds, and never treat the wait as a failure, cancel it, or retry it while it is waiting.
 If a command is denied, do not retry it or work around it; say so in your final answer.`;
@@ -1112,7 +1105,7 @@ export class TaskSandbox extends DurableObject<Env> {
       const summary = summarize(events);
       state.thread_id = summary.session_id ?? state.thread_id;
       run.result = {
-        text: summary.text && summary.text.length > MAX_RESULT_TEXT ? summary.text.slice(0, MAX_RESULT_TEXT - CUT_OFF.length) + CUT_OFF : summary.text,
+        text: summary.text === undefined ? undefined : clipResult(summary.text),
         stop_reason: summary.stop_reason,
         turns: summary.turns,
         tool_calls: summary.tool_calls,

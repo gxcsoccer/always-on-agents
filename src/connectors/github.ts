@@ -276,6 +276,8 @@ export function normalize(
           number,
           comment_id: payload.comment.id,
           is_pull_request: Boolean(payload.issue.pull_request),
+          // Shown to the model next to the comment, which on its own does not say where it was made.
+          where: `${payload.issue.pull_request ? "pull request" : "issue"} #${number} of ${repo}`,
           // Which revision of which comment this is, so a later edit or deletion can void it.
           subject,
           revision,
