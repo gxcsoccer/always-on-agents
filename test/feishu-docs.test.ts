@@ -67,7 +67,7 @@ function installFakeFeishu() {
       if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id, type: body.msg_type, content: JSON.parse(body.content), uuid: body.uuid });
       return Response.json({ code: 0, data: { message_id: "om_1" } });
     }
-    if (url.host === "accounts.feishu.cn" && url.pathname === "/oauth/v3/token") {
+    if (url.host === "open.feishu.cn" && url.pathname === "/open-apis/authen/v2/oauth/token") {
       const consent = feishu.codes.get(body.code);
       // A code can be offered once, whatever comes of it.
       feishu.codes.delete(body.code);

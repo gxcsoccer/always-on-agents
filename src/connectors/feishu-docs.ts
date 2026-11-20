@@ -20,7 +20,15 @@ import { API, sendToPerson } from "./feishu-api";
 import { SCOPES, type Who, grantName, grantOf, grantsKey } from "./feishu-grant";
 import type { ConnectorTool, ToolContext } from "./types";
 
-const TOKEN = "https://accounts.feishu.cn/oauth/v3/token";
+/**
+ * Feishu's token endpoint, the one its own authorisation page says to pair with PKCE. The newer
+ * one (accounts.feishu.cn/oauth/v3/token) turned down our verifier with 20049 against the real
+ * service, for a challenge computed as RFC 7636 says; Feishu's notes say that endpoint refuses a
+ * verifier when it holds no challenge for the code, and that this one does not. Request and
+ * response are otherwise the same. The exchange still needs the app's secret, and the token is
+ * still kept only if it is the invited person's.
+ */
+const TOKEN = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
 /** How much of a document one read returns. */
 export const MAX_DOCUMENT_TEXT = 40_000;
 /** Feishu's codes for "this user token is no good": invalid, expired, or lacking what the person must grant. */
