@@ -572,7 +572,7 @@ describe("tasks and approvals", () => {
     expect(toolOutputs().at(-1).error).toBeDefined();
     expect(await answersSent(id)).toHaveLength(0);
     // A press on this question's own card.
-    const own = await stub.outboxSince(0);
+    const own = await stub.outboxSince("console", 0);
     const idem = `ask:${id}:1`;
     expect(own.some((m: any) => m.text.includes(code))).toBe(true);
     await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat", data: { card: true, question: idem } }));
@@ -753,7 +753,7 @@ describe("tasks and approvals", () => {
     expect(row.status).toBe("withdrawn");
     expect(JSON.parse(row.closed)).toEqual({ state: "withdrawn" });
     // Nobody was shown it.
-    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
+    expect((await scope.stub.outboxSince("console", 0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
   });
 
   it("does not let a closed question that is backing off hold up the messages behind it, or show on the console", async () => {
@@ -770,7 +770,7 @@ describe("tasks and approvals", () => {
     });
     await scope.stub.taskEvent(id, 2, "result", { text: "done without it" });
     // Closed but not yet flushed: the console does not show it.
-    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
+    expect((await scope.stub.outboxSince("console", 0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
     model.replies([say("the task finished")], [say("")]);
     await wake(scope.stub);
     const rows = await runInDurableObject(scope.stub, (_instance: unknown, state: DurableObjectState) => [...state.storage.sql.exec("SELECT idem, status FROM outbox ORDER BY id")] as any[]);
@@ -818,7 +818,7 @@ describe("tasks and approvals", () => {
     // Out of the ordered queue, waiting its turn to be looked for; not sent, not dropped.
     expect(rows.find((r) => r.idem === `ask:${id}:1`).status).toBe("reconciling");
     expect(rows.filter((r) => r.idem !== `ask:${id}:1`).every((r) => r.status === "sent")).toBe(true);
-    expect((await scope.stub.outboxSince(0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
+    expect((await scope.stub.outboxSince("console", 0)).some((m: any) => m.text.includes("needs approval"))).toBe(false);
   });
 
   it("takes questions that were pending before the send marker existed as possibly sent", async () => {
@@ -833,6 +833,10 @@ describe("tasks and approvals", () => {
       sql.exec("ALTER TABLE outbox DROP COLUMN started");
       sql.exec("DROP TABLE unsettled");
       sql.exec("ALTER TABLE outbox DROP COLUMN review");
+      sql.exec("DROP INDEX items_outside");
+      sql.exec("DROP INDEX inbox_run");
+      sql.exec("ALTER TABLE items DROP COLUMN outside");
+      sql.exec("ALTER TABLE outbox DROP COLUMN private");
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
@@ -1295,7 +1299,7 @@ describe("records and limits", () => {
     await stub.taskEvent(id, 1, "needs_input", { source: "proxy", id: "q-1", action: "git_push", resource: "acme/demo", summary });
     model.replies([say("")]);
     await wake(stub);
-    const question = (await stub.outboxSince(0)).find((m: any) => m.text.includes("needs approval")).text;
+    const question = (await stub.outboxSince("console", 0)).find((m: any) => m.text.includes("needs approval")).text;
     // What people are shown is the push itself, ref by ref, not a paraphrase.
     expect(question).toContain(summary);
 
@@ -1377,7 +1381,7 @@ describe("records and limits", () => {
     const id = (await stub.inspect()).tasks[0].id;
     expect(await stub.quotesOpenQuestion("HTTP and TODO", "pr:1")).toBe(false);
     await stub.taskEvent(id, 1, "needs_input", { source: "gate", id: "q-1", command: "rm -rf x" });
-    const code = (await stub.outboxSince(0)).find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
+    const code = (await stub.outboxSince("console", 0)).find((m: any) => m.text.includes("needs approval")).text.match(/approve ([A-Z0-9]{4})/)[1];
     expect(await stub.quotesOpenQuestion(`${"word ".repeat(10_000)} no ${code.toLowerCase()}`, "pr:1")).toBe(true);
     expect(await stub.quotesOpenQuestion("HTTP and TODO", "pr:1")).toBe(false);
     // The same code quoted in another pull request is not a reply to this question.

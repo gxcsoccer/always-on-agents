@@ -9,6 +9,7 @@
  *   - `admin`:     the operator's requests for setting it up
  *   - `scheduled`: work to do every minute, such as keeping a connection open
  *   - `channel`:   delivering the agent's messages to a conversation in that system
+ *   - `tools`:     things the agent can do in that system on one person's behalf
  *
  * A connector that only reports events (a CI notifier, say) has `http` and nothing else.
  *
@@ -35,6 +36,49 @@ export interface Connector {
   /** Called every minute. */
   scheduled?(env: Env): Promise<void>;
   channel?: Channel;
+  /** Named `<connector name>_…`. See ConnectorTool for when they are offered. */
+  tools?: ConnectorTool[];
+}
+
+/**
+ * Something the agent can do in an outside system for one person, as that person.
+ *
+ * A connector's tools are offered only where it is beyond doubt whose authority a call carries:
+ * in a person's own private conversation, in a run started by nothing but that person's own
+ * messages, all of which arrived through this connector with the same verified origin. The Brain
+ * decides this; the model cannot choose whom a tool acts for, and neither can the tool's
+ * arguments.
+ *
+ * What a tool returns comes from outside and may be written by anyone, and what the model goes on
+ * to say carries it. The Brain treats it so: from the first such call on, the run can only reply
+ * to the person and read again; and when the run ends everything it produced is removed from the
+ * conversation's record, leaving a note that something was read.
+ *
+ * A tool call may be repeated after an interruption, so a tool must be safe to run twice.
+ */
+export interface ConnectorTool {
+  name: string;
+  description: string;
+  /**
+   * What the tool does to the outside system. Only "read" exists: a tool that looks and changes
+   * nothing. Once a run has read outside text, reading again is the only thing a connector's tool
+   * may still do in it.
+   */
+  effect: "read";
+  /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
+  parameters: Record<string, unknown>;
+  run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface ToolContext {
+  env: Env;
+  scope: Scope;
+  /** The one person this run acts for, as the connector identified them. */
+  person: string;
+  /** What the connector verified about where that person's messages came from. */
+  origin: Record<string, string>;
+  /** Names this call; the same on a repeat. */
+  callId: string;
 }
 
 export interface Ingress {

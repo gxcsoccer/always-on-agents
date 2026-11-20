@@ -19,7 +19,8 @@ curl -X POST $B/v1/console/users/alice/messages -H "authorization: Bearer $TENAN
 curl -X POST $B/v1/console/chats/team/messages -H "authorization: Bearer $TENANT_KEY" \
   -H 'content-type: application/json' -d '{"user":"bob","text":"@agent summarise this thread"}'
 
-# Read what the agent said. `after` is the last message id seen; `wait` long-polls up to 25 seconds.
+# Read what the agent said to the console. `after` is the last message id seen; `wait` long-polls up to 25 seconds.
+# Messages the agent sent through another connector (to a Feishu chat, say) are not returned here.
 curl "$B/v1/console/users/alice/messages?after=0&wait=25" -H "authorization: Bearer $TENANT_KEY"
 ```
 
@@ -165,6 +166,8 @@ export const exampleConnector: Connector = {
   async scheduled(env) {},
   // Optional: delivering the agent's messages
   channel: { deliver, amend, standing },
+  // Optional: things the agent can do in that system for one person
+  tools: [{ name: "example_read", description, parameters, run }],
 };
 ```
 
@@ -176,6 +179,20 @@ Each part is optional and independent. A connector that only reports events (a C
 | `channel.deliver` | Send one message. Throw if it was not delivered. It will be retried, so use the message's `idem` key to avoid sending twice. |
 | `channel.amend` | Optional. Show a delivered approval question as closed. |
 | `channel.standing` | Required if people can edit or delete what they said in that system. See below. |
+
+### Tools
+
+A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else.
+
+The core decides when a connector's tools exist at all, and for whom:
+
+- **Only where it is beyond doubt whose authority a call carries.** Tools are offered in a person's own scope, in their private conversation through this connector, in a run started by nothing but ordinary messages that person wrote to the agent there. To make that possible a connector gives such messages `data.origin` (what it verified about where they came from, such as the app and the organisation; every value non-empty), `data.direct: true`, and the session key `privateSessionKey(name, origin)` from `src/events.ts`. A button press, a reply to a question, something routed from elsewhere, a timer, a worker's report, another person's message, or a message through another connector: any of these in the batch and the tools are not there. In a group or a repository they never are.
+- **The private conversation is its own.** The same user id can be reached in other ways, for instance by a tenant's backend through the console. Those are other conversations with their own history; nothing said in the private one is shown to them.
+- **Arguments cannot choose the person.** `context.person` comes from the stored events, worked out again at each call.
+- **What a tool returns is outside text, and so is what is made of it.** From its first use of a connector's tool, a run can do two things only: reply to the person, and read again. Every other tool is refused, by a list of what is allowed rather than of what is forbidden. When the run ends, everything it produced is removed from the conversation's record, the original text and the model's own words alike, and replaced by one fixed note. The messages it wrote are emptied, in every form, once they have been delivered or given up, and the text of its errors is not kept. A later run reads again from what the person themselves pointed to. While a run is still under way (paused for a budget, or retrying), its record is kept.
+- **Nothing is routed across a private conversation.** A reply elsewhere that names an open question's code is normally taken to that question. Not into or out of a private conversation.
+- **Every call is audited** (`tool.used`, with the person and the tool, not the arguments).
+- A call may be repeated after an interruption, so a tool must be safe to run twice.
 
 ### What the core decides, whatever a connector says
 

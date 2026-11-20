@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { approvalCard, decrypt, normalize, normalizeCardAction, sentAt, verifySignature } from "../src/connectors/feishu";
+import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
 const Q = "ask:11111111-2222-3333-4444-555555555555:1";
@@ -51,7 +52,20 @@ describe("turning a Feishu message into an event", () => {
   it("puts a direct message in the sender's own scope", () => {
     const result = normalize(app, envelope({ chat_type: "p2p" }));
     expect(result?.scope).toEqual({ tenant: "acme", kind: "user", id: "ou_alice" });
-    expect(result?.event).toMatchObject({ source: "feishu", source_id: "om_1", session_key: "dm", text: "hello", principal: { kind: "human", id: "ou_alice", explicit: true } });
+    expect(result?.event).toMatchObject({ source: "feishu", source_id: "om_1", text: "hello", principal: { kind: "human", id: "ou_alice", explicit: true } });
+    // A direct chat is that person's private conversation through this app and organisation,
+    // and what they write there is an ordinary request in their own words.
+    const origin = result?.event.data?.origin as Record<string, string>;
+    expect(origin).toMatchObject({ app_id: "cli_test" });
+    expect(origin.tenant_key).toBeTruthy();
+    expect(result?.event.session_key).toBe(privateSessionKey("feishu", origin));
+    // Written out as data, so no choice of values can make two origins read the same.
+    expect(privateSessionKey("x", { a: "1,b=2" })).not.toBe(privateSessionKey("x", { a: "1", b: "2" }));
+    expect(result?.event.data?.direct).toBe(true);
+    // In a group it is neither.
+    const group = normalize(app, envelope({ chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }], content: JSON.stringify({ text: "@_user_1 hello" }) }));
+    expect(group?.event.session_key).toBe("chat");
+    expect(group?.event.data?.direct).toBeUndefined();
     expect(result?.event.reply_to).toEqual({ connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_chat" } });
   });
 

@@ -17,16 +17,16 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
-import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
-import { type Item, ModelError, messageText, respond } from "../model/openai";
+import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, isPrivateSession, privateSessionKey, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
+import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
 import { registry } from "../registry";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
-import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, executeTool } from "./tools";
+import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, describeTool, executeTool } from "./tools";
 
 /** Events arriving within this window are answered in one run. */
 const BATCH_WINDOW_MS = 2_000;
@@ -59,6 +59,10 @@ const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
+const READ_OUTSIDE = "this run has read text from outside through a tool. From then on it can only reply to the person with send_message and read again; no other tool can be used in it. If the person wants something else done, they can ask for it in a new message";
+const OUTSIDE_REMOVED = "[In this turn you answered using a tool that read text from outside. What it returned, and what you said and did with it, are not kept here. If the content is needed again, read it again from what the person themselves pointed to.]";
+const DELIVERY_WITHHELD = "delivery failed; the details are not kept";
+const ERROR_WITHHELD = "failed after reading outside text; the details are not kept";
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
 const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
@@ -89,6 +93,8 @@ interface RunRow {
 
 export class BrainAgent extends DurableObject<Env> {
   readonly #sql: SqlStorage;
+  /** Calls in this invocation whose result came from a connector's tool, until they are recorded. */
+  readonly #outside = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -131,7 +137,10 @@ export class BrainAgent extends DurableObject<Env> {
       );
       // Its answer goes where the question was asked, not to wherever the reply came from. Where it
       // did come from is kept: what the same person says there next still bears on it.
-      if (sessions.size === 1 && !sessions.has(event.session_key)) {
+      // Not into or out of someone's private conversation: what is said there stays there, and what
+      // is said elsewhere is not written into it.
+      const crosses = isPrivateSession(event.session_key) || [...sessions].some(isPrivateSession);
+      if (sessions.size === 1 && !sessions.has(event.session_key) && !crosses) {
         event = { ...event, session_key: [...sessions][0], reply_to: undefined, data: { ...event.data, routed_from: event.session_key } };
       }
     }
@@ -347,9 +356,11 @@ export class BrainAgent extends DurableObject<Env> {
       const dangling = danglingCalls(items);
       if (dangling.length > 0) {
         for (const call of dangling) {
-          const output = await executeTool(this.#toolHost(run), call);
+          // Decided at the moment of use, a repeat after an interruption included.
+          const output = this.#mayUse(runId, call.name) ? await executeTool(this.#toolHost(run), call) : JSON.stringify({ error: READ_OUTSIDE });
+          const outside = this.#outside.delete(call.call_id);
           if (!this.#stillActive(runId)) return;
-          this.#append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output });
+          this.#append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output }, outside);
         }
         continue;
       }
@@ -386,7 +397,7 @@ export class BrainAgent extends DurableObject<Env> {
           model: this.env.BRAIN_MODEL,
           instructions: this.#instructions(),
           input: items,
-          tools: TOOLS,
+          tools: this.#toolsFor(runId),
         });
       } catch (err) {
         await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
@@ -421,12 +432,14 @@ export class BrainAgent extends DurableObject<Env> {
     const message = err instanceof Error ? err.message : String(err);
     if (err instanceof ModelError && !err.retryable && err.status !== 0) return this.#abandon(runId, message);
     const delay = RUN_RETRY_DELAYS_MS[Math.min(run.entries - 1, RUN_RETRY_DELAYS_MS.length - 1)];
-    this.#sql.exec("UPDATE runs SET retry_at = ?, error = ? WHERE id = ?", Date.now() + delay, message.slice(0, 1_000), runId);
+    this.#sql.exec("UPDATE runs SET retry_at = ?, error = ? WHERE id = ?", Date.now() + delay, this.#sawOutside(runId) ? ERROR_WITHHELD : message.slice(0, 1_000), runId);
   }
 
   #abandon(runId: string, reason: string): void {
     const run = this.#rows<RunRow>("SELECT * FROM runs WHERE id = ?", runId)[0];
     if (!run) return;
+    // Looked at before the run's record is cleared.
+    const outside = this.#sawOutside(runId);
     this.ctx.storage.transactionSync(() => {
       // Close any open tool call so the transcript stays well-formed for the next run.
       for (const call of danglingCalls(this.#transcript(run.session_id))) {
@@ -437,7 +450,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#notify(`abandoned:${runId}`, run.session_id, runId, "Something went wrong on my side and I could not finish handling that. Please try again.");
       this.#finish(runId, "failed", reason);
     });
-    this.#log("run_abandoned", { run: runId, reason: reason.slice(0, 300) });
+    this.#log("run_abandoned", { run: runId, reason: outside ? ERROR_WITHHELD : reason.slice(0, 300) });
   }
 
   #finish(runId: string, status: "done" | "failed", error?: string): void {
@@ -446,21 +459,95 @@ export class BrainAgent extends DurableObject<Env> {
       if (!run || run.status !== "running") return;
       const now = Date.now();
       this.#sql.exec("UPDATE inbox SET status = ? WHERE run_id = ? AND status = 'claimed'", status === "done" ? "done" : "dead", runId);
-      this.#sql.exec("UPDATE runs SET status = ?, ended_at = ?, retry_at = NULL, error = ? WHERE id = ?", status, now, error?.slice(0, 1_000) ?? null, runId);
+      // An error can quote what the model was sent. From a run that read outside text, only the fact is kept.
+      const said = error === undefined ? null : this.#sawOutside(runId) ? ERROR_WITHHELD : error.slice(0, 1_000);
+      this.#sql.exec("UPDATE runs SET status = ?, ended_at = ?, retry_at = NULL, error = ? WHERE id = ?", status, now, said, runId);
       this.#sql.exec("UPDATE sessions SET updated_at = ? WHERE id = ?", now, run.session_id);
+      this.#forgetOutside(run);
       if (this.#meta("active_run") === runId) this.#sql.exec("DELETE FROM meta WHERE key = 'active_run'");
     });
   }
 
-  #append(sessionId: string, runId: string, item: Item): void {
+  #append(sessionId: string, runId: string, item: Item, outside = false): void {
     this.#sql.exec(
-      "INSERT INTO items (session_id, seq, run_id, is_user, item) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM items WHERE session_id = ?), ?, ?, ?)",
+      "INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM items WHERE session_id = ?), ?, ?, ?, ?)",
       sessionId,
       sessionId,
       runId,
       item.role === "user" ? 1 : 0,
       JSON.stringify(item),
+      outside ? 1 : 0,
     );
+  }
+
+  /**
+   * Whose authority a connector's tools would carry in this run, if anyone's. There is such a
+   * person only when it is beyond doubt. This is that person's own scope and their private
+   * conversation through one connector. Everything that started the run is an ordinary message
+   * they wrote to the agent there: not a button press, not a reply to a question, not something
+   * routed from elsewhere, not a timer or a worker's report. Every one came through that
+   * connector, which the deployment trusts, with one and the same verified origin, none of it
+   * empty. Anything else and there is no such person. Worked out from the stored events each
+   * time it is needed, never remembered.
+   */
+  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string> } | undefined {
+    const scope = this.#scope();
+    if (scope.kind !== "user") return undefined;
+    const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
+    if (events.length === 0) return undefined;
+    const source = events[0].source;
+    const origin = originOf(events[0]);
+    if (!origin || toolsOf(source).length === 0) return undefined;
+    const conversation = privateSessionKey(source, origin);
+    for (const event of events) {
+      const principal = JSON.parse(event.principal) as Principal;
+      if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return undefined;
+      if (!this.#isDecider(principal, event.source) || principal.id !== scope.id) return undefined;
+      const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
+      // A request, in the person's own words, made here.
+      if (data.direct !== true || data.card !== undefined || data.question !== undefined || data.reply_only !== undefined || data.routed_from !== undefined) return undefined;
+      const same = originOf(event);
+      if (!same || JSON.stringify(same) !== JSON.stringify(origin)) return undefined;
+    }
+    return { connector: source, person: scope.id, origin };
+  }
+
+  /**
+   * Ends what a run that read outside text leaves behind. Text a connector's tool brought in was
+   * for that run, and so is everything the run went on to say or do with it: the model's own
+   * words about a document carry the document. So the run's whole record, apart from what the
+   * person wrote, is replaced by one fixed note. A later run sees that something was read; it is
+   * not handed the content, in the original or retold, nor anything else the model wrote.
+   * Messages the run wrote are emptied once they have been delivered or given up.
+   */
+  #forgetOutside(run: RunRow): void {
+    const outputs = this.#rows<{ item: string }>("SELECT item FROM items WHERE run_id = ? AND outside = 1", run.id);
+    if (outputs.length === 0) return;
+    this.#sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
+    // Fixed words only. Nothing the model wrote is carried over, not even what it asked a tool for.
+    this.#append(run.session_id, run.id, { role: "assistant", content: OUTSIDE_REMOVED });
+    this.#sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
+    this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+    this.#scrubDelivered();
+  }
+
+  /**
+   * Empties messages written in a run that read outside text, once they will not be sent again:
+   * delivered, or given up. Their words, any structured form of them, and any error text are
+   * removed; what is needed to know they were sent, and where, stays. While a message is still to
+   * be delivered or reconciled it is kept, since it cannot be sent otherwise.
+   */
+  #scrubDelivered(): void {
+    this.#sql.exec(
+      "UPDATE outbox SET text = '', review = NULL, error = CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE private = 1 AND status IN ('sent', 'dead') AND (text != '' OR review IS NOT NULL OR (error IS NOT NULL AND error != ?))",
+      DELIVERY_WITHHELD,
+      DELIVERY_WITHHELD,
+    );
+  }
+
+  /** Whether this run has been given text from outside by a connector's tool. */
+  #sawOutside(runId: string): boolean {
+    return this.#outside.size > 0 || this.#rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", runId).length > 0;
   }
 
   /**
@@ -477,6 +564,29 @@ export class BrainAgent extends DurableObject<Env> {
       this.#rows<{ seq: number }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq ??
       floor;
     return this.#rows<{ item: string }>("SELECT item FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, start).map((r) => JSON.parse(r.item) as Item);
+  }
+
+  /**
+   * The Brain's own tools, and a connector's where this run acts for one person through it. Once
+   * the run has read outside text, only what it may still use (see #mayUse).
+   */
+  #toolsFor(runId: string): ToolDefinition[] {
+    const acting = this.#actingFor(runId);
+    const all = acting ? [...TOOLS, ...toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, each.parameters))] : TOOLS;
+    return all.filter((each) => this.#mayUse(runId, each.name));
+  }
+
+  /**
+   * Whether a tool may be used in this run now. Before the run has read outside text: any tool it
+   * has. After: the reply to the person, and a connector's tools that only read. That is a list of
+   * what is allowed, not of what is forbidden, so a tool added later is refused until it is put on
+   * it.
+   */
+  #mayUse(runId: string, name: string): boolean {
+    if (!this.#sawOutside(runId)) return true;
+    if (name === "send_message") return true;
+    const acting = this.#actingFor(runId);
+    return acting !== undefined && toolsOf(acting.connector).some((each) => each.name === name && each.effect === "read");
   }
 
   #instructions(): string {
@@ -510,6 +620,7 @@ export class BrainAgent extends DurableObject<Env> {
       ask ? JSON.stringify(ask) : null,
       review ? JSON.stringify(review) : null,
     );
+    if (runId && this.#sawOutside(runId)) this.#sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     return { ok: true };
   }
 
@@ -563,6 +674,7 @@ export class BrainAgent extends DurableObject<Env> {
       const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
+      this.#scrubDelivered();
       // It may have been closed while it was on its way.
       if (row.ask) this.#showClosed(row.idem);
       return true;
@@ -575,9 +687,12 @@ export class BrainAgent extends DurableObject<Env> {
       const tooFar = notBefore > Date.now() + MAX_DEFERRAL_MS;
       const dead = tooFar || attempts > OUTBOX_RETRY_DELAYS_MS.length;
       const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), notBefore);
-      const why = `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
+      // An error can quote what was being sent. For a message from a run that read outside text, only the fact is kept.
+      const isPrivate = this.#rows<{ private: number }>("SELECT private FROM outbox WHERE id = ?", row.id)[0]?.private === 1;
+      const why = isPrivate ? DELIVERY_WITHHELD : `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
       this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, why, row.id);
-      if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
+      if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: isPrivate ? DELIVERY_WITHHELD : String(err).slice(0, 300) });
+      this.#scrubDelivered();
       return false;
     }
   }
@@ -588,6 +703,19 @@ export class BrainAgent extends DurableObject<Env> {
     const session = this.#rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#sql;
     return {
+      connectorTool: async (callId, name, args) => {
+        // Decided afresh at the moment of use, from what is stored: also after an interruption.
+        const acting = this.#actingFor(run.id);
+        const found = acting && toolsOf(acting.connector).find((each) => each.name === name);
+        if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
+        // Whatever comes back is from outside, including an error that quotes something.
+        this.#outside.add(callId);
+        // What this run has already written to send, and whatever it writes from here on.
+        this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+        // Which tool and for whom. Not its arguments: they can name what the person is reading.
+        this.#audit(acting.person, "tool.used", { tool: name, call: callId });
+        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, callId }, args);
+      },
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
       sendReview: (callId, summary, commit, comments) => {
         // The same review in words, for wherever comments cannot be attached to lines.
@@ -644,7 +772,9 @@ export class BrainAgent extends DurableObject<Env> {
         return { ok: true, cancelled: active };
       },
 
-      dispatchTask: (callId, title, brief, repository) => this.#dispatchTask(run, session.session_key, callId, title, brief, repository),
+      dispatchTask: async (callId, title, brief, repository) => {
+        return this.#dispatchTask(run, session.session_key, callId, title, brief, repository);
+      },
       taskStatus: (taskId) => this.#taskStatus(taskId),
       answerTask: (callId, taskId, decision, reason) => this.#answerTask(run, session.session_key, callId, taskId, decision, reason),
       cancelTask: (taskId) => this.#cancelTask(session.session_key, taskId),
@@ -1334,10 +1464,19 @@ export class BrainAgent extends DurableObject<Env> {
     if (!this.#meta("default_target")) this.#setMeta("default_target", JSON.stringify(target));
   }
 
-  /** Messages written since `afterId`, for connectors whose clients pull instead of being pushed to. */
-  async outboxSince(afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
+  /**
+   * Messages written since `afterId` and addressed to the named connector, for one whose clients
+   * pull instead of being pushed to. A message addressed anywhere else is not theirs to read: what
+   * the agent says to someone in another system stays in that system.
+   */
+  async outboxSince(connector: string, afterId: number, limit = 50): Promise<{ id: number; text: string; status: string; created_at: number }[]> {
     // A question withdrawn before it went out was never said to anyone, on any channel.
-    return this.#rows("SELECT id, text, status, created_at FROM outbox WHERE id > ? AND status NOT IN ('withdrawn', 'reconciling') AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?", afterId, Math.min(limit, 200));
+    return this.#rows(
+      "SELECT id, text, status, created_at FROM outbox WHERE id > ? AND json_extract(target, '$.connector') = ? AND status NOT IN ('withdrawn', 'reconciling') AND NOT (status = 'pending' AND ask IS NOT NULL AND closed IS NOT NULL) ORDER BY id LIMIT ?",
+      afterId,
+      connector,
+      Math.min(limit, 200),
+    );
   }
 
   async inspect(): Promise<Record<string, unknown>> {
@@ -1403,6 +1542,18 @@ function today(): string {
 }
 
 /** Function calls in the transcript that have no output yet. */
+/**
+ * What a connector verified about where an event came from, with its keys in order. Undefined
+ * unless it is a set of named, non-empty strings: an origin with a gap in it identifies nothing.
+ */
+function originOf(event: InboxRow): Record<string, string> | undefined {
+  const origin = event.data ? (JSON.parse(event.data) as { origin?: unknown }).origin : undefined;
+  if (!origin || typeof origin !== "object" || Array.isArray(origin)) return undefined;
+  const entries = Object.entries(origin as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0 || entries.some(([key, value]) => key === "" || typeof value !== "string" || value === "" || value === "undefined")) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
 function danglingCalls(items: Item[]): ToolCall[] {
   const answered = new Set(items.filter((i) => i.type === "function_call_output").map((i) => i.call_id));
   return items.filter((i) => i.type === "function_call" && !answered.has(i.call_id)).map((i) => ({ call_id: i.call_id, name: i.name, arguments: i.arguments ?? "{}" }));

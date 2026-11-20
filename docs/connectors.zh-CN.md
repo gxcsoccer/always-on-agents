@@ -20,6 +20,7 @@ curl -X POST $B/v1/console/chats/team/messages -H "authorization: Bearer $TENANT
   -H 'content-type: application/json' -d '{"user":"bob","text":"@agent 总结一下这个话题"}'
 
 # 读取 agent 说了什么。`after` 是已读到的最后一条消息的编号；`wait` 表示长轮询，最多 25 秒。
+# agent 经由其他 connector 发出的消息（比如发到飞书单聊的）不会在这里返回。
 curl "$B/v1/console/users/alice/messages?after=0&wait=25" -H "authorization: Bearer $TENANT_KEY"
 ```
 
@@ -166,6 +167,8 @@ export const exampleConnector: Connector = {
   async scheduled(env) {},
   // 可选：投递 agent 的消息
   channel: { deliver, amend, standing },
+  // 可选：agent 可以替某一个人在那个系统里做的事
+  tools: [{ name: "example_read", description, parameters, run }],
 };
 ```
 
@@ -177,6 +180,20 @@ export const exampleConnector: Connector = {
 | `channel.deliver` | 发送一条消息，没送达就抛错。它会被重试，所以要用消息的 `idem` 避免重复发送 |
 | `channel.amend` | 可选。把已送达的审批提问显示为已关闭 |
 | `channel.standing` | 如果那个系统里的人可以编辑或删除自己说过的话，就必须实现。见下文 |
+
+### 工具
+
+connector 可以给 agent 提供工具：agent 可以替某一个人在外部系统里做的事，比如以这个人的身份读一篇文档。一个工具是 `{ name, description, effect: "read", parameters, run(context, args) }`，名字是 `<connector 名>_…`。目前只有只读的工具。`context.person` 是这次调用替谁做；工具必须以这个人的身份行事，不能是别人。
+
+connector 的工具什么时候存在、替谁存在，由核心决定：
+
+- **只在“这次调用代表谁”毫无疑问的地方提供。** 必须是这个人自己的作用域里、他经由这个 connector 的私有对话，而且触发这次运行的全部是他在那里写给 agent 的普通消息。为此，connector 要给这类消息带上 `data.origin`（你核实过的来源，比如哪个应用、哪个组织，每个值都不能为空）、`data.direct: true`，并使用 `src/events.ts` 里 `privateSessionKey(name, origin)` 给出的会话键。这一批里只要有按钮点击、对提问的回复、从别处路由来的消息、定时器、worker 的回报、别人的消息，或经由其他 connector 来的消息，工具就不存在。在群和仓库里永远不存在。
+- **私有对话是独立的。** 同一个用户 id 还可能以别的方式被触达，比如租户后台通过控制台。那些是另外的对话，有各自的历史；私有对话里说过的话不会展示给它们。
+- **参数选不了人。** `context.person` 来自已存储的事件，每次调用时重新推导。
+- **工具返回的是外部文本，由它衍生的内容也是。** 一次运行从第一次使用 connector 的工具起，只能做两件事：回复这个人，以及再读一次。其他工具一律拒绝，依据是一张“允许做什么”的清单，而不是“禁止做什么”的清单。运行结束时，它产生的一切都会从对话记录里移除，原文和模型自己的话都一样，换成一条固定的说明。它写的消息在送达或被放弃之后，各种形式的内容都会清空，错误信息的文字也不保留。后面的运行需要时，从这个人自己指向的东西重新读。运行还在进行中（因预算暂停，或在重试）时，它的记录会保留。
+- **不跨私有对话路由。** 平时，在别处写的、带着某个未决问题确认码的回复会被归到那个问题上。但不会归进私有对话，也不会从私有对话里归出去。
+- **每次调用都写审计**（`tool.used`，记录是谁、哪个工具，不记参数）。
+- 调用可能在中断后重复执行，所以工具必须可以安全地执行两次。
 
 ### 不管 connector 怎么说，都由核心决定的事
 

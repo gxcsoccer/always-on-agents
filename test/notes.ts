@@ -10,6 +10,9 @@ import config from "../src/agent.config";
 import { DeliveryDeferred, type Standing } from "../src/connectors/types";
 
 export const notes: Map<string, Standing> = ((globalThis as any).__notes ??= new Map());
+/** Pages by "<person>/<name>", and every read that was made of them. */
+export const pages: Map<string, string> = ((globalThis as any).__pages ??= new Map());
+export const reads: { person: string; origin: Record<string, string>; page: string }[] = ((globalThis as any).__reads ??= []);
 
 if (!config.connectors.some((connector) => connector.name === "notes")) {
   config.connectors.push({
@@ -24,6 +27,21 @@ if (!config.connectors.some((connector) => connector.name === "notes")) {
         return notes.get(subject);
       },
     },
+    // A tool for tests: reads a page that a test put in `pages`, for whoever the run acts for.
+    tools: [
+      {
+        name: "notes_read",
+        description: "Read one of the person's pages.",
+        effect: "read",
+        parameters: { page: { type: "string" } },
+        async run(context, args) {
+          reads.push({ person: context.person, origin: context.origin, page: String(args.page) });
+          const text = pages.get(`${context.person}/${String(args.page)}`);
+          if (text === undefined) throw new Error("no such page for this person");
+          return { text };
+        },
+      },
+    ],
   });
   config.trusted.push("notes");
 }

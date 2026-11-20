@@ -74,10 +74,34 @@ export interface InboundEvent {
   /**
    * Free for the connector, with a few fields the Brain reads. One of them is `where`: a few words
    * on where the event happened ("pull request #3 of owner/name"), from what the connector verified,
-   * shown to the model beside the event's text.
+   * shown to the model beside the event's text. Another is `origin`: what the connector verified
+   * about where the event came from (which app, which organisation), as strings. A connector's
+   * tools are offered only when every message in a run has the same origin. And `direct`: true
+   * for an ordinary message a person wrote to the agent in private, as opposed to a button they
+   * pressed or a reply that was routed from elsewhere.
    */
   data?: Record<string, unknown>;
   reply_to?: Target;
+}
+
+/**
+ * The name of a person's private conversation through one connector, from one verified origin.
+ *
+ * A person's scope can be reached in more than one way: the same user id may be spoken for by a
+ * tenant's backend through the console and by the person themselves in a chat product. Those are
+ * different audiences and must not share a history. A connector that offers tools gives its
+ * direct, private messages this key, and the Brain offers the tools in no other conversation, so
+ * what is read for a person stays where only that person, through that origin, takes part.
+ */
+export function privateSessionKey(connector: string, origin: Record<string, string>): string {
+  // The origin is written out as data, in key order, so that no choice of keys or values can make
+  // two different origins read the same.
+  return `private:${connector}:${JSON.stringify(Object.keys(origin).sort().map((key) => [key, origin[key]]))}`;
+}
+
+/** Whether a conversation is someone's private one through a connector (see privateSessionKey). */
+export function isPrivateSession(sessionKey: string): boolean {
+  return sessionKey.startsWith("private:");
 }
 
 /** Events a worker sends back to the Brain that started it. */

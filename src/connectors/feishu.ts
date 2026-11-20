@@ -17,7 +17,7 @@
  * as a card, and is replaced by a closed card once it is decided or withdrawn.
  */
 import type { Env } from "../env";
-import { type InboundEvent, type Scope, type Target, scopeName } from "../events";
+import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
 import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
 
@@ -184,11 +184,12 @@ export function normalizeCardAction(app: FeishuApp, body: any): { scope: Scope; 
       source: "feishu",
       source_id: `card:${body.header.event_id}`,
       kind: "message",
-      session_key: group ? "chat" : "dm",
+      // In a direct chat, the same conversation as that person's own messages there.
+      session_key: group ? "chat" : privateSessionKey("feishu", { app_id: app.app_id, tenant_key: String(operator.tenant_key) }),
       principal: { kind: "human", id: openId, explicit: true },
       text: `${value.decision === "approve_all" ? "approve all" : value.decision} ${value.code}`,
       // Which question's card was pressed. The press answers that question and no other.
-      data: { chat_id: chatId, card: true, route_by_code: true, question: value.q },
+      data: { chat_id: chatId, card: true, route_by_code: true, question: value.q, origin: { app_id: app.app_id, tenant_key: String(operator.tenant_key) } },
       reply_to: { connector: "feishu", address: { app_id: app.app_id, chat_id: chatId } },
     },
   };
@@ -253,10 +254,17 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       // Feishu can deliver the same message more than once, under different event ids.
       source_id: message.message_id,
       kind: "message",
-      session_key: group ? (thread ? `thread:${thread}` : "chat") : "dm",
+      // A direct chat is that person's private conversation through this app, apart from any
+      // other way their scope can be reached.
+      session_key: group ? (thread ? `thread:${thread}` : "chat") : privateSessionKey("feishu", { app_id: app.app_id, tenant_key: String(sender.tenant_key) }),
       principal: { kind: "human", id: openId, explicit: true },
       text,
       data: {
+        // Which app received it and which organisation the sender belongs to, both as Feishu
+        // stated them in the verified event.
+        origin: { app_id: app.app_id, tenant_key: String(sender.tenant_key) },
+        // An ordinary message written to the agent in a direct chat.
+        ...(group ? {} : { direct: true }),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,
