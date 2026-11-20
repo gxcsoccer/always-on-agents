@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, type Outcome, type Receipt, amend, canRevisit, deliver, standingOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, messageText, respond } from "../model/openai";
@@ -26,7 +26,7 @@ import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { buildInstructions } from "./prompt";
 import { migrate } from "./schema";
-import { TOOLS, type ToolCall, type ToolHost, executeTool } from "./tools";
+import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, executeTool } from "./tools";
 
 /** Events arriving within this window are answered in one run. */
 const BATCH_WINDOW_MS = 2_000;
@@ -489,11 +489,21 @@ export class BrainAgent extends DurableObject<Env> {
 
   // ------------------------------------------------------------------ outbox
 
-  #enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion): { ok: true } {
+  #enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview): { ok: true } {
     const target = this.#rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
-    this.#sql.exec("INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask) VALUES (?, ?, ?, ?, ?, ?, ?)", idem, runId, target, text, now, now, ask ? JSON.stringify(ask) : null);
+    this.#sql.exec(
+      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      idem,
+      runId,
+      target,
+      text,
+      now,
+      now,
+      ask ? JSON.stringify(ask) : null,
+      review ? JSON.stringify(review) : null,
+    );
     return { ok: true };
   }
 
@@ -544,7 +554,7 @@ export class BrainAgent extends DurableObject<Env> {
     this.#sql.exec("UPDATE outbox SET started = 1 WHERE id = ?", row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-      const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}) });
+      const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
       // It may have been closed while it was on its way.
@@ -566,6 +576,12 @@ export class BrainAgent extends DurableObject<Env> {
     const sql = this.#sql;
     return {
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
+      sendReview: (callId, summary, commit, comments) => {
+        // The same review in words, for wherever comments cannot be attached to lines.
+        const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
+        if (said.length > MAX_MESSAGE_TEXT) throw new Error(`the review is too long: summary and comments together must stay within ${MAX_MESSAGE_TEXT} characters`);
+        return this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
+      },
 
       memoryList: () => ({ files: this.#rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
       memoryRead: (path) => {

@@ -91,6 +91,19 @@ export interface OutboundMessage {
    * can show something better than text (buttons, say) builds it from this.
    */
   ask?: ApprovalQuestion;
+  /**
+   * Set when the message is a code review. `text` says the same in words (the summary, then each
+   * comment with its file and line); a connector that can attach comments to lines builds them
+   * from this.
+   */
+  review?: CodeReview;
+}
+
+export interface CodeReview {
+  summary: string;
+  /** The commit that was reviewed, if known. Lines are only meaningful against it. */
+  commit?: string;
+  comments: { path: string; line: number; body: string }[];
 }
 
 export interface ApprovalQuestion {

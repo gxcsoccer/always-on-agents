@@ -13,7 +13,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import type { Connector, OutboundMessage, Receipt, Standing } from "./types";
+import type { CodeReview, Connector, OutboundMessage, Receipt, Standing } from "./types";
 
 export const githubConnector: Connector = {
   name: "github",
@@ -79,6 +79,87 @@ function ownWords(body: string): string {
   }
   // Code spans, which may run over several lines.
   return kept.join("\n").replace(/(`+)[\s\S]*?\1/g, " ");
+}
+
+/**
+ * The lines of each file that a comment can be attached to: those the pull request adds or shows
+ * as context, numbered as in the new version of the file. GitHub refuses a comment anywhere else,
+ * and with it the whole review.
+ */
+export function commentableLines(files: { filename?: string; patch?: string }[]): Map<string, Set<number>> {
+  const lines = new Map<string, Set<number>>();
+  for (const file of files) {
+    if (!file.filename || !file.patch) continue;
+    const set = new Set<number>();
+    let at = 0;
+    for (const line of file.patch.split("\n")) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hunk) at = Number(hunk[1]);
+      else if (at > 0 && (line.startsWith("+") || line.startsWith(" "))) set.add(at++);
+    }
+    lines.set(file.filename, set);
+  }
+  return lines;
+}
+
+/**
+ * Posts a review on a pull request: the summary as its body, each comment on its line. It only
+ * comments; approving or requesting changes is left to people. Returns undefined when the
+ * conversation is not a pull request.
+ *
+ * A comment is attached to a line only if the review is of the pull request's current head and
+ * the line is one the change touches or shows. Any other comment is kept, in the body, with its
+ * file and line: a review is never dropped, or a comment put on the wrong line, for that.
+ */
+async function deliverReview(headers: Record<string, string>, repo: string, number: string, review: CodeReview, marker: string): Promise<Receipt | undefined> {
+  const pull = `https://api.github.com/repos/${repo}/pulls/${number}`;
+  const found = await fetch(pull, { headers });
+  if (found.status === 404) return undefined;
+  if (!found.ok) throw new Error(`GitHub returned ${found.status} reading the pull request`);
+  const head = ((await found.json()) as { head?: { sha?: string } }).head?.sha;
+  if (!head) throw new Error("GitHub did not say which commit the pull request is at");
+
+  // An earlier attempt at this same review, if it got through.
+  for (let page = 1; page <= 10; page++) {
+    const listed = await fetch(`${pull}/reviews?per_page=100&page=${page}`, { headers });
+    if (!listed.ok) throw new Error(`GitHub returned ${listed.status} listing reviews`);
+    const batch = (await listed.json()) as { id: number; body?: string; submitted_at?: string }[];
+    const earlier = batch.find((each) => each.body?.includes(marker));
+    if (earlier) return { subject: `github:review:${earlier.id}`, holder: fingerprint(earlier.body ?? ""), posted_at: Date.parse(earlier.submitted_at ?? "") || undefined };
+    if (batch.length < 100) break;
+  }
+
+  const moved = review.commit !== undefined && review.commit !== head;
+  let lines = new Map<string, Set<number>>();
+  if (!moved && review.comments.length > 0) {
+    const files: { filename?: string; patch?: string }[] = [];
+    for (let page = 1; page <= 30; page++) {
+      const listed = await fetch(`${pull}/files?per_page=100&page=${page}`, { headers });
+      if (!listed.ok) throw new Error(`GitHub returned ${listed.status} listing the changed files`);
+      const batch = (await listed.json()) as { filename?: string; patch?: string }[];
+      files.push(...batch);
+      if (batch.length < 100) break;
+    }
+    lines = commentableLines(files);
+  }
+  const placed = review.comments.filter((c) => lines.get(c.path)?.has(c.line));
+  const body = (attached: typeof placed) => {
+    const rest = review.comments.filter((c) => !attached.includes(c));
+    const why = moved ? `This review is of ${review.commit!.slice(0, 7)}; the pull request has moved to ${head.slice(0, 7)} since, so its comments are listed here rather than attached to lines.` : "Not on a line this pull request changes or shows:";
+    return [review.summary, ...(rest.length > 0 ? [why, ...rest.map((c) => `\`${c.path}:${c.line}\`\n${c.body}`)] : []), marker].join("\n\n");
+  };
+  const post = (attached: typeof placed) =>
+    fetch(`${pull}/reviews`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ commit_id: head, event: "COMMENT", body: body(attached), comments: attached.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: c.body })) }),
+    });
+  let response = await post(placed);
+  // Refused as it stands (a line GitHub will not take after all): the same review, all in the body.
+  if (response.status === 422 && placed.length > 0) response = await post([]);
+  if (!response.ok) throw new Error(`GitHub returned ${response.status} posting the review: ${(await response.text()).slice(0, 200)}`);
+  const created = (await response.json()) as { id: number; body?: string };
+  return { subject: `github:review:${created.id}`, holder: fingerprint(created.body ?? "") };
 }
 
 /** A short fingerprint of a comment's text, to tell two revisions with the same timestamp apart. */
@@ -343,6 +424,13 @@ export async function deliverGithub(env: Env, scope: Scope, target: Target, mess
   };
   const marker = `<!-- always-on-agent:${message.idem.replace(/[^\w:.|-]/g, "")} -->`;
   const comments = `https://api.github.com/repos/${repo}/issues/${number}/comments`;
+
+  // A review goes out as one, with its comments on the lines they are about, where this is a pull
+  // request. Anywhere else it is sent as the ordinary comment below, which says the same in words.
+  if (message.review) {
+    const reviewed = await deliverReview(headers, repo, number, message.review, marker);
+    if (reviewed) return reviewed;
+  }
 
   // A question someone will approve is shown literally. Rendered as Markdown, a branch called
   // __release__ would appear as "release" in bold, which is not the branch being pushed.

@@ -78,6 +78,16 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 
 An unlinked account is still identified, but is not a member of the scope: it cannot approve anything. A `user_id` cannot contain `:`.
 
+### Reviewing a pull request
+
+Ask in a comment on the pull request: `@your-bot-handle review this`. The agent gives the work to a sandboxed worker, which reads the change and reports back; the agent then posts one review.
+
+- The review's summary is its body, and each finding is a comment on the line it is about. A finding on a line the pull request neither changes nor shows is kept in the body with its file and line, because GitHub accepts comments only on lines of the diff.
+- If the pull request has moved on from the commit that was reviewed, nothing is attached to lines: the findings are listed in the body, with the commit they are about.
+- The agent only comments. It neither approves nor requests changes; that is left to people.
+- The worker reads; it cannot download packages, so it runs only what works with the sandbox image and the repository. The review says what was and was not checked.
+- Posting needs the App's **Pull requests: read and write** permission. A review is not an approval of anything in the sense of [Approvals](approvals.md), and gives the worker no credential to push.
+
 ## Feishu / Lark
 
 The agent is a bot in direct chats and group chats. A direct chat is one scope per user (`tenant:user:<open_id>`); a group is one scope (`tenant:chat:<chat_id>`). In a group it hears only messages that mention it. A topic thread is a conversation of its own; an ordinary reply is not.

@@ -832,6 +832,7 @@ describe("tasks and approvals", () => {
       // Put the store back to how version 9 left it, with two questions waiting to go out.
       sql.exec("ALTER TABLE outbox DROP COLUMN started");
       sql.exec("DROP TABLE unsettled");
+      sql.exec("ALTER TABLE outbox DROP COLUMN review");
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
@@ -1165,6 +1166,29 @@ describe("tasks and approvals", () => {
     const outputs = toolOutputs();
     expect(outputs.at(-2)).not.toHaveProperty("error");
     expect(outputs.at(-1).error).toMatch(/too long|at most|8000|8,000/);
+  });
+
+  it("queues a review with its parts, and with the same review in words for where lines cannot carry comments", async () => {
+    const { stub } = brain("chat");
+    const comments = [{ path: "src/a.ts", line: 12, body: "off by one" }];
+    model.replies(
+      [call("send_review", { summary: "One problem.", commit: null, comments })],
+      [call("send_review", { summary: "x", commit: "abc", comments: [] })],
+      [call("send_review", { summary: "x", commit: null, comments: [{ path: "../etc/passwd", line: 1, body: "b" }] })],
+      [call("send_review", { summary: "x".repeat(4_000), commit: null, comments: Array.from({ length: 5 }, () => ({ path: "a", line: 1, body: "y".repeat(1_000) })) })],
+      [say("")],
+    );
+    await stub.ingest(message("@agent review", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    const outputs = toolOutputs();
+    expect(outputs[0]).toMatchObject({ ok: true });
+    expect(outputs[1].error).toMatch(/40-character SHA/);
+    expect(outputs[2].error).toMatch(/path inside the repository/);
+    expect(outputs[3].error).toMatch(/too long/);
+    const rows = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT text, review FROM outbox WHERE review IS NOT NULL").toArray());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text).toBe("One problem.\n\nsrc/a.ts:12\noff by one");
+    expect(JSON.parse(String(rows[0].review))).toEqual({ summary: "One problem.", comments });
   });
 
   it("tells the model where a comment was made, which the comment itself does not say", async () => {

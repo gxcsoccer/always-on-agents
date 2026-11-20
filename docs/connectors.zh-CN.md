@@ -79,6 +79,16 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 没有关联的账号仍然会被识别出来，但不算作用域的成员：它不能批准任何东西。
 `user_id` 不能包含 `:`。
 
+### review 一个 PR
+
+在 PR 的评论里提出：`@机器人 review 一下`。agent 把这件事交给沙箱里的 worker，worker 读完改动后汇报，agent 再发出一份 review。
+
+- review 的总评是正文，每条发现是挂在对应行上的评论。如果某条发现所在的行既不是这次 PR 改动的行、也不在 diff 显示的范围内，它会带着文件和行号留在正文里，因为 GitHub 只接受挂在 diff 行上的评论。
+- 如果 PR 在被 review 之后又有了新提交，就不往行上挂任何评论：发现都列在正文里，并注明它们针对的是哪个提交。
+- agent 只发评论，不批准，也不要求修改；这两件事留给人。
+- worker 只读代码；它下载不了依赖，所以只能运行靠沙箱镜像和仓库本身就能跑的检查。review 里会说明核对了什么、没核对什么。
+- 发 review 需要 App 有 **Pull requests：读写**权限。review 不是[审批](approvals.zh-CN.md)意义上的批准，也不会给 worker 任何推送凭据。
+
 ## 飞书
 
 agent 在单聊和群聊里是一个机器人。单聊里每个用户一个作用域（`租户:user:<open_id>`），一个群是一个作用域（`租户:chat:<chat_id>`）。在群里它只听得到 @ 了它的消息。话题是一个独立的对话，普通的“回复”不是。
