@@ -84,7 +84,8 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 在 PR 的评论里提出：`@机器人 review 一下`。agent 把这件事交给沙箱里的 worker，worker 读完改动后汇报，agent 再发出一份 review。
 
 - review 的总评是正文，每条发现是挂在对应行上的评论。如果某条发现所在的行既不是这次 PR 改动的行、也不在 diff 显示的范围内，它会带着文件和行号留在正文里，因为 GitHub 只接受挂在 diff 行上的评论。
-- 如果 PR 在被 review 之后又有了新提交，或者 review 没有说明针对的是哪个提交，就不往行上挂任何评论：发现都列在正文里，并注明它们针对的是哪个提交。
+- 只有确知针对的是 PR 当前提交的 review，才会作为 review 发出。如果 PR 之后又有了新提交，或者 review 没有说明针对哪个提交，它会作为一条普通评论发出并注明这一点，发现连同文件和行号列在评论里：针对某个提交的结论，不会被显示成针对另一个提交的结论。
+- worker 发现的内容以“无作用”的形式发出：其中的 @ 不会通知任何人，其中的 suggestion 代码块不会变成可一键应用的修改。其中的链接仍然是链接。
 - agent 只发评论，不批准，也不要求修改；这两件事留给人。
 - worker 只读代码；它下载不了依赖，所以只能运行靠沙箱镜像和仓库本身就能跑的检查。review 里会说明核对了什么、没核对什么。
 - 发 review 需要 App 有 **Pull requests：读写**权限。review 不是[审批](approvals.zh-CN.md)意义上的批准，也不会给 worker 任何推送凭据。
