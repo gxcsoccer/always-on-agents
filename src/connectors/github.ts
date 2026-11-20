@@ -168,10 +168,16 @@ export function isOurs(found: { body?: string; user?: { login?: string } }, mark
 
 /** Throws for a response that was not a success, carrying GitHub's own word on when to try again. */
 async function refused(response: Response, doing: string): Promise<never> {
-  const said = `GitHub returned ${response.status} ${doing}: ${(await response.text().catch(() => "")).slice(0, 200)}`;
+  const text = await response.text().catch(() => "");
+  const said = `GitHub returned ${response.status} ${doing}: ${text.slice(0, 200)}`;
   const after = Number(response.headers.get("retry-after"));
   const reset = response.headers.get("x-ratelimit-remaining") === "0" ? Number(response.headers.get("x-ratelimit-reset")) * 1_000 : NaN;
-  const notBefore = Number.isFinite(after) && after > 0 ? Date.now() + after * 1_000 : Number.isFinite(reset) && reset > Date.now() ? reset : undefined;
+  // GitHub's own time where it gives one. Throttled without one (a secondary rate limit), its
+  // guidance is to wait at least a minute. An ordinary refusal, such as a missing permission, is
+  // not slowed down.
+  const throttled = response.status === 429 || (response.status === 403 && /secondary rate limit|abuse detection/i.test(text));
+  const notBefore =
+    Number.isFinite(after) && after > 0 ? Date.now() + after * 1_000 : Number.isFinite(reset) && reset > Date.now() ? reset : throttled ? Date.now() + SECONDARY_LIMIT_WAIT_MS : undefined;
   throw notBefore ? new DeliveryDeferred(said, notBefore) : new Error(said);
 }
 
@@ -180,6 +186,7 @@ function mustWait(response: Response): boolean {
   return response.headers.has("retry-after") || response.headers.get("x-ratelimit-remaining") === "0" || response.status === 429;
 }
 
+const SECONDARY_LIMIT_WAIT_MS = 60_000;
 type Headers = Record<string, string>;
 const SEARCH_PAGES = 10;
 

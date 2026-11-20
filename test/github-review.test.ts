@@ -185,6 +185,29 @@ describe("a code review on GitHub", () => {
     }
   });
 
+  it("keeps GitHub's own deadline however long, waits a minute when throttled without one, and does not slow an ordinary refusal", async () => {
+    const attempt = async (options: Parameters<typeof github>[0]) => {
+      github(options);
+      const before = Date.now();
+      const error = await send().then(() => undefined, (err) => err);
+      return { error, wait: error instanceof DeliveryDeferred ? error.notBefore - before : undefined };
+    };
+    const long = await attempt({ refuseStatus: 429, refuse: { message: "rate limited" }, refuseHeaders: { "retry-after": "7200" } });
+    expect(long.wait).toBeGreaterThanOrEqual(7_200_000);
+    expect(long.wait).toBeLessThan(7_210_000);
+    for (const secondary of [
+      { refuseStatus: 429, refuse: { message: "You have exceeded a secondary rate limit." } },
+      { refuseStatus: 403, refuse: { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." } },
+    ]) {
+      const throttled = await attempt(secondary);
+      expect(throttled.wait).toBeGreaterThanOrEqual(60_000);
+      expect(throttled.wait).toBeLessThan(70_000);
+    }
+    const denied = await attempt({ refuseStatus: 403, refuse: { message: "Resource not accessible by integration" } });
+    expect(denied.error).toBeInstanceOf(Error);
+    expect(denied.error).not.toBeInstanceOf(DeliveryDeferred);
+  });
+
   it("makes what a worker wrote inert without changing any code in it", async () => {
     const posted = github();
     await send({

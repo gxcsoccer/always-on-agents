@@ -46,8 +46,11 @@ const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
 const MODEL_CALL_RESERVE = 20_000;
 const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
-/** The longest an outside system's request to wait is honoured for one attempt. */
-const MAX_DEFERRAL_MS = 60 * 60_000;
+/**
+ * A bound on an outside system's request to wait, so that a mistaken or hostile value cannot park
+ * a message for good. Far longer than any wait such a system really asks for.
+ */
+const MAX_DEFERRAL_MS = 24 * 60 * 60_000;
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How long finished records are kept before housekeeping removes them. */
 const RETAIN_RECORDS_MS = 30 * 86_400_000;
@@ -565,8 +568,9 @@ export class BrainAgent extends DurableObject<Env> {
     } catch (err) {
       const attempts = row.attempts + 1;
       const dead = attempts > OUTBOX_RETRY_DELAYS_MS.length;
-      // No sooner than the usual wait, and no sooner than the outside system asked for, within reason.
-      const asked = err instanceof DeliveryDeferred ? Math.min(err.notBefore, Date.now() + MAX_DEFERRAL_MS) : 0;
+      // No sooner than the usual wait, and no sooner than the outside system asked for. Its time
+      // is kept as given; only one so far off that it cannot be meant is held to the limit.
+      const asked = err instanceof DeliveryDeferred && Number.isFinite(err.notBefore) ? Math.min(err.notBefore, Date.now() + MAX_DEFERRAL_MS) : 0;
       const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), asked);
       this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, String(err).slice(0, 500), row.id);
       if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: String(err).slice(0, 300) });
