@@ -16,7 +16,8 @@ This is young software. It runs on Cloudflare and has been exercised against rea
 - GitHub signature checks and normalisation, the GitHub App token flow, and Feishu decryption, signatures, cards and normalisation;
 - the webhook handlers end to end with real encryption and signatures;
 - the Feishu long connection against a stand-in that lives in its own Durable Object: connect, ping, an event and its acknowledgement, a card press and its answer, a message in several frames, refusals and back-off;
-- the task object's own bookkeeping for held questions and standing approvals.
+- the task object's own bookkeeping for held questions and standing approvals;
+- reading a Feishu document as a person, against a stand-in for Feishu: the invitation, the consent coming back, another account or organisation completing it, a link used twice, declined, forged or too old, an authorisation taken away while one is on its way back, a document the person may not open, a token Feishu stopped honouring, a document that tells the agent to read another, an authorisation taken away or replaced while a read is under way, an invitation Feishu did not take at first, and a person who had allowed the app more, or less, than reading needs.
 
 ### On Cloudflare, by hand
 
@@ -48,7 +49,8 @@ Roughly in order of importance.
 12. **All tenants share one model key, and the sandboxed agent only talks to OpenAI's API.** `OPENAI_BASE_URL` redirects the Brain but not the agent in the sandbox.
 13. **The sandbox task's state is read and written as a whole.** The known overwrites are handled; it has not been systematically changed to per-field updates.
 14. **The sandbox cannot download packages from registries** such as npm or PyPI. Tests can use tools and dependencies already in the image or supplied with the project. A test that still needs a registry download cannot run as configured.
-15. **Other worker types are not implemented.** Notes on one that was researched are in [docs/research](research/).
+15. **Reading Feishu documents has not been exercised against Feishu itself yet**, only against a stand-in. An authorisation lasts about two hours (the life of the token Feishu issues); it is not renewed, so the person is invited again. Only documents (docx) and wiki pages that are documents can be read, as plain text, up to 40,000 characters.
+16. **Other worker types are not implemented.** Notes on one that was researched are in [docs/research](research/).
 
 ## Reporting problems
 

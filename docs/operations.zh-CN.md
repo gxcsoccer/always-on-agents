@@ -39,6 +39,8 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 | `GITHUB_BOT_HANDLE` | 密钥 | agent 在 GitHub 上的账号名（App 的 slug），人们用它来 @ agent |
 | `GITHUB_BOT_EMAIL` | 密钥 | 沙箱里提交代码时使用的邮箱 |
 | `GITHUB_TOKEN` | 密钥 | 一个用于所有仓库的令牌，只在没有配置 App 时使用。仅限本地开发 |
+| `PUBLIC_ORIGIN` | 密钥或变量 | 这个部署对外的地址，比如 `https://agent.example.com`。读取飞书文档时需要：用户授权后，飞书把他送回这里 |
+| `GRANTS_KEY` | 密钥 | 用来加密用户授权产生的令牌。32 个以上的随机字符。改掉它之后，已保存的授权全部无法读取，用户会被重新邀请授权 |
 | `GATE_HOLD_PATTERN` | 密钥或变量 | 可选。一个正则，匹配到的沙箱内 shell 命令需要人批准。默认没有 |
 
 沙箱里用哪个 coding agent、哪个版本，写死在 `Dockerfile` 里。
@@ -69,6 +71,7 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 | `POST /v1/admin/tasks/:id/probe` | 在任务的容器里做一组检查（它能访问什么、持有什么） |
 | `POST /v1/admin/tasks/:id/kill-container` | 销毁容器，用来演练恢复 |
 | `GET /v1/admin/feishu-links/:app_id` | 一条飞书长连接的状态 |
+| `GET`、`DELETE /v1/admin/feishu-grants/:app_id/:tenant_key/:open_id` | 某个人读取文档的授权是否还在；`DELETE` 收回它。不会返回令牌 |
 
 ### 其他接口
 
@@ -77,6 +80,7 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 | `GET /healthz` | 存活检查 |
 | `POST /v1/github/webhook` | 接收 GitHub 的投递 |
 | `POST /v1/feishu/events/:app_id` | 接收飞书的投递（webhook 方式） |
+| `GET /v1/feishu/oauth/callback` | 用户授权读取文档后，飞书把他的浏览器送回这里 |
 | `/v1/console/...` | 控制台 connector，用租户的 API key 鉴权。见 [Connector](connectors.zh-CN.md) |
 
 ## 观测

@@ -490,7 +490,7 @@ export class BrainAgent extends DurableObject<Env> {
    * empty. Anything else and there is no such person. Worked out from the stored events each
    * time it is needed, never remembered.
    */
-  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string> } | undefined {
+  #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: { text: string; data: Record<string, unknown> }[] } | undefined {
     const scope = this.#scope();
     if (scope.kind !== "user") return undefined;
     const events = this.#rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId);
@@ -509,7 +509,7 @@ export class BrainAgent extends DurableObject<Env> {
       const same = originOf(event);
       if (!same || JSON.stringify(same) !== JSON.stringify(origin)) return undefined;
     }
-    return { connector: source, person: scope.id, origin };
+    return { connector: source, person: scope.id, origin, said: events.map((event) => ({ text: event.text ?? "", data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} })) };
   }
 
   /**
@@ -521,14 +521,13 @@ export class BrainAgent extends DurableObject<Env> {
    * Messages the run wrote are emptied once they have been delivered or given up.
    */
   #forgetOutside(run: RunRow): void {
-    const outputs = this.#rows<{ item: string }>("SELECT item FROM items WHERE run_id = ? AND outside = 1", run.id);
-    if (outputs.length === 0) return;
+    if (this.#rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
     // Fixed words only. Nothing the model wrote is carried over, not even what it asked a tool for.
     this.#append(run.session_id, run.id, { role: "assistant", content: OUTSIDE_REMOVED });
     this.#sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
     this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
-    this.#scrubDelivered();
+    this.#scrubDelivered("run_id = ?", run.id);
   }
 
   /**
@@ -537,10 +536,11 @@ export class BrainAgent extends DurableObject<Env> {
    * removed; what is needed to know they were sent, and where, stays. While a message is still to
    * be delivered or reconciled it is kept, since it cannot be sent otherwise.
    */
-  #scrubDelivered(): void {
+  #scrubDelivered(which: "id = ?" | "run_id = ?", value: number | string): void {
     this.#sql.exec(
-      "UPDATE outbox SET text = '', review = NULL, error = CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE private = 1 AND status IN ('sent', 'dead') AND (text != '' OR review IS NOT NULL OR (error IS NOT NULL AND error != ?))",
+      `UPDATE outbox SET text = '', review = NULL, error = CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE ${which} AND private = 1 AND status IN ('sent', 'dead') AND (text != '' OR review IS NOT NULL OR (error IS NOT NULL AND error != ?))`,
       DELIVERY_WITHHELD,
+      value,
       DELIVERY_WITHHELD,
     );
   }
@@ -674,7 +674,7 @@ export class BrainAgent extends DurableObject<Env> {
       const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
-      this.#scrubDelivered();
+      this.#scrubDelivered("id = ?", row.id);
       // It may have been closed while it was on its way.
       if (row.ask) this.#showClosed(row.idem);
       return true;
@@ -692,7 +692,7 @@ export class BrainAgent extends DurableObject<Env> {
       const why = isPrivate ? DELIVERY_WITHHELD : `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
       this.#sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ? WHERE id = ?", dead ? "dead" : status, attempts, nextAt, why, row.id);
       if (dead) this.#log("message_undeliverable", { outbox_id: row.id, error: isPrivate ? DELIVERY_WITHHELD : String(err).slice(0, 300) });
-      this.#scrubDelivered();
+      this.#scrubDelivered("id = ?", row.id);
       return false;
     }
   }
@@ -714,7 +714,7 @@ export class BrainAgent extends DurableObject<Env> {
         this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
         // Which tool and for whom. Not its arguments: they can name what the person is reading.
         this.#audit(acting.person, "tool.used", { tool: name, call: callId });
-        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, callId }, args);
+        return found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: acting.said, callId }, args);
       },
       sendMessage: (callId, text) => this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text),
       sendReview: (callId, summary, commit, comments) => {

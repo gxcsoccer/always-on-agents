@@ -147,6 +147,31 @@ curl -X POST $B/v1/admin/tenants/acme/chat-repos -H "authorization: Bearer $ADMI
 
 Tasks started in that group can then clone and push to that repository (pushes still need approval). Pass `"repo": null` to remove the link; it takes effect at once, for running tasks too. Direct chats cannot be linked.
 
+### Reading a person's documents
+
+In a direct chat, a person can give the agent a link to a Feishu document (`…/docx/…`, or a `…/wiki/…` page that is a document) and ask about it. The agent reads it **as that person**, with their own access, through the tool `feishu_read_document`. What the person cannot open, the agent cannot open for them; what the bot could open plays no part.
+
+- **The person authorises once, in Feishu.** The first time, the bot sends them a card with a link to Feishu's consent page (OAuth with PKCE). The link works once, for ten minutes, and only for them: when Feishu sends their browser back, the token is kept only if Feishu says it belongs to the very person the card was sent to, in the same organisation. They then ask again.
+- **Only a document the person linked in the request itself is read.** The link must be in their message as plain text (`https://….feishu.cn/docx/…` or `…/wiki/…`; `larkoffice.com` too). The connector records the links when the message arrives, from what the person typed: each is taken whole, up to the next space, and judged by its own host and path, so a Feishu address carried inside some other link does not count. A link followed directly by sentence punctuation is still found, and so is one with words right before it; words written straight onto its end could be part of its address, so then it is not counted; where it cannot be told where a link ends (two links run together without a space, say), it is not counted and has to be pasted apart. Text the agent has read cannot send it to another document, and neither can a word that merely looks like a document's id, or the name of someone mentioned.
+- **The invitation is the connector's own to send.** It is a fixed card, to that one person. It is sent once however often it is asked for, retried for a few minutes if Feishu does not take it, and replaced by a new one once it is nearly spent. Its link is never given to the model.
+- **The token is for reading documents and nothing else**, whatever else the person has allowed the app before: only what the invitation asked for is requested when the token is issued, and a token that reaches further is not kept. A document link asks for documents; a wiki link asks for wiki pages as well, and only then. If that is not given, what the person had allowed before stays as it was.
+- **An authorisation taken away or replaced during a read stops that read.** What the earlier token fetched is not handed on, and that read neither removes the newer authorisation nor asks for another.
+- **The token is stored sealed**, in an object of its own per person and app, with a key derived from the `GRANTS_KEY` secret. It is never shown to the model, logged, or returned by any endpoint.
+- **A document the person may not open leaves the authorisation as it is.** A token Feishu no longer honours is forgotten and the person is invited again.
+- Everything in [Tools](#tools) applies: direct chats only, and a run that has read a document can only reply to that person.
+
+To set it up:
+
+1. In the developer console, under the app's permissions, enable the **user-identity** scopes `docx:document:readonly` and `wiki:node:read`; under security settings, register the redirect URL `https://<your domain>/v1/feishu/oauth/callback`; publish a version. People who will authorise must be in the app's availability range.
+2. Set two secrets on the Worker: `PUBLIC_ORIGIN` (`https://<your domain>`) and `GRANTS_KEY` (32 or more random characters, for instance from `openssl rand -base64 48`).
+
+```bash
+# Does this person's authorisation stand? DELETE takes it away, including one still being given.
+curl $B/v1/admin/feishu-grants/cli_xxx/<tenant_key>/<open_id> -H "authorization: Bearer $ADMIN_KEY"
+```
+
+For now an authorisation lasts as long as the token Feishu issues, about two hours; after that the person is invited again.
+
 ### Language
 
 The card's fixed text is currently Chinese only.
@@ -182,7 +207,7 @@ Each part is optional and independent. A connector that only reports events (a C
 
 ### Tools
 
-A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else.
+A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else. `context.said` is that person's messages that started the run, each with its text and the `data` the connector attached, so a tool can hold a call to what they themselves asked for. A tool that cannot act because the person has not authorised it may have its connector send that person, and only them, the connector's own fixed invitation; nothing else is sent on a tool's account.
 
 The core decides when a connector's tools exist at all, and for whom:
 
