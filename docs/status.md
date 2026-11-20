@@ -24,6 +24,7 @@ This is young software. It runs on Cloudflare and has been exercised against rea
 - Dispatching sandbox tasks, a 13-minute task, a redeploy while a task runs, automatic recovery after the container is destroyed, upgrading a scope that holds older data.
 - **GitHub**, with a private repository and a real GitHub App installed on it: a comment dispatches a task, the task clones with a token issued for that installation and repository, the push is held, an approval comment releases it, the branch moves to the approved commit, and the result is posted as the App's bot. Also: an approval comment deleted straight away does not approve; an edited question cannot be approved; one task making two pushes asks once after "approve all".
 - **Feishu**, with a real custom app: direct chat, group chat with a mention, approval cards with buttons, and a push approved from a group linked to a repository. This was done over both transports; over the long connection the message, the card and the button press all arrived on the connection.
+- **After the connector interface change**: an existing chat scope opened after migrations 12 and 13 with its history intact, a sandbox task ran in the rebuilt image, a push from a Feishu group was approved on its card and the card showed Approved, and a mention on GitHub was answered. Not exercised by hand: a question set aside while its answer was unconfirmed, and the "outcome unknown" ending; those are covered by automated tests only.
 
 ### Not covered by automated tests
 
@@ -46,7 +47,8 @@ Roughly in order of importance.
 11. **Feishu app secrets and per-repository webhook secrets are stored as they are in the Registry Durable Object**, relying on the platform's encryption at rest. (Tenant API keys are not: only their hashes are kept.)
 12. **All tenants share one model key, and the sandboxed agent only talks to OpenAI's API.** `OPENAI_BASE_URL` redirects the Brain but not the agent in the sandbox.
 13. **The sandbox task's state is read and written as a whole.** The known overwrites are handled; it has not been systematically changed to per-field updates.
-14. **Other worker types are not implemented.** Notes on one that was researched are in [docs/research](research/).
+14. **The sandbox cannot download packages from registries** such as npm or PyPI. Tests can use tools and dependencies already in the image or supplied with the project. A test that still needs a registry download cannot run as configured.
+15. **Other worker types are not implemented.** Notes on one that was researched are in [docs/research](research/).
 
 ## Reporting problems
 
