@@ -170,6 +170,8 @@ export class Registry extends DurableObject<Env> {
   /** Records that an external account (e.g. a GitHub login) is this tenant's user. */
   async linkIdentity(tenant: string, provider: string, externalId: string, userId: string): Promise<void> {
     this.#requireTenant(tenant);
+    // "<system>:<account>" is how an account that is not linked to anyone is named, so no user is.
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(userId)) throw new Error("user_id may contain letters, digits, '.', '_' and '-' only");
     this.ctx.storage.sql.exec(
       "INSERT INTO identities (tenant, provider, external_id, user_id) VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET user_id = excluded.user_id",
       tenant,

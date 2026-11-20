@@ -24,12 +24,12 @@ import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } f
 export const feishuConnector: Connector = {
   name: "feishu",
   async http(request, env, path, ingress) {
-    if (path.length === 2 && path[0] === "events" && request.method === "POST") return handleFeishuWebhook(request, env, path[1], (work) => ingress.defer(work));
+    if (path[0] === "events" && path[1] && request.method === "POST") return handleFeishuWebhook(request, env, path[1], (work) => ingress.defer(work));
     return json({ error: "not found" }, 404);
   },
   async admin({ method, path, url, body }, env) {
-    if (path[0] === "feishu-links" && path.length === 2 && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
-    if (path[0] !== "tenants" || path.length !== 3 || path[2] !== "feishu-apps" || method !== "POST") return undefined;
+    if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
+    if (path[0] !== "tenants" || path[2] !== "feishu-apps" || method !== "POST") return undefined;
     const app = await body();
     await registry(env).setFeishuApp(path[1], {
       app_id: String(app.app_id ?? ""),

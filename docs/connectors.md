@@ -76,7 +76,7 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
   -H 'content-type: application/json' -d '{"provider":"github","external_id":"583231","user_id":"alice"}'
 ```
 
-An unlinked account is still identified, but is not a member of the scope: it cannot approve anything.
+An unlinked account is still identified, but is not a member of the scope: it cannot approve anything. A `user_id` may contain letters, digits, `.`, `_` and `-` only.
 
 ## Feishu / Lark
 
@@ -171,4 +171,4 @@ Each part is optional and independent. A connector that only reports events (a C
 - **Accounts that are not tenant users.** If the connector identifies an account in its own system that is not linked to a user of the tenant, it sets `principal.unlinked`. Such a person is not a member of any scope.
 - **Messages that can change.** A connector whose messages can be edited or deleted gives its events a `subject`, a `revision` and a `holder`, and implements `channel.standing`, which reads the message again from the system. Before an approval counts, the Brain asks it what the message says now. A message that names a subject from a connector without `standing` cannot approve anything.
 
-Connectors are compiled into the Worker. A connector that needs a Durable Object of its own (as Feishu's long connection does) also needs the class exported from `src/index.ts` and a binding in `wrangler.jsonc`.
+Connectors are first-party code compiled into the Worker: each one is handed the whole environment and writes its own name on its events. The `trusted` list guards against a connector being relied on by oversight, not against one that misstates where its events came from, so review a connector as you would any code that holds the deployment's secrets. A connector that needs a Durable Object of its own (as Feishu's long connection does) also needs the class exported from `src/index.ts` and a binding in `wrangler.jsonc`.

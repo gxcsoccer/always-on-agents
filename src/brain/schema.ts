@@ -146,9 +146,10 @@ export const MIGRATIONS: string[] = [
   // under the same id, against a card left open.
   `UPDATE outbox SET started = 1 WHERE status = 'pending' AND ask IS NOT NULL;`,
   // 12: an account that is not linked to a tenant user used to be recognised by the form of its
-  // id; it is now marked as such by the connector. Mark the ones already stored.
+  // id; it is now marked as such by the connector. Mark the ones already stored. GLOB, because the
+  // old test was case-sensitive and LIKE is not.
   `UPDATE inbox SET principal = json_set(principal, '$.unlinked', json('true'))
-     WHERE source = 'github' AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') LIKE 'github:%';`,
+     WHERE source = 'github' AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') GLOB 'github:*';`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -17,6 +17,9 @@ export class FakeTask extends DurableObject {
   }
   async answer(decision: string, reason: string, questionId?: string, standing = false) {
     this.#record("answer", { decision, reason, questionId, standing });
+    // A test can have the answer take a while to be confirmed, so that other things happen meanwhile.
+    const delay = (this.#policy() as { answerDelayMs?: number }).answerDelayMs;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     // Like the real task: the first answer to a question stands.
     const answers = (this.ctx.storage.kv.get("answers") as Record<string, string> | undefined) ?? {};
     answers[questionId ?? ""] ??= decision;
@@ -28,7 +31,7 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
+  async configure(policy: { answerDelayMs?: number; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {

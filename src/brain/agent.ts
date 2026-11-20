@@ -733,7 +733,7 @@ export class BrainAgent extends DurableObject<Env> {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be answered there");
 
-    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; standing?: boolean; before?: { decision: "allow" | "deny"; decided_by: string } };
+    type Intent = { call_id: string; pending_id: string; decision: "allow" | "deny"; reason: string; decided_by: string; deciding_event: number; ask?: string; standing?: boolean; before?: { decision: "allow" | "deny"; decided_by: string } };
     let intent = task.answering ? (JSON.parse(task.answering) as Intent) : undefined;
     // An approval is about to be acted on: look again at where the replies it could rest on were
     // read from. From here to the worker call nothing else can interleave.
@@ -888,7 +888,7 @@ export class BrainAgent extends DurableObject<Env> {
       // only for pushes that update branches, which is also the only kind it is offered for.
       const asksAbout = pending as { source?: string; refs?: RefUpdate[] };
       const standing = decision === "allow" && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
-      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
+      intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(pending.ask ? { ask: pending.ask } : {}), ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
       this.#sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
       this.#audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id, ...(standing ? { standing: true } : {}) });
@@ -907,7 +907,11 @@ export class BrainAgent extends DurableObject<Env> {
     );
     const askedAs = task.pending ? (JSON.parse(task.pending) as { id?: string; ask?: string }) : {};
     const forTheTask = decided === "allow" && intent.decision === "allow" && intent.standing === true;
-    if (askedAs.id === intent.pending_id) this.#closeQuestion(askedAs.ask, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
+    // The question that was answered, which need not be the one open now: a newer question may
+    // have taken its place while the answer was on its way, and marked it as no longer standing.
+    // What the worker actually did with it is the truth, and is shown instead.
+    const answeredAsk = intent.ask ?? (askedAs.id === intent.pending_id ? askedAs.ask : undefined);
+    this.#closeQuestion(answeredAsk, { state: decided === "allow" ? "approved" : "refused", standing: forTheTask });
     if (decided === intent.decision) return { ok: true, task_id: taskId, decision: decided, decided_by: intent.decided_by, ...(forTheTask ? { standing: "later pushes of the same branches in this task will not ask again" } : {}) };
     // The decision in force is the earlier one, and so is the person it is attributed to.
     const earlier = intent.before?.decision === decided ? intent.before.decided_by : undefined;
@@ -921,7 +925,9 @@ export class BrainAgent extends DurableObject<Env> {
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be cancelled there");
     if (TERMINAL_TASK.has(task.status)) return { ok: true, task_id: taskId, status: task.status };
     await this.env.TASKS.getByName(taskId).cancel();
-    this.#setTask(taskId, "cancelled", {});
+    // A question still open when the task is cancelled has nothing left to answer.
+    const open = this.#rows<{ pending: string | null }>("SELECT pending FROM tasks WHERE id = ? AND status = 'needs_input'", taskId)[0]?.pending;
+    if (this.#setTask(taskId, "cancelled", {}) && open) this.#closeQuestion((JSON.parse(open) as { ask?: string }).ask, { state: "withdrawn" });
     this.#audit("(agent)", "task.cancelled", { task_id: taskId });
     await registry(this.env).releaseTaskSlot(taskId);
     return { ok: true, task_id: taskId, status: "cancelled" };
@@ -1162,7 +1168,14 @@ export class BrainAgent extends DurableObject<Env> {
    */
   #closeQuestion(ask: string | undefined, outcome: Outcome): void {
     if (!ask) return;
-    this.#sql.exec("UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND closed IS NULL", JSON.stringify(outcome), ask);
+    // The first ending stands, except that a decision replaces "withdrawn": a question can be set
+    // aside before it is learnt that the worker had already been given an answer to it.
+    this.#sql.exec(
+      "UPDATE outbox SET closed = ? WHERE idem = ? AND ask IS NOT NULL AND (closed IS NULL OR (? AND json_extract(closed, '$.state') = 'withdrawn'))",
+      JSON.stringify(outcome),
+      ask,
+      outcome.state === "withdrawn" ? 0 : 1,
+    );
     this.#showClosed(ask);
   }
 
@@ -1205,14 +1218,21 @@ export class BrainAgent extends DurableObject<Env> {
    */
   async #refreshStanding(events: InboxRow[]): Promise<void> {
     const subjects = new Map<string, string>();
+    const deciding = new Set<string>();
     for (const event of events) {
       const subject = event.data ? (JSON.parse(event.data) as { subject?: string }).subject : undefined;
-      if (subject) subjects.set(subject, event.source);
+      if (!subject) continue;
+      subjects.set(subject, event.source);
+      if (this.#isDecider(JSON.parse(event.principal) as Principal, event.source)) deciding.add(subject);
     }
     for (const [subject, source] of subjects) {
       // A message that can change, from a connector that cannot say what it says now, cannot be
       // relied on for an approval.
-      if (!canRevisit(source)) throw new Error(`a reply here came through "${source}", which cannot confirm what the reply says now, so nothing can be approved on it`);
+      // Only where it could decide something: a notification nobody's approval rests on is left alone.
+      if (!canRevisit(source)) {
+        if (!deciding.has(subject)) continue;
+        throw new Error(`a reply here came through "${source}", which cannot confirm what the reply says now, so nothing can be approved on it`);
+      }
       const standing = await standingOf(this.env, source, this.#scope(), subject);
       if (standing) this.#revise(subject, standing.revision, standing.deleted, standing.holder);
     }

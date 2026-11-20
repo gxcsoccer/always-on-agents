@@ -15,6 +15,12 @@
  * What a connector may not decide. It says who caused an event; whether that person's word counts
  * is decided by the Brain, and only for connectors the deployment lists as trusted (see
  * `agent.config.ts`). A connector outside that list can inform the agent and nothing more.
+ *
+ * What this interface does not do. Connectors are first-party code compiled into the Worker: each
+ * one is handed the whole environment and writes its own name on the events it hands over. The
+ * trusted list therefore guards against a connector being relied on by oversight, not against one
+ * that misstates where its events came from. Review a connector as you would any code that holds
+ * the deployment's secrets.
  */
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";

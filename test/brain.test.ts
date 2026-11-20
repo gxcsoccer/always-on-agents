@@ -210,11 +210,14 @@ describe("timers and memory", () => {
       insert("github", "old-outsider", { kind: "human", id: "github:42", explicit: true });
       insert("github", "old-member", { kind: "human", id: "alice", explicit: true });
       insert("github", "old-ci", { kind: "automation", id: "github:ci", explicit: false });
+      // The old test was case-sensitive: this was a member then and is one now.
+      insert("github", "old-mixed-case", { kind: "human", id: "GitHub:member", explicit: true });
       state.storage.sql.exec(MIGRATIONS[11]);
       const unlinked = (sourceId: string) => state.storage.sql.exec("SELECT json_extract(principal, '$.unlinked') AS u FROM inbox WHERE source_id = ?", sourceId).one().u;
       expect(unlinked("old-outsider")).toBe(1);
       expect(unlinked("old-member")).toBeNull();
       expect(unlinked("old-ci")).toBeNull();
+      expect(unlinked("old-mixed-case")).toBeNull();
     });
   });
 
@@ -264,6 +267,12 @@ describe("tasks and approvals", () => {
     await wake(stub);
     return toolOutputs().at(-1);
   }
+
+  /** How each approval question here ended, oldest first; null while it is open. */
+  const closures = (stub: any) =>
+    runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) =>
+      state.storage.sql.exec("SELECT closed FROM outbox WHERE ask IS NOT NULL ORDER BY id").toArray().map((row: any) => (row.closed ? JSON.parse(row.closed) : null)),
+    );
 
   const answersSent = async (id: string) => (await task(id).calls()).filter((c: any) => c.method === "answer").map((c: any) => c.args);
 
@@ -1003,6 +1012,33 @@ describe("tasks and approvals", () => {
     // The late question was put to nobody: one question was ever asked, the first.
     expect(state.outbox.filter((m: any) => m.text.includes("needs approval"))).toHaveLength(1);
   });
+
+  it("closes an open question when its task is cancelled", async () => {
+    const { stub, id } = await taskAwaitingApproval();
+    model.replies([call("cancel_task", { task_id: id })], [say("")]);
+    await stub.ingest(message("@agent never mind", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    expect((await stub.inspect()).tasks[0].status).toBe("cancelled");
+    expect(await closures(stub)).toEqual([{ state: "withdrawn" }]);
+  });
+
+  it("shows what was decided on a question that a newer one replaced before the answer was confirmed", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerDelayMs: 1_500 });
+    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "ok" })], [say("")]);
+    // Left to its own alarm this time, so that something else can reach the Brain while it works.
+    await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
+    // The worker has the answer, and puts its next question before the Brain hears that it landed.
+    await vi.waitFor(async () => expect(await answersSent(id)).toHaveLength(1), { timeout: 8_000, interval: 50 });
+    await stub.taskEvent(id, 2, "needs_input", { ...ask, id: "q-2" });
+    expect(await closures(stub)).toEqual([{ state: "withdrawn" }, null]);
+
+    // Once the answer is confirmed, the first card says what happened to it, not that it was set
+    // aside. The second question is still open.
+    await vi.waitFor(async () => expect((await closures(stub))[0]).toMatchObject({ state: "approved" }), { timeout: 8_000, interval: 50 });
+    expect((await closures(stub))[1]).toBeNull();
+    expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
+  }, 20_000);
 
   it("asks nothing for a question that arrives before the result it was sent ahead of", async () => {
     const { stub } = brain("chat");

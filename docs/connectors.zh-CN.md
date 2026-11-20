@@ -77,6 +77,7 @@ curl -X POST $B/v1/admin/tenants/acme/identities -H "authorization: Bearer $ADMI
 ```
 
 没有关联的账号仍然会被识别出来，但不算作用域的成员：它不能批准任何东西。
+`user_id` 只能包含字母、数字、`.`、`_` 和 `-`。
 
 ## 飞书
 
@@ -171,4 +172,4 @@ export const exampleConnector: Connector = {
 - **不是租户用户的账号。** 如果 connector 在自己的系统里认出了一个账号，但它没有关联到租户的用户，就设置 `principal.unlinked`。这样的人不是任何作用域的成员。
 - **会变的消息。** 消息可以被编辑或删除的 connector，要给事件带上 `subject`、`revision` 和 `holder`，并实现 `channel.standing`（向那个系统重新读一遍这条消息）。批准生效之前，Brain 会问它这条消息现在说的是什么。带着 subject、而所属 connector 又没有 `standing` 的消息，不能批准任何事。
 
-connector 是编译进 Worker 的。需要自己的 Durable Object 的 connector（比如飞书长连接）还要从 `src/index.ts` 导出这个类，并在 `wrangler.jsonc` 里加一条绑定。
+connector 是编译进 Worker 的第一方代码：每个 connector 都能拿到完整的环境，事件上的来源名字也是它自己写的。`trusted` 名单防的是“无意中依赖了某个 connector”，防不了一个谎报事件来源的 connector，所以审查 connector 要像审查任何持有部署密钥的代码一样。需要自己的 Durable Object 的 connector（比如飞书长连接）还要从 `src/index.ts` 导出这个类，并在 `wrangler.jsonc` 里加一条绑定。

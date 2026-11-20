@@ -18,11 +18,11 @@ import type { Connector, OutboundMessage, Receipt, Standing } from "./types";
 export const githubConnector: Connector = {
   name: "github",
   async http(request, env, path) {
-    if (path.length === 1 && path[0] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
+    if (path[0] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
     return json({ error: "not found" }, 404);
   },
   async admin({ method, path, body }, env) {
-    if (path[0] !== "tenants" || path.length !== 3 || method !== "POST") return undefined;
+    if (path[0] !== "tenants" || method !== "POST") return undefined;
     if (path[2] === "github-installations") {
       await registry(env).linkGithubInstallation(String((await body()).installation_id ?? ""), path[1]);
       return json({ ok: true });
