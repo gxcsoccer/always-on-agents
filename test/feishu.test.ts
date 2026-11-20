@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { approvalCard, decrypt, normalize, normalizeCardAction, sentAt, verifySignature } from "../src/connectors/feishu";
+import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
 const Q = "ask:11111111-2222-3333-4444-555555555555:1";
@@ -57,7 +58,9 @@ describe("turning a Feishu message into an event", () => {
     const origin = result?.event.data?.origin as Record<string, string>;
     expect(origin).toMatchObject({ app_id: "cli_test" });
     expect(origin.tenant_key).toBeTruthy();
-    expect(result?.event.session_key).toBe(`private:feishu:app_id=cli_test,tenant_key=${origin.tenant_key}`);
+    expect(result?.event.session_key).toBe(privateSessionKey("feishu", origin));
+    // Written out as data, so no choice of values can make two origins read the same.
+    expect(privateSessionKey("x", { a: "1,b=2" })).not.toBe(privateSessionKey("x", { a: "1", b: "2" }));
     expect(result?.event.data?.direct).toBe(true);
     // In a group it is neither.
     const group = normalize(app, envelope({ chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }], content: JSON.stringify({ text: "@_user_1 hello" }) }));

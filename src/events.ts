@@ -94,10 +94,14 @@ export interface InboundEvent {
  * what is read for a person stays where only that person, through that origin, takes part.
  */
 export function privateSessionKey(connector: string, origin: Record<string, string>): string {
-  const parts = Object.keys(origin)
-    .sort()
-    .map((key) => `${key}=${origin[key]}`);
-  return `private:${connector}:${parts.join(",")}`;
+  // The origin is written out as data, in key order, so that no choice of keys or values can make
+  // two different origins read the same.
+  return `private:${connector}:${JSON.stringify(Object.keys(origin).sort().map((key) => [key, origin[key]]))}`;
+}
+
+/** Whether a conversation is someone's private one through a connector (see privateSessionKey). */
+export function isPrivateSession(sessionKey: string): boolean {
+  return sessionKey.startsWith("private:");
 }
 
 /** Events a worker sends back to the Brain that started it. */

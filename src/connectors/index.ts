@@ -23,6 +23,7 @@ for (const connector of config.connectors) {
   for (const tool of connector.tools ?? []) {
     if (toolNames.has(tool.name) || TOOLS.some((own) => own.name === tool.name)) throw new Error(`two tools are named "${tool.name}"`);
     toolNames.add(tool.name);
+    if (tool.effect !== "read") throw new Error(`tool "${tool.name}" must declare that it only reads`);
     if (!tool.name.startsWith(`${connector.name.replace(/-/g, "_")}_`) || !/^[a-z][a-z0-9_]{2,63}$/.test(tool.name)) throw new Error(`tool "${tool.name}" must be named ${connector.name}_…`);
   }
   byName.set(connector.name, connector);

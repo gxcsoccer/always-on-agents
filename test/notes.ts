@@ -32,6 +32,7 @@ if (!config.connectors.some((connector) => connector.name === "notes")) {
       {
         name: "notes_read",
         description: "Read one of the person's pages.",
+        effect: "read",
         parameters: { page: { type: "string" } },
         async run(context, args) {
           reads.push({ person: context.person, origin: context.origin, page: String(args.page) });

@@ -49,16 +49,22 @@ export interface Connector {
  * decides this; the model cannot choose whom a tool acts for, and neither can the tool's
  * arguments.
  *
- * What a tool returns comes from outside and may be written by anyone. The Brain treats it so: in
- * a run that has used a connector tool the agent's memory and standing instructions cannot be
- * changed, and when the run ends the returned text is removed from the conversation's record,
- * leaving a note that it was read.
+ * What a tool returns comes from outside and may be written by anyone, and what the model goes on
+ * to say carries it. The Brain treats it so: from the first such call on, the run can only reply
+ * to the person and read again; and when the run ends everything it produced is removed from the
+ * conversation's record, leaving a note that something was read.
  *
  * A tool call may be repeated after an interruption, so a tool must be safe to run twice.
  */
 export interface ConnectorTool {
   name: string;
   description: string;
+  /**
+   * What the tool does to the outside system. Only "read" exists: a tool that looks and changes
+   * nothing. Once a run has read outside text, reading again is the only thing a connector's tool
+   * may still do in it.
+   */
+  effect: "read";
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
