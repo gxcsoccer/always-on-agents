@@ -541,8 +541,16 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(toolOutputs()[1]).toEqual({ text: "Judy's." });
     expect(invitation(judy.openId).searchParams.get("scope")).toBe("docx:document:readonly wiki:node:read");
     // Feishu will not issue that; the code is offered once, and what she had stays as it was.
+    // The operator is told which step it was and Feishu's own code for it, and nothing more.
     const issued = feishu.tokens.size;
-    expect((await consent(invitation(judy.openId), judy)).status).toBe(400);
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((line: unknown) => void lines.push(String(line)));
+    try {
+      expect((await consent(invitation(judy.openId), judy)).status).toBe(400);
+    } finally {
+      log.mockRestore();
+    }
+    expect(lines.filter((line) => line.includes("feishu_authorisation_refused")).map((line) => JSON.parse(line))).toEqual([{ feishu_authorisation_refused: "exchange_failed", app: APP_ID, status: 400, code: 20068 }]);
     expect(feishu.tokens.size).toBe(issued);
     expect(await (await judy.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly" });
   });

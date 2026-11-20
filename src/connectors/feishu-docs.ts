@@ -243,9 +243,12 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   const code = url.searchParams.get("code") ?? "";
   if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
 
-  const refused = (why: string) => {
-    // Which step failed, for the operator. Nothing Feishu or the browser sent is logged.
-    console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id }));
+  const refused = (why: string, answer?: { status: number; code?: unknown }) => {
+    // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
+    // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
+    // sent is logged.
+    const code = answer && typeof answer.code === "number" && Number.isInteger(answer.code) ? answer.code : undefined;
+    console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}) } : {}) }));
     return page("授权没有成功", "请回到飞书，重新向我发起请求。如果一直不成功，请联系管理员。", 400);
   };
   const app = await registry(env).feishuApp(who.app_id);
@@ -259,7 +262,7 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
   });
   const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string };
-  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed");
+  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed", { status: exchange.status, code: issued.code });
   const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
   if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
   // The token must be for what was asked and nothing more. One that reaches further is not kept.
@@ -269,7 +272,7 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   // organisation. Anyone else who opened the link and consented gets nothing installed.
   const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } });
   const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
-  if (!asked.ok || info.code !== 0) return refused("identity_unknown");
+  if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
     console.log(JSON.stringify({ feishu_authorisation_refused: "another_account", app: who.app_id }));
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
