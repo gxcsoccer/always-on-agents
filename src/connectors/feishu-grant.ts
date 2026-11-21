@@ -15,6 +15,11 @@
  * Every token kept here has a version of its own. A read that began under one version is not
  * finished, and cannot take the grant away, once another token or none is in its place.
  *
+ * Where the person also gave leave for it (`offline_access`), Feishu issues a second token with
+ * which a new first one can be had when it runs out. That second token can be used once and is
+ * replaced each time, so renewing is done here and nowhere else, one at a time; a renewal whose
+ * outcome is not known for certain ends the grant, and the person is asked again.
+ *
  * Every authorisation belongs to a generation. Dropping the grant starts a new one, and anything
  * begun in an earlier generation (an invitation still open in a browser, a callback on its way)
  * can no longer install a token.
@@ -22,7 +27,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../env";
-import { sendToPerson } from "./feishu-api";
+import { registry } from "../registry";
+import { TOKEN_V2, TOKEN_V3, sendToPerson } from "./feishu-api";
 
 /** A person as one Feishu app sees them: the app, the organisation, and their id under that app. */
 export interface Who {
@@ -50,7 +56,16 @@ interface Stored {
   who: Who;
   generation: number;
   pending: Pending[];
-  grant?: { sealed: string; expires_at: number; scope: string; version: string };
+  grant?: {
+    sealed: string;
+    expires_at: number;
+    scope: string;
+    version: string;
+    /** The token for renewing, sealed; until when it can be used; and which endpoint issued it. */
+    refresh?: { sealed: string; expires_at: number; endpoint: "v2" | "v3" };
+    /** Set, with the time, just before a renewal is sent, and cleared when its outcome is recorded. */
+    renewing?: number;
+  };
   /**
    * The earlier message whose link has been read on the strength of a later one, and the tool
    * call that read it. See `finish`.
@@ -59,8 +74,12 @@ interface Stored {
 }
 
 const AUTHORIZE = "https://accounts.feishu.cn/open-apis/authen/v1/authorize";
-/** Everything a person is ever asked to allow: reading documents, and finding which document a wiki page is. */
-export const SCOPES = ["docx:document:readonly", "wiki:node:read"];
+/**
+ * Everything a person is ever asked to allow: reading documents, finding which document a wiki
+ * page is, and, where the operator has turned it on for the app, leave to renew without them.
+ */
+export const OFFLINE = "offline_access";
+export const SCOPES = ["docx:document:readonly", "wiki:node:read", OFFLINE];
 /** What the caller knew of the grant when it decided an invitation was needed. */
 export interface Seen {
   generation: number;
@@ -98,7 +117,7 @@ export class FeishuGrant extends DurableObject<Env> {
       delete stored.grant;
     }
     // Someone has authorised since the caller looked: there is nothing to ask for.
-    if (stored.grant && stored.grant.expires_at - now >= EXPIRY_MARGIN_MS && scope.every((each) => stored.grant!.scope.split(" ").includes(each))) return "superseded";
+    if (stored.grant && usable(stored.grant, now) && scope.every((each) => stored.grant!.scope.split(" ").includes(each))) return "superseded";
     stored.pending = stored.pending.filter((each) => each.expires_at > now);
     let pending = stored.pending.find((each) => each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS && scope.every((wanted) => each.scope.includes(wanted)));
     if (!pending) {
@@ -187,24 +206,97 @@ export class FeishuGrant extends DurableObject<Env> {
    * either order. A token that covers no more than a usable one already held changes nothing, so
    * finishing the older, narrower invitation last does not take away what the wider one gave.
    */
-  async install(generation: number, token: { access_token: string; expires_at: number; scope: string }): Promise<boolean> {
+  async install(generation: number, token: { access_token: string; expires_at: number; scope: string; refresh?: { token: string; expires_at: number; endpoint: "v2" | "v3" } }): Promise<boolean> {
     // Sealed under a version of its own. All that is awaited comes before the record is read:
     // from the read to the write nothing else can run, so the decision below is about the grant
     // as it is at the moment of writing, however many installs overlap.
     const version = random(16);
     const key = await this.#key();
     const sealed = await seal(key, token.access_token, version);
+    const refresh = token.refresh ? { sealed: await seal(key, token.refresh.token, `${version}:refresh`), expires_at: token.refresh.expires_at, endpoint: token.refresh.endpoint } : undefined;
     // A token already held that can no longer be opened (the key changed) is no reason to turn
     // this one away. Which version that is, is found out here, before the read that decides.
     const earlier = (await this.#load())?.grant;
     const unreadable = earlier && !(await open(key, earlier.sealed, earlier.version).then(() => true, () => false)) ? earlier.version : undefined;
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
-    const has = stored.grant && stored.grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
+    const has = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
     if (has && token.scope.split(" ").every((each) => has.includes(each))) return true;
-    stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version };
+    stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version, ...(refresh ? { refresh } : {}) };
     void this.ctx.storage.put("grant", stored);
     return true;
+  }
+
+  /** One renewal at a time: everyone who needs the token while it is being renewed waits for the same one. */
+  #renewal?: Promise<void>;
+
+  /**
+   * Gets a new token with the one kept for that, if the first has run out. Feishu lets the second
+   * token be used once and replaces it, so this must not run twice at once, and must not lose
+   * what comes back.
+   *
+   * Before the request goes out, the grant is marked as being renewed. If the answer is a new
+   * pair of tokens for exactly what the person allowed, they replace the old pair in one write.
+   * In every other case (refused, an answer that cannot be read, no answer, a grant found still
+   * marked from an attempt that never finished) it cannot be relied on that the old second token
+   * still works, so the grant ends and the person is asked again. The grant keeps its version
+   * through a renewal: it is the same authorisation.
+   */
+  async #renew(): Promise<void> {
+    const key = await this.#key();
+    const first = await this.#load();
+    const grant = first?.grant;
+    if (!first || !grant || grant.expires_at - Date.now() >= EXPIRY_MARGIN_MS) return;
+    const end = async (why: string, answer?: { status: number; code?: unknown }) => {
+      const stored = await this.#load();
+      // Only the grant this attempt was about. One installed or dropped meanwhile is left alone.
+      if (stored?.generation === first.generation && stored.grant?.version === grant.version) {
+        delete stored.grant;
+        void this.ctx.storage.put("grant", stored);
+      }
+      const code = answer && typeof answer.code === "number" && Number.isInteger(answer.code) ? answer.code : undefined;
+      console.log(JSON.stringify({ feishu_grant_not_renewed: why, app: first.who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}) } : {}) }));
+    };
+    if (!grant.refresh || grant.refresh.expires_at - Date.now() < EXPIRY_MARGIN_MS) return;
+    // Left marked by an attempt that was cut off: whether Feishu used up the token is not known.
+    if (grant.renewing !== undefined) return end("outcome_unknown");
+    let token: string;
+    try {
+      token = await open(key, grant.refresh.sealed, `${grant.version}:refresh`);
+    } catch {
+      return end("unreadable");
+    }
+    const app = await registry(this.env).feishuApp(first.who.app_id);
+    if (!app) return end("unknown_app");
+
+    // Marked in one step with the check that it is still the same grant and still unmarked.
+    const marked = await this.#load();
+    if (marked?.generation !== first.generation || marked.grant?.version !== grant.version || marked.grant.renewing !== undefined || marked.grant.refresh?.sealed !== grant.refresh.sealed) return;
+    marked.grant.renewing = Date.now();
+    void this.ctx.storage.put("grant", marked);
+
+    // The older endpoint only renews what it issued itself; the current one renews either.
+    const endpoint = app.oauth_v2 && grant.refresh.endpoint === "v2" ? "v2" : "v3";
+    // Asked for exactly what the person allowed, never for all they ever allowed this app.
+    const response = await fetch(endpoint === "v2" ? TOKEN_V2 : TOKEN_V3, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ grant_type: "refresh_token", client_id: app.app_id, client_secret: app.app_secret, refresh_token: token, scope: grant.scope }),
+    }).catch(() => undefined);
+    if (!response) return end("no_answer");
+    const issued = (await response.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number; scope?: string };
+    if (!response.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token || typeof issued.refresh_token !== "string" || !issued.refresh_token) return end("refused", { status: response.status, code: issued.code });
+    const allowed = grant.scope.split(" ").filter(Boolean);
+    const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
+    if (granted.length !== allowed.length || granted.some((each) => !allowed.includes(each))) return end("scope_changed");
+
+    const sealed = await seal(key, issued.access_token, grant.version);
+    const refresh = { sealed: await seal(key, issued.refresh_token, `${grant.version}:refresh`), expires_at: Date.now() + Math.max(0, Number(issued.refresh_token_expires_in) || 0) * 1_000, endpoint } as const;
+    const stored = await this.#load();
+    // Dropped or replaced while Feishu was answering: the new pair belongs to a grant that is gone.
+    if (stored?.generation !== first.generation || stored.grant?.version !== grant.version) return;
+    stored.grant = { sealed, expires_at: Date.now() + Math.max(0, Number(issued.expires_in) || 0) * 1_000, scope: grant.scope, version: grant.version, refresh };
+    void this.ctx.storage.put("grant", stored);
   }
 
   /**
@@ -214,7 +306,13 @@ export class FeishuGrant extends DurableObject<Env> {
    * back when asking for an invitation.
    */
   async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] }; unreadable?: string; answered?: { message: string; by: string } }> {
-    const stored = await this.#load();
+    let stored = await this.#load();
+    // Run out, but renewable: renewed first, by one renewal however many are waiting.
+    if (stored?.grant && stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS && stored.grant.refresh) {
+      this.#renewal ??= this.#renew().finally(() => (this.#renewal = undefined));
+      await this.#renewal;
+      stored = await this.#load();
+    }
     const generation = stored?.generation ?? 1;
     const answered = stored?.answered;
     if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation, answered };
@@ -260,10 +358,10 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 
   /** For the operator: whether there is a grant, and until when. Never the token. */
-  async status(): Promise<{ authorised: boolean; expires_at?: number; scope?: string; pending: number }> {
+  async status(): Promise<{ authorised: boolean; expires_at?: number; renewable_until?: number; scope?: string; pending: number }> {
     const stored = await this.#load();
-    const live = stored?.grant && stored.grant.expires_at > Date.now() ? stored.grant : undefined;
-    return { authorised: Boolean(live), ...(live ? { expires_at: live.expires_at, scope: live.scope } : {}), pending: stored?.pending.filter((each) => each.expires_at > Date.now()).length ?? 0 };
+    const live = stored?.grant && usable(stored.grant, Date.now(), 0) ? stored.grant : undefined;
+    return { authorised: Boolean(live), ...(live ? { expires_at: live.expires_at, ...(live.refresh ? { renewable_until: live.refresh.expires_at } : {}), scope: live.scope } : {}), pending: stored?.pending.filter((each) => each.expires_at > Date.now()).length ?? 0 };
   }
 
   #load(): Promise<Stored | undefined> {
@@ -295,6 +393,11 @@ function invitationCard(url: string): unknown {
       { tag: "note", elements: [plain("链接 10 分钟内有效，只对你本人有效。授权完成后，请把刚才的请求再发一次。")] },
     ],
   };
+}
+
+/** Whether a grant can still produce a token: its own has time left, or it can be renewed. */
+function usable(grant: NonNullable<Stored["grant"]>, now: number, margin = EXPIRY_MARGIN_MS): boolean {
+  return grant.expires_at - now >= margin || (grant.refresh !== undefined && grant.refresh.expires_at - now >= margin);
 }
 
 /** The deployment's key for sealing tokens, if one long enough to be a key is set. */

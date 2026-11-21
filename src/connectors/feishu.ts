@@ -34,11 +34,14 @@ export const feishuConnector: Connector = {
   },
   async admin({ method, path, url, body }, env) {
     if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
-    // Which of Feishu's token endpoints this one app's authorisation codes are exchanged at.
+    // How this one app's authorisations are obtained: which token endpoint, and whether they can be renewed.
     if (path[0] === "feishu-apps" && path[1] && path[2] === "oauth" && path.length === 3 && method === "POST") {
-      const endpoint = (await body()).token_endpoint;
-      if (endpoint !== "v2" && endpoint !== "v3") return json({ error: "token_endpoint must be v2 or v3" }, 400);
-      return (await registry(env).setFeishuOauthEndpoint(path[1], endpoint)) ? json({ ok: true, token_endpoint: endpoint }) : json({ error: "unknown app" }, 404);
+      const { token_endpoint: endpoint, offline_access: offline } = await body();
+      if (endpoint === undefined && offline === undefined) return json({ error: "give token_endpoint, offline_access, or both" }, 400);
+      if (endpoint !== undefined && endpoint !== "v2" && endpoint !== "v3") return json({ error: "token_endpoint must be v2 or v3" }, 400);
+      if (offline !== undefined && typeof offline !== "boolean") return json({ error: "offline_access must be true or false" }, 400);
+      const now = await registry(env).setFeishuOauth(path[1], { token_endpoint: endpoint, offline_access: offline });
+      return now ? json({ ok: true, ...now }) : json({ error: "unknown app" }, 404);
     }
     // One person's authorisation to read their documents: whether it stands, and taking it away.
     if (path[0] === "feishu-grants" && path.length === 4 && (method === "GET" || method === "DELETE")) {

@@ -71,7 +71,7 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 | `POST /v1/admin/tasks/:id/probe` | 在任务的容器里做一组检查（它能访问什么、持有什么） |
 | `POST /v1/admin/tasks/:id/kill-container` | 销毁容器，用来演练恢复 |
 | `GET /v1/admin/feishu-links/:app_id` | 一条飞书长连接的状态 |
-| `POST /v1/admin/feishu-apps/:app_id/oauth` | 选择该应用的授权码在飞书的哪个接口换取令牌：`{"token_endpoint":"v2"}` 或 `"v3"`（默认）。见 [Connector](connectors.zh-CN.md) |
+| `POST /v1/admin/feishu-apps/:app_id/oauth` | 该应用的授权如何取得：`{"token_endpoint":"v2"}` 或 `"v3"`（默认）决定用飞书的哪个接口换令牌；`{"offline_access":true}` 表示请用户允许续期，让授权长期有效。可以只给其中一项。见 [Connector](connectors.zh-CN.md) |
 | `GET`、`DELETE /v1/admin/feishu-grants/:app_id/:tenant_key/:open_id` | 某个人读取文档的授权是否还在；`DELETE` 收回它。不会返回令牌 |
 
 ### 其他接口

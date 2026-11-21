@@ -16,20 +16,10 @@
  */
 import type { Env } from "../env";
 import { registry } from "../registry";
-import { API, sendToPerson } from "./feishu-api";
-import { SCOPES, type Who, grantName, grantOf, grantsKey } from "./feishu-grant";
+import { API, TOKEN_V2, TOKEN_V3, sendToPerson } from "./feishu-api";
+import { OFFLINE, type Who, grantName, grantOf, grantsKey } from "./feishu-grant";
 import type { ConnectorTool, ToolContext } from "./types";
 
-/** Feishu's token endpoint. It checks the PKCE verifier against the challenge sent at authorisation. */
-const TOKEN = "https://accounts.feishu.cn/oauth/v3/token";
-/**
- * Feishu's older token endpoint, used only for an app the operator has switched to it (see
- * `oauth_v2` in the registry). Feishu's authorisation page says to pair PKCE with this one for
- * now; its notes also say this one does not refuse a verifier when no challenge is held for the
- * code. So on this endpoint a successful exchange does not show that the verifier was checked.
- * Request and response are the same.
- */
-const TOKEN_V2 = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
 /** How much of a document one read returns. */
 export const MAX_DOCUMENT_TEXT = 40_000;
 /** Feishu's codes for "this user token is no good": invalid, expired, or lacking what the person must grant. */
@@ -176,7 +166,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // By another call, that is. This same call may be running again after an interruption.
   if (carriedFrom !== undefined && answered?.message === carriedFrom && answered.by !== context.callId) return alreadyRead;
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
-  const needed = target.kind === "wiki" ? SCOPES : ["docx:document:readonly"];
+  // Where the operator has turned it on for this app, also leave to renew the token without them.
+  const needed = [...(target.kind === "wiki" ? ["docx:document:readonly", "wiki:node:read"] : ["docx:document:readonly"]), ...(app.oauth_offline ? [OFFLINE] : [])];
   // The authorisation was taken away, or replaced, while this read was under way: what the old
   // token fetched is not handed on, and this read does not ask for a new one.
   const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
@@ -266,12 +257,12 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
   // to hold. The code is used once.
   // One endpoint per code, chosen by the app's setting; never one after the other.
-  const exchange = await fetch(app.oauth_v2 ? TOKEN_V2 : TOKEN, {
+  const exchange = await fetch(app.oauth_v2 ? TOKEN_V2 : TOKEN_V3, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
   });
-  const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string };
+  const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number };
   if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed", { status: exchange.status, code: issued.code, endpoint: app.oauth_v2 ? "v2" : "v3" });
   const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
   if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
@@ -288,7 +279,16 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }
 
-  const kept = await grant.install(invitation.generation, { access_token: issued.access_token, expires_at: Date.now() + Math.max(0, Number(issued.expires_in) || 0) * 1_000, scope: granted.join(" ") });
+  // With the person's leave to act while they are away comes a second token, for getting a new
+  // first one when it runs out. It is asked for only where the invitation asked for that leave.
+  const lasting = invitation.scope.includes(OFFLINE) && typeof issued.refresh_token === "string" && issued.refresh_token !== "";
+  if (invitation.scope.includes(OFFLINE) && !lasting) return refused("no_refresh_token");
+  const kept = await grant.install(invitation.generation, {
+    access_token: issued.access_token,
+    expires_at: Date.now() + Math.max(0, Number(issued.expires_in) || 0) * 1_000,
+    scope: granted.join(" "),
+    ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + Math.max(0, Number(issued.refresh_token_expires_in) || 0) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
+  });
   if (!kept) return refused("superseded");
   defer(sendToPerson(env, who.app_id, who.open_id, `granted:${state[2]}`, { text: "授权成功。请把刚才的请求再发一次，我就可以读取文档了。" }).catch(() => undefined));
   return page("授权成功", "现在可以回到飞书，把刚才的请求再发一次。");

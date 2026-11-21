@@ -7,6 +7,17 @@ import { registry } from "../registry";
 
 export const API = "https://open.feishu.cn/open-apis";
 
+/** Feishu's token endpoint. It checks the PKCE verifier against the challenge sent at authorisation. */
+export const TOKEN_V3 = "https://accounts.feishu.cn/oauth/v3/token";
+/**
+ * Feishu's older token endpoint, used only for an app the operator has switched to it (see
+ * `oauth_v2` in the registry). Feishu's authorisation page says to pair PKCE with this one for
+ * now; its notes also say this one does not refuse a verifier when no challenge is held for the
+ * code. So on this endpoint a successful exchange does not show that the verifier was checked.
+ * Request and response are the same.
+ */
+export const TOKEN_V2 = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
+
 /** The app's tenant_access_token, cached in the registry until shortly before it expires. */
 export async function tenantAccessToken(env: Env, appId: string): Promise<string> {
   const app = await registry(env).feishuApp(appId);
