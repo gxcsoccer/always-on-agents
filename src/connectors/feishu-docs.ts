@@ -253,6 +253,9 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   };
   const app = await registry(env).feishuApp(who.app_id);
   if (!app) return refused("unknown_app");
+  // Lasting authorisations were turned off for this app after the invitation went out: it is
+  // turned away before anything is asked of Feishu.
+  if (invitation.scope.includes(OFFLINE) && !app.oauth_offline) return refused("offline_turned_off");
   // Only what the invitation asked the person for is asked of Feishu, whatever else they have
   // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
   // to hold. The code is used once.
@@ -270,8 +273,7 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
   // The token must be for what was asked and nothing more. One that reaches further is not kept.
   if (!sameSet(granted, invitation.scope)) return refused("scope_too_wide");
-  // Lasting authorisations were turned off for this app after the invitation went out.
-  if (invitation.scope.includes(OFFLINE) && !app.oauth_offline) return refused("offline_turned_off");
+
 
   // Whose token is it? The answer must be the person the invitation was sent to, in the same
   // organisation. Anyone else who opened the link and consented gets nothing installed.
@@ -287,6 +289,8 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
   // first one when it runs out. It is asked for only where the invitation asked for that leave.
   const lasting = invitation.scope.includes(OFFLINE) && typeof issued.refresh_token === "string" && issued.refresh_token !== "" && lifetime(issued.refresh_token_expires_in) > 0;
   if (invitation.scope.includes(OFFLINE) && !lasting) return refused("no_refresh_token");
+  // And if it was turned off while Feishu was answering, what came back is not kept.
+  if (invitation.scope.includes(OFFLINE) && !(await registry(env).feishuApp(who.app_id))?.oauth_offline) return refused("offline_turned_off");
   const kept = await grant.install(invitation.generation, {
     access_token: issued.access_token,
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,

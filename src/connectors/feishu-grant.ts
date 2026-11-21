@@ -124,7 +124,11 @@ export class FeishuGrant extends DurableObject<Env> {
     }
     // Someone has authorised since the caller looked: there is nothing to ask for.
     if (stored.grant && usable(stored.grant, now) && scope.every((each) => stored.grant!.scope.split(" ").includes(each))) return "superseded";
-    stored.pending = stored.pending.filter((each) => each.expires_at > now);
+    // An invitation of the other kind (lasting where this asks for a short one, or the reverse) is
+    // from before the app's setting changed. It could no longer be completed, so it is closed:
+    // not offered again, not retried, and its link no longer works.
+    const lasting = scope.includes(OFFLINE);
+    stored.pending = stored.pending.filter((each) => each.expires_at > now && each.scope.includes(OFFLINE) === lasting);
     let pending = stored.pending.find((each) => each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS && scope.every((wanted) => each.scope.includes(wanted)));
     if (!pending) {
       pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS, delivered: false, attempts: 0, next_attempt_at: now };
@@ -309,6 +313,19 @@ export class FeishuGrant extends DurableObject<Env> {
     // For exactly what the person allowed: the same set, no more, no less, nothing twice.
     if (!sameSet(String(issued.scope ?? "").split(/\s+/).filter(Boolean), grant.scope.split(" ").filter(Boolean))) return end("scope_changed");
 
+    // The operator may have turned lasting authorisations off while Feishu was answering. Then
+    // the new pair is not kept: the grant is left to lapse, without a token for renewing.
+    const still = await registry(this.env).feishuApp(first.who.app_id);
+    if (!still?.oauth_offline) {
+      const off = await this.#load();
+      if (off?.generation === first.generation && off.grant?.version === grant.version) {
+        delete off.grant.refresh;
+        delete off.grant.renewing;
+        void this.ctx.storage.put("grant", off);
+      }
+      console.log(JSON.stringify({ feishu_grant_not_renewed: "turned_off", app: first.who.app_id }));
+      return;
+    }
     const sealed = await seal(key, issued.access_token, grant.version);
     const refresh = { sealed: await seal(key, issued.refresh_token, `${grant.version}:refresh`), expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint } as const;
     const stored = await this.#load();

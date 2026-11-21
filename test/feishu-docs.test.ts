@@ -31,6 +31,8 @@ const feishu = {
   renewals: [] as { endpoint: string; scope: unknown; outcome: string }[],
   /** What Feishu does with the next renewal, instead of answering it properly. */
   renewalFault: undefined as undefined | "no_answer" | "garbage" | "wider" | "null" | "no_lifetime" | "twice",
+  /** Runs while a code is being exchanged. */
+  duringExchange: undefined as undefined | (() => Promise<void>),
   /** Runs while a renewal is being answered. */
   duringRenewal: undefined as undefined | (() => Promise<void>),
   /** Every token exchange: which endpoint, for which app. */
@@ -64,6 +66,7 @@ function installFakeFeishu() {
   feishu.renewals.length = 0;
   feishu.renewalFault = undefined;
   feishu.duringRenewal = undefined;
+  feishu.duringExchange = undefined;
   feishu.sendAttempts = 0;
   feishu.wikiNotCovered = false;
   feishu.duringRead = undefined;
@@ -112,6 +115,7 @@ function installFakeFeishu() {
         return pair(held, feishu.renewalFault === "wider" ? [...scope, "im:message"] : scope);
       }
       feishu.exchanges.push({ endpoint: tokenEndpoint, app: body.client_id });
+      await feishu.duringExchange?.();
       const consent = feishu.codes.get(body.code);
       // A code can be offered once, whatever comes of it.
       feishu.codes.delete(body.code);
@@ -929,6 +933,77 @@ describe("an authorisation that lasts", () => {
     expect(invitation(wren.openId).searchParams.get("scope")).toBe("docx:document:readonly");
     const stored = await runInDurableObject(await wren.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"));
     expect(stored.grant?.refresh).toBeUndefined();
+  });
+
+  it("keeps nothing that comes back after the operator turned it off, and offers a card that can be completed", async () => {
+    const off = () => (env as any).REGISTRY.getByName("global").setFeishuOauth(APP_ID, { offline_access: false });
+    // Turned off while a renewal is with Feishu: the new pair is not kept.
+    const xena = someone();
+    feishu.docs.set("DocXena00000000000001", { readers: [xena.openId], text: "Xena." });
+    await authorised(xena, "DocXena00000000000001");
+    await runOut(xena);
+    feishu.duringRenewal = async () => {
+      feishu.duringRenewal = undefined;
+      await off();
+    };
+    expect((await (await xena.grant()).held()).credential).toBeUndefined();
+    expect(feishu.renewals.map((each) => each.outcome)).toEqual(["ok"]);
+    expect((await (await xena.grant()).status()).authorised).toBe(false);
+    const kept = await runInDurableObject(await xena.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"));
+    expect(kept.grant?.refresh).toBeUndefined();
+
+    // Turned off while a first lasting authorisation is being exchanged: not kept either.
+    await settings({ offline_access: true });
+    const yara = someone();
+    feishu.docs.set("DocYara00000000000001", { readers: [yara.openId], text: "Yara." });
+    model.replies([call("feishu_read_document", { document: link("DocYara00000000000001") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await yara.says(`读一下 ${link("DocYara00000000000001")}`);
+    feishu.duringExchange = async () => {
+      feishu.duringExchange = undefined;
+      await off();
+    };
+    expect((await consent(invitation(yara.openId), yara)).status).toBe(400);
+    expect((await (await yara.grant()).status()).authorised).toBe(false);
+    // Already off when the person comes back: nothing is asked of Feishu at all.
+    await settings({ offline_access: true });
+    model.replies([call("feishu_read_document", { document: link("DocYara00000000000001") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await yara.says(`读一下 ${link("DocYara00000000000001")}`);
+    const stale = invitation(yara.openId);
+    await off();
+    const exchanges = feishu.exchanges.length;
+    expect((await consent(stale, yara)).status).toBe(400);
+    expect(feishu.exchanges.length).toBe(exchanges);
+
+    // A lasting card is out, the setting goes off, she asks again: a new card, without the lasting leave, that works.
+    await settings({ offline_access: true });
+    const zoe = someone();
+    feishu.docs.set("DocZoe000000000000001", { readers: [zoe.openId], text: "Zoe." });
+    expect((await read(zoe, "DocZoe000000000000001")).authorisation_needed).toBe(true);
+    const lasting = invitation(zoe.openId);
+    expect(lasting.searchParams.get("scope")).toContain("offline_access");
+    const before = cards();
+    await off();
+    expect((await read(zoe, "DocZoe000000000000001")).authorisation_needed).toBe(true);
+    expect(cards()).toBe(before + 1);
+    expect(invitation(zoe.openId).searchParams.get("scope")).toBe("docx:document:readonly");
+    // The old card's link is closed; the new one completes.
+    expect((await consent(lasting, zoe)).status).toBe(400);
+    expect((await consent(invitation(zoe.openId), zoe)).status).toBe(200);
+    expect(await read(zoe, "DocZoe000000000000001")).toEqual({ text: "Zoe." });
+
+    // One that had not been delivered yet is not retried after the switch.
+    await settings({ offline_access: true });
+    const abby = someone();
+    feishu.docs.set("DocAbby00000000000001", { readers: [abby.openId], text: "Abby." });
+    feishu.failSends = 1;
+    expect((await read(abby, "DocAbby00000000000001")).note).toMatch(/could not be delivered/);
+    await off();
+    expect((await read(abby, "DocAbby00000000000001")).authorisation_needed).toBe(true);
+    await runInDurableObject(await abby.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      expect(stored.pending.map((each: any) => each.scope.join(" "))).toEqual(["docx:document:readonly"]);
+    });
+    expect(feishu.sent.filter((each) => each.to === abby.openId && each.type === "interactive").map((each) => new URL(each.content.elements.find((e: any) => e.tag === "action").actions[0].url).searchParams.get("scope"))).toEqual(["docx:document:readonly"]);
   });
 
   it("renews at the older endpoint only what that endpoint issued", async () => {
