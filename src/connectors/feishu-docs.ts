@@ -17,7 +17,7 @@
 import type { Env } from "../env";
 import { registry } from "../registry";
 import { API, TOKEN_V2, TOKEN_V3, sendToPerson } from "./feishu-api";
-import { OFFLINE, type Who, grantName, grantOf, grantsKey } from "./feishu-grant";
+import { OFFLINE, type Who, grantName, grantOf, grantsKey, lifetime, sameSet } from "./feishu-grant";
 import type { ConnectorTool, ToolContext } from "./types";
 
 /** How much of a document one read returns. */
@@ -173,7 +173,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
   // The invitation is the grant's own to send, to this person and nobody else, and only if the
   // grant is still as this read saw it. Its link is never part of what the model is given.
-  const invite = async (refused?: string) => {
+  const invite = async (refused?: { version: string; rotation: number }) => {
     const how = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
     if (how === "superseded") return superseded;
     const where = how === "queued" ? "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. If none arrives, they can ask again." : "An invitation to authorise is in this chat, sent to them directly. Tell them to use it and then ask again.";
@@ -195,7 +195,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (step === "wiki" && result.code === NOT_COVERED) return (await grant.stands(credential.version)) ? { error: "the person's authorisation does not cover this wiki page; ask them for the document's own link (…/docx/…)" } : superseded;
     // The token is no longer good: forget that token, and only that one, and ask again. A document
     // the person may not open says nothing about the authorisation, which is kept.
-    if (result.status === 401 || REAUTHORISE.has(result.code ?? 0)) return invite(credential.version);
+    if (result.status === 401 || REAUTHORISE.has(result.code ?? 0)) return invite({ version: credential.version, rotation: credential.rotation });
     if (!(await grant.stands(credential.version))) return superseded;
     if (result.status === 403 || result.status === 404) return { error: "the person cannot open this document, or it does not exist" };
     return { error: `Feishu could not provide the document (status ${result.status}, code ${result.code ?? "none"})` };
@@ -262,12 +262,16 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
   });
-  const issued = (await exchange.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number };
-  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token) return refused("exchange_failed", { status: exchange.status, code: issued.code, endpoint: app.oauth_v2 ? "v2" : "v3" });
+  const answer = ((await exchange.json().catch(() => null)) as unknown) ?? {};
+  const issued = (typeof answer === "object" ? answer : {}) as { code?: number; access_token?: string; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number };
+  // A token that is there and has time left, or nothing.
+  if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token || !lifetime(issued.expires_in)) return refused("exchange_failed", { status: exchange.status, code: issued.code, endpoint: app.oauth_v2 ? "v2" : "v3" });
   const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
   if (invitation.scope.some((each) => !granted.includes(each))) return refused("scope_missing");
   // The token must be for what was asked and nothing more. One that reaches further is not kept.
-  if (granted.some((each) => !invitation.scope.includes(each))) return refused("scope_too_wide");
+  if (!sameSet(granted, invitation.scope)) return refused("scope_too_wide");
+  // Lasting authorisations were turned off for this app after the invitation went out.
+  if (invitation.scope.includes(OFFLINE) && !app.oauth_offline) return refused("offline_turned_off");
 
   // Whose token is it? The answer must be the person the invitation was sent to, in the same
   // organisation. Anyone else who opened the link and consented gets nothing installed.
@@ -281,13 +285,13 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
 
   // With the person's leave to act while they are away comes a second token, for getting a new
   // first one when it runs out. It is asked for only where the invitation asked for that leave.
-  const lasting = invitation.scope.includes(OFFLINE) && typeof issued.refresh_token === "string" && issued.refresh_token !== "";
+  const lasting = invitation.scope.includes(OFFLINE) && typeof issued.refresh_token === "string" && issued.refresh_token !== "" && lifetime(issued.refresh_token_expires_in) > 0;
   if (invitation.scope.includes(OFFLINE) && !lasting) return refused("no_refresh_token");
   const kept = await grant.install(invitation.generation, {
     access_token: issued.access_token,
-    expires_at: Date.now() + Math.max(0, Number(issued.expires_in) || 0) * 1_000,
+    expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,
     scope: granted.join(" "),
-    ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + Math.max(0, Number(issued.refresh_token_expires_in) || 0) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
+    ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
   });
   if (!kept) return refused("superseded");
   defer(sendToPerson(env, who.app_id, who.open_id, `granted:${state[2]}`, { text: "授权成功。请把刚才的请求再发一次，我就可以读取文档了。" }).catch(() => undefined));

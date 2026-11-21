@@ -30,7 +30,7 @@ const feishu = {
   /** Every renewal asked of Feishu. */
   renewals: [] as { endpoint: string; scope: unknown; outcome: string }[],
   /** What Feishu does with the next renewal, instead of answering it properly. */
-  renewalFault: undefined as undefined | "no_answer" | "garbage" | "wider",
+  renewalFault: undefined as undefined | "no_answer" | "garbage" | "wider" | "null" | "no_lifetime" | "twice",
   /** Runs while a renewal is being answered. */
   duringRenewal: undefined as undefined | (() => Promise<void>),
   /** Every token exchange: which endpoint, for which app. */
@@ -98,6 +98,7 @@ function installFakeFeishu() {
         await feishu.duringRenewal?.();
         if (feishu.renewalFault === "no_answer") return (note("no_answer"), Promise.reject(new Error("network")));
         if (feishu.renewalFault === "garbage") return (note("garbage"), new Response("<html>", { status: 502 }));
+        if (feishu.renewalFault === "null") return (note("null"), new Response("null", { headers: { "content-type": "application/json" } }));
         if (body.client_id !== APP_ID || body.client_secret !== "app-secret") return (note("bad_client"), Response.json({ code: 20002 }, { status: 400 }));
         // The older endpoint renews only what it issued itself.
         if (!held || (tokenEndpoint === "v2" && held.endpoint !== "v2")) return (note("invalid"), Response.json({ code: 20026 }, { status: 400 }));
@@ -105,6 +106,9 @@ function installFakeFeishu() {
         held.state = "used";
         note("ok");
         const scope = typeof body.scope === "string" ? body.scope.split(" ") : [...(feishu.consented.get(held.open_id) ?? []), "im:message"];
+        if (feishu.renewalFault === "no_lifetime") return Response.json({ code: 0, access_token: "u-dead", expires_in: 0, refresh_token: "r-dead", refresh_token_expires_in: 604800, scope: scope.join(" ") });
+        // One permission named twice in place of another: as many names, not the same set.
+        if (feishu.renewalFault === "twice") return Response.json({ code: 0, access_token: "u-twice", expires_in: 7200, refresh_token: "r-twice", refresh_token_expires_in: 604800, scope: [scope[0], ...scope.slice(0, -1)].join(" ") });
         return pair(held, feishu.renewalFault === "wider" ? [...scope, "im:message"] : scope);
       }
       feishu.exchanges.push({ endpoint: tokenEndpoint, app: body.client_id });
@@ -511,7 +515,7 @@ describe("reading a Feishu document as the person who asked", () => {
       for (const token of feishu.tokens.values()) token.good = false;
       const inside = await grantOf(env as any, hana.who);
       const now = await inside.held();
-      await inside.invite(hana.who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly"], { generation: now.generation, refused: now.credential!.version });
+      await inside.invite(hana.who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly"], { generation: now.generation, refused: { version: now.credential!.version, rotation: now.credential!.rotation } });
       const taken = await inside.redeem(invitation(hana.openId).searchParams.get("state")!.split(".")[1]);
       await inside.install(taken!.generation, { access_token: "u-newer", expires_at: Date.now() + 3_600_000, scope: "docx:document:readonly" });
       sent = cards();
@@ -816,6 +820,9 @@ describe("an authorisation that lasts", () => {
       ["no answer came", () => void (feishu.renewalFault = "no_answer"), "no_answer"],
       ["the answer could not be read", () => void (feishu.renewalFault = "garbage"), "garbage"],
       ["the new token reaches further", () => void (feishu.renewalFault = "wider"), "ok"],
+      ["the answer is JSON null", () => void (feishu.renewalFault = "null"), "null"],
+      ["the new token has no time left", () => void (feishu.renewalFault = "no_lifetime"), "ok"],
+      ["one permission comes back twice in place of another", () => void (feishu.renewalFault = "twice"), "ok"],
       ["an earlier attempt was cut off", (person) => runOut(person, (grant) => (grant.renewing = Date.now() - 5_000)), undefined],
       ["the token for renewing has itself run out", (person) => runOut(person, (grant) => (grant.refresh.expires_at = Date.now() - 1)), undefined],
     ];
@@ -852,6 +859,76 @@ describe("an authorisation that lasts", () => {
     expect((await (await sara.grant()).held()).credential).toBeUndefined();
     expect(feishu.renewals.map((each) => each.outcome)).toEqual(["ok"]);
     expect(await (await sara.grant()).status()).toMatchObject({ authorised: false });
+  });
+
+  it("is not ended by a late refusal of the token a renewal has since replaced", async () => {
+    const uma = someone();
+    feishu.docs.set("DocUma000000000000001", { readers: [uma.openId], text: "Uma." });
+    await authorised(uma, "DocUma000000000000001");
+    const grant = await uma.grant();
+    // A read takes the token; before Feishu answers it, the token runs out and is renewed.
+    const old = (await grant.held()).credential!;
+    await runOut(uma);
+    const fresh = (await grant.held()).credential!;
+    expect(fresh.version).toBe(old.version);
+    expect(fresh.rotation).toBe(old.rotation + 1);
+    expect(fresh.token).not.toBe(old.token);
+    // If the old read succeeded after all, it may still finish: it is the same authorisation.
+    expect(await grant.finish(old.version)).toBe("ok");
+    // If Feishu refused the old token, that says nothing about the new one: nothing is dropped, nobody is invited.
+    const before = cards();
+    expect(await grant.invite(uma.who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly", "offline_access"], { generation: 1, refused: { version: old.version, rotation: old.rotation } })).toBe("superseded");
+    expect(await grant.status()).toMatchObject({ authorised: true, pending: 0 });
+    expect(cards()).toBe(before);
+    expect(await read(uma, "DocUma000000000000001")).toEqual({ text: "Uma." });
+    // A refusal of the token held now does end it.
+    expect(await grant.invite(uma.who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly", "offline_access"], { generation: 1, refused: { version: fresh.version, rotation: fresh.rotation } })).toBe("sent");
+    expect((await grant.status()).authorised).toBe(false);
+  });
+
+  it("sends no card to a read that was waiting for a renewal when the grant was taken away", async () => {
+    const vera = someone();
+    feishu.docs.set("DocVera00000000000001", { readers: [vera.openId], text: "Vera." });
+    await authorised(vera, "DocVera00000000000001");
+    await runOut(vera);
+    const before = cards();
+    feishu.duringRenewal = async () => {
+      feishu.duringRenewal = undefined;
+      await (await grantOf(env as any, vera.who)).drop(vera.who);
+    };
+    expect((await read(vera, "DocVera00000000000001")).error).toMatch(/authorisation changed/);
+    expect(cards()).toBe(before);
+    expect(await (await vera.grant()).status()).toMatchObject({ authorised: false, pending: 0 });
+    // A new request of hers is invited as usual.
+    expect((await read(vera, "DocVera00000000000001")).authorisation_needed).toBe(true);
+    expect(cards()).toBe(before + 1);
+  });
+
+  it("stops renewing, and keeps no token for it, once the operator turns it off", async () => {
+    const wren = someone();
+    feishu.docs.set("DocWren00000000000001", { readers: [wren.openId], text: "Wren." });
+    // An invitation for a lasting authorisation is out when the setting is turned off: it is not honoured.
+    model.replies([call("feishu_read_document", { document: link("DocWren00000000000001") })], [call("send_message", { text: "请先授权" })], [say("")]);
+    await wren.says(`读一下 ${link("DocWren00000000000001")}`);
+    const lasting = invitation(wren.openId);
+    expect(JSON.stringify(feishu.sent.at(-2)?.content ?? feishu.sent.at(-1)?.content)).toContain("自动续期");
+    await settings({ offline_access: false });
+    expect((await consent(lasting, wren)).status).toBe(400);
+    expect((await (await wren.grant()).status()).authorised).toBe(false);
+
+    // One that was given while it was on is used until it runs out, and then not renewed.
+    await settings({ offline_access: true });
+    await authorised(wren, "DocWren00000000000001");
+    expect((await (await wren.grant()).status()).renewable_until).toBeGreaterThan(Date.now());
+    await settings({ offline_access: false });
+    expect(await read(wren, "DocWren00000000000001")).toEqual({ text: "Wren." });
+    await runOut(wren);
+    feishu.renewals.length = 0;
+    expect((await read(wren, "DocWren00000000000001")).authorisation_needed).toBe(true);
+    expect(feishu.renewals).toEqual([]);
+    expect(invitation(wren.openId).searchParams.get("scope")).toBe("docx:document:readonly");
+    const stored = await runInDurableObject(await wren.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"));
+    expect(stored.grant?.refresh).toBeUndefined();
   });
 
   it("renews at the older endpoint only what that endpoint issued", async () => {
@@ -947,7 +1024,7 @@ describe("the document tool by itself", () => {
     expect((await consent(invitation("ou_race"), { openId: "ou_race" })).status).toBe(200);
     expect(await grant.invite(who, redirect, docx, { generation: seen.generation })).toBe("superseded");
     // A refusal of a token that is no longer the one held.
-    expect(await grant.invite(who, redirect, docx, { generation: seen.generation, refused: "an-older-version" })).toBe("superseded");
+    expect(await grant.invite(who, redirect, docx, { generation: seen.generation, refused: { version: "an-older-version", rotation: 0 } })).toBe("superseded");
     // The grant was taken away after the caller looked.
     await grant.drop(who);
     expect(await grant.invite(who, redirect, docx, { generation: seen.generation })).toBe("superseded");

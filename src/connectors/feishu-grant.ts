@@ -61,6 +61,8 @@ interface Stored {
     expires_at: number;
     scope: string;
     version: string;
+    /** How many times this grant's tokens have been replaced by a renewal. Names one access token. */
+    rotation?: number;
     /** The token for renewing, sealed; until when it can be used; and which endpoint issued it. */
     refresh?: { sealed: string; expires_at: number; endpoint: "v2" | "v3" };
     /** Set, with the time, just before a renewal is sent, and cleared when its outcome is recorded. */
@@ -83,8 +85,12 @@ export const SCOPES = ["docx:document:readonly", "wiki:node:read", OFFLINE];
 /** What the caller knew of the grant when it decided an invitation was needed. */
 export interface Seen {
   generation: number;
-  /** The version of the token Feishu has just refused, if that is why. */
-  refused?: string;
+  /**
+   * The token Feishu has just refused, if that is why: the grant's version and which of its
+   * successive tokens it was. A refusal of a token that has since been replaced by a renewal
+   * says nothing about the one held now.
+   */
+  refused?: { version: string; rotation: number };
 }
 /** How long an invitation to authorise can be used. Feishu's own code lasts five minutes after consent. */
 const INVITATION_TTL_MS = 10 * 60_000;
@@ -113,7 +119,7 @@ export class FeishuGrant extends DurableObject<Env> {
     const now = Date.now();
     if (stored.generation !== seen.generation) return "superseded";
     if (seen.refused !== undefined) {
-      if (stored.grant?.version !== seen.refused) return "superseded";
+      if (stored.grant?.version !== seen.refused.version || (stored.grant.rotation ?? 0) !== seen.refused.rotation) return "superseded";
       delete stored.grant;
     }
     // Someone has authorised since the caller looked: there is nothing to ask for.
@@ -151,9 +157,10 @@ export class FeishuGrant extends DurableObject<Env> {
     void this.ctx.storage.put("grant", before);
     this.#arm(before);
     const { who } = before;
+    const lasting = pending.scope.includes(OFFLINE);
     const state = `${await grantName(who)}.${pending.nonce}`;
     const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: who.app_id, response_type: "code", redirect_uri: pending.redirect, scope: pending.scope.join(" "), state, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
-    const sent = await sendToPerson(this.env, who.app_id, who.open_id, `invite:${pending.nonce}`, { card: invitationCard(url) }).then(
+    const sent = await sendToPerson(this.env, who.app_id, who.open_id, `invite:${pending.nonce}`, { card: invitationCard(url, lasting) }).then(
       () => true,
       () => false,
     );
@@ -268,6 +275,16 @@ export class FeishuGrant extends DurableObject<Env> {
     }
     const app = await registry(this.env).feishuApp(first.who.app_id);
     if (!app) return end("unknown_app");
+    // The operator has turned lasting authorisations off for this app: nothing is renewed any
+    // more, and the token for renewing is not kept. The person is invited afresh when they next ask.
+    if (!app.oauth_offline) {
+      const off = await this.#load();
+      if (off?.generation === first.generation && off.grant?.version === grant.version && off.grant.refresh?.sealed === grant.refresh.sealed) {
+        delete off.grant.refresh;
+        void this.ctx.storage.put("grant", off);
+      }
+      return;
+    }
 
     // Marked in one step with the check that it is still the same grant and still unmarked.
     const marked = await this.#load();
@@ -284,18 +301,20 @@ export class FeishuGrant extends DurableObject<Env> {
       body: JSON.stringify({ grant_type: "refresh_token", client_id: app.app_id, client_secret: app.app_secret, refresh_token: token, scope: grant.scope }),
     }).catch(() => undefined);
     if (!response) return end("no_answer");
-    const issued = (await response.json().catch(() => ({}))) as { code?: number; access_token?: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number; scope?: string };
-    if (!response.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token || typeof issued.refresh_token !== "string" || !issued.refresh_token) return end("refused", { status: response.status, code: issued.code });
-    const allowed = grant.scope.split(" ").filter(Boolean);
-    const granted = String(issued.scope ?? "").split(/\s+/).filter(Boolean);
-    if (granted.length !== allowed.length || granted.some((each) => !allowed.includes(each))) return end("scope_changed");
+    const issued = (((await response.json().catch(() => null)) as unknown) ?? {}) as { code?: number; access_token?: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number; scope?: string };
+    if (typeof issued !== "object") return end("refused", { status: response.status });
+    if (!response.ok || issued.code !== 0) return end("refused", { status: response.status, code: issued.code });
+    // A pair that is whole and has time left, or nothing.
+    if (typeof issued.access_token !== "string" || !issued.access_token || typeof issued.refresh_token !== "string" || !issued.refresh_token || !lifetime(issued.expires_in) || !lifetime(issued.refresh_token_expires_in)) return end("malformed", { status: response.status });
+    // For exactly what the person allowed: the same set, no more, no less, nothing twice.
+    if (!sameSet(String(issued.scope ?? "").split(/\s+/).filter(Boolean), grant.scope.split(" ").filter(Boolean))) return end("scope_changed");
 
     const sealed = await seal(key, issued.access_token, grant.version);
-    const refresh = { sealed: await seal(key, issued.refresh_token, `${grant.version}:refresh`), expires_at: Date.now() + Math.max(0, Number(issued.refresh_token_expires_in) || 0) * 1_000, endpoint } as const;
+    const refresh = { sealed: await seal(key, issued.refresh_token, `${grant.version}:refresh`), expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint } as const;
     const stored = await this.#load();
     // Dropped or replaced while Feishu was answering: the new pair belongs to a grant that is gone.
     if (stored?.generation !== first.generation || stored.grant?.version !== grant.version) return;
-    stored.grant = { sealed, expires_at: Date.now() + Math.max(0, Number(issued.expires_in) || 0) * 1_000, scope: grant.scope, version: grant.version, refresh };
+    stored.grant = { sealed, expires_at: Date.now() + lifetime(issued.expires_in) * 1_000, scope: grant.scope, version: grant.version, rotation: (grant.rotation ?? 0) + 1, refresh };
     void this.ctx.storage.put("grant", stored);
   }
 
@@ -305,23 +324,27 @@ export class FeishuGrant extends DurableObject<Env> {
    * `stands` with that version before relying on anything it fetched, and hands the generation
    * back when asking for an invitation.
    */
-  async held(): Promise<{ generation: number; credential?: { token: string; version: string; scope: string[] }; unreadable?: string; answered?: { message: string; by: string } }> {
+  async held(): Promise<{ generation: number; credential?: { token: string; version: string; rotation: number; scope: string[] }; unreadable?: { version: string; rotation: number }; answered?: { message: string; by: string } }> {
     let stored = await this.#load();
+    // The generation the caller is told is the one found on arrival. If the grant is taken away
+    // while this waits for a renewal, the caller must find that out when it next asks for
+    // anything, not be handed the new generation as though it had looked after the change.
+    const generation = stored?.generation ?? 1;
     // Run out, but renewable: renewed first, by one renewal however many are waiting.
     if (stored?.grant && stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS && stored.grant.refresh) {
       this.#renewal ??= this.#renew().finally(() => (this.#renewal = undefined));
       await this.#renewal;
       stored = await this.#load();
     }
-    const generation = stored?.generation ?? 1;
     const answered = stored?.answered;
-    if (!stored?.grant || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation, answered };
+    if (!stored?.grant || stored.generation !== generation || stored.grant.expires_at - Date.now() < EXPIRY_MARGIN_MS) return { generation, answered };
+    const rotation = stored.grant.rotation ?? 0;
     try {
-      return { generation, answered, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, scope: stored.grant.scope.split(" ").filter(Boolean) } };
+      return { generation, answered, credential: { token: await open(await this.#key(), stored.grant.sealed, stored.grant.version), version: stored.grant.version, rotation, scope: stored.grant.scope.split(" ").filter(Boolean) } };
     } catch {
-      // Sealed under another key, or damaged. It cannot be used; the caller reports its version
-      // as refused when asking for an invitation, which forgets exactly this one.
-      return { generation, answered, unreadable: stored.grant.version };
+      // Sealed under another key, or damaged. It cannot be used; the caller reports it as refused
+      // when asking for an invitation, which forgets exactly this one.
+      return { generation, answered, unreadable: { version: stored.grant.version, rotation } };
     }
   }
 
@@ -382,7 +405,7 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 }
 
-function invitationCard(url: string): unknown {
+function invitationCard(url: string, lasting: boolean): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   return {
     config: { wide_screen_mode: true },
@@ -390,6 +413,8 @@ function invitationCard(url: string): unknown {
     elements: [
       { tag: "div", text: plain("要读取你的飞书文档，需要你先授权。授权后我只能以你的身份读取文档，你打不开的文档我也读不到。") },
       { tag: "action", actions: [{ tag: "button", text: plain("去授权"), type: "primary", url }] },
+      // Said before it is given: this authorisation renews itself, and how to end it.
+      ...(lasting ? [{ tag: "div", text: plain("这次授权会长期有效：到期后我会自动续期，不再每次请你授权，直到被解除或满一年。需要解除时，可以在飞书的授权管理里取消，或联系管理员。") }] : []),
       { tag: "note", elements: [plain("链接 10 分钟内有效，只对你本人有效。授权完成后，请把刚才的请求再发一次。")] },
     ],
   };
@@ -398,6 +423,16 @@ function invitationCard(url: string): unknown {
 /** Whether a grant can still produce a token: its own has time left, or it can be renewed. */
 function usable(grant: NonNullable<Stored["grant"]>, now: number, margin = EXPIRY_MARGIN_MS): boolean {
   return grant.expires_at - now >= margin || (grant.refresh !== undefined && grant.refresh.expires_at - now >= margin);
+}
+
+/** A lifetime in seconds as Feishu states it, or 0 if it is not a positive number. */
+export function lifetime(seconds: unknown): number {
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+/** Whether two lists name the same things, each once. */
+export function sameSet(a: string[], b: string[]): boolean {
+  return a.length === b.length && new Set(a).size === a.length && new Set(b).size === b.length && a.every((each) => b.includes(each));
 }
 
 /** The deployment's key for sealing tokens, if one long enough to be a key is set. */
