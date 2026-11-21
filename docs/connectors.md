@@ -179,7 +179,16 @@ curl -X POST $B/v1/admin/feishu-apps/cli_xxx/oauth -H "authorization: Bearer $AD
 
 Know what that gives up: Feishu's notes say the older endpoint does not refuse a verifier when it holds no challenge for the code, so a successful exchange there does not show that PKCE was checked. What still stands is the app's secret at the exchange, the single-use state bound to the invited person, the identity check and the exact-scope check. It is off unless turned on, per app.
 
-For now an authorisation lasts as long as the token Feishu issues, about two hours; after that the person is invited again.
+**How long an authorisation lasts.** By default as long as the token Feishu issues, about two hours; after that the person is invited again. To make it last, enable the `offline_access` permission for the app in Feishu (user identity), publish that version, check that "refresh user_access_token" is on under security settings, and then turn it on here:
+
+```bash
+curl -X POST $B/v1/admin/feishu-apps/cli_xxx/oauth -H "authorization: Bearer $ADMIN_KEY" \
+  -H 'content-type: application/json' -d '{"offline_access":true}'
+```
+
+People are then asked for that leave as well (those who authorised before are asked once more), and Feishu issues a second token for renewing the first. It can be used once and is replaced each time, so renewal happens in one place, one at a time, for exactly the permissions the person gave. If a renewal is refused, or its outcome cannot be known for certain (no answer, an unreadable answer, an attempt cut off halfway, a token that reaches further than before), the grant ends and the person is invited again; nothing is retried with a token that may be spent. Feishu sets the limits: the renewing token has its own lifetime (about a week in Feishu's examples, extended by each renewal), and after 365 days the person must authorise afresh. Turn the setting on only after the permission is published: until then Feishu's consent page fails.
+
+The invitation card says, before the person agrees, that this authorisation renews itself and how to end it. Turning the setting off again (`{"offline_access":false}`) stops it for that app: new invitations no longer ask for it, an invitation for it that is still out is not honoured, and nothing is renewed any more; an authorisation already given keeps working until its current token runs out (about two hours), at which point the token for renewing is discarded and the person is invited afresh. To end one person's authorisation at once, use `DELETE /v1/admin/feishu-grants/…` above. Neither tells Feishu to revoke what it issued; the person can do that in Feishu's own authorisation settings.
 
 ### Language
 

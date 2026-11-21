@@ -71,7 +71,7 @@ Every request carries `authorization: Bearer $ADMIN_KEY`. There is one admin key
 | `POST /v1/admin/tasks/:id/probe` | Runs checks inside the task's container (what it can reach, what it holds). |
 | `POST /v1/admin/tasks/:id/kill-container` | Destroys the container, to exercise recovery. |
 | `GET /v1/admin/feishu-links/:app_id` | The state of a Feishu long connection. |
-| `POST /v1/admin/feishu-apps/:app_id/oauth` | Chooses which of Feishu's token endpoints that app's authorisation codes are exchanged at: `{"token_endpoint":"v2"}` or `"v3"` (the default). See [Connectors](connectors.md). |
+| `POST /v1/admin/feishu-apps/:app_id/oauth` | How that app's authorisations are obtained: `{"token_endpoint":"v2"}` or `"v3"` (the default) for which of Feishu's token endpoints is used; `{"offline_access":true}` to ask people for leave to renew, so an authorisation lasts. Either or both. See [Connectors](connectors.md). |
 | `GET`, `DELETE /v1/admin/feishu-grants/:app_id/:tenant_key/:open_id` | Whether one person's authorisation to read their documents stands; `DELETE` takes it away. Never returns a token. |
 
 ### Other endpoints
