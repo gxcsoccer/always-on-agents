@@ -199,7 +199,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const asPerson = async (path: string) => {
     // The last look before Feishu is asked: the token is still the person's grant, and a request
     // that waited is still in its time. Nothing else happens between this and the request.
-    if (lapsed() || !(await grant.stands(credential.version))) return { status: 0, code: undefined, data: undefined, gone: true };
+    if (!(await grant.stands(credential.version)) || lapsed()) return { status: 0, code: undefined, data: undefined, gone: true };
     const response = await fetch(`${API}${path}`, { headers: { authorization: `Bearer ${credential.token}` } });
     const body = (await response.json().catch(() => ({}))) as { code?: number; data?: any };
     return { status: response.status, code: body.code, data: body.data, gone: false };
@@ -233,6 +233,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // is used up here.
   const end = await grant.finish(credential.version, carriedFrom === undefined ? undefined : { message: carriedFrom, by: context.callId });
   if (end !== "ok") return end === "taken" ? alreadyRead : superseded;
+  // What was read, as Feishu resolved it: a wiki page can come to hold another document.
+  context.identified?.({ document: canonical }, `docx:${documentId}`);
   const text = String(raw.data?.content ?? "");
   return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
 }

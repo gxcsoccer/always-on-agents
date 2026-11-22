@@ -145,6 +145,13 @@ export interface ToolContext {
    * and no other earlier one, as part of what the request rests on.
    */
   relied?(recent: number): void;
+  /**
+   * To be called by a tool that has read something, before it returns: the call that would read
+   * the same thing again, in the tool's own canonical form, and a name for the very thing that
+   * was read as the outside system resolved it (a link can come to point elsewhere). Kept by the
+   * Brain so that an answer can later be tied to what it was read from.
+   */
+  identified?(request: Record<string, unknown>, identity: string): void;
 }
 
 export interface Ingress {
@@ -190,7 +197,13 @@ export interface Channel {
    * and it must never add a message to the conversation. Called once per message a person
    * addressed to the agent, as soon as the message is stored; nothing waits for it.
    */
-  received?(env: Env, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target }): Promise<void>;
+  /**
+   * `wanted` is asked last of all, just before anything is posted: it says no once the sign
+   * would come too late to mean anything (the message has been dealt with, or time has passed).
+   * Resolves to whether the outside system confirmed the sign; false when there was nothing to
+   * mark or it was skipped.
+   */
+  received?(env: Env, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean>;
   /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,

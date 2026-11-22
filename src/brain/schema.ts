@@ -214,6 +214,7 @@ export const MIGRATIONS: string[] = [
      call TEXT NOT NULL,
      events TEXT NOT NULL,
      fingerprint TEXT NOT NULL,
+     identity TEXT NOT NULL,
      text TEXT NOT NULL,
      expires_at INTEGER NOT NULL,
      created_at INTEGER NOT NULL

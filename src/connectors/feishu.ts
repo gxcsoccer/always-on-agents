@@ -383,18 +383,21 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */
-export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }): Promise<void> {
+export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean> {
   const messageId = typeof event.data?.message_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(event.data.message_id) ? event.data.message_id : undefined;
   const appId = event.reply_to?.address.app_id;
   // Only a message a person wrote: a button press has no message of theirs to mark.
-  if (!messageId || !appId || event.data?.card !== undefined) return;
+  if (!messageId || !appId || event.data?.card !== undefined) return false;
   const token = await tenantAccessToken(env, appId);
+  // Too late to mean "it has arrived": nothing is posted.
+  if (!event.wanted()) return false;
   const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ reaction_type: { emoji_type: "Get" } }),
   });
-  if (!response.ok) throw new Error(`Feishu returned ${response.status}`);
+  const result = (await response.json().catch(() => ({}))) as { code?: number };
+  return response.ok && result.code === 0;
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

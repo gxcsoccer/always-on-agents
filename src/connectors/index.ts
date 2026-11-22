@@ -85,12 +85,9 @@ export function dedupeWindow(name: string): number | undefined {
   return byName.get(name)?.channel?.dedupeMs;
 }
 
-/** Shows a person that their message has arrived, where the connector can. Never throws. */
-export async function received(env: Env, name: string, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target }): Promise<boolean> {
+/** Shows a person that their message has arrived, where the connector can. Never throws; true only if the outside system confirmed it. */
+export async function received(env: Env, name: string, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean> {
   const show = byName.get(name)?.channel?.received;
   if (!show) return false;
-  return show(env, scope, event).then(
-    () => true,
-    () => false,
-  );
+  return show(env, scope, event).catch(() => false);
 }
