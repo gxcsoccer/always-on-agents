@@ -1166,6 +1166,47 @@ describe("tasks and approvals", () => {
     expect(await closures(stub)).toEqual([{ state: "refused", standing: false }]);
   });
 
+  it("reports what the worker was told when a task is cancelled with its approval unconfirmed, and answers nothing twice", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    // The worker records the approval; word of that never gets back.
+    await task(id).configure({ answerUnheard: true });
+    expect((await reply(stub, id, "bob", `approve ${code}`)).error).toMatch(/connection lost/);
+    expect((await stub.inspect()).tasks[0].status).toBe("needs_input");
+    expect(await closures(stub)).toEqual([null]);
+
+    // Then the task is called off. The question is not shown as withdrawn on a guess.
+    await task(id).configure({});
+    model.replies([call("cancel_task", { task_id: id })], [say("")]);
+    await stub.ingest(message("@agent never mind", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    expect((await stub.inspect()).tasks[0].status).toBe("cancelled");
+    expect(await closures(stub)).toEqual([null]);
+
+    // The worker is asked what it holds for that question, and the question ends as that.
+    await wake(stub);
+    expect(await closures(stub)).toEqual([{ state: "approved", standing: false }]);
+    // One answer was ever sent, and the approval stays with the person who gave it.
+    expect(await answersSent(id)).toHaveLength(1);
+    const audit = (await stub.inspect()).audit.map((entry: any) => ({ actor: entry.actor, action: entry.action }));
+    expect(audit.filter((entry: any) => entry.action === "task.approved")).toEqual([{ actor: "bob", action: "task.approved" }]);
+    expect(audit.some((entry: any) => entry.action === "task.answer_unverified")).toBe(false);
+  });
+
+  it("records that an answer could not be verified, when a cancelled task's records are gone", async () => {
+    const { stub, id, code } = await taskAwaitingApproval();
+    await task(id).configure({ answerUnheard: true });
+    await reply(stub, id, "bob", `approve ${code}`);
+    await task(id).configure({ forgotten: true });
+    model.replies([call("cancel_task", { task_id: id })], [say("")]);
+    await stub.ingest(message("@agent never mind", { user: "bob", session_key: "chat" }));
+    await wake(stub);
+    await wake(stub);
+    // Neither approved nor withdrawn: unknown, and written down as such.
+    expect(await closures(stub)).toEqual([{ state: "unknown" }]);
+    expect((await stub.inspect()).audit.map((entry: any) => entry.action)).toContain("task.answer_unverified");
+    expect(await answersSent(id)).toHaveLength(1);
+  });
+
   it("says a question's outcome cannot be verified when the worker's records are gone, rather than guess", async () => {
     const { stub, id, code } = await taskAwaitingApproval();
     await task(id).configure({ answerUnheard: true });
