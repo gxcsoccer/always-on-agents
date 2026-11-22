@@ -509,6 +509,8 @@ export class BrainAgent extends DurableObject<Env> {
           await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
           if (!this.#stillActive(runId)) return;
           this.#endRequest(carried.id, "void", why ?? "it is no longer the person's to ask here");
+          // They were waiting for this: told, in fixed words, that it stopped.
+          this.#notify(`withheld:answer:${carried.id}`, run.session_id, null, WITHHELD);
           break;
         }
       }
@@ -1024,7 +1026,7 @@ export class BrainAgent extends DurableObject<Env> {
         // Which earlier messages of the person the tool acted on, as it says itself.
         const relied = new Set<number>();
         const named = new Set<number>();
-        let identified: { request: Record<string, unknown>; identity: string; under?: { condition: string; generation: number } } | undefined;
+        let identified: { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
         const evidence = () => {
           const said = this.#basis(run.id).map((each) => each.id);
           const recent = [...relied].map((index) => acting.recentIds[index]).filter((each) => each !== undefined);
@@ -1047,9 +1049,9 @@ export class BrainAgent extends DurableObject<Env> {
             if (replaced) this.#cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.
             // Only what the tool itself identified: its canonical call and the thing as resolved.
-            const read = identified as { request: Record<string, unknown>; identity: string; under?: { condition: string; generation: number } } | undefined;
+            const read = identified as { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
             if (read && typeof result === "object" && result !== null && !("error" in result)) {
-              this.#noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), call: key, events: evidence(), fingerprint: await fingerprint(result), identity: read.identity, ...(read.under ?? {}) });
+              this.#noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), call: key, events: evidence(), fingerprint: await fingerprint(result), identity: read.identity, ...read.under });
             }
             return result;
           }

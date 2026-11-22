@@ -1390,7 +1390,8 @@ describe("a request that waits and is carried on", () => {
     expect(oda.cards().length).toBe(1);
     expect((await (await oda.grant()).status()).pending).toBe(0);
     expect(await oda.requests()).toMatchObject([{ id, status: "void" }]);
-    expect(oda.heard()).toEqual([]);
+    // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
+    expect(oda.heard()).toEqual(["I stopped before answering: the authorisation for what I was reading has ended, so nothing of it was sent. Please ask again."]);
     expect(carried()).toEqual([]);
   });
 
@@ -1407,7 +1408,8 @@ describe("a request that waits and is carried on", () => {
     expect(carried()).toEqual([]);
     expect(JSON.stringify(modelCalls)).not.toContain("The text of");
     expect(await pam.requests()).toMatchObject([{ id, status: "void" }]);
-    expect(pam.heard()).toEqual([]);
+    // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
+    expect(pam.heard()).toEqual(["I stopped before answering: the authorisation for what I was reading has ended, so nothing of it was sent. Please ask again."]);
     expect(await rowsOf(pam.stub, "SELECT 1 FROM outbox WHERE continuation IS NOT NULL")).toEqual([]);
 
     // For a wiki page: taken away once the page has been looked up. The document behind it is not asked for.
@@ -1451,7 +1453,8 @@ describe("a request that waits and is carried on", () => {
         expect(carried()).toEqual([]);
         expect(JSON.stringify(modelCalls)).not.toContain("The text of");
         expect(await quin.requests()).toMatchObject([{ id: request, status: "void" }]);
-        expect(quin.heard()).toEqual([]);
+        // Told that it stopped, in fixed words; nothing of the document.
+        expect(quin.heard()).toEqual(["I stopped before answering: the authorisation for what I was reading has ended, so nothing of it was sent. Please ask again."]);
         expect(await answer(quin, request)).toEqual([]);
       } else {
         expect(outputsIn(carried()[0])).toEqual([{ text: "The text of DocQuin00000000000001." }]);
@@ -1484,7 +1487,8 @@ describe("a request that waits and is carried on", () => {
     await authorises(ray);
     expect(model.remaining()).toBe(0);
     expect(carried().length).toBe(1);
-    expect(ray.heard()).toEqual([]);
+    // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
+    expect(ray.heard()).toEqual(["I stopped before answering: the authorisation for what I was reading has ended, so nothing of it was sent. Please ask again."]);
     expect(await answer(ray, id)).toEqual([]);
     expect(await ray.requests()).toMatchObject([{ id, status: "void" }]);
 

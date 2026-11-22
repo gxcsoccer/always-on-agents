@@ -158,7 +158,7 @@ export interface ToolContext {
    * (`condition`, `generation`): what `holds` can be asked about later. With it, what was read
    * goes no further (to the model, to the channel) once that no longer holds.
    */
-  identified?(request: Record<string, unknown>, identity: string, under?: { condition: string; generation: number }): void;
+  identified?(request: Record<string, unknown>, identity: string, under: { condition: string; generation: number }): void;
 }
 
 export interface Ingress {

@@ -23,7 +23,7 @@ Then create a tenant (see below) and connect something to it: [Connectors](conne
 
 A deploy restarts the Durable Objects. Runs in progress resume from their transcripts, sandbox tasks keep their containers, and Feishu long connections reconnect within a few seconds.
 
-**Moving to the version in which requests wait.** Before it, a person who authorised reading their Feishu documents was told to send their request again; from it on, the request is kept and carried on (see [Connectors](connectors.md)). Someone who is in the middle of authorising when this version is deployed holds a card from the old one. That card still works and the token is stored, but the request made before the deploy was never kept, so it is not carried on. The page they land on says so for every case: a request that is waiting is carried on, and if nothing arrives within a few minutes they should ask again. Nothing needs doing by hand. Messages that were already being retried at that moment are treated as possibly delivered: they are not given a fresh hour in which to be repeated.
+**Moving to the version in which requests wait.** Before it, a person who authorised reading their Feishu documents was told to send their request again; from it on, the request is kept and carried on (see [Connectors](connectors.md)). Someone who is in the middle of authorising when this version is deployed holds a card from the old one. That card still works and the token is stored, but the request made before the deploy was never kept, so it is not carried on. The page they land on says so for every case: a request that is waiting is carried on, and if nothing arrives within a few minutes they should ask again. An invitation from the old version that had not been delivered when this version is deployed is not sent by anything any more: it lapses within its ten minutes, and the person has to ask again. Nothing needs doing by hand. Messages that were already being retried at that moment are treated as possibly delivered: they are not given a fresh hour in which to be repeated.
 
 ## Configuration
 
@@ -44,7 +44,7 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `PUBLIC_ORIGIN` | secret or variable | Where the deployment is reached from outside, such as `https://agent.example.com`. Needed for reading people's Feishu documents: it is where Feishu sends them back after they authorise. |
 | `GRANTS_KEY` | secret | Seals the tokens people's authorisations produce. 32 or more random characters. Changing it makes every stored authorisation unreadable, and people are invited to authorise again. |
 | `GATE_HOLD_PATTERN` | secret or variable | Optional regular expression for shell commands inside the sandbox that a person must approve. Default: none. |
-| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run, nothing is noted about what was read, and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more and are deleted when their 24 hours are up. |
+| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run, nothing is noted about what was read, and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more, a follow-up under way at that moment is stopped at its next model call or send, and the kept answers are deleted when their 24 hours are up. |
 
 The sandboxed coding agent and its version are fixed in the `Dockerfile`.
 
@@ -131,10 +131,25 @@ An entry in `outbox` has one of these statuses.
 | `pending` | To be sent, or being retried. |
 | `draft` | The answer of a request being carried on, while its run is still under way. Nothing sends a draft. |
 | `sent` | Handed over, and the outside system confirmed it. |
-| `void` | Never handed over: the request it belonged to was called off or no longer stood, or the invitation it was to show could no longer be used. Its text is removed. |
+| `void` | Never handed over: the request it belonged to was called off or no longer stood, what the run that wrote it had read may no longer be passed on (the authorisation ended, or a reopened answer was no longer kept), or the invitation it was to show could no longer be used. Its text is removed. |
 | `dead` | Given up, and it is certain nothing was posted: every attempt was refused by the outside system. Also the ending for any failed message on a connector that states no window for repeats. |
 | `unverified` | Not sent (again), though an attempt may have arrived and that cannot be checked. This is what a message becomes when its retries are used up after an attempt with no clear answer, or when its first attempt is older than the window in which the system drops repeats (one hour for Feishu). Its text is removed. It is never sent again. |
 | `withdrawn`, `reconciling` | Approval questions only. See [Approvals](approvals.md). |
+
+Two columns tie a pending message to what its run read, and neither is returned by the admin API. `guard` holds what the message may go out under: the connector, the condition and generation the read was made under, and for a follow-up the time until which the answer is kept. It holds no document text. `source` is written only with `FOLLOW_UPS=on`: the call that would read the same document again (its link), the document's id, a hash of what was read, the ids of the person's messages the read rests on, and the sentences the answer quoted word for word from the document (20 at most). Both are cleared as soon as the message is no longer `pending` or `draft`, however it ended.
+
+### Fixed messages from the system
+
+These are the ones that go with requests that wait and with reads. They are written by code, not by the model, appear in `outbox` with their text, and are sent in English.
+
+| Sent when | Text begins |
+|---|---|
+| A run that had read something was stopped before a model call because what it read under no longer holds. What it had written and not sent is `void`. | "I stopped before answering: the authorisation for what I was reading has ended…" |
+| A message written after a read was not sent because what it was read under no longer holds, or its time was up; it is `void`. Not sent when the person called the request off, for an invitation, or when the message ended as `unverified`. | "I did not send what I had written for you…" |
+| A carried-on request's run ended without writing an answer. | "I could not finish what you asked for earlier. Please ask again." |
+| More than one request could be meant by a cancellation. The opening sentence is the model's, in the person's language, with a fixed English one as the fallback; the numbered list is the person's own words. | "More than one of your requests could be meant. Which one?" |
+
+In the Brain's storage the first two are keyed `withheld:<run id>` and `withheld:<key of the message that was not sent>`, so each is sent once.
 
 ### Log lines and audit entries
 
@@ -182,7 +197,7 @@ A memory file longer than its limit is stored whole; the run is told that the re
 | A finished task's container, checkpoints and records | 24 hours |
 | The text of handled events | 30 days (the record itself, without its text, for 365 days so that a late redelivery is still recognised) |
 | Delivered messages and finished timers and tasks | 30 days |
-| A delivered answer kept for follow-ups | 24 hours from delivery, then deleted. None are kept unless `FOLLOW_UPS=on`. |
+| A delivered answer kept for follow-ups, with the sentences it quoted from what was read | 24 hours from delivery, then deleted. None are kept unless `FOLLOW_UPS=on`. |
 | An ended request (the record of a wait) | 30 days |
 | A conversation's transcript | Kept in full while the conversation is in use. Once a conversation has been quiet for 30 days it is cut back to roughly its latest 200 items (the cut lands on a user turn, so slightly fewer may remain). There is no upper limit on how long an active conversation's text is kept. |
 | Audit entries | 365 days |
