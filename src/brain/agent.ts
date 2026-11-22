@@ -78,6 +78,7 @@ const HELD_LONG_MS = 60_000;
 /** How long a delivered answer can be reopened for a follow-up. */
 const ANSWER_KEPT_MS = 24 * 60 * 60_000;
 const WITHHELD = "I stopped before answering: the authorisation for what I was reading has ended, so nothing of it was sent. Please ask again.";
+const NOT_SENT = "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.";
 const NOT_ANSWERED = "I could not finish what you asked for earlier. Please ask again.";
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 const WAITING_NOTE =
@@ -884,6 +885,11 @@ export class BrainAgent extends DurableObject<Env> {
           // the record says so: it is not shown as never sent.
           const how = row.uncertain ? "unverified" : "void";
           this.#sql.exec("UPDATE outbox SET status = ?, text = '', review = NULL, error = NULL WHERE id = ? AND status = 'pending'", how, row.id);
+          // Something written for the person that will now certainly not reach them, and not
+          // because they called it off: they are told so, in fixed words, rather than left waiting.
+          const calledOff = row.continuation ? this.#rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", row.continuation)[0]?.status === "cancelled" : false;
+          const session = this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", row.run_id ?? "")[0]?.session_id;
+          if (how === "void" && !calledOff && !row.interaction && session && (row.guard || row.continuation)) this.#notify(`withheld:${row.idem}`, session, null, NOT_SENT);
           if (row.continuation) this.#endRequest(row.continuation, how, how === "void" ? "it no longer stood when its answer was to be sent" : "its answer may have been delivered; that could not be verified");
           if (how === "unverified") this.#log("message_unverified", { outbox_id: row.id });
           continue;
