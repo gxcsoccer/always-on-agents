@@ -147,7 +147,7 @@ Worker 输出结构化日志（每行一个 JSON 对象），`wrangler.jsonc` �
 | 什么时候发 | 正文开头 |
 |---|---|
 | 一次读过东西的 run 在调用模型之前被停下，因为读取所依据的条件已经不成立。它已经写好而没发出的内容记为 `void` | “I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.” |
-| 读取之后写的一条消息没有发出，因为读取所依据的条件已经不成立，或者时间已过，或者试了八次都问不到这个条件的所有者；它记为 `void`。这个人自己取消了请求时、对邀请、以及消息以 `unverified` 结束时，不发这条提示 | “I did not send what I had written for you…” |
+| 读取之后写的一条消息没有发出，因为读取所依据的条件已经不成立，或者时间已过；它记为 `void`。试了八次都问不到这个条件的所有者时也不发出，提示换成“没能确认授权是否仍然有效”那一句；这八次单独计数，不占用正常投递的重试次数。这个人自己取消了请求时、对邀请、以及消息以 `unverified` 结束时，不发这条提示 | “I did not send what I had written for you…” |
 | 接着处理请求的那次 run 结束时没有写出答复 | “I could not finish what you asked for earlier. Please ask again.” |
 | 一次取消可能指的请求不止一个。开头那句话是模型用这个人的语言写的，没有时用一句固定的话（语言按同样的办法选）；编号列表是这个人自己的原话 | “More than one of your requests could be meant. Which one?” |
 
