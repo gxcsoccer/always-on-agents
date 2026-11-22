@@ -147,6 +147,44 @@ describe("timers and memory", () => {
     expect(state.timers[0].status).toBe("done");
   });
 
+  it("is told whether someone is waiting, by what started the run and not by where it is", async () => {
+    // A person writes: someone is waiting, whether in a direct chat or a group.
+    for (const kind of ["user", "chat"] as const) {
+      const { stub } = brain(kind);
+      model.replies([say("")]);
+      await stub.ingest(message("hello"));
+      await wake(stub);
+      expect(modelCalls.at(-1).instructions).toContain("Someone is waiting for you");
+      expect(modelCalls.at(-1).instructions).not.toContain("Woken by something that happened");
+    }
+    // Something merely happens in that same private conversation: nobody is.
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("the nightly build finished", { kind: "notice", principal: { kind: "automation", id: "ci", explicit: false } }));
+    await wake(stub);
+    expect(modelCalls.at(-1).instructions).toContain("Woken by something that happened");
+    expect(modelCalls.at(-1).instructions).not.toContain("Someone is waiting for you");
+    // A message that was not addressed to the agent is not someone waiting for it either.
+    model.replies([say("")]);
+    await stub.ingest(message("talking to someone else", { principal: { kind: "human", id: "alice", explicit: false } }));
+    await wake(stub);
+    expect(modelCalls.at(-1).instructions).toContain("Woken by something that happened");
+
+    // A worker reporting on a task a person asked for: no one wrote just now, but they are owed the result.
+    const asked = brain();
+    model.replies([call("dispatch_task", { title: "t", brief: "b", repository: null })], [say("")]);
+    await asked.stub.ingest(message("please do this"));
+    await wake(asked.stub);
+    const id = toolOutputs().at(-1).task_id;
+    model.replies([call("send_message", { text: "done" })], [say("")]);
+    await asked.stub.taskEvent(id, 1, "result", { text: "Done." });
+    await wake(asked.stub);
+    const told = modelCalls.at(-1).instructions;
+    expect(told).toContain("Woken by something that happened");
+    expect(told).toContain("they are owed the result");
+    expect(told).not.toMatch(/nobody is waiting/i);
+  });
+
   it("lets a person set standing instructions, and shows them to later runs", async () => {
     const { stub } = brain();
     model.replies([call("memory_write", { path: "instructions.md", content: "Answer in Chinese." })], [say("")]);
