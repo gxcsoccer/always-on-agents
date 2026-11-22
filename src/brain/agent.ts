@@ -847,7 +847,10 @@ export class BrainAgent extends DurableObject<Env> {
           if (how === "unverified") this.#log("message_unverified", { outbox_id: row.id });
           continue;
         }
-        if (!(await this.#attempt(row, "pending"))) return;
+        if (await this.#attempt(row, "pending")) continue;
+        // Not delivered. One that is still to be tried holds the queue; one that has left it
+        // (nothing to send, or given up) does not keep the messages behind it waiting.
+        if (this.#rows<{ status: string }>("SELECT status FROM outbox WHERE id = ?", row.id)[0]?.status === "pending") return;
       }
     } finally {
       await this.#reconcileClosed();
