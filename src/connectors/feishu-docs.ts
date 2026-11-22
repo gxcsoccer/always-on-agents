@@ -151,6 +151,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     carriedFrom = id;
     // This earlier message, and no other, is part of what the request rests on.
     context.relied?.("recent", context.recent.indexOf(last));
+    // And the one message that asked for it now ("总结"), where there is exactly one: a reply to
+    // that is about this request too. With several, which of them asked is not known.
+    if (context.said.length === 1) context.relied?.("said", 0);
   }
   // Which of the messages just written name this document: a reply to one of those is about it.
   context.said.forEach((message, index) => {

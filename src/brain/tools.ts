@@ -16,7 +16,7 @@ export interface ToolCall {
 export interface ToolHost {
   /** A tool that is not one of the Brain's own: a connector's, if this run may use it. */
   connectorTool(callId: string, name: string, args: Record<string, unknown>): Promise<unknown>;
-  sendMessage(callId: string, text: string, quotes: string[]): unknown;
+  sendMessage(callId: string, text: string, quotes: { point: string; quote: string }[]): unknown;
   sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
   memoryRead(path: string): unknown;
@@ -58,7 +58,14 @@ export const TOOLS: ToolDefinition[] = [
   tool(
     "send_message",
     "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
-    { text: string, quotes: { type: "array", items: string, description: "When this message says what something you read with a tool says: the sentences in it that you relied on, copied exactly as they stand there, one for each point you make. They are kept so that a later question about one of your points can be checked against the source. Empty in every other case." } },
+    {
+      text: string,
+      quotes: {
+        type: "array",
+        description: "When this message says what something you read with a tool says: for each point you make, the point in a few of your own words and the one sentence of the source it rests on, copied exactly as it stands there. They are kept so that a later question about a point can be checked against the source. Empty in every other case.",
+        items: { type: "object", properties: { point: string, quote: string }, required: ["point", "quote"], additionalProperties: false },
+      },
+    },
   ),
   tool(
     "send_review",
@@ -147,7 +154,7 @@ export async function executeTool(host: ToolHost, call: ToolCall): Promise<strin
 function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
   switch (call.name) {
     case "send_message":
-      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT), Array.isArray(a.quotes) ? a.quotes.filter((each: unknown): each is string => typeof each === "string").slice(0, 20) : []);
+      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT), Array.isArray(a.quotes) ? a.quotes.filter((each: any) => typeof each?.quote === "string").map((each: any) => ({ point: typeof each.point === "string" ? each.point.slice(0, 300) : "", quote: each.quote as string })).slice(0, 20) : []);
     case "send_review": {
       if (!Array.isArray(a.comments) || a.comments.length > MAX_REVIEW_COMMENTS) throw new Error(`comments must be a list of at most ${MAX_REVIEW_COMMENTS}`);
       const comments = a.comments.map((c: Record<string, unknown>, i: number) => ({
@@ -202,4 +209,10 @@ function text(value: unknown, name: string, max: number, allowEmpty = false): st
 function integer(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${name} must be an integer`);
   return value;
+}
+
+/** send_message as it is offered where nothing is kept for follow-ups: without the quotes. */
+export function withoutQuotes(definition: ToolDefinition): ToolDefinition {
+  const { quotes: _quotes, ...properties } = (definition.parameters as { properties: Record<string, unknown> }).properties;
+  return { ...definition, parameters: { ...(definition.parameters as object), properties, required: Object.keys(properties) } } as ToolDefinition;
 }
