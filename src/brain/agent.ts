@@ -400,7 +400,7 @@ export class BrainAgent extends DurableObject<Env> {
           baseUrl: this.env.OPENAI_BASE_URL,
           apiKey: this.env.OPENAI_API_KEY,
           model: this.env.BRAIN_MODEL,
-          instructions: this.#instructions(),
+          instructions: this.#instructions(runId),
           input: items,
           tools: this.#toolsFor(runId),
         });
@@ -605,9 +605,15 @@ export class BrainAgent extends DurableObject<Env> {
     return acting !== undefined && toolsOf(acting.connector).some((each) => each.name === name && each.effect === "read");
   }
 
-  #instructions(): string {
+  #instructions(runId: string): string {
+    // A person who deliberately wrote to the agent is waiting for it; anything else merely happened.
+    const waiting = this.#rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
+      const principal = JSON.parse(event.principal) as Principal;
+      return principal.kind === "human" && principal.explicit === true;
+    });
     return buildInstructions({
       scope: this.#scope(),
+      situation: waiting ? "conversation" : "background",
       now: Date.now(),
       instructions: this.#rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,

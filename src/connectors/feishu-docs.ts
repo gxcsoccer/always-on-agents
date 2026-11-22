@@ -30,7 +30,7 @@ const NOT_COVERED = 99991679;
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
   description:
-    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If this request has no link, it can be about the one document they linked just before (within about ten minutes), once; if they linked several, or you are not sure which they mean, ask them to send the link together with what they want. If the result says authorisation is needed, an invitation to authorise is in this chat, sent to the person directly: tell them to use it and then ask again.",
+    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If this request has no link, it can be about the one document they linked just before (within about ten minutes), once; if they linked several, or you are not sure which they mean, ask them to send the link together with what they want. If the result says authorisation is needed, the person has been told so directly, in this chat, with what to do next.",
   effect: "read",
   parameters: { document: { type: "string" } },
   run: reported,
@@ -176,7 +176,10 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const invite = async (refused?: { version: string; rotation: number }) => {
     const how = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
     if (how === "superseded") return superseded;
-    const where = how === "queued" ? "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. If none arrives, they can ask again." : "An invitation to authorise is in this chat, sent to them directly. Tell them to use it and then ask again.";
+    const where =
+      how === "queued"
+        ? "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. Tell them that, and that they can ask again if none arrives."
+        : "They have been sent an invitation in this chat that says what to do and that they should ask again afterwards. They have been told; there is nothing you need to add.";
     return { authorisation_needed: true, note: `The person has not authorised this, or the authorisation has ended. ${where} Nothing was read.` };
   };
   // Not authorised at all, or for documents and not for wiki pages: ask for what this needs.

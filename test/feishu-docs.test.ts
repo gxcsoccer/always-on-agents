@@ -559,7 +559,7 @@ describe("reading a Feishu document as the person who asked", () => {
     const first = invitation(ivan.openId).searchParams.get("state");
 
     // Asked again while that invitation is good: no second card.
-    expect((await ask()).note).toMatch(/is in this chat/);
+    expect((await ask()).note).toMatch(/sent an invitation in this chat/);
     expect(cards().length).toBe(1);
 
     // Once it is too old to offer, asking again brings a new card with a new link.

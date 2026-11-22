@@ -147,6 +147,30 @@ describe("timers and memory", () => {
     expect(state.timers[0].status).toBe("done");
   });
 
+  it("is told whether someone is waiting, by what started the run and not by where it is", async () => {
+    // A person writes: someone is waiting, whether in a direct chat or a group.
+    for (const kind of ["user", "chat"] as const) {
+      const { stub } = brain(kind);
+      model.replies([say("")]);
+      await stub.ingest(message("hello"));
+      await wake(stub);
+      expect(modelCalls.at(-1).instructions).toContain("Someone is waiting for you");
+      expect(modelCalls.at(-1).instructions).not.toContain("Nobody is waiting");
+    }
+    // Something merely happens in that same private conversation: nobody is.
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("the nightly build finished", { kind: "notice", principal: { kind: "automation", id: "ci", explicit: false } }));
+    await wake(stub);
+    expect(modelCalls.at(-1).instructions).toContain("Nobody is waiting");
+    expect(modelCalls.at(-1).instructions).not.toContain("Someone is waiting for you");
+    // A message that was not addressed to the agent is not someone waiting for it either.
+    model.replies([say("")]);
+    await stub.ingest(message("talking to someone else", { principal: { kind: "human", id: "alice", explicit: false } }));
+    await wake(stub);
+    expect(modelCalls.at(-1).instructions).toContain("Nobody is waiting");
+  });
+
   it("lets a person set standing instructions, and shows them to later runs", async () => {
     const { stub } = brain();
     model.replies([call("memory_write", { path: "instructions.md", content: "Answer in Chinese." })], [say("")]);
