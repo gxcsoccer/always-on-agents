@@ -1397,7 +1397,6 @@ export class BrainAgent extends DurableObject<Env> {
       }
     };
     if (!row.continuation) return guarded();
-    if (!row.continuation) return "send";
     const record = () => this.#rows<Continuation>("SELECT * FROM continuations WHERE id = ?", row.continuation)[0];
     const unheard = (sessionId: string): "pending" | "claimed" | undefined =>
       this.#rows<{ status: "pending" | "claimed" }>("SELECT status FROM inbox WHERE status IN ('pending', 'claimed') AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY status DESC LIMIT 1", sessionId)[0]?.status;

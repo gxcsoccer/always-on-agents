@@ -44,7 +44,7 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `PUBLIC_ORIGIN` | secret or variable | Where the deployment is reached from outside, such as `https://agent.example.com`. Needed for reading people's Feishu documents: it is where Feishu sends them back after they authorise. |
 | `GRANTS_KEY` | secret | Seals the tokens people's authorisations produce. 32 or more random characters. Changing it makes every stored authorisation unreadable, and people are invited to authorise again. |
 | `GATE_HOLD_PATTERN` | secret or variable | Optional regular expression for shell commands inside the sandbox that a person must approve. Default: none. |
-| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run, nothing is noted about what was read, and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more, a follow-up under way at that moment is stopped at its next model call or send, and the kept answers are deleted when their 24 hours are up. |
+| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run; a run that reads notes only under which condition and generation it read, for the length of the run; `send_message` is offered without `quotes`; and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more, a follow-up under way at that moment is stopped at its next model call or send, and the kept answers are deleted when their 24 hours are up. |
 
 The sandboxed coding agent and its version are fixed in the `Dockerfile`.
 
@@ -136,7 +136,9 @@ An entry in `outbox` has one of these statuses.
 | `unverified` | Not sent (again), though an attempt may have arrived and that cannot be checked. This is what a message becomes when its retries are used up after an attempt with no clear answer, or when its first attempt is older than the window in which the system drops repeats (one hour for Feishu). Its text is removed. It is never sent again. |
 | `withdrawn`, `reconciling` | Approval questions only. See [Approvals](approvals.md). |
 
-Two columns tie a pending message to what its run read, and neither is returned by the admin API. `guard` holds what the message may go out under: the connector, the condition and generation the read was made under, and for a follow-up the time until which the answer is kept. It holds no document text. `source` is written only with `FOLLOW_UPS=on`: the call that would read the same document again (its link), the document's id, a hash of what was read, the ids of the person's messages the read rests on, and the sentences the answer quoted word for word from the document (20 at most). Both are cleared as soon as the message is no longer `pending` or `draft`, however it ended.
+Two columns tie a pending message to what its run read, and neither is returned by the admin API. `guard` holds what the message may go out under: the connector, the condition and generation the read was made under, and for a follow-up the time until which the answer is kept. It holds no document text. `source` is different, and should be read plainly: it holds document text. It is written only with `FOLLOW_UPS=on`, and holds the call that would read the same document again (its link), the document's id, a hash of what was read, the ids of the person's messages the read rests on, and up to 20 passages: for each, a few words for the point, the sentence quoted from the document, and up to 40 characters of the text on either side of it. That text stays on the row until the message leaves the queue. Both columns are cleared as soon as the message is no longer `pending` or `draft`, however it ended; for an answer that was delivered, the passages then live in `answers` for its 24 hours.
+
+With `FOLLOW_UPS` not `on`, none of that is kept. A run that reads notes only the connector, condition and generation it read under, for the length of the run, so that the checks before each model call and each send can be made: no link, no document id, no message ids, no hash. `send_message` is offered to the model without `quotes`.
 
 ### Fixed messages from the system
 
@@ -144,12 +146,12 @@ These are the ones that go with requests that wait and with reads. They are writ
 
 | Sent when | Text begins |
 |---|---|
-| A run that had read something was stopped before a model call because what it read under no longer holds. What it had written and not sent is `void`. | "I stopped before answering: the authorisation for what I was reading has ended…" |
-| A message written after a read was not sent because what it was read under no longer holds, or its time was up; it is `void`. Not sent when the person called the request off, for an invitation, or when the message ended as `unverified`. | "I did not send what I had written for you…" |
+| A run that had read something was stopped before a model call because what it read under no longer holds. What it had written and not sent is `void`. | "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again." |
+| A message written after a read was not sent because what it was read under no longer holds, or its time was up, or the owner of that condition could not be asked after eight tries; it is `void`. Not sent when the person called the request off, for an invitation, or when the message ended as `unverified`. | "I did not send what I had written for you…" |
 | A carried-on request's run ended without writing an answer. | "I could not finish what you asked for earlier. Please ask again." |
 | More than one request could be meant by a cancellation. The opening sentence is the model's, in the person's language, with a fixed English one as the fallback; the numbered list is the person's own words. | "More than one of your requests could be meant. Which one?" |
 
-In the Brain's storage the first two are keyed `withheld:<run id>` and `withheld:<key of the message that was not sent>`, so each is sent once.
+The first two share one key, `withheld:<run id>`, so a person gets at most one of them for a run, whichever comes first and however many of the run's messages were withheld.
 
 ### Log lines and audit entries
 
@@ -182,6 +184,7 @@ These are constants in the code, not configuration.
 | Sandbox task: recoveries after losing the container | 2 |
 | A push held for approval | 50 min |
 | A carried-on request, from being taken up to its answer being handed to the channel | 1 hour. Past it nothing more is read and an unsent answer is not sent. |
+| A message whose condition cannot be checked because its owner cannot be asked | Put off 8 times, about a minute apart, then given up: `void`, or `unverified` if an attempt may have arrived. The person gets the notice. |
 | An invitation to authorise on Feishu | 10 min. A request waits no longer than the invitation it was shown with. |
 | `index.md` loaded into a run | The first 4,000 characters |
 | `instructions.md` loaded into a run | The first 8,000 characters |
