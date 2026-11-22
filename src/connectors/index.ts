@@ -84,3 +84,13 @@ export async function holds(env: Env, name: string, scope: Scope, condition: str
 export function dedupeWindow(name: string): number | undefined {
   return byName.get(name)?.channel?.dedupeMs;
 }
+
+/** Shows a person that their message has arrived, where the connector can. Never throws. */
+export async function received(env: Env, name: string, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target }): Promise<boolean> {
+  const show = byName.get(name)?.channel?.received;
+  if (!show) return false;
+  return show(env, scope, event).then(
+    () => true,
+    () => false,
+  );
+}

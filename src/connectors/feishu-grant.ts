@@ -192,12 +192,12 @@ export class FeishuGrant extends DurableObject<Env> {
     }
     const after = await this.#load();
     if (after?.owed?.event !== event) return;
-    // Cleared only when the Brain said it heard. Otherwise tried again, less and less often; after
-    // some hours the Brain's own asking (when the person writes, and at the deadline) is all that is left.
+    // Cleared only when the Brain said it heard. Until then it is tried again, less often as
+    // time goes on but without end.
     if (heard) delete after.owed;
     else after.owed = { event, attempts: attempts + 1 };
     void this.ctx.storage.put("grant", after);
-    if (!heard && attempts < 20) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** attempts));
+    if (!heard) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)));
   }
 
   /**

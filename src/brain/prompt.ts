@@ -81,6 +81,8 @@ export interface PromptParts {
   tasks: { id: string; title: string; status: string; last_progress?: string | null }[];
   /** Requests in this conversation that wait on something or are being carried on, with the person's own words. */
   requests?: { id: string; asked: string }[];
+  /** Earlier answers in this conversation that rested on something read, and can be reopened for a follow-up. */
+  answers?: { id: string; asked: string; at: number }[];
 }
 
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
@@ -97,6 +99,10 @@ export function buildInstructions(parts: PromptParts): string {
   if (parts.requests?.length) {
     const lines = parts.requests.map((each) => `- ${each.id}: ${JSON.stringify(each.asked)}`);
     sections.push(`Requests that are waiting\nThese were asked for here and could not be done yet (the person has to authorise something first, say). Each is carried on by itself when it can be, and answered then. Leave them alone unless the person calls one off or replaces it; someone asking about something else in the meantime has not called anything off.\n${lines.join("\n")}`);
+  }
+  if (parts.answers?.length) {
+    const lines = parts.answers.map((each) => `- ${each.id} (answered ${new Date(each.at).toISOString()}): ${JSON.stringify(each.asked)}`);
+    sections.push(`Answers you can reopen\nYou answered these from something you read for the person. What you read and what you said are not in this conversation's record any more; reopen_answer brings one back, read afresh, when the person asks a follow-up about it. Shown with what the person asked at the time.\n${lines.join("\n")}`);
   }
   sections.push(`Current time: ${new Date(parts.now).toISOString()}`);
   return sections.join("\n\n");

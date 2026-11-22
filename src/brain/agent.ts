@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Holds, type Outcome, type Receipt, DeliveryRejected, DeliveryVoid, type Waiting, amend, canRevisit, dedupeWindow, deliver, holds, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Holds, type Outcome, type Receipt, DeliveryRejected, DeliveryVoid, type Waiting, amend, canRevisit, dedupeWindow, deliver, holds, received, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, isPrivateSession, privateSessionKey, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
@@ -75,6 +75,8 @@ const HANDLING_LIMIT_MS = 60 * 60_000;
 const HELD_MS = 3_000;
 /** The same, when what it waits on will not change within this wake-up. */
 const HELD_LONG_MS = 60_000;
+/** How long a delivered answer can be reopened for a follow-up. */
+const ANSWER_KEPT_MS = 24 * 60 * 60_000;
 const NOT_ANSWERED = "I could not finish what you asked for earlier. Please ask again.";
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 const WAITING_NOTE =
@@ -118,6 +120,19 @@ interface InboxRow {
 }
 
 type Said = { text: string; data: Record<string, unknown> };
+/** One thing a run read for the person: which tool, with what, on which of their messages, and what it said (as a fingerprint). */
+interface Source {
+  connector: string;
+  tool: string;
+  args: string;
+  call: string;
+  events: { said: number[]; recent: number[] };
+  fingerprint: string;
+}
+async function fingerprint(value: unknown): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value))));
+  return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 /** How far back a person's earlier messages still count as part of what they are asking now. */
 const RECENT_REQUEST_MS = 10 * 60_000;
 const MAX_RECENT_REQUESTS = 5;
@@ -187,6 +202,13 @@ export class BrainAgent extends DurableObject<Env> {
     const subject = event.data?.subject;
     if (typeof subject === "string") this.#revise(subject, Number(event.data?.revision ?? 0), false, String(event.data?.holder ?? ""));
     const inserted = this.#insertEvent(event);
+    // A person who addressed the agent is shown at once, on their own message, that it arrived.
+    // Only that: nothing waits for it, nothing depends on it, and it is not a message.
+    const principal = event.principal;
+    if (inserted && event.kind === "message" && principal.kind === "human" && principal.explicit) {
+      const at = Date.now();
+      this.ctx.waitUntil(received(this.env, event.source, this.#scope(), { source_id: event.source_id, data: event.data, reply_to: event.reply_to }).then((shown) => void (shown && this.#log("received_shown", { ms: Date.now() - at }))));
+    }
     // Someone who writes while a request of theirs waits may be saying that the wait is over
     // ("done"). That is not taken from their words: the condition's owner is asked again.
     if (inserted && event.kind === "message") {
@@ -222,6 +244,7 @@ export class BrainAgent extends DurableObject<Env> {
     try {
       this.#fireTimers(Date.now());
       this.#deadlines(Date.now());
+      this.#sql.exec("DELETE FROM answers WHERE expires_at <= ?", Date.now());
       this.#housekeeping(Date.now());
       await this.#flushOutbox();
       await this.#settleQuestions();
@@ -429,6 +452,14 @@ export class BrainAgent extends DurableObject<Env> {
       if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
         await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
         if (!this.#stillActive(runId)) return;
+        // A request that was being carried on cannot wait until tomorrow: its time would be up.
+        // It ends here, and the person is told, in place of its answer.
+        const carrying = this.#continuationOf(runId);
+        if (carrying) {
+          if (carrying.status === "resuming") this.#draft(carrying, run, "I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow.");
+          this.#log("budget_exhausted", { run: runId, tokens_today: this.#tokensToday() });
+          break;
+        }
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
         this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, "I have reached today's usage limit here and will pick this up tomorrow.");
@@ -520,9 +551,11 @@ export class BrainAgent extends DurableObject<Env> {
       // A task that never got past "dispatching" in this run will not be picked up by anything else.
       this.#sql.exec("UPDATE tasks SET status = 'failed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", Date.now(), run.session_id);
       // For a request that was being carried on, this takes the place of its answer: one or the other.
-      const carried = this.#resumed(runId);
-      if (carried) this.#draft(carried, run, "Something went wrong on my side and I could not finish handling that. Please try again.");
-      else this.#notify(`abandoned:${runId}`, run.session_id, runId, "Something went wrong on my side and I could not finish handling that. Please try again.");
+      const carried = this.#continuationOf(runId);
+      if (carried?.status === "resuming") this.#draft(carried, run, "Something went wrong on my side and I could not finish handling that. Please try again.");
+      // One that went back to waiting, or ended, has nothing to say here: its answer, if it gets
+      // one, is the request's.
+      else if (!carried) this.#notify(`abandoned:${runId}`, run.session_id, runId, "Something went wrong on my side and I could not finish handling that. Please try again.");
       this.#finish(runId, "failed", reason);
     });
     this.#log("run_abandoned", { run: runId, reason: outside ? ERROR_WITHHELD : reason.slice(0, 300) });
@@ -542,6 +575,14 @@ export class BrainAgent extends DurableObject<Env> {
       // step: its one answer becomes a message to deliver, and the request one that is being
       // answered. Until here the answer was a draft that nothing would send. A request that is
       // no longer being carried on (told to wait again, ended) leaves no answer behind.
+      // A run that read exactly one thing for the person: its messages carry where they came
+      // from, so that one delivered can be reopened for a follow-up. One that drew on several
+      // things carries nothing: reading one of them again would not vouch for the rest.
+      const sources = JSON.parse(this.#meta(`sources:${runId}`) ?? "[]") as Source[];
+      this.#sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
+      if (status === "done" && sources.length > 0 && sources.every((each) => each.tool === sources[0].tool && each.args === sources[0].args)) {
+        this.#sql.exec("UPDATE outbox SET source = ? WHERE run_id = ? AND status IN ('pending', 'draft')", JSON.stringify(sources.at(-1)), runId);
+      }
       const carried = this.#continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
@@ -577,9 +618,16 @@ export class BrainAgent extends DurableObject<Env> {
    * time it is needed, never remembered.
    */
   #actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
+    return this.#actingOn(this.#basis(runId), this.#resumed(runId) ? (JSON.parse(this.#resumed(runId)!.events) as { recent: number[] }).recent : undefined);
+  }
+
+  /**
+   * The same judgement over given messages: `events` as what was asked, and, if `kept` is given,
+   * exactly those earlier messages as what came shortly before (instead of looking for them).
+   */
+  #actingOn(events: InboxRow[], kept?: number[]): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
     const scope = this.#scope();
     if (scope.kind !== "user") return undefined;
-    const events = this.#basis(runId);
     if (events.length === 0) return undefined;
     const source = events[0].source;
     const origin = originOf(events[0]);
@@ -602,12 +650,11 @@ export class BrainAgent extends DurableObject<Env> {
     // mean over two messages: a link, then what to do with it. These are their own words as
     // they arrived, never anything a run wrote or read.
     const first = events[0];
-    const resumed = this.#resumed(runId);
     let recent: InboxRow[];
-    if (resumed) {
+    if (kept) {
       // Not looked for again: the very messages that were found when the request was made, all
       // still there and still passing the same test.
-      const ids = (JSON.parse(resumed.events) as { recent: number[] }).recent;
+      const ids = kept;
       recent = ids.length === 0 ? [] : this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids);
       if (recent.length !== ids.length || !recent.every((each) => each.text !== null && own(each))) return undefined;
     } else {
@@ -681,7 +728,8 @@ export class BrainAgent extends DurableObject<Env> {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
     const acting = this.#actingFor(runId);
-    const all = acting ? [...TOOLS, ...toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : TOOLS;
+    const own = TOOLS.filter((each) => each.name !== "reopen_answer" || (acting !== undefined && this.#followUps()));
+    const all = acting ? [...own, ...toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.#mayUse(runId, each.name));
   }
 
@@ -714,6 +762,7 @@ export class BrainAgent extends DurableObject<Env> {
       instructions: this.#rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
       tasks: this.#rows<Row>("SELECT id, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at") as any,
+      answers: this.#reopenable(this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? ""),
       requests: this.#cancellable(this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "").map((each) => ({ id: each.id, asked: this.#askedFor(each) })),
     });
   }
@@ -810,22 +859,54 @@ export class BrainAgent extends DurableObject<Env> {
   async #attempt(row: Row, status: "pending" | "reconciling"): Promise<boolean> {
     // Recorded before anything is sent: if this instance dies between the send and the receipt,
     // the row still says that an attempt was begun.
-    this.#sql.exec("UPDATE outbox SET started = 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?", Date.now(), row.id);
+    // Likewise that its outcome is not known: it stays so unless the channel says, of this very
+    // attempt, that nothing was posted. An instance that dies after the channel took the message
+    // leaves a row that says "may have arrived", not one that looks untouched.
+    this.#sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?", Date.now(), row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
       const receipt = await deliver(this.env, this.#scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
+      // Delivered, with a receipt to know it by, and from one source: kept for a while, so the
+      // person can ask about it. Its words are taken before they are removed from the outbox.
+      if (row.source && receipt && this.#followUps() && isPrivateSession(this.#sessionKeyOf(row.target, row.run_id))) {
+        const source = JSON.parse(row.source) as Source;
+        this.#sql.exec(
+          "INSERT OR IGNORE INTO answers (id, session_id, outbox_id, subject, target, connector, tool, args, call, events, fingerprint, text, expires_at, created_at) VALUES (?, (SELECT session_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `ans_${row.id}`,
+          row.run_id,
+          row.id,
+          receipt.subject,
+          row.target,
+          source.connector,
+          source.tool,
+          source.args,
+          source.call,
+          JSON.stringify(source.events),
+          source.fingerprint,
+          row.text,
+          Date.now() + ANSWER_KEPT_MS,
+          Date.now(),
+        );
+      }
       this.#scrubDelivered("id = ?", row.id);
-      if (row.continuation) this.#endRequest(row.continuation, "done", "answered");
+      if (row.continuation) {
+        // From the request being taken up (its condition holding) to its answer being handed over.
+        const taken = this.#rows<{ claimed_at: number | null }>("SELECT claimed_at FROM continuations WHERE id = ?", row.continuation)[0]?.claimed_at;
+        if (taken) this.#log("request_answered", { ms: Date.now() - taken });
+        this.#endRequest(row.continuation, "done", "answered");
+      }
       // It may have been closed while it was on its way.
       if (row.ask) this.#showClosed(row.idem);
       return true;
     } catch (err) {
       // The connector found nothing left to send: nothing was posted, and it is not tried again.
+      // That settles this attempt, not an earlier one whose outcome was never heard.
       if (err instanceof DeliveryVoid) {
-        this.#sql.exec("UPDATE outbox SET status = 'void', text = '', error = NULL WHERE id = ? AND status = ?", row.id, status);
-        if (row.continuation) this.#endRequest(row.continuation, "void", "there was nothing left to send");
+        const how = row.uncertain ? "unverified" : "void";
+        this.#sql.exec("UPDATE outbox SET status = ?, text = '', error = NULL, uncertain = ? WHERE id = ? AND status = ?", how, row.uncertain ? 1 : 0, row.id, status);
+        if (row.continuation) this.#endRequest(row.continuation, how, how === "void" ? "there was nothing left to send" : "its answer may have been delivered; that could not be verified");
         return false;
       }
       // Whether this attempt can have reached anyone. Only the outside system saying no, or
@@ -875,8 +956,15 @@ export class BrainAgent extends DurableObject<Env> {
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
         const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
-        // In place of a request that still waits: that one ends in the same step this one is kept or done.
-        const replaced = !carried && typeof replaces === "string" && replaces !== "" ? this.#mayCancel(run, replaces, callId) : undefined;
+        // In place of a request that still waits: that one ends in the same step this one is kept
+        // or done. Ending a request changes something, so it needs what calling one off needs,
+        // decided here and before anything is read: a run that has read outside text may not.
+        const replacing = !carried && typeof replaces === "string" && replaces !== "";
+        if (replacing && !this.#mayUse(run.id, "cancel_request")) throw new Error(READ_OUTSIDE);
+        const replaced = replacing ? this.#mayCancel(run, replaces as string, callId) : undefined;
+        // Which earlier messages of the person the tool acted on, as it says itself.
+        const relied = new Set<number>();
+        const evidence = () => ({ said: this.#basis(run.id).map((each) => each.id), recent: [...relied].map((index) => acting.recentIds[index]).filter((each) => each !== undefined) });
         const notAfter = (carried?.claimed_at ?? 0) + HANDLING_LIMIT_MS;
         if (carried && Date.now() > notAfter) {
           this.#endRequest(carried.id, "void", "it was not finished in time");
@@ -888,15 +976,19 @@ export class BrainAgent extends DurableObject<Env> {
         this.#audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, relied: (index) => void relied.add(index), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           if (!isWaiting(result)) {
-            if (replaced) this.#cancel(replaced, callId);
+            if (replaced) this.#cancel(replaced.record, callId, replaced.choosing);
+            // What was read, for a later follow-up; a refusal or an error is not something read.
+            if (typeof result === "object" && result !== null && !("error" in result)) {
+              this.#noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(given), call: key, events: evidence(), fingerprint: await fingerprint(result) });
+            }
             return result;
           }
           // Nothing was read. The answer the model gets is written here, not by the tool.
           waits = true;
           this.#outside.delete(callId);
-          return this.#wait(run, acting, key, name, given, result.waiting, replaced ? { record: replaced, by: callId } : undefined);
+          return this.#wait(run, { connector: acting.connector, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
         } finally {
           // What this run has already written to send, and whatever it writes from here on.
           if (!waits) this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
@@ -904,16 +996,22 @@ export class BrainAgent extends DurableObject<Env> {
       },
       sendMessage: (callId, text) => {
         const carried = this.#continuationOf(run.id);
-        if (!carried) return this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text);
+        if (!carried) {
+          // The first thing said after "more than one could be meant" is the question that asks which.
+          const asked = JSON.parse(this.#meta("asked_which") ?? "null") as { run: string; question?: string } | null;
+          if (asked && asked.run === run.id && asked.question === undefined) this.#setMeta("asked_which", JSON.stringify({ ...asked, question: `msg:${callId}` }));
+          return this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text);
+        }
         // Everything such a run says belongs to the request it carries on. That request has one
         // answer, kept as a draft until the run ends; one that is waiting again has none.
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
         return this.#draft(carried, run, text);
       },
+      reopenAnswer: (callId, answerId) => this.#reopenAnswer(run, callId, answerId),
       cancelRequest: (callId, requestId) => {
         const chosen = this.#mayCancel(run, requestId, callId);
-        this.#cancel(chosen, callId);
-        return { ok: true, cancelled: chosen.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
+        this.#cancel(chosen.record, callId, chosen.choosing);
+        return { ok: true, cancelled: chosen.record.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
       },
       sendReview: (callId, summary, commit, comments) => {
         // The same review in words, for wherever comments cannot be attached to lines.
@@ -1025,7 +1123,7 @@ export class BrainAgent extends DurableObject<Env> {
    * of them. One step: the record, and the message that shows the way in, exist together or not
    * at all, so nothing can be acted on before there is a request to carry on.
    */
-  #wait(run: RunRow, acting: { connector: string; recentIds: number[] }, id: string, tool: string, args: Record<string, unknown>, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string }): unknown {
+  #wait(run: RunRow, acting: { connector: string; events: { said: number[]; recent: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
     this.ctx.storage.transactionSync(() => {
       const existing = this.#rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       if (existing && existing.status !== "resuming") throw new Error("that request has ended");
@@ -1042,10 +1140,11 @@ export class BrainAgent extends DurableObject<Env> {
           "INSERT INTO continuations (id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
           id,
           run.session_id,
-          JSON.stringify({ said: basis.map((each) => each.id), recent: acting.recentIds }),
+          JSON.stringify(acting.events),
           acting.connector,
           tool,
-          JSON.stringify(args),
+          // What to call again, as the tool itself put it: never what the model wrote.
+          JSON.stringify(waiting.request),
           target,
           waiting.subject,
           waiting.condition,
@@ -1056,7 +1155,7 @@ export class BrainAgent extends DurableObject<Env> {
         );
         this.#audit("(system)", "request.waiting", { request: id, on: waiting.on });
       }
-      if (replacing) this.#cancel(replacing.record, replacing.by);
+      if (replacing) this.#cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, "I need you to authorise this before I can go on.", undefined, undefined, { interaction: waiting.interaction, target: now.target });
@@ -1251,10 +1350,10 @@ export class BrainAgent extends DurableObject<Env> {
    *
    * `by` names the call: a call that already ended the request is let through when replayed.
    */
-  #mayCancel(run: RunRow, requestId: string, by: string): Continuation {
+  #mayCancel(run: RunRow, requestId: string, by: string): { record: Continuation; choosing?: number } {
     if (this.#continuationOf(run.id) || !this.#actingFor(run.id)) throw new Error("a request can only be cancelled when the person themselves asks for that, in their own private conversation");
     const done = this.#rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND session_id = ? AND status = 'cancelled' AND why = ?", requestId, run.session_id, calledOff(by))[0];
-    if (done) return done;
+    if (done) return { record: done };
     const events = this.#basis(run.id);
     const repliedTo = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
     const open = this.#cancellable(run.session_id);
@@ -1263,27 +1362,34 @@ export class BrainAgent extends DurableObject<Env> {
     const chosen = candidates.find((each) => each.id === requestId);
     if (!chosen) throw new Error(candidates.length === 0 ? "there is no request that this could be about" : `that is not a request this could be about. It could be about: ${describe(candidates)}`);
 
-    const asked = JSON.parse(this.#meta("asked_which") ?? "null") as { ids: string[]; run: string; chose?: number } | null;
+    const asked = JSON.parse(this.#meta("asked_which") ?? "null") as { ids: string[]; run: string; session: string; question?: string; chose?: number } | null;
     // A message that has already picked one does not get to pick again, by any route.
-    if (asked?.chose === events[0].id) throw new Error("this message has already been taken as choosing one request; another needs the person to say so again");
-    if (candidates.length === 1) return chosen;
-    // The answer to "which one?": the first message here after that question reached the person.
-    const question = asked ? this.#rows<{ n: number; unsent: number | null; sent_at: number | null }>("SELECT COUNT(*) AS n, SUM(status != 'sent' OR receipt IS NULL) AS unsent, MAX(sent_at) AS sent_at FROM outbox WHERE run_id = ?", asked.run)[0] : undefined;
-    const delivered = question !== undefined && question.n > 0 && !question.unsent && question.sent_at != null ? question.sent_at : undefined;
+    if (asked?.chose !== undefined && events.some((each) => each.id === asked.chose)) throw new Error("this message has already been taken as choosing one request; another needs the person to say so again");
+    if (candidates.length === 1) return { record: chosen };
+    // The answer to "which one?" is the first message here after that very question reached the
+    // person, by its own receipt, and it has to stand alone: batched with another message, there
+    // is no telling which of them chose.
+    const question = asked?.question && asked.session === run.session_id ? this.#rows<{ status: string; receipt: string | null; sent_at: number | null }>("SELECT status, receipt, sent_at FROM outbox WHERE idem = ?", asked.question)[0] : undefined;
+    const delivered = question?.status === "sent" && question.receipt && question.sent_at != null ? question.sent_at : undefined;
     const first = delivered === undefined ? undefined : this.#rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND received_at >= ? AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY id LIMIT 1", delivered, run.session_id)[0];
-    if (asked && asked.chose === undefined && repliedTo.length === 0 && first !== undefined && first.id === events[0].id && asked.ids.includes(requestId)) {
-      this.#setMeta("asked_which", JSON.stringify({ ...asked, chose: events[0].id }));
-      return chosen;
-    }
-    this.#setMeta("asked_which", JSON.stringify({ ids: candidates.map((each) => each.id), run: run.id }));
+    if (asked && asked.chose === undefined && repliedTo.length === 0 && first !== undefined && events.length === 1 && first.id === events[0].id && asked.ids.includes(requestId)) return { record: chosen, choosing: first.id };
+    this.#setMeta("asked_which", JSON.stringify({ ids: candidates.map((each) => each.id), run: run.id, session: run.session_id }));
     throw new Error(`more than one request could be meant, so none was cancelled. Ask the person which one: ${describe(candidates)}`);
   }
 
-  /** Ends a request the person called off. An answer written and not yet handed over is not sent, and what it said is removed. */
-  #cancel(chosen: Continuation, by: string): void {
+  /**
+   * Ends a request the person called off. An answer written and not yet handed over is not sent,
+   * and what it said is removed. If this used up the one choice after a question, that is
+   * recorded in the same step, not before: an interruption on the way here leaves the choice open.
+   */
+  #cancel(chosen: Continuation, by: string, choosing?: number): void {
     this.ctx.storage.transactionSync(() => {
       this.#endRequest(chosen.id, "cancelled", calledOff(by));
       this.#sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL, error = NULL WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", `answer:${chosen.id}`);
+      if (choosing !== undefined) {
+        const asked = JSON.parse(this.#meta("asked_which") ?? "null") as Record<string, unknown> | null;
+        if (asked) this.#setMeta("asked_which", JSON.stringify({ ...asked, chose: choosing }));
+      }
     });
   }
 
@@ -1296,6 +1402,104 @@ export class BrainAgent extends DurableObject<Env> {
       const data = JSON.parse(each.data ?? "{}") as { subject?: unknown; message_id?: unknown };
       return data.subject === subject || (typeof data.message_id === "string" && `${each.source}:message:${data.message_id}` === subject);
     });
+  }
+
+  // ---- answers that can be followed up
+  //
+  // What a run read for a person is not kept in the conversation, and neither is what it said
+  // about it. An answer that was delivered is kept apart for a day, and comes back only through
+  // reopen_answer: for the person it was given to, in the conversation it was given in, when
+  // they are asking about that answer, and only after its source has been read again as them.
+  // If they can no longer read the source, the old answer does not come back either.
+
+  #followUps(): boolean {
+    return this.env.FOLLOW_UPS !== "off";
+  }
+
+  #noteSource(runId: string, source: Source): void {
+    const noted = JSON.parse(this.#meta(`sources:${runId}`) ?? "[]") as Source[];
+    this.#setMeta(`sources:${runId}`, JSON.stringify([...noted, source]));
+  }
+
+  #sessionKeyOf(_target: string, runId: string | null): string {
+    return this.#rows<{ session_key: string }>("SELECT s.session_key FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?", runId ?? "")[0]?.session_key ?? "";
+  }
+
+  #reopenable(sessionId: string): { id: string; asked: string; at: number }[] {
+    if (!this.#followUps()) return [];
+    return this.#rows<{ id: string; events: string; created_at: number }>("SELECT id, events, created_at FROM answers WHERE session_id = ? AND expires_at > ? ORDER BY created_at DESC LIMIT 5", sessionId, Date.now()).map((each) => {
+      const ids = (JSON.parse(each.events) as { said: number[] }).said;
+      const asked = this.#rows<{ text: string | null }>(`SELECT text FROM inbox WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids).map((row) => row.text ?? "").join(" ").slice(0, 200);
+      return { id: each.id, asked, at: each.created_at };
+    });
+  }
+
+  /**
+   * Brings an earlier answer back for a follow-up, with what its source says now.
+   *
+   * Which answer is the model's to propose and this code's to bound: if the person replied to a
+   * message, it must be that answer's message; otherwise it must be the last thing the agent
+   * said to them in this conversation. Whether their words are about it at all is left to the
+   * model (a decision the user made: see docs/design/agent-core-step0.md, 5.3). The source is
+   * then read again as the person, on the strength of the request they made when it was first
+   * read; only if that succeeds is the old answer handed over, with the source as it is now and
+   * whether it has changed. If the read has to wait (their authorisation has ended), the
+   * follow-up waits like any request and is carried on when they have authorised again.
+   */
+  async #reopenAnswer(run: RunRow, callId: string, answerId: string): Promise<unknown> {
+    if (!this.#followUps()) throw new Error("there is no such tool in this run");
+    const carried = this.#continuationOf(run.id);
+    if (carried && (carried.status !== "resuming" || carried.call_id !== callId || carried.tool !== "reopen_answer")) throw new Error("this run can only answer the request it carries on");
+    const acting = this.#actingFor(run.id);
+    if (!acting) throw new Error("an answer can only be reopened when the person themselves asks, in their own private conversation");
+    // Told to wait before: the same answer on a replay, as for any call that waits.
+    if (!carried && this.#rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) return { waiting: true, request: callId, note: WAITING_NOTE };
+    const id = carried ? String((JSON.parse(carried.args) as { answer_id?: unknown }).answer_id ?? "") : answerId;
+    const kept = () => this.#rows<Row>("SELECT * FROM answers WHERE id = ? AND session_id = ? AND expires_at > ?", id, run.session_id, Date.now())[0];
+    const answer = kept();
+    if (!answer) throw new Error("there is no such answer here, or it is no longer kept. If the person wants it again, they can ask for it anew");
+    const repliedTo = this.#basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    if (repliedTo.length > 0) {
+      if (!repliedTo.every((subject) => subject === answer.subject)) throw new Error("the message the person replied to is not that answer");
+    } else if (!carried) {
+      const last = this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", answer.target)[0];
+      if (last?.id !== answer.outbox_id) throw new Error("that answer is not the last thing you said to them, so it is not clear they mean it. Ask them, or they can reply to the answer they mean");
+    }
+    const found = toolsOf(answer.connector).find((each) => each.name === answer.tool);
+    const events = JSON.parse(answer.events) as { said: number[]; recent: number[] };
+    const rows = this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${events.said.map(() => "?").join(",")}) ORDER BY id`, ...events.said);
+    const original = rows.length === events.said.length && rows.every((each) => each.text !== null) ? this.#actingOn(rows, events.recent) : undefined;
+    if (!found || !original || original.person !== acting.person || original.connector !== acting.connector) throw new Error("what the person asked for at the time is no longer on record, so this cannot be reopened. They can ask for it anew");
+    const notAfter = (carried?.claimed_at ?? 0) + HANDLING_LIMIT_MS;
+    if (carried && Date.now() > notAfter) {
+      this.#endRequest(carried.id, "void", "it was not finished in time");
+      throw new Error("this request was not finished in time; nothing was read. The person can ask again");
+    }
+    this.#outside.add(callId);
+    this.#audit(acting.person, "tool.used", { tool: answer.tool, call: answer.call, reopening: id });
+    let waits = false;
+    try {
+      const result = await found.run({ env: this.env, scope: this.#scope(), person: acting.person, origin: acting.origin, said: original.said, recent: original.recent, callId: answer.call, ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, JSON.parse(answer.args) as Record<string, unknown>);
+      if (isWaiting(result)) {
+        waits = true;
+        this.#outside.delete(callId);
+        return this.#wait(run, { connector: answer.connector, events: { said: this.#basis(run.id).map((each) => each.id), recent: [] } }, carried ? carried.id : callId, "reopen_answer", { ...result.waiting, request: { answer_id: id } });
+      }
+      // Not readable now: nothing of the old answer is handed over.
+      if (typeof result !== "object" || result === null || "error" in result) return result;
+      const now = kept();
+      if (!now) throw new Error("that answer is no longer kept");
+      const print = await fingerprint(result);
+      this.#noteSource(run.id, { connector: answer.connector, tool: answer.tool, args: answer.args, call: answer.call, events, fingerprint: print });
+      return {
+        source_now: result,
+        your_answer_then: now.text,
+        source_changed: print !== now.fingerprint,
+        note: print !== now.fingerprint ? "The source has changed since you answered. Say so, and answer from what it says now; do not present the old answer's points as what it says now." : "The source says what it said when you answered.",
+      };
+    } finally {
+      if (!waits) this.#sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+    }
   }
 
   /**

@@ -198,6 +198,27 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE outbox ADD COLUMN first_attempt_at INTEGER;
    ALTER TABLE outbox ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0;
    UPDATE outbox SET first_attempt_at = created_at, uncertain = 1 WHERE started = 1 AND status = 'pending' AND ask IS NULL;`,
+  // 21: answers that were delivered to a person about one thing read for them, kept for a short
+  // while so that a follow-up can be answered: what was said, what it was read from and on whose
+  // request, and a fingerprint of what the source said then. `outbox.source` carries the same
+  // from the run that read to the moment of delivery.
+  `CREATE TABLE answers (
+     id TEXT PRIMARY KEY,
+     session_id TEXT NOT NULL,
+     outbox_id INTEGER NOT NULL,
+     subject TEXT NOT NULL,
+     target TEXT NOT NULL,
+     connector TEXT NOT NULL,
+     tool TEXT NOT NULL,
+     args TEXT NOT NULL,
+     call TEXT NOT NULL,
+     events TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     text TEXT NOT NULL,
+     expires_at INTEGER NOT NULL,
+     created_at INTEGER NOT NULL
+   );
+   ALTER TABLE outbox ADD COLUMN source TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

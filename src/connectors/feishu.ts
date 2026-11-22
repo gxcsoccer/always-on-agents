@@ -77,7 +77,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -380,6 +380,21 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // something to count as delivered.
   if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
   return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */
+export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }): Promise<void> {
+  const messageId = typeof event.data?.message_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(event.data.message_id) ? event.data.message_id : undefined;
+  const appId = event.reply_to?.address.app_id;
+  // Only a message a person wrote: a button press has no message of theirs to mark.
+  if (!messageId || !appId || event.data?.card !== undefined) return;
+  const token = await tenantAccessToken(env, appId);
+  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ reaction_type: { emoji_type: "Get" } }),
+  });
+  if (!response.ok) throw new Error(`Feishu returned ${response.status}`);
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

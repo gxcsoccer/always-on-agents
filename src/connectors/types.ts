@@ -60,17 +60,20 @@ export type Holds = { state: "holds"; since: number } | { state: "not_yet" | "go
  *   condition   - what exactly has to hold for this request
  *   generation  - `holds` answers "gone" once the connector has moved past it
  *   until       - the condition has to have come to hold before this, in ms
+ *   request     - the call to make again when the condition holds, in the tool's own canonical
+ *                 form: only what identifies the thing asked for. The Brain stores this, never
+ *                 the arguments the model wrote
  *   interaction - what to put in front of the person so that they can bring it about. The Brain
  *                 sends it through the conversation's channel, which turns it into something to
  *                 look at only at the moment of sending (see OutboundMessage.interaction)
  */
 export interface Waiting {
-  waiting: { on: string; subject: string; condition: string; generation: number; until: number; interaction: string };
+  waiting: { on: string; subject: string; condition: string; generation: number; until: number; interaction: string; request: Record<string, unknown> };
 }
 
 export function isWaiting(result: unknown): result is Waiting {
   const w = (result as Waiting | null)?.waiting;
-  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until);
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null;
 }
 
 /**
@@ -136,6 +139,12 @@ export interface ToolContext {
    * not start the request over under a newer generation.
    */
   resuming?: { generation: number; notAfter: number };
+  /**
+   * To be called by a tool that acts on one of the `recent` messages (by its index there) rather
+   * than on what was just said: "summarise it" after a link. The Brain then keeps that message,
+   * and no other earlier one, as part of what the request rests on.
+   */
+  relied?(recent: number): void;
 }
 
 export interface Ingress {
@@ -175,6 +184,13 @@ export interface Channel {
    * the Brain refuses them.
    */
   standing?(env: Env, scope: Scope, subject: string): Promise<Standing | undefined>;
+  /**
+   * Shows the person, on the very message they wrote, that it has arrived: a reaction, say. It
+   * is a sign, not a message: it may fail, repeat or come late without anything depending on it,
+   * and it must never add a message to the conversation. Called once per message a person
+   * addressed to the agent, as soon as the message is stored; nothing waits for it.
+   */
+  received?(env: Env, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target }): Promise<void>;
   /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,

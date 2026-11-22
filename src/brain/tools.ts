@@ -30,6 +30,7 @@ export interface ToolHost {
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
   cancelTask(taskId: string): Promise<unknown>;
   cancelRequest(callId: string, requestId: string): unknown;
+  reopenAnswer(callId: string, answerId: string): Promise<unknown>;
 }
 
 /** The longest message the Brain can send. */
@@ -117,6 +118,11 @@ export const TOOLS: ToolDefinition[] = [
   ),
   tool("cancel_task", "Stop a task and discard its sandbox.", { task_id: string }),
   tool(
+    "reopen_answer",
+    "Bring back an earlier answer of yours that rested on something you read for the person (they are listed for you under \"Answers you can reopen\"), together with what that source says now, so that you can answer a follow-up about it: \"expand on the second point\", \"where does it say that\". Use it only when the person is asking about that answer; not for a new subject, and not when they say they do not want it read. If the source has changed since, say so before you answer from the new text.",
+    { answer_id: string },
+  ),
+  tool(
     "cancel_request",
     "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If it tells you more than one request could be meant, ask the person which.",
     { request_id: string },
@@ -177,6 +183,8 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
       return host.answerTask(call.call_id, text(a.task_id, "task_id", 64), a.decision, text(a.reason, "reason", 1_000, true));
     case "cancel_task":
       return host.cancelTask(text(a.task_id, "task_id", 64));
+    case "reopen_answer":
+      return host.reopenAnswer(call.call_id, text(a.answer_id, "answer_id", 200));
     case "cancel_request":
       return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200));
     default:
