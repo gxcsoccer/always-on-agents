@@ -49,7 +49,7 @@ describe("following up: the strict and the proposed decision on the same inputs"
 });
 
 describe("a passage an answer rested on", () => {
-  const text = "Intro. The budget is 40 million. Details follow. The team has nine people. End.";
+  const text = "Introduction to the plan. The budget is 40 million. Details follow. The team has nine people. End of the plan.";
 
   it("is tied to one place, or not at all", () => {
     expect(locate("budget", "The budget is 40 million.", [text])).toMatchObject({ found: true });
@@ -69,7 +69,15 @@ describe("a passage an answer rested on", () => {
     // The same words moved under another heading prove nothing about the point they supported.
     expect(passageNow(budget, ["Rejected proposals. The budget is 40 million. Rejected."], false).now).toBe("cannot verify");
     // Not read whole this time, and the passage is not in the part read.
-    expect(passageNow(team, ["Intro. The budget is 40 million."], true).now).toBe("cannot verify");
+    expect(passageNow(team, ["Introduction to the plan. The budget is 40 million."], true).now).toBe("cannot verify");
+    // The last sentence of the document, moved under another heading: nothing follows it either
+    // time, and an empty anchor is not evidence of anything.
+    const end = "Approved for this project. The budget is 40 million.";
+    const last = locate("budget", "The budget is 40 million.", [end]);
+    expect(passageNow(last, ["Explicitly rejected proposal. The budget is 40 million."], false).now).toBe("cannot verify");
+    expect(passageNow(last, [end], false).now).toBe("unchanged");
+    // A few characters are kept, as not tied to any place.
+    expect(locate("short", "九人", ["团队有九人。"])).toMatchObject({ found: false, quote: "九人" });
     // Never tied to a place when the answer was written.
     expect(passageNow(locate("made up", "nowhere", [text]), [text], false).now).toBe("cannot verify");
   });

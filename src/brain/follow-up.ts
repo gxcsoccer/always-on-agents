@@ -56,10 +56,14 @@ export interface Passage {
 }
 
 const AROUND = 40;
+/** An anchor shorter than this (the quote stands at the very start or end, say) says too little about where it stood. */
+const ANCHOR_MIN = 8;
+/** A quote shorter than this is kept, but never taken as tied to a place: too many places could hold it. */
+export const QUOTE_MIN = 6;
 
 /** Ties a quote to its one place in what was read, or says it could not be. */
 export function locate(point: string, quote: string, read: string[]): Passage {
-  const places = read.flatMap((text) => occurrences(text, quote).map((at) => ({ text, at })));
+  const places = quote.length < QUOTE_MIN ? [] : read.flatMap((text) => occurrences(text, quote).map((at) => ({ text, at })));
   if (places.length !== 1) return { point, quote, found: false };
   const { text, at } = places[0];
   return { point, quote, found: true, before: text.slice(Math.max(0, at - AROUND), at), after: text.slice(at + quote.length, at + quote.length + AROUND) };
@@ -75,7 +79,11 @@ export type PassageNow = "unchanged" | "changed" | "cannot verify";
 export function passageNow(passage: Passage, now: string[], partial: boolean): { now: PassageNow; why: string } {
   if (!passage.found) return { now: "cannot verify", why: "it could not be tied to one place in the source when the answer was written" };
   const places = now.flatMap((text) => occurrences(text, passage.quote).map((at) => ({ before: text.slice(Math.max(0, at - AROUND), at), after: text.slice(at + passage.quote.length, at + passage.quote.length + AROUND) })));
-  if (places.some((each) => each.before === passage.before || each.after === passage.after)) return { now: "unchanged", why: "the same words stand where they stood" };
+  // The same words with the same text on one side of them, where that text is enough to tell a
+  // place by. An anchor that is empty or a few characters long matches anywhere and proves nothing.
+  const same = (then: string | undefined, now: string) => then !== undefined && then.length >= ANCHOR_MIN && then === now;
+  const matching = places.filter((each) => same(passage.before, each.before) || same(passage.after, each.after));
+  if (matching.length === 1) return { now: "unchanged", why: "the same words stand where they stood" };
   if (places.length > 0) return { now: "cannot verify", why: "the words are there, but what surrounds them is not what it was" };
   return partial ? { now: "cannot verify", why: "the source is longer than what was read this time, and the passage is not in the part read" } : { now: "changed", why: "the words are no longer there as they were" };
 }
