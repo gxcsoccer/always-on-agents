@@ -24,7 +24,7 @@ import { type Item, ModelError, type ToolDefinition, messageText, respond } from
 import { registry } from "../registry";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
-import { buildInstructions } from "./prompt";
+import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS, buildInstructions } from "./prompt";
 import { migrate } from "./schema";
 import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, describeTool, executeTool } from "./tools";
 
@@ -936,6 +936,9 @@ export class BrainAgent extends DurableObject<Env> {
         const exists = this.#rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
         if (!exists && this.#rows<{ n: number }>("SELECT COUNT(*) AS n FROM memory")[0].n >= MAX_MEMORY_FILES) throw new Error("memory is full; delete something first");
         sql.exec("INSERT INTO memory (path, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at", path, content, Date.now());
+        // Said at the moment it happens, so the file is shortened by the run that made it long.
+        const limit = path === "index.md" ? MAX_LOADED_INDEX : path === "instructions.md" ? MAX_LOADED_INSTRUCTIONS : undefined;
+        if (limit !== undefined && content.trim().length > limit) return { ok: true, path, note: `saved, but only the first ${limit} characters of ${path} are loaded into a run; shorten it, and move detail into other files` };
         return { ok: true, path };
       },
       memoryDelete: (path) => {

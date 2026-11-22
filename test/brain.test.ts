@@ -271,6 +271,23 @@ describe("timers and memory", () => {
     expect(await stub.readMemory("instructions.md")).toBeNull();
   });
 
+  it("loads only the first part of an index that has grown long, and says so when it is written", async () => {
+    const { stub } = brain();
+    const long = `${"- notes/a.md: something worth knowing\n".repeat(200)}THE-END`;
+    model.replies([call("memory_write", { path: "index.md", content: long })], [say("")], [say("")]);
+    await stub.ingest(message("remember all this"));
+    await wake(stub);
+    expect(toolOutputs().at(-1).note).toMatch(/only the first 4000 characters/);
+    // The whole file is kept; a later run is given the start of it and told the rest was left out.
+    expect(await stub.readMemory("index.md")).toBe(long);
+    await stub.ingest(message("hello again"));
+    await wake(stub);
+    const given = modelCalls.at(-1).instructions as string;
+    expect(given).toContain("- notes/a.md: something worth knowing");
+    expect(given).not.toContain("THE-END");
+    expect(given).toContain("index.md is longer than what is loaded into a run");
+  });
+
   it("rejects memory paths that are not plain markdown files", async () => {
     const { stub } = brain();
     model.replies([call("memory_write", { path: "../secrets.md", content: "x" }), call("memory_write", { path: "notes/a.txt", content: "x" })], [say("")]);
