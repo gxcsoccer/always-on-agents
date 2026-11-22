@@ -78,11 +78,21 @@ const HELD_MS = 3_000;
 const HELD_LONG_MS = 60_000;
 /** How long a delivered answer can be reopened for a follow-up. */
 const ANSWER_KEPT_MS = 24 * 60 * 60_000;
-const WITHHELD = "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.";
+/**
+ * What the system itself says to a person about a request of theirs, in fixed words. Said in the
+ * language they last wrote in here, as far as that can be told without a model: Chinese if their
+ * latest message has Chinese characters in it, English otherwise.
+ */
+const NOTICES = {
+  withheld: { en: "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.", zh: "我在完成之前停下了：读取所依据的授权已经结束。请再问一次。" },
+  notSent: { en: "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.", zh: "我写好的内容没有发给你：读取所依据的授权已经结束，或者已经过了太久。请再问一次。" },
+  notAnswered: { en: "I could not finish what you asked for earlier. Please ask again.", zh: "你之前让我做的事我没能完成，请再问一次。" },
+  limit: { en: "I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow.", zh: "我今天的用量已经用完，没能完成你之前让我做的事。请明天再问一次。" },
+  which: { en: "More than one of your requests could be meant. Which one?", zh: "你指的可能不止一件事，是哪一件？" },
+  invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
+} as const;
 /** How often a message whose condition's owner cannot be asked is put off before it is given up. */
 const MAX_UNASKED = 8;
-const NOT_SENT = "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.";
-const NOT_ANSWERED = "I could not finish what you asked for earlier. Please ask again.";
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 const WAITING_NOTE =
   "This cannot be done until the person does something that only they can do (authorise it, say). The system itself is showing them how, in this conversation; do not repeat or paraphrase that, and do not ask them to send their request again. The request is kept under the id given here and is carried on by itself once they have done it: its answer is sent to them then. There is nothing more for you to do about it in this run, and nothing to say about it.";
@@ -480,7 +490,7 @@ export class BrainAgent extends DurableObject<Env> {
         // It ends here, and the person is told, in place of its answer.
         const carrying = this.#continuationOf(runId);
         if (carrying) {
-          if (carrying.status === "resuming") this.#draft(carrying, run, "I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow.");
+          if (carrying.status === "resuming") this.#draft(carrying, run, this.#notice("limit", run.session_id));
           this.#log("budget_exhausted", { run: runId, tokens_today: this.#tokensToday() });
           break;
         }
@@ -513,7 +523,7 @@ export class BrainAgent extends DurableObject<Env> {
           if (!this.#stillActive(runId)) return;
           this.#endRequest(carried.id, "void", why ?? "it is no longer the person's to ask here");
           // They were waiting for this: told, in fixed words, that it stopped.
-          this.#notify(`withheld:${runId}`, run.session_id, null, WITHHELD);
+          this.#notify(`withheld:${runId}`, run.session_id, null, this.#notice("withheld", run.session_id));
           break;
         }
       }
@@ -536,7 +546,7 @@ export class BrainAgent extends DurableObject<Env> {
           // Nothing more of it goes out; the person is told, in fixed words, that it stopped.
           this.#sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status = 'pending' AND started = 0", runId);
           if (carried) this.#endRequest(carried.id, "void", over);
-          this.#notify(`withheld:${runId}`, run.session_id, null, WITHHELD);
+          this.#notify(`withheld:${runId}`, run.session_id, null, this.#notice("withheld", run.session_id));
           break;
         }
       }
@@ -642,7 +652,7 @@ export class BrainAgent extends DurableObject<Env> {
       const carried = this.#continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
-        if (this.#rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#draft(carried, run, NOT_ANSWERED);
+        if (this.#rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#draft(carried, run, this.#notice("notAnswered", run.session_id));
         this.#sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) this.#sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
@@ -853,6 +863,12 @@ export class BrainAgent extends DurableObject<Env> {
     return { ok: true };
   }
 
+  /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */
+  #notice(which: keyof typeof NOTICES, sessionId: string): string {
+    const last = this.#rows<{ text: string | null }>("SELECT text FROM inbox WHERE kind = 'message' AND text IS NOT NULL AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY id DESC LIMIT 1", sessionId)[0]?.text ?? "";
+    return NOTICES[which][/[\u4e00-\u9fff]/.test(last) ? "zh" : "en"];
+  }
+
   /** A message from the system rather than the model. Having nowhere to send it must never fail the caller. */
   #notify(idem: string, sessionId: string, runId: string | null, text: string, continuation?: Continuation): void {
     try {
@@ -904,7 +920,7 @@ export class BrainAgent extends DurableObject<Env> {
           // because they called it off: they are told so, in fixed words, rather than left waiting.
           const calledOff = row.continuation ? this.#rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", row.continuation)[0]?.status === "cancelled" : false;
           const session = this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", row.run_id ?? "")[0]?.session_id;
-          if (how === "void" && !calledOff && !row.interaction && session && (row.guard || row.continuation)) this.#notify(`withheld:${row.run_id ?? row.idem}`, session, null, NOT_SENT);
+          if (how === "void" && !calledOff && !row.interaction && session && (row.guard || row.continuation)) this.#notify(`withheld:${row.run_id ?? row.idem}`, session, null, this.#notice("notSent", session));
           if (row.continuation) this.#endRequest(row.continuation, how, how === "void" ? "it no longer stood when its answer was to be sent" : "its answer may have been delivered; that could not be verified");
           if (how === "unverified") this.#log("message_unverified", { outbox_id: row.id });
           continue;
@@ -1242,7 +1258,7 @@ export class BrainAgent extends DurableObject<Env> {
       if (replacing) this.#cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
-      this.#enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, "I need you to authorise this before I can go on.", undefined, undefined, { interaction: waiting.interaction, target: now.target });
+      this.#enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: now.target });
       // The condition may already hold (the person used an earlier invitation a moment ago): ask.
       this.#hint(now, `asked:${waiting.interaction}`);
     });
@@ -1484,7 +1500,7 @@ export class BrainAgent extends DurableObject<Env> {
     // which message asked, about which requests, and when it reached the person. Its opening
     // words are the model's, so that it is in the person's language; the list is their own words.
     const key = `which:${by}`;
-    this.#enqueueMessage(key, run.session_id, null, `${ask.trim() || "More than one of your requests could be meant. Which one?"}\n${candidates.map((each, index) => `${index + 1}. "${this.#askedFor(each)}"`).join("\n")}`);
+    this.#enqueueMessage(key, run.session_id, null, `${ask.trim() || this.#notice("which", run.session_id)}\n${candidates.map((each, index) => `${index + 1}. "${this.#askedFor(each)}"`).join("\n")}`);
     this.#setMeta(which, JSON.stringify({ ids: candidates.map((each) => each.id), question: key }));
     throw new Error(`more than one request could be meant, so none was cancelled. The person has been asked which one, by the system itself; do not ask again. They could mean: ${describe(candidates)}`);
   }

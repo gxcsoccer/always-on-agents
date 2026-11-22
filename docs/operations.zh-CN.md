@@ -142,14 +142,14 @@ Worker 输出结构化日志（每行一个 JSON 对象），`wrangler.jsonc` �
 
 ### 系统发出的固定消息
 
-这里列的是和“会等待的请求”以及读取有关的那几条。它们由代码写出，不是模型写的，会带着正文出现在 `outbox` 里，用英文发送。
+这里列的是和“会等待的请求”以及读取有关的那几条。它们由代码写出，不是模型写的，会带着正文出现在 `outbox` 里。这个人在该对话里最近一条消息含有中文字符时用中文发送，否则用英文（下表列的是英文措辞）。
 
 | 什么时候发 | 正文开头 |
 |---|---|
 | 一次读过东西的 run 在调用模型之前被停下，因为读取所依据的条件已经不成立。它已经写好而没发出的内容记为 `void` | “I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.” |
 | 读取之后写的一条消息没有发出，因为读取所依据的条件已经不成立，或者时间已过，或者试了八次都问不到这个条件的所有者；它记为 `void`。这个人自己取消了请求时、对邀请、以及消息以 `unverified` 结束时，不发这条提示 | “I did not send what I had written for you…” |
 | 接着处理请求的那次 run 结束时没有写出答复 | “I could not finish what you asked for earlier. Please ask again.” |
-| 一次取消可能指的请求不止一个。开头那句话是模型用这个人的语言写的，没有时用固定的英文；编号列表是这个人自己的原话 | “More than one of your requests could be meant. Which one?” |
+| 一次取消可能指的请求不止一个。开头那句话是模型用这个人的语言写的，没有时用一句固定的话（语言按同样的办法选）；编号列表是这个人自己的原话 | “More than one of your requests could be meant. Which one?” |
 
 前两条共用一个键 `withheld:<run 编号>`，所以对同一次 run，这个人最多只会收到其中一条——先发生的那一条，不管这次 run 有多少条消息被扣下。
 

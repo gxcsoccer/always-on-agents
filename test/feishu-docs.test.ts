@@ -965,8 +965,8 @@ describe("a request that waits and is carried on", () => {
   });
 
   type Person = ReturnType<typeof someone>;
-  const NOT_ANSWERED = "I could not finish what you asked for earlier. Please ask again.";
-  const NOT_SENT = "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.";
+  const NOT_ANSWERED = "你之前让我做的事我没能完成，请再问一次。";
+  const NOT_SENT = "我写好的内容没有发给你：读取所依据的授权已经结束，或者已经过了太久。请再问一次。";
   let asks = 0;
   /** Someone with a document of their own (or several) that only they can open. */
   const owner = (...docs: string[]) => {
@@ -1391,7 +1391,7 @@ describe("a request that waits and is carried on", () => {
     expect((await (await oda.grant()).status()).pending).toBe(0);
     expect(await oda.requests()).toMatchObject([{ id, status: "void" }]);
     // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
-    expect(oda.heard()).toEqual(["I stopped before finishing: the authorisation for what I was reading has ended. Please ask again."]);
+    expect(oda.heard()).toEqual(["我在完成之前停下了：读取所依据的授权已经结束。请再问一次。"]);
     expect(carried()).toEqual([]);
   });
 
@@ -1409,7 +1409,7 @@ describe("a request that waits and is carried on", () => {
     expect(JSON.stringify(modelCalls)).not.toContain("The text of");
     expect(await pam.requests()).toMatchObject([{ id, status: "void" }]);
     // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
-    expect(pam.heard()).toEqual(["I stopped before finishing: the authorisation for what I was reading has ended. Please ask again."]);
+    expect(pam.heard()).toEqual(["我在完成之前停下了：读取所依据的授权已经结束。请再问一次。"]);
     expect(await rowsOf(pam.stub, "SELECT 1 FROM outbox WHERE continuation IS NOT NULL")).toEqual([]);
 
     // For a wiki page: taken away once the page has been looked up. The document behind it is not asked for.
@@ -1454,7 +1454,7 @@ describe("a request that waits and is carried on", () => {
         expect(JSON.stringify(modelCalls)).not.toContain("The text of");
         expect(await quin.requests()).toMatchObject([{ id: request, status: "void" }]);
         // Told that it stopped, in fixed words; nothing of the document.
-        expect(quin.heard()).toEqual(["I stopped before finishing: the authorisation for what I was reading has ended. Please ask again."]);
+        expect(quin.heard()).toEqual(["我在完成之前停下了：读取所依据的授权已经结束。请再问一次。"]);
         expect(await answer(quin, request)).toEqual([]);
       } else {
         expect(outputsIn(carried()[0])).toEqual([{ text: "The text of DocQuin00000000000001." }]);
@@ -1472,7 +1472,7 @@ describe("a request that waits and is carried on", () => {
     await rowsOf(rex.stub, "INSERT OR REPLACE INTO meta (key, value) VALUES (?, '99999999')", `tokens:${new Date().toISOString().slice(0, 10)}`);
     await authorises(rex);
     expect(carried()).toEqual([]);
-    expect(rex.heard()).toEqual(["I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow."]);
+    expect(rex.heard()).toEqual(["我今天的用量已经用完，没能完成你之前让我做的事。请明天再问一次。"]);
     expect(await rex.requests()).toMatchObject([{ id, status: "done" }]);
     expect((await rowsOf(rex.stub, "SELECT idem FROM outbox WHERE interaction IS NULL")).map((each) => each.idem)).toEqual([`answer:${id}`]);
     expect(JSON.stringify(modelCalls)).not.toContain("The text of");
@@ -1488,7 +1488,7 @@ describe("a request that waits and is carried on", () => {
     expect(model.remaining()).toBe(0);
     expect(carried().length).toBe(1);
     // The person was waiting: they are told, in fixed words and nothing of the document, that it stopped.
-    expect(ray.heard()).toEqual(["I stopped before finishing: the authorisation for what I was reading has ended. Please ask again."]);
+    expect(ray.heard()).toEqual(["我在完成之前停下了：读取所依据的授权已经结束。请再问一次。"]);
     expect(await answer(ray, id)).toEqual([]);
     expect(await ray.requests()).toMatchObject([{ id, status: "void" }]);
 
@@ -1607,7 +1607,8 @@ describe("a request that waits and is carried on", () => {
   });
 
   /** The question the system itself puts when more than one request could be meant. */
-  const WHICH = /^More than one of your requests could be meant\. Which one\?\n1\. ".*"\n2\. ".*"$/;
+  // The fixed opening, in the language the person last wrote in: these people write Chinese.
+  const WHICH = /^你指的可能不止一件事，是哪一件？\n1\. ".*"\n2\. ".*"$/;
   const askedWhich = async (person: Person) => (await rowsOf(person.stub, "SELECT value FROM meta WHERE key LIKE 'asked_which:%'")).map((each) => JSON.parse(each.value));
 
   it("asks which request is meant when two share a card, cancels the one named next, and answers the other (F15, F20)", async () => {
@@ -2422,7 +2423,7 @@ describe("following up on an answer", () => {
     expect(outputsIn(carried[0])[0].error).toEqual(expect.any(String));
     expect(feishu.reads).toEqual([]);
     expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
-    expect(jan.heard()).toEqual(["I could not finish what you asked for earlier. Please ask again."]);
+    expect(jan.heard()).toEqual(["你之前让我做的事我没能完成，请再问一次。"]);
     expect((await jan.requests())[1].status).toBe("done");
   });
 
@@ -2501,8 +2502,8 @@ describe("following up on an answer", () => {
     expect(read()).toEqual(["DocNia000000000000001"]);
   });
 
-  const WITHHELD = "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.";
-  const NOT_SENT = "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.";
+  const WITHHELD = "我在完成之前停下了：读取所依据的授权已经结束。请再问一次。";
+  const NOT_SENT = "我写好的内容没有发给你：读取所依据的授权已经结束，或者已经过了太久。请再问一次。";
   /**
    * A day goes by for whatever this Brain keeps of answers. Nothing can wait that long here, so
    * the dates are moved: on the kept answer, and where a run or a message carries that date along.

@@ -142,14 +142,14 @@ With `FOLLOW_UPS` not `on`, none of that is kept. A run that reads notes only th
 
 ### Fixed messages from the system
 
-These are the ones that go with requests that wait and with reads. They are written by code, not by the model, appear in `outbox` with their text, and are sent in English.
+These are the ones that go with requests that wait and with reads. They are written by code, not by the model, appear in `outbox` with their text, and are sent in Chinese if the person's latest message in that conversation has Chinese characters in it, in English otherwise (the English wording is shown here).
 
 | Sent when | Text begins |
 |---|---|
 | A run that had read something was stopped before a model call because what it read under no longer holds. What it had written and not sent is `void`. | "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again." |
 | A message written after a read was not sent because what it was read under no longer holds, or its time was up, or the owner of that condition could not be asked after eight tries; it is `void`. Not sent when the person called the request off, for an invitation, or when the message ended as `unverified`. | "I did not send what I had written for you…" |
 | A carried-on request's run ended without writing an answer. | "I could not finish what you asked for earlier. Please ask again." |
-| More than one request could be meant by a cancellation. The opening sentence is the model's, in the person's language, with a fixed English one as the fallback; the numbered list is the person's own words. | "More than one of your requests could be meant. Which one?" |
+| More than one request could be meant by a cancellation. The opening sentence is the model's, in the person's language, with a fixed sentence (chosen the same way) as the fallback; the numbered list is the person's own words. | "More than one of your requests could be meant. Which one?" |
 
 The first two share one key, `withheld:<run id>`, so a person gets at most one of them for a run, whichever comes first and however many of the run's messages were withheld.
 
