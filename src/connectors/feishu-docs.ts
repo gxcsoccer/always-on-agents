@@ -16,9 +16,9 @@
  */
 import type { Env } from "../env";
 import { registry } from "../registry";
-import { API, TOKEN_V2, TOKEN_V3, sendToPerson } from "./feishu-api";
-import { OFFLINE, type Who, grantName, grantOf, grantsKey, lifetime, sameSet } from "./feishu-grant";
-import type { ConnectorTool, ToolContext } from "./types";
+import { API, TOKEN_V2, TOKEN_V3 } from "./feishu-api";
+import { OFFLINE, SCOPES, type Who, grantName, grantOf, grantsKey, lifetime, sameSet } from "./feishu-grant";
+import { type ConnectorTool, type Holds, type ToolContext, type Waiting, isWaiting } from "./types";
 
 /** How much of a document one read returns. */
 export const MAX_DOCUMENT_TEXT = 40_000;
@@ -30,7 +30,7 @@ const NOT_COVERED = 99991679;
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
   description:
-    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If this request has no link, it can be about the one document they linked just before (within about ten minutes), once; if they linked several, or you are not sure which they mean, ask them to send the link together with what they want. If the result says authorisation is needed, its note says whether the person has already been told and what, if anything, is left for you to say.",
+    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link exactly as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked in this request can be read. If this request has no link, it can be about the one document they linked just before (within about ten minutes), once; if they linked several, or you are not sure which they mean, ask them to send the link together with what they want.",
   effect: "read",
   parameters: { document: { type: "string" } },
   run: reported,
@@ -44,8 +44,8 @@ export const readDocument: ConnectorTool = {
  */
 async function reported(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
   try {
-    const result = (await read(context, args)) as { text?: string; authorisation_needed?: boolean; error?: string };
-    const how = result.text !== undefined ? "read" : result.authorisation_needed ? "invited" : (REASONS.find(([, words]) => result.error?.startsWith(words))?.[0] ?? "other");
+    const result = (await read(context, args)) as { text?: string; error?: string };
+    const how = result.text !== undefined ? "read" : isWaiting(result) ? "invited" : (REASONS.find(([, words]) => result.error?.startsWith(words))?.[0] ?? "other");
     console.log(JSON.stringify({ feishu_read_document: how, app: context.origin.app_id ?? "" }));
     return result;
   } catch (err) {
@@ -171,19 +171,14 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // The authorisation was taken away, or replaced, while this read was under way: what the old
   // token fetched is not handed on, and this read does not ask for a new one.
   const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
-  // The invitation is the grant's own to send, to this person and nobody else, and only if the
-  // grant is still as this read saw it. Its link is never part of what the model is given.
+  // Not yet, then: the request waits for the person to authorise, and the Brain carries it on
+  // when they have. What it waits for is named here; the invitation is the Brain's to send, and
+  // its link is made only as it is sent.
+  const name = await grantName(who);
   const invite = async (refused?: { version: string; rotation: number }) => {
-    const how = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
-    if (how === "superseded") return superseded;
-    // What the model is told depends on what actually reached the person. Nothing here claims
-    // more than happened: after authorising, they still have to ask again.
-    const where = {
-      sent: "They have just been sent an invitation in this chat. It says what to do and that they should ask again afterwards, so do not say the same again.",
-      already: "An invitation sent to them earlier in this chat can still be used; no new one was sent. Do not repeat it unprompted, but if they ask where to authorise or say they got nothing, point them to that invitation.",
-      queued: "An invitation to authorise could not be delivered to them just now; it is being retried for a few minutes. Tell them that, and that they can ask again if none arrives.",
-    }[how];
-    return { authorisation_needed: true, note: `The person has not authorised this, or the authorisation has ended. ${where} Nothing was read.` };
+    const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
+    if (invitation === "superseded") return superseded;
+    return { waiting: { on: "authorisation", subject: name, condition: conditionOf(name, needed), generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}` } } satisfies Waiting;
   };
   // Not authorised at all, or for documents and not for wiki pages: ask for what this needs.
   // A token that is held but can no longer be read (the key changed, say) is reported as refused,
@@ -226,6 +221,25 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
 }
 
+/** What a read waits on: this person's grant covering these scopes. */
+function conditionOf(grant: string, scope: string[]): string {
+  return `${grant}:${[...scope].sort().join(" ")}`;
+}
+
+/** Whether what a read was waiting on holds now, asked of the grant itself. */
+export async function authorisationHolds(env: Env, condition: string, generation: number): Promise<Holds> {
+  const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);
+  const scope = found?.[2].split(" ") ?? [];
+  if (!found || scope.some((each) => !SCOPES.includes(each))) return { state: "gone" };
+  return env.FEISHU_GRANTS.getByName(found[1]).covers(scope, generation);
+}
+
+/** The card for an invitation named by a Waiting's `interaction`, or nothing if it can no longer be used. */
+export async function invitationFor(env: Env, interaction: string): Promise<unknown | null> {
+  const found = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{20,100})$/.exec(interaction);
+  return found ? env.FEISHU_GRANTS.getByName(found[1]).card(found[2]) : null;
+}
+
 /** Where Feishu sends the person back to. It must be registered, exactly, in the app's security settings. */
 export function redirectUri(env: Env): string | undefined {
   const origin = env.PUBLIC_ORIGIN?.replace(/\/+$/, "");
@@ -238,7 +252,7 @@ export function redirectUri(env: Env): string | undefined {
  * exchanged with the verifier only we hold, and the token is kept only if Feishu says it belongs
  * to that same person.
  */
-export async function handleOauthCallback(request: Request, env: Env, defer: (work: Promise<unknown>) => void): Promise<Response> {
+export async function handleOauthCallback(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const state = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{20,100})$/.exec(url.searchParams.get("state") ?? "");
   if (!state || !grantsKey(env)) return page("这个链接无法使用", "请回到飞书，重新向我发起请求。", 400);
@@ -304,8 +318,8 @@ export async function handleOauthCallback(request: Request, env: Env, defer: (wo
     ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
   });
   if (!kept) return refused("superseded");
-  defer(sendToPerson(env, who.app_id, who.open_id, `granted:${state[2]}`, { text: "授权成功。请把刚才的请求再发一次，我就可以读取文档了。" }).catch(() => undefined));
-  return page("授权成功", "现在可以回到飞书，把刚才的请求再发一次。");
+  // The grant tells the person's Brain, and keeps telling it until it is heard.
+  return page("授权成功", "现在可以回到飞书。我会接着处理你刚才的请求，不用再发一遍。");
 }
 
 /** A page with fixed words only: nothing from the request is ever written into it. */

@@ -68,6 +68,8 @@ export interface PromptParts {
   instructions?: string;
   index?: string;
   tasks: { id: string; title: string; status: string; last_progress?: string | null }[];
+  /** Requests in this conversation that wait on something or are being carried on, with the person's own words. */
+  requests?: { id: string; asked: string }[];
 }
 
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
@@ -80,6 +82,10 @@ export function buildInstructions(parts: PromptParts): string {
   if (parts.tasks.length > 0) {
     const lines = parts.tasks.map((t) => `- ${t.id} "${t.title}": ${t.status}${t.last_progress ? ` — ${t.last_progress}` : ""}`);
     sections.push(`Tasks you have running\n${lines.join("\n")}`);
+  }
+  if (parts.requests?.length) {
+    const lines = parts.requests.map((each) => `- ${each.id}: ${JSON.stringify(each.asked)}`);
+    sections.push(`Requests that are waiting\nThese were asked for here and could not be done yet (the person has to authorise something first, say). Each is carried on by itself when it can be, and answered then. Leave them alone unless the person calls one off or replaces it; someone asking about something else in the meantime has not called anything off.\n${lines.join("\n")}`);
   }
   sections.push(`Current time: ${new Date(parts.now).toISOString()}`);
   return sections.join("\n\n");

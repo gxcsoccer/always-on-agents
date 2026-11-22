@@ -163,6 +163,35 @@ export const MIGRATIONS: string[] = [
   // 17, 18: the lookups made for every run and every tool call.
   `CREATE INDEX items_outside ON items (run_id) WHERE outside = 1;`,
   `CREATE INDEX inbox_run ON inbox (run_id, id);`,
+  // 19: requests that could not be carried out yet and are carried on when a condition holds.
+  // `id` is the tool call that was told to wait, and stays the name of the request.
+  `CREATE TABLE continuations (
+     id TEXT PRIMARY KEY,
+     session_id TEXT NOT NULL,
+     events TEXT NOT NULL,                      -- the inbox ids of the person's messages it rests on
+     connector TEXT NOT NULL,
+     tool TEXT NOT NULL,
+     args TEXT NOT NULL,
+     target TEXT NOT NULL,                      -- where its answer goes: as it was when asked
+     subject TEXT NOT NULL,
+     condition TEXT NOT NULL,
+     generation INTEGER NOT NULL,
+     interaction TEXT NOT NULL,
+     until INTEGER NOT NULL,
+     status TEXT NOT NULL,                      -- waiting | resuming | answering | done | failed | cancelled | expired | void
+     run_id TEXT,
+     call_id TEXT,                              -- the call the continuing run makes in its place
+     claimed_at INTEGER,
+     created_at INTEGER NOT NULL,
+     ended_at INTEGER,
+     why TEXT
+   );
+   CREATE INDEX continuations_open ON continuations (status, until);`,
+  // 20: a message that may only go out while a request still stands, or that shows something to
+  // act on; and when a message was first tried, to know when a repeat would no longer be dropped.
+  `ALTER TABLE outbox ADD COLUMN continuation TEXT;
+   ALTER TABLE outbox ADD COLUMN interaction TEXT;
+   ALTER TABLE outbox ADD COLUMN first_attempt_at INTEGER;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

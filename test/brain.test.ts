@@ -875,6 +875,8 @@ describe("tasks and approvals", () => {
       sql.exec("DROP INDEX inbox_run");
       sql.exec("ALTER TABLE items DROP COLUMN outside");
       sql.exec("ALTER TABLE outbox DROP COLUMN private");
+      sql.exec("DROP TABLE continuations");
+      for (const column of ["continuation", "interaction", "first_attempt_at"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });

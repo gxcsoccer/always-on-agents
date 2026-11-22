@@ -83,7 +83,7 @@ function installFakeFeishu() {
       if (body.msg_type === "interactive" && feishu.failSends > 0) return (feishu.failSends--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
       // Feishu drops a repeat of the same uuid.
       if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id, type: body.msg_type, content: JSON.parse(body.content), uuid: body.uuid });
-      return Response.json({ code: 0, data: { message_id: "om_1" } });
+      return Response.json({ code: 0, data: { message_id: `om_sent_${body.uuid}` } });
     }
     const tokenEndpoint = url.host === "accounts.feishu.cn" && url.pathname === "/oauth/v3/token" ? "v3" : url.host === "open.feishu.cn" && url.pathname === "/open-apis/authen/v2/oauth/token" ? "v2" : undefined;
     if (tokenEndpoint) {
@@ -167,14 +167,19 @@ function someone() {
     await wake(stub);
   };
   const who = { app_id: APP_ID, tenant_key: ORG, open_id: openId };
-  return { openId, stub, says, who, grant: () => grantOf(env as any, who) };
+  /** Lets everything that is due happen: the grant telling the Brain, the Brain carrying on and sending. */
+  const settle = async () => {
+    await runDurableObjectAlarm(await grantOf(env as any, who));
+    for (let i = 0; i < 8 && (await wake(stub)); i++);
+  };
+  return { openId, stub, says, who, settle, grant: () => grantOf(env as any, who) };
 }
 
 const link = (token: string, kind = "docx") => `https://example.feishu.cn/${kind}/${token}`;
 const toolOutputs = () => modelCalls.at(-1)!.input.filter((i: any) => i.type === "function_call_output").map((i: any) => JSON.parse(i.output));
 /** The link on the newest invitation card sent to this person. */
 const invitation = (openId: string) => {
-  const card = feishu.sent.filter((each) => each.to === openId && each.type === "interactive").at(-1);
+  const card = feishu.sent.filter((each) => each.to === `oc_${openId}` && each.type === "interactive").at(-1);
   return new URL(card!.content.elements.find((e: any) => e.tag === "action").actions[0].url);
 };
 /** The person (or someone else) consents in Feishu, and their browser is sent back to us. */
@@ -191,9 +196,13 @@ async function consent(authorize: URL, as: { openId: string; org?: string }, out
 }
 /** Asks for a document, and authorises when invited. Leaves the person with a standing grant. */
 async function authorised(person: ReturnType<typeof someone>, doc: string, kind = "docx") {
-  model.replies([call("feishu_read_document", { document: link(doc, kind) })], [call("send_message", { text: "请先授权" })], [say("")]);
+  model.replies([call("feishu_read_document", { document: link(doc, kind) })], [say("")]);
   await person.says(`读一下 ${link(doc, kind)}`);
   expect((await consent(invitation(person.openId), person)).status).toBe(200);
+  // The request is carried on by itself: the document is read and answered, with nothing more said.
+  model.replies([call("send_message", { text: "读好了" })], [say("")]);
+  await person.settle();
+  feishu.reads.length = 0;
 }
 
 beforeEach(async () => {

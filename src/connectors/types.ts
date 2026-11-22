@@ -38,6 +38,39 @@ export interface Connector {
   channel?: Channel;
   /** Named `<connector name>_…`. See ConnectorTool for when they are offered. */
   tools?: ConnectorTool[];
+  /**
+   * Required of a connector whose tools can answer "not yet" (see Waiting). Says whether a
+   * condition one of its tools named holds now, checked afresh against whatever the connector
+   * itself keeps: never against what a caller says. `since` is when it began to hold, by the
+   * connector's own record. "gone" means it can no longer come to hold as it was asked for.
+   * Throws if that cannot be found out right now.
+   */
+  holds?(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds>;
+}
+
+export type Holds = { state: "holds"; since: number } | { state: "not_yet" | "gone" };
+
+/**
+ * A tool's answer when it cannot act until something happens that is not the agent's to do (the
+ * person authorising, say). The Brain keeps the request and carries it on once the condition
+ * holds; the tool is then called again with the same `callId`. All of these are the connector's
+ * own strings, which the Brain stores and hands back without reading:
+ *   subject     - whose condition it is; a report that "something changed for this subject"
+ *                 (see BrainAgent.conditionReported) makes the Brain ask `holds` again
+ *   condition   - what exactly has to hold for this request
+ *   generation  - `holds` answers "gone" once the connector has moved past it
+ *   until       - the condition has to have come to hold before this, in ms
+ *   interaction - what to put in front of the person so that they can bring it about. The Brain
+ *                 sends it through the conversation's channel, which turns it into something to
+ *                 look at only at the moment of sending (see OutboundMessage.interaction)
+ */
+export interface Waiting {
+  waiting: { on: string; subject: string; condition: string; generation: number; until: number; interaction: string };
+}
+
+export function isWaiting(result: unknown): result is Waiting {
+  const w = (result as Waiting | null)?.waiting;
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until);
 }
 
 /**
@@ -56,9 +89,9 @@ export interface Connector {
  *
  * A tool call may be repeated after an interruption, so a tool must be safe to run twice.
  *
- * A tool that cannot act yet because the person has not authorised it may have its connector send
- * that person, and only them, the connector's own fixed invitation to do so. Nothing else is sent
- * on a tool's account: what the agent says goes through the Brain.
+ * A tool that cannot act yet because the person has not authorised it answers with a Waiting.
+ * It sends nothing itself: what the person is shown goes out through the Brain, like everything
+ * else said to them.
  */
 export interface ConnectorTool {
   name: string;
@@ -135,6 +168,12 @@ export interface Channel {
    * the Brain refuses them.
    */
   standing?(env: Env, scope: Scope, subject: string): Promise<Standing | undefined>;
+  /**
+   * For how long the outside system drops a repeat of the same `idem`. A message whose first
+   * attempt is older than this and was never confirmed is not sent again: it may have arrived,
+   * and a second copy could no longer be told from the first.
+   */
+  dedupeMs?: number;
 }
 
 /**
@@ -173,6 +212,13 @@ export interface OutboundMessage {
    * from this.
    */
   review?: CodeReview;
+  /**
+   * A Waiting's `interaction`, for the connector that made it to turn into what the person is
+   * shown. Whatever it stands for (a link that authorises, say) exists only inside the connector
+   * and in the message as sent; the Brain never holds it. A channel that does not know the
+   * reference sends `text`.
+   */
+  interaction?: string;
 }
 
 export interface CodeReview {

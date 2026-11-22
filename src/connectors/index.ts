@@ -9,10 +9,10 @@ import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
 import type { Scope, Target } from "../events";
-import type { ApprovalQuestion, Connector, ConnectorTool, OutboundMessage, Outcome, Receipt, Standing } from "./types";
+import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Receipt, Standing } from "./types";
 
 export type * from "./types";
-export { DeliveryDeferred } from "./types";
+export { DeliveryDeferred, isWaiting } from "./types";
 
 const RESERVED = new Set(["admin", "worker", "timer", "system"]);
 const byName = new Map<string, Connector>();
@@ -71,4 +71,16 @@ export function canRevisit(name: string): boolean {
 /** What a revisable message says at its source now. Throws if the source cannot be asked. */
 export async function standingOf(env: Env, name: string, scope: Scope, subject: string): Promise<Standing | undefined> {
   return byName.get(name)?.channel?.standing?.(env, scope, subject);
+}
+
+/** Whether a condition a connector's tool named holds now, asked of that connector. Throws if it cannot be asked. */
+export async function holds(env: Env, name: string, scope: Scope, condition: string, generation: number): Promise<Holds> {
+  const ask = byName.get(name)?.holds;
+  if (!ask) throw new Error(`connector "${name}" cannot say whether a condition holds`);
+  return ask(env, scope, condition, generation);
+}
+
+/** For how long this connector's system drops a repeated message, if it says. */
+export function dedupeWindow(name: string): number | undefined {
+  return byName.get(name)?.channel?.dedupeMs;
 }
