@@ -16,7 +16,7 @@ export interface ToolCall {
 export interface ToolHost {
   /** A tool that is not one of the Brain's own: a connector's, if this run may use it. */
   connectorTool(callId: string, name: string, args: Record<string, unknown>): Promise<unknown>;
-  sendMessage(callId: string, text: string): unknown;
+  sendMessage(callId: string, text: string, quotes: string[]): unknown;
   sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
   memoryRead(path: string): unknown;
@@ -29,7 +29,7 @@ export interface ToolHost {
   taskStatus(taskId: string): Promise<unknown>;
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
   cancelTask(taskId: string): Promise<unknown>;
-  cancelRequest(callId: string, requestId: string): unknown;
+  cancelRequest(callId: string, requestId: string, ask: string): unknown;
   reopenAnswer(callId: string, answerId: string): Promise<unknown>;
 }
 
@@ -58,7 +58,7 @@ export const TOOLS: ToolDefinition[] = [
   tool(
     "send_message",
     "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
-    { text: string },
+    { text: string, quotes: { type: "array", items: string, description: "When this message says what something you read with a tool says: the sentences in it that you relied on, copied exactly as they stand there, one for each point you make. They are kept so that a later question about one of your points can be checked against the source. Empty in every other case." } },
   ),
   tool(
     "send_review",
@@ -125,7 +125,7 @@ export const TOOLS: ToolDefinition[] = [
   tool(
     "cancel_request",
     "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If more than one request could be meant, the system asks the person which, itself; say nothing more about it then.",
-    { request_id: string },
+    { request_id: string, ask: { type: "string", description: "One short sentence, in the person's language, asking which of their requests they mean. It is sent, followed by the list of those requests, only if more than one could be meant." } },
   ),
 ];
 
@@ -147,7 +147,7 @@ export async function executeTool(host: ToolHost, call: ToolCall): Promise<strin
 function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
   switch (call.name) {
     case "send_message":
-      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT));
+      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT), Array.isArray(a.quotes) ? a.quotes.filter((each: unknown): each is string => typeof each === "string").slice(0, 20) : []);
     case "send_review": {
       if (!Array.isArray(a.comments) || a.comments.length > MAX_REVIEW_COMMENTS) throw new Error(`comments must be a list of at most ${MAX_REVIEW_COMMENTS}`);
       const comments = a.comments.map((c: Record<string, unknown>, i: number) => ({
@@ -186,7 +186,7 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
     case "reopen_answer":
       return host.reopenAnswer(call.call_id, text(a.answer_id, "answer_id", 200));
     case "cancel_request":
-      return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200));
+      return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200), typeof a.ask === "string" ? a.ask.slice(0, 300) : "");
     default:
       return host.connectorTool(call.call_id, call.name, a);
   }

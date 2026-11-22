@@ -140,18 +140,25 @@ export interface ToolContext {
    */
   resuming?: { generation: number; notAfter: number };
   /**
-   * To be called by a tool that acts on one of the `recent` messages (by its index there) rather
-   * than on what was just said: "summarise it" after a link. The Brain then keeps that message,
-   * and no other earlier one, as part of what the request rests on.
+   * To be called by a tool for each of the person's messages its action actually rests on: the
+   * one in `said` that names the thing, or the one in `recent` (by its index there) when the
+   * tool acts on that rather than on what was just said ("summarise it" after a link). The
+   * Brain keeps the earlier message as part of what the request rests on, and takes a reply to
+   * any of these messages, and to no other, as being about this request.
    */
-  relied?(recent: number): void;
+  relied?(from: "said" | "recent", index: number): void;
   /**
    * To be called by a tool that has read something, before it returns: the call that would read
    * the same thing again, in the tool's own canonical form, and a name for the very thing that
    * was read as the outside system resolved it (a link can come to point elsewhere). Kept by the
    * Brain so that an answer can later be tied to what it was read from.
    */
-  identified?(request: Record<string, unknown>, identity: string): void;
+  /**
+   * `under` names the condition the read was made under, in the same terms as a Waiting's
+   * (`condition`, `generation`): what `holds` can be asked about later. With it, what was read
+   * goes no further (to the model, to the channel) once that no longer holds.
+   */
+  identified?(request: Record<string, unknown>, identity: string, under?: { condition: string; generation: number }): void;
 }
 
 export interface Ingress {

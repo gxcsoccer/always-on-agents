@@ -150,8 +150,12 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     chosen = documents(last);
     carriedFrom = id;
     // This earlier message, and no other, is part of what the request rests on.
-    context.relied?.(context.recent.indexOf(last));
+    context.relied?.("recent", context.recent.indexOf(last));
   }
+  // Which of the messages just written name this document: a reply to one of those is about it.
+  context.said.forEach((message, index) => {
+    if (documents(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
+  });
   if (!chosen.some((each) => each.kind === target.kind && each.token === target.token)) return { error: "only a document the person linked in this request can be read (or, if this request links none, the one they linked just before)" };
 
   const redirect = redirectUri(env);
@@ -234,7 +238,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const end = await grant.finish(credential.version, carriedFrom === undefined ? undefined : { message: carriedFrom, by: context.callId });
   if (end !== "ok") return end === "taken" ? alreadyRead : superseded;
   // What was read, as Feishu resolved it: a wiki page can come to hold another document.
-  context.identified?.({ document: canonical }, `docx:${documentId}`);
+  context.identified?.({ document: canonical }, `docx:${documentId}`, { condition: conditionOf(name, needed), generation });
   const text = String(raw.data?.content ?? "");
   return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
 }

@@ -201,7 +201,8 @@ export const MIGRATIONS: string[] = [
   // 21: answers that were delivered to a person about one thing read for them, kept for a short
   // while so that a follow-up can be answered: what was said, what it was read from and on whose
   // request, and a fingerprint of what the source said then. `outbox.source` carries the same
-  // from the run that read to the moment of delivery.
+  // from the run that read to the moment of delivery. `outbox.guard` is what a message written
+  // after reading may only go out under: the conditions its sources were read under, and a time.
   `CREATE TABLE answers (
      id TEXT PRIMARY KEY,
      session_id TEXT NOT NULL,
@@ -209,17 +210,14 @@ export const MIGRATIONS: string[] = [
      subject TEXT NOT NULL,
      target TEXT NOT NULL,
      connector TEXT NOT NULL,
-     tool TEXT NOT NULL,
-     args TEXT NOT NULL,
-     call TEXT NOT NULL,
-     events TEXT NOT NULL,
-     fingerprint TEXT NOT NULL,
-     identity TEXT NOT NULL,
+     sources TEXT NOT NULL,                     -- every thing it was read from: the call to read it again, what it resolved to, its fingerprint then
+     quotes TEXT NOT NULL,                      -- the sentences the answer said it rested on, each found word for word in what was read
      text TEXT NOT NULL,
      expires_at INTEGER NOT NULL,
      created_at INTEGER NOT NULL
    );
-   ALTER TABLE outbox ADD COLUMN source TEXT;`,
+   ALTER TABLE outbox ADD COLUMN source TEXT;
+   ALTER TABLE outbox ADD COLUMN guard TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
