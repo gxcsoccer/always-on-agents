@@ -23,6 +23,8 @@ Then create a tenant (see below) and connect something to it: [Connectors](conne
 
 A deploy restarts the Durable Objects. Runs in progress resume from their transcripts, sandbox tasks keep their containers, and Feishu long connections reconnect within a few seconds.
 
+**Moving to the version in which requests wait.** Before it, a person who authorised reading their Feishu documents was told to send their request again; from it on, the request is kept and carried on (see [Connectors](connectors.md)). Someone who is in the middle of authorising when this version is deployed holds a card from the old one. That card still works and the token is stored, but the request made before the deploy was never kept, so it is not carried on. The page they land on says so for every case: a request that is waiting is carried on, and if nothing arrives within a few minutes they should ask again. Nothing needs doing by hand. Messages that were already being retried at that moment are treated as possibly delivered: they are not given a fresh hour in which to be repeated.
+
 ## Configuration
 
 Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret put` (or in `.dev.vars` for local development; see `.dev.vars.example`).
@@ -42,6 +44,7 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `PUBLIC_ORIGIN` | secret or variable | Where the deployment is reached from outside, such as `https://agent.example.com`. Needed for reading people's Feishu documents: it is where Feishu sends them back after they authorise. |
 | `GRANTS_KEY` | secret | Seals the tokens people's authorisations produce. 32 or more random characters. Changing it makes every stored authorisation unreadable, and people are invited to authorise again. |
 | `GATE_HOLD_PATTERN` | secret or variable | Optional regular expression for shell commands inside the sandbox that a person must approve. Default: none. |
+| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run, nothing is noted about what was read, and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more and are deleted when their 24 hours are up. |
 
 The sandboxed coding agent and its version are fixed in the `Dockerfile`.
 
@@ -64,7 +67,7 @@ Every request carries `authorization: Bearer $ADMIN_KEY`. There is one admin key
 
 | Request | Returns |
 |---|---|
-| `GET /v1/admin/scopes/:scope` | A scope's state: inbox counts, recent events, runs, memory files, timers, tasks, outbox, today's tokens, health figures and the latest audit entries. URL-encode the scope name. |
+| `GET /v1/admin/scopes/:scope` | A scope's state: inbox counts, recent events, runs, memory files, timers, tasks, outbox, today's tokens, health figures, the latest audit entries, and `waits` (below). The outbox entries show no text for a message written after a run read outside text, or for the answer to a request that waited. URL-encode the scope name. |
 | `GET /v1/admin/scopes/:scope/memory?path=...` | One memory file. |
 | `GET /v1/admin/tasks/:id` | A sandbox task's state. Secrets are hidden. |
 | `GET /v1/admin/tasks/:id/files/{events,hooks,stderr}` | The tail of one of the task's logs. |
@@ -95,8 +98,58 @@ The Worker writes structured logs (one JSON object per line); observability is e
 | `oldest_pending_age_ms` | How long the oldest unhandled event has waited. Should stay near zero. |
 | `dead_events` | Events given up on. |
 | `undeliverable_messages` | Messages that could not be delivered after all retries. |
+| `unverified_messages` | Messages that may have been delivered and could not be checked; they are not sent again. |
 | `lost_tasks` | Sandbox tasks whose container was lost and could not be restored. |
 | `abandoned_runs` | Runs entered five times without finishing. |
+
+`undeliverable_messages` counts messages that ended as `dead` only; ones that ended as `unverified` are counted in `unverified_messages`.
+
+### What the scope is waiting on
+
+`waits` lists, in one shape, the latest 20 requests that waited for a condition (a person authorising, say) and the latest 20 approval questions. Each entry has `kind` (`request` or `approval`), `id`, `state`, `shown` (whether the invitation or the question was delivered) and `since` (when it began). It is read-only; approvals are kept where they always were.
+
+| `state` | For a request | For an approval |
+|---|---|---|
+| `waiting` | The condition does not hold yet. | No answer yet. |
+| `continuing` | Taken up; a run is making the call again. | |
+| `answer to be sent` | The run ended; its answer is in the outbox. | |
+| `reconciling` | | An answer was sent to the worker and is not yet confirmed. |
+| `done` | Answered. | Approved. |
+| `refused` | | Refused. |
+| `failed` | Its answer could not be delivered. | |
+| `withdrawn` | Called off by the person, ran out of time, or what it waited for was taken away. | Withdrawn. |
+| `cannot be verified` | Its answer may have been delivered; that could not be checked. | Whether the answer took effect cannot be found out. |
+
+Why a request ended is in the audit entry `request.ended`.
+
+### Message statuses
+
+An entry in `outbox` has one of these statuses.
+
+| Status | Means |
+|---|---|
+| `pending` | To be sent, or being retried. |
+| `draft` | The answer of a request being carried on, while its run is still under way. Nothing sends a draft. |
+| `sent` | Handed over, and the outside system confirmed it. |
+| `void` | Never handed over: the request it belonged to was called off or no longer stood, or the invitation it was to show could no longer be used. Its text is removed. |
+| `dead` | Given up, and it is certain nothing was posted: every attempt was refused by the outside system. Also the ending for any failed message on a connector that states no window for repeats. |
+| `unverified` | Not sent (again), though an attempt may have arrived and that cannot be checked. This is what a message becomes when its retries are used up after an attempt with no clear answer, or when its first attempt is older than the window in which the system drops repeats (one hour for Feishu). Its text is removed. It is never sent again. |
+| `withdrawn`, `reconciling` | Approval questions only. See [Approvals](approvals.md). |
+
+### Log lines and audit entries
+
+| Log line | Means |
+|---|---|
+| `received_shown` | The sign that a person's message arrived (on Feishu, a reaction) was shown; `ms` is the time from the message being stored. It is written only when the outside system confirmed the sign. If the line is missing for Feishu messages, check the app's reaction permission; it is also missing, by design, when the sign was skipped because the message had already been dealt with or 15 seconds had passed. |
+| `request_answered` | The answer of a carried-on request was delivered; `claim_to_receipt_ms` is the time from the request being taken up to the channel confirming the answer. |
+| `message_unverified` | A message was given the status `unverified` before another attempt was made (its request no longer stood, or the window for repeats had passed); `outbox_id` names it. |
+| `message_undeliverable` | A message was given up after its retries, as `dead` or as `unverified`. |
+
+| Audit action | Means |
+|---|---|
+| `request.waiting` | A request was kept; `on` says what it waits for. |
+| `request.resumed` | A request was taken up; `run` is the run carrying it on. |
+| `request.ended` | A request ended; `as` is `done`, `failed`, `cancelled`, `expired`, `void` or `unverified`, and `why` says what ended it. |
 
 ## Limits
 
@@ -113,6 +166,12 @@ These are constants in the code, not configuration.
 | Sandbox task: model calls | 400 |
 | Sandbox task: recoveries after losing the container | 2 |
 | A push held for approval | 50 min |
+| A carried-on request, from being taken up to its answer being handed to the channel | 1 hour. Past it nothing more is read and an unsent answer is not sent. |
+| An invitation to authorise on Feishu | 10 min. A request waits no longer than the invitation it was shown with. |
+| `index.md` loaded into a run | The first 4,000 characters |
+| `instructions.md` loaded into a run | The first 8,000 characters |
+
+A memory file longer than its limit is stored whole; the run is told that the rest was left out and to shorten it.
 | Model request from the sandbox | 4 MB |
 | Push from the sandbox | 64 MB |
 
@@ -123,6 +182,8 @@ These are constants in the code, not configuration.
 | A finished task's container, checkpoints and records | 24 hours |
 | The text of handled events | 30 days (the record itself, without its text, for 365 days so that a late redelivery is still recognised) |
 | Delivered messages and finished timers and tasks | 30 days |
+| A delivered answer kept for follow-ups | 24 hours from delivery, then deleted. None are kept unless `FOLLOW_UPS=on`. |
+| An ended request (the record of a wait) | 30 days |
 | A conversation's transcript | Kept in full while the conversation is in use. Once a conversation has been quiet for 30 days it is cut back to roughly its latest 200 items (the cut lands on a user turn, so slightly fewer may remain). There is no upper limit on how long an active conversation's text is kept. |
 | Audit entries | 365 days |
 

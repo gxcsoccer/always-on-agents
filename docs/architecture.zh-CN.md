@@ -15,6 +15,7 @@
 │ Brain（每个作用域一个 Durable Object）                │
 │ SQLite: inbox · sessions · items · memory · timers  │
 │         · tasks · outbox · runs · audit             │
+│         · continuations · answers                   │
 │ alarm(): 触发定时器 → 投递发件箱 → 执行 run           │
 └───┬────────────────────────────────────┬───────────┘
     │ 派活 / 答复 / 取消                   │ 投递
@@ -32,9 +33,17 @@
 |---|---|---|
 | 事件收件箱 | Brain 的 `inbox` 表 | 按 `(source, source_id)` 去重；写入成功即确认；每次激活都会检查并补设 alarm |
 | 定时器 | `timers` 表，复用对象唯一的 alarm | 到期只往收件箱插一条事件，不直接运行 agent；错过的周期不补发 |
-| 记忆 | `memory` 表，按路径存 Markdown | `instructions.md` 和 `index.md` 每次 run 都会加载；记忆不跨作用域 |
+| 记忆 | `memory` 表，按路径存 Markdown | `instructions.md` 和 `index.md` 每次 run 都会加载，分别只加载前 8,000 和前 4,000 个字符，超出的部分不加载；记忆不跨作用域 |
 | 权限 | 见[审批](approvals.zh-CN.md) | 由代码判定，不靠提示词 |
 | 发件箱 | `outbox` 表 | 严格按顺序投递，失败退避重试，每条消息有幂等键 |
+
+有三样东西建立在这些原语之上。每一样的设计理由见[设计文档](design/agent-core.zh-CN.md)和它的[约定](design/agent-core-step0.zh-CN.md)；connector 需要做什么，见 [Connector](connectors.zh-CN.md)。
+
+**会等待、之后被接着处理的请求。** connector 的工具可以回答“现在还不行”：得先发生一件不归 agent 做的事，比如某个人去授权。Brain 把这个请求保存在 `continuations` 表里，连同之后要再做一次的调用（按工具自己的写法）和它所依据的这个人的原话，然后这次 run 照常结束。“条件可能成立了”的通知，不管来自 connector 还是别处，都只是收件箱里的一个事件、一个去问的理由：Brain 会重新去问拥有这个条件的 connector，条件是否成立、从什么时候开始成立。如果它在截止时间之前就成立了，就由一次单独的 run 把那一次调用再做一遍，并写出一条答复。把读到的内容交给模型之前、把答复交给渠道之前，都会再问一次 connector；整个过程有一小时。在答复第一次交出去之前，这个人可以取消请求或把它换成别的；可能所指的不止一个时，由 Brain 自己问是哪一个。审批提问是另一种等待，仍按原来的方式保存；管理接口查看作用域时，两种等待以同一种形式列出。
+
+**对人只有一个出口。** 给人看的一切都经过发件箱，包括请他去完成请求所等的那件事的邀请。Brain 手里只有邀请的引用，从不持有它的内容：卡片和其中的链接由 connector 在发送的那一刻生成。绑定在某个请求上的消息，只有在这个请求仍然成立时才会发出，而且不会抢在这个人已经写下、还没被处理的消息前面。一次投递怎样收场，记为四种之一：已发送；从未交出（`void`）；被外部系统拒绝（`dead`）；可能已经送达但无法核实（`unverified`），这种情况下不会再发。在消息之外，connector 还可以在这个人自己的消息上表示“已收到”。
+
+**已送达的答复。** 一次 run 通过 connector 的工具读到的内容，以及它就此说的话，在 run 结束时会从对话记录里移除。运维打开追问功能之后（默认关闭），带着回执送达的答复，如果写它的 run 只读了一样东西、只说了一句话，会在 `answers` 表里单独保存 24 小时。它只能通过一个工具取回：只给当初收到它的那个人，只在当初的那个对话里，而且要先以这个人的身份把来源重新读一遍，并确认读到的还是原来那样东西。这个人的话算不算追问，交给模型判断；可能指的是哪一条答复，由代码限定。
 
 ## 作用域和租户
 
@@ -92,6 +101,7 @@ worker 对自己的描述不可信：那只是容器里的一个进程在说话�
 |---|---|
 | 事件、作用域、身份 | `src/events.ts` |
 | 收件箱、run、任务、发件箱 | `src/brain/agent.ts` |
+| 会等待的请求，以及可以追问的答复 | `src/brain/agent.ts` 里 “requests that wait” 和 “answers that can be followed up” 两节；`src/connectors/types.ts` 里的 `Waiting` 和 `holds` |
 | 模型能做什么 | `src/brain/tools.ts`、`src/brain/prompt.ts` |
 | 审批规则 | `src/brain/agent.ts` 里的 `#answerTask` 和 `readDecision` |
 | 沙箱的边界 | `src/workers/sandbox/outbound.ts` |

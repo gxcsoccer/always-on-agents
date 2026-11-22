@@ -2276,6 +2276,7 @@ export class BrainAgent extends DurableObject<Env> {
         })(),
         dead_events: count("inbox", "status = 'dead'"),
         undeliverable_messages: count("outbox", "status = 'dead'"),
+        unverified_messages: count("outbox", "status = 'unverified'"),
         lost_tasks: count("tasks", "status = 'lost'"),
         abandoned_runs: count("runs", "status = 'failed'"),
       },

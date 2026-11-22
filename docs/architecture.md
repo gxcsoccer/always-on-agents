@@ -15,6 +15,7 @@ Feishu / GitHub / console / timers / worker reports
 │ Brain  (one Durable Object per scope)               │
 │ SQLite: inbox · sessions · items · memory · timers  │
 │         · tasks · outbox · runs · audit             │
+│         · continuations · answers                   │
 │ alarm(): fire timers → deliver outbox → run         │
 └───┬────────────────────────────────────┬───────────┘
     │ dispatch / answer / cancel         │ deliver
@@ -32,9 +33,17 @@ Feishu / GitHub / console / timers / worker reports
 |---|---|---|
 | Event inbox | the Brain's `inbox` table | Deduplicated on `(source, source_id)`. A successful insert is the acknowledgement. Every activation checks that an alarm is set. |
 | Timers | the `timers` table, on the object's single alarm | A due timer only inserts an event; it never runs the agent directly. Missed periods are not replayed. |
-| Memory | the `memory` table, Markdown by path | `instructions.md` and `index.md` are loaded into every run. Memory never crosses scopes. |
+| Memory | the `memory` table, Markdown by path | `instructions.md` and `index.md` are loaded into every run, the first 8,000 and 4,000 characters of each and no more. Memory never crosses scopes. |
 | Permissions | see [Approvals](approvals.md) | Decided by code, not by the prompt. |
 | Outbox | the `outbox` table | Delivered strictly in order, retried with back-off, one idempotency key per message. |
+
+Three things are built on these. The reasoning for each is in the [design](design/agent-core.md) and its [contract](design/agent-core-step0.md); what a connector has to do is in [Connectors](connectors.md).
+
+**Requests that wait and are carried on.** A connector's tool can answer "not yet": something has to happen first that is not the agent's to do, such as a person authorising. The Brain keeps the request in the `continuations` table, with the call to make again as the tool itself put it and the person's own messages it rests on, and the run ends as usual. A report that the condition may hold, from the connector or from anything else, is only an event in the inbox and a reason to ask: the connector that owns the condition is asked afresh whether it holds and since when. If it held before the deadline, a run of its own makes that one call again and writes one answer. The connector is asked again before what was read is given to the model and before the answer is handed to the channel, and the whole of it has one hour. A request can be called off or replaced by the person until its answer is first handed over; when more than one could be meant, the Brain itself asks which. Approval questions are a different kind of wait and are kept as they were; an admin's view of a scope lists both in one shape.
+
+**One way out to people.** Everything a person is shown goes through the outbox, including the invitation to do what a request waits for. The Brain holds a reference to the invitation and never its content: the connector makes the card and its link at the moment of sending. A message tied to a request goes out only while that request still stands, and never ahead of something the person has written that has not been handled. How a delivery ended is recorded as one of four things: sent, never handed over (`void`), refused by the outside system (`dead`), or possibly arrived and not checkable (`unverified`), in which case it is not sent again. Separately from messages, a connector can show on a person's own message that it has arrived.
+
+**Delivered answers.** What a run read through a connector's tool, and what it said about it, is removed from the conversation's record when the run ends. Where an operator has turned follow-ups on (they are off by default), an answer that was delivered with a receipt, from a run that read exactly one thing and said exactly one thing, is kept apart in the `answers` table for 24 hours. It comes back only through one tool, for the person it was given to, in the conversation it was given in, and only after the source has been read again as that person and found to be the same thing. Whether the person's words are a follow-up is left to the model; which answer can be meant is bounded by code.
 
 ## Scopes and tenants
 
@@ -92,6 +101,7 @@ A connector owns three things for one outside system: verifying an inbound reque
 |---|---|
 | Events, scopes, principals | `src/events.ts` |
 | The inbox, runs, tasks, the outbox | `src/brain/agent.ts` |
+| Requests that wait, and answers that can be followed up | the sections of those names in `src/brain/agent.ts`; `Waiting` and `holds` in `src/connectors/types.ts` |
 | What the model can do | `src/brain/tools.ts`, `src/brain/prompt.ts` |
 | The approval rules | `#answerTask` and `readDecision` in `src/brain/agent.ts` |
 | The sandbox's boundary | `src/workers/sandbox/outbound.ts` |
