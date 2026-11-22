@@ -127,8 +127,15 @@ export interface ToolContext {
    * messages as they arrived; nothing a run wrote or read is among them.
    */
   recent: { text: string; data: Record<string, unknown> }[];
-  /** Names this call; the same on a repeat. */
+  /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
+  /**
+   * Set when this call carries on a request that waited (see Waiting). The call is good only
+   * for the generation the request waited on and only until `notAfter`: if the connector has
+   * moved past that generation, or the time is up, the tool must do nothing and say so. It must
+   * not start the request over under a newer generation.
+   */
+  resuming?: { generation: number; notAfter: number };
 }
 
 export interface Ingress {
@@ -188,6 +195,28 @@ export class DeliveryDeferred extends Error {
   ) {
     super(message);
     this.name = "DeliveryDeferred";
+  }
+}
+
+/**
+ * Thrown by `deliver` when the outside system answered and refused the message: it is certain
+ * that nothing was posted. Any other failure leaves that open.
+ */
+export class DeliveryRejected extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryRejected";
+  }
+}
+
+/**
+ * Thrown by `deliver` when there is no longer anything to send (what the message was to show
+ * can no longer be used). Nothing was posted, and it is not tried again.
+ */
+export class DeliveryVoid extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryVoid";
   }
 }
 

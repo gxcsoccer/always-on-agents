@@ -168,7 +168,7 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE continuations (
      id TEXT PRIMARY KEY,
      session_id TEXT NOT NULL,
-     events TEXT NOT NULL,                      -- the inbox ids of the person's messages it rests on
+     events TEXT NOT NULL,                      -- {said, recent}: inbox ids of the person's messages it rests on
      connector TEXT NOT NULL,
      tool TEXT NOT NULL,
      args TEXT NOT NULL,
@@ -182,16 +182,22 @@ export const MIGRATIONS: string[] = [
      run_id TEXT,
      call_id TEXT,                              -- the call the continuing run makes in its place
      claimed_at INTEGER,
+     check_at INTEGER,                          -- when its condition is next asked about, if its owner could not be asked
      created_at INTEGER NOT NULL,
      ended_at INTEGER,
      why TEXT
    );
    CREATE INDEX continuations_open ON continuations (status, until);`,
   // 20: a message that may only go out while a request still stands, or that shows something to
-  // act on; and when a message was first tried, to know when a repeat would no longer be dropped.
+  // act on; when a message was first tried, to know when a repeat would no longer be dropped; and
+  // whether any attempt ended without the outside system saying that nothing was posted. Messages
+  // already begun when this is introduced are taken as begun when written and as uncertain: they
+  // get no fresh window in which to be repeated.
   `ALTER TABLE outbox ADD COLUMN continuation TEXT;
    ALTER TABLE outbox ADD COLUMN interaction TEXT;
-   ALTER TABLE outbox ADD COLUMN first_attempt_at INTEGER;`,
+   ALTER TABLE outbox ADD COLUMN first_attempt_at INTEGER;
+   ALTER TABLE outbox ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0;
+   UPDATE outbox SET first_attempt_at = created_at, uncertain = 1 WHERE started = 1 AND status = 'pending' AND ask IS NULL;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

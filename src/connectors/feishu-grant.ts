@@ -63,11 +63,14 @@ interface Stored {
     refresh?: { sealed: string; expires_at: number; endpoint: "v2" | "v3" };
     /** Set, with the time, just before a renewal is sent, and cleared when its outcome is recorded. */
     renewing?: number;
-    /** When this authorisation was given. A renewal does not change it. */
-    since?: number;
+    /**
+     * Since when each permission has been held without a break in this generation. A wider token
+     * that replaces a narrower one keeps the earlier time for what the narrower already covered.
+     */
+    since?: Record<string, number>;
   };
   /** Set with a token that was just kept, until the person's Brain has been told (see `alarm`). */
-  owed?: string;
+  owed?: { event: string; attempts: number };
   /**
    * The earlier message whose link has been read on the strength of a later one, and the tool
    * call that read it. See `finish`.
@@ -163,7 +166,9 @@ export class FeishuGrant extends DurableObject<Env> {
     if ((stored?.generation ?? 1) !== generation) return { state: "gone" };
     const grant = stored?.grant;
     if (!grant || !usable(grant, Date.now()) || scope.some((each) => !grant.scope.split(" ").includes(each))) return { state: "not_yet" };
-    return { state: "holds", since: grant.since ?? 0 };
+    // Held since the latest of the times its parts were given. One on record from before these
+    // times were kept counts as held all along.
+    return { state: "holds", since: Math.max(0, ...scope.map((each) => grant.since?.[each] ?? 0)) };
   }
 
   /**
@@ -172,21 +177,27 @@ export class FeishuGrant extends DurableObject<Env> {
    * The Brain takes it as a reason to ask `covers` again, and as nothing more.
    */
   async alarm(): Promise<void> {
+    // (Before the Brain sent invitations, this alarm retried cards the grant had not managed to
+    // deliver. One left over from then is not sent from here any more: it lapses within minutes,
+    // and when the person asks again it is named again and sent by the Brain.)
     const stored = await this.#load();
     if (!stored?.owed) return;
-    const event = stored.owed;
+    const { event, attempts } = stored.owed;
+    let heard = false;
     try {
       const app = await registry(this.env).feishuApp(stored.who.app_id);
-      if (app) await this.env.BRAIN.getByName(scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id })).conditionReported("feishu", await grantName(stored.who), event);
+      if (app) heard = (await this.env.BRAIN.getByName(scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id })).conditionReported("feishu", await grantName(stored.who), event)).ok;
     } catch {
-      void this.ctx.storage.setAlarm(Date.now() + 15_000);
-      return;
+      heard = false;
     }
     const after = await this.#load();
-    if (after?.owed === event) {
-      delete after.owed;
-      void this.ctx.storage.put("grant", after);
-    }
+    if (after?.owed?.event !== event) return;
+    // Cleared only when the Brain said it heard. Otherwise tried again, less and less often; after
+    // some hours the Brain's own asking (when the person writes, and at the deadline) is all that is left.
+    if (heard) delete after.owed;
+    else after.owed = { event, attempts: attempts + 1 };
+    void this.ctx.storage.put("grant", after);
+    if (!heard && attempts < 20) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** attempts));
   }
 
   /**
@@ -220,14 +231,17 @@ export class FeishuGrant extends DurableObject<Env> {
     const refresh = token.refresh ? { sealed: await seal(key, token.refresh.token, `${version}:refresh`), expires_at: token.refresh.expires_at, endpoint: token.refresh.endpoint } : undefined;
     // A token already held that can no longer be opened (the key changed) is no reason to turn
     // this one away. Which version that is, is found out here, before the read that decides.
-    const earlier = (await this.#load())?.grant;
-    const unreadable = earlier && !(await open(key, earlier.sealed, earlier.version).then(() => true, () => false)) ? earlier.version : undefined;
+    const before = (await this.#load())?.grant;
+    const unreadable = before && !(await open(key, before.sealed, before.version).then(() => true, () => false)) ? before.version : undefined;
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
     const has = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
     if (has && token.scope.split(" ").every((each) => has.includes(each))) return true;
-    stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version, since: Date.now(), ...(refresh ? { refresh } : {}) };
-    stored.owed = version;
+    // What the token it replaces already covered, and still could, has been held since then.
+    const earlier = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant : undefined;
+    const since = Object.fromEntries(token.scope.split(" ").filter(Boolean).map((each) => [each, (earlier?.scope.split(" ").includes(each) ? earlier.since?.[each] : undefined) ?? Date.now()]));
+    stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version, since, ...(refresh ? { refresh } : {}) };
+    stored.owed = { event: version, attempts: 0 };
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
     return true;

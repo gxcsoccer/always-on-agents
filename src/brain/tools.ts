@@ -29,7 +29,7 @@ export interface ToolHost {
   taskStatus(taskId: string): Promise<unknown>;
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
   cancelTask(taskId: string): Promise<unknown>;
-  cancelRequest(requestId: string): unknown;
+  cancelRequest(callId: string, requestId: string): unknown;
 }
 
 /** The longest message the Brain can send. */
@@ -118,7 +118,7 @@ export const TOOLS: ToolDefinition[] = [
   tool("cancel_task", "Stop a task and discard its sandbox.", { task_id: string }),
   tool(
     "cancel_request",
-    "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it, or want something else instead of it; not because they went on to talk about something else. If it tells you more than one request could be meant, ask the person which.",
+    "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If it tells you more than one request could be meant, ask the person which.",
     { request_id: string },
   ),
 ];
@@ -178,7 +178,7 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
     case "cancel_task":
       return host.cancelTask(text(a.task_id, "task_id", 64));
     case "cancel_request":
-      return host.cancelRequest(text(a.request_id, "request_id", 200));
+      return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200));
     default:
       return host.connectorTool(call.call_id, call.name, a);
   }

@@ -162,15 +162,19 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
 
   const grant = await grantOf(env, who);
   const { generation, credential, unreadable, answered } = await grant.held();
+  // The authorisation was taken away, or replaced, while this read was under way: what the old
+  // token fetched is not handed on, and this read does not ask for a new one.
+  const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
+  // A request that waited is carried on under the authorisation it waited for, and in its time.
+  // Past either, it is over: nothing is read, and it is not started again under a newer one.
+  const lapsed = () => context.resuming !== undefined && Date.now() > context.resuming.notAfter;
+  if (context.resuming && (generation !== context.resuming.generation || lapsed())) return superseded;
   const alreadyRead = { error: "the document the person linked earlier has already been read for them once; for more, ask them to send the link again with what they want" };
   // By another call, that is. This same call may be running again after an interruption.
   if (carriedFrom !== undefined && answered?.message === carriedFrom && answered.by !== context.callId) return alreadyRead;
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
   // Where the operator has turned it on for this app, also leave to renew the token without them.
   const needed = [...(target.kind === "wiki" ? ["docx:document:readonly", "wiki:node:read"] : ["docx:document:readonly"]), ...(app.oauth_offline ? [OFFLINE] : [])];
-  // The authorisation was taken away, or replaced, while this read was under way: what the old
-  // token fetched is not handed on, and this read does not ask for a new one.
-  const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
   // Not yet, then: the request waits for the person to authorise, and the Brain carries it on
   // when they have. What it waits for is named here; the invitation is the Brain's to send, and
   // its link is made only as it is sent.
@@ -211,6 +215,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (found?.obj_type !== "docx" || typeof found.obj_token !== "string" || !/^[A-Za-z0-9]{10,64}$/.test(found.obj_token)) return { error: "that wiki page is not a document; only documents can be read" };
     documentId = found.obj_token;
   }
+  if (lapsed()) return superseded;
   const raw = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/raw_content`);
   if (raw.status !== 200 || raw.code !== 0) return failed(raw, "docx");
   // Asked last of all, just before the text is handed on. A link taken from an earlier message

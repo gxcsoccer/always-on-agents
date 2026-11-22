@@ -22,7 +22,7 @@ import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -353,7 +353,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // What the person is to act on, made now and kept nowhere. One that can no longer be used is
   // not sent at all: there is nothing left to act on.
   const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
-  if (message.interaction && !invitation) return;
+  if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
   // An approval question or an invitation goes out as a card; everything else as text.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
   const msgType = card ? "interactive" : "text";
@@ -371,10 +371,15 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
         body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
-  if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
+  const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
+  // Feishu answered and said no: nothing was posted. A failure on its side leaves that open.
+  if (response.status < 500 && typeof result.code === "number" && result.code !== 0) throw new DeliveryRejected(said);
+  if (!response.ok || result.code !== 0) throw new Error(said);
   // Which message this is, so a reply to it can be told from a reply to anything else, and so a
-  // question's card can be closed later.
-  if (result.data?.message_id) return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+  // question's card can be closed later. Accepted without saying which message it became is not
+  // something to count as delivered.
+  if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
+  return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */
