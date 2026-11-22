@@ -53,8 +53,16 @@ const feishu = {
   codes: new Map<string, { open_id: string; tenant_key: string; challenge: string; redirect: string }>(),
   /** The reactions the bot put on people's messages. */
   reactions: [] as { message: string; emoji: string; bearer: string }[],
+  /** How often the bot tried to put a reaction on a message. */
+  reactionAttempts: 0,
   /** Feishu fails every reaction. */
   failReactions: false,
+  /** Feishu answers every reaction with HTTP 200 and an error code inside. */
+  refuseReactions: false,
+  /** Runs while the app's own token is being issued. */
+  duringAppToken: undefined as undefined | (() => Promise<void>),
+  /** How many of the bot's next messages in words Feishu takes and then fails to confirm. */
+  loseTexts: 0,
   /** What the bot sent to people. */
   sent: [] as { to: string; type: string; content: any; uuid: string }[],
   /** Every document request, with the token it was made with. */
@@ -75,6 +83,10 @@ function installFakeFeishu() {
   feishu.rejectTexts = 0;
   feishu.reactions.length = 0;
   feishu.failReactions = false;
+  feishu.reactionAttempts = 0;
+  feishu.refuseReactions = false;
+  feishu.duringAppToken = undefined;
+  feishu.loseTexts = 0;
   feishu.duringModel = undefined;
   feishu.exchanges.length = 0;
   feishu.refreshTokens.clear();
@@ -94,21 +106,28 @@ function installFakeFeishu() {
     }
     const bearer = String((init?.headers as Record<string, string> | undefined)?.authorization ?? "").replace(/^Bearer /, "");
     const body = init?.body ? JSON.parse(String(init.body)) : {};
-    if (url.host === "open.feishu.cn" && url.pathname.endsWith("/auth/v3/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: "t-app", expire: 7200 });
+    if (url.host === "open.feishu.cn" && url.pathname.endsWith("/auth/v3/tenant_access_token/internal")) {
+      await feishu.duringAppToken?.();
+      return Response.json({ code: 0, tenant_access_token: "t-app", expire: 7200 });
+    }
     if (url.host === "open.feishu.cn" && url.pathname.endsWith("/im/v1/messages")) {
       if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
       if (body.msg_type === "interactive") feishu.sendAttempts++;
       if (body.msg_type === "interactive" && feishu.failSends > 0) return (feishu.failSends--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
       if (body.msg_type === "text" && feishu.failTexts > 0) return (feishu.failTexts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
       if (body.msg_type === "text" && feishu.rejectTexts > 0) return (feishu.rejectTexts--, Response.json({ code: 230002, msg: "refused" }, { status: 400 }));
+      const lost = body.msg_type === "text" && feishu.loseTexts > 0 && feishu.loseTexts-- > 0;
       // Feishu drops a repeat of the same uuid.
       if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id, type: body.msg_type, content: JSON.parse(body.content), uuid: body.uuid });
+      if (lost) return Response.json({ code: 230001, msg: "busy" }, { status: 500 });
       return Response.json({ code: 0, data: { message_id: `om_sent_${body.uuid}` } });
     }
     // "Got it" on a message the person wrote. Nothing is said, and no document is asked for.
     const reactedTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reactions$/.exec(url.pathname)?.[1] : undefined;
     if (reactedTo) {
+      feishu.reactionAttempts++;
       if (feishu.failReactions) return Response.json({ code: 230001, msg: "busy" }, { status: 500 });
+      if (feishu.refuseReactions) return Response.json({ code: 231003, msg: "not allowed" });
       feishu.reactions.push({ message: reactedTo, emoji: body.reaction_type?.emoji_type, bearer });
       return Response.json({ code: 0, data: {} });
     }
@@ -1264,6 +1283,51 @@ describe("a request that waits and is carried on", () => {
     expect(read()).toEqual(["DocLou000000000000001"]);
   });
 
+  it("reads again and still answers once when the run that carries a request on is interrupted after reading (F7)", async () => {
+    const lux = owner("DocLux000000000000001");
+    const id = await asksFor(lux, "DocLux000000000000001");
+    // The document is read; the model's answer breaks off, and the run is put off.
+    whileModel(carrying, cutShort);
+    carriesOn("总结");
+    await authorises(lux);
+    expect(read()).toEqual(["DocLux000000000000001"]);
+    expect(lux.heard()).toEqual([]);
+    expect(await lux.requests()).toMatchObject([{ id, status: "resuming" }]);
+    // What the read gave was lost with the interruption, so the run makes its call again.
+    const [{ call_id: made }] = await rowsOf(lux.stub, "SELECT call_id FROM continuations");
+    await replay(lux, made);
+    await rowsOf(lux.stub, "UPDATE runs SET retry_at = 0 WHERE status = 'running'");
+    await lux.quiet();
+    expect(read()).toEqual(["DocLux000000000000001", "DocLux000000000000001"]);
+    expect(lux.heard()).toEqual(["总结"]);
+    expect(await lux.requests()).toMatchObject([{ id, status: "done" }]);
+    expect((await rowsOf(lux.stub, "SELECT 1 FROM outbox WHERE continuation IS NOT NULL")).length).toBe(1);
+  });
+
+  it("stops sending an answer whose receipt was lost once the authorisation is gone, and does not call it unsent (F19)", async () => {
+    const mia = owner("DocMia000000000000001");
+    const id = await asksFor(mia, "DocMia000000000000001");
+    // Feishu takes the answer and fails to say so.
+    feishu.loseTexts = 1;
+    carriesOn("总结");
+    await authorises(mia);
+    expect(mia.heard()).toEqual(["总结"]);
+    expect(await answer(mia, id)).toMatchObject([{ status: "pending", text: "总结", started: 1, uncertain: 1 }]);
+    await (await mia.grant()).drop(mia.who);
+    const attempts = feishu.sendAttempts;
+    const taken = feishu.sent.length;
+    await mia.due();
+    await mia.quiet();
+    expect(await answer(mia, id)).toMatchObject([{ status: "unverified", text: "" }]);
+    expect(await mia.requests()).toMatchObject([{ id, status: "unverified" }]);
+    expect(feishu.sent.length).toBe(taken);
+    expect(feishu.sendAttempts).toBe(attempts);
+    expect((await mia.stub.inspect()).waits).toMatchObject([{ id, state: "cannot be verified" }]);
+    await mia.due();
+    await mia.settle();
+    expect(mia.heard()).toEqual(["总结"]);
+  });
+
   it("says that it could not finish, once, when the run that carried a request on wrote no answer", async () => {
     const max = owner("DocMax000000000000001");
     const id = await asksFor(max, "DocMax000000000000001");
@@ -1523,6 +1587,10 @@ describe("a request that waits and is carried on", () => {
     expect((await rowsOf(val.stub, "SELECT 1 FROM outbox WHERE continuation IS NOT NULL")).length).toBe(1);
   });
 
+  /** The question the system itself puts when more than one request could be meant. */
+  const WHICH = /^More than one of your requests could be meant\. Which one\?\n1\. ".*"\n2\. ".*"$/;
+  const askedWhich = async (person: Person) => (await rowsOf(person.stub, "SELECT value FROM meta WHERE key LIKE 'asked_which:%'")).map((each) => JSON.parse(each.value));
+
   it("asks which request is meant when two share a card, cancels the one named next, and answers the other (F15, F20)", async () => {
     const wes = owner("DocWesA00000000000001", "DocWesB00000000000001");
     const a = await asksFor(wes, "DocWesA00000000000001");
@@ -1531,14 +1599,19 @@ describe("a request that waits and is carried on", () => {
     expect(wes.cards().length).toBe(1);
     expect(new Set((await wes.requests()).map((each) => each.interaction)).size).toBe(1);
 
-    // "Never mind", and the model picks one. That could be either, so neither is cancelled.
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "你指哪一个？" })], [say("")]);
+    // "Never mind", and the model picks one. That could be either, so neither is cancelled, and
+    // the system itself asks him which, in his own words for each. The model is told not to ask too.
+    model.replies([call("cancel_request", { request_id: a }, "cancel_wes")], [say("")]);
     await wes.says("算了");
-    expect(toolOutputs()[0].error).toMatch(/more than one request could be meant/);
+    expect(toolOutputs()[0].error).toMatch(/more than one request could be meant.*has been asked which one, by the system itself; do not ask again/);
     expect(toolOutputs()[0].error).toContain(a);
     expect(toolOutputs()[0].error).toContain(b);
     expect((await wes.requests()).map((each) => each.status)).toEqual(["waiting", "waiting"]);
-    expect(wes.heard()).toEqual(["你指哪一个？"]);
+    expect(wes.heard()).toEqual([expect.stringMatching(WHICH)]);
+    expect(wes.heard()[0]).toContain("DocWesA00000000000001");
+    expect(wes.heard()[0]).toContain("DocWesB00000000000001");
+    expect(await askedWhich(wes)).toEqual([{ ids: [a, b], question: "which:cancel_wes" }]);
+    expect(await rowsOf(wes.stub, "SELECT status, receipt IS NOT NULL AS receipt FROM outbox WHERE idem = 'which:cancel_wes'")).toEqual([{ status: "sent", receipt: 1 }]);
 
     // His next message says which. The model may then pick one of the two, once: a second
     // cancellation on the strength of the same message is refused.
@@ -1551,7 +1624,7 @@ describe("a request that waits and is carried on", () => {
     // The card is still good for the one that is left, and only that one is read and answered.
     carriesOn("第二个的总结");
     await authorises(wes);
-    expect(wes.heard()).toEqual(["你指哪一个？", "已取消第一个", "第二个的总结"]);
+    expect(wes.heard()).toEqual([expect.stringMatching(WHICH), "已取消第一个", "第二个的总结"]);
     expect(read()).toEqual(["DocWesB00000000000001"]);
     expect(await wes.requests()).toMatchObject([{ id: a, status: "cancelled" }, { id: b, status: "done" }]);
   });
@@ -1562,15 +1635,16 @@ describe("a request that waits and is carried on", () => {
     const b = await asksFor(xan, "DocXanB00000000000001");
     // The card, as Feishu named it when it took it.
     const card = `om_sent_${xan.cards()[0].uuid}`;
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "你指哪一个？" })], [say("")]);
+    model.replies([call("cancel_request", { request_id: a })], [say("")]);
     await xan.says("算了", undefined, card);
     expect(toolOutputs()[0].error).toMatch(/more than one request could be meant/);
+    expect(xan.heard()).toEqual([expect.stringMatching(WHICH)]);
     model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "已取消第一个" })], [say("")]);
     await xan.says("第一个");
     expect(toolOutputs()[0]).toMatchObject({ ok: true, cancelled: a });
     carriesOn("第二个的总结");
     await authorises(xan);
-    expect(xan.heard()).toEqual(["你指哪一个？", "已取消第一个", "第二个的总结"]);
+    expect(xan.heard()).toEqual([expect.stringMatching(WHICH), "已取消第一个", "第二个的总结"]);
     expect(read()).toEqual(["DocXanB00000000000001"]);
     expect(await xan.requests()).toMatchObject([{ id: a, status: "cancelled" }, { id: b, status: "done" }]);
 
@@ -1589,18 +1663,19 @@ describe("a request that waits and is carried on", () => {
     const b = await asksFor(zed, "DocZedB00000000000001");
     // The question is written, and Feishu does not take it yet.
     feishu.failTexts = 1;
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "你指哪一个？" })], [say("")]);
+    model.replies([call("cancel_request", { request_id: a })], [say("")]);
     await zed.says("算了");
     expect(zed.heard()).toEqual([]);
-    // What he writes now cannot be an answer to a question he has not seen.
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "请再说一次是哪一个" })], [say("")]);
+    expect(await rowsOf(zed.stub, "SELECT status FROM outbox WHERE idem LIKE 'which:%'")).toEqual([{ status: "pending" }]);
+    // What he writes now cannot be an answer to a question he has not seen. He is asked again.
+    model.replies([call("cancel_request", { request_id: a })], [say("")]);
     await zed.says("第一个");
     expect(toolOutputs()[0].error).toMatch(/more than one request could be meant/);
     expect((await zed.requests()).map((each) => each.status)).toEqual(["waiting", "waiting"]);
     // Both questions arrive; his next message is an answer.
     await zed.due();
     await zed.quiet();
-    expect(zed.heard()).toEqual(["你指哪一个？", "请再说一次是哪一个"]);
+    expect(zed.heard()).toEqual([expect.stringMatching(WHICH), expect.stringMatching(WHICH)]);
     model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "已取消第一个" })], [say("")]);
     await zed.says("第一个");
     expect(toolOutputs()[0]).toMatchObject({ ok: true, cancelled: a });
@@ -1749,19 +1824,28 @@ describe("a request that waits and is carried on", () => {
     expect(JSON.stringify(input.slice(input.map((each) => each.role).lastIndexOf("user")))).not.toContain("IGNORE-ME");
   });
 
-  // BUG: this fails, and is left failing on purpose. The call that is made again is the one the
-  // tool named (see the test above), but the first run's own record stays in the conversation:
-  // its function_call item, with the arguments exactly as the model wrote them, is part of the
-  // transcript that the continuing run's model is given. So what the model wrote the first time
-  // does reach the model of the run that carries the request on.
-  it.fails("gives the run that carries a request on nothing of what the model wrote in the call that was told to wait", async () => {
-    const fen = owner("DocFen000000000000001");
-    model.replies([call("feishu_read_document", { document: `${link("DocFen000000000000001")}?x=IGNORE-ME` })], [say("")]);
-    await fen.says(`总结 ${link("DocFen000000000000001")}`);
-    carriesOn("总结");
+  it("leaves nothing of a run that read outside text and was then told to wait, for the run that carries the request on", async () => {
+    const fen = owner("DocFenX00000000000001", "DocFenY00000000000001");
+    feishu.wiki.set("WikiFen00000000000001", { obj_type: "docx", obj_token: "DocFenY00000000000001" });
+    await authorised(fen, "DocFenX00000000000001");
+    // She has allowed documents. One run reads a document, and is then told to wait for the wiki
+    // page, which it asked for with something of its own added to the link.
+    const id = `req_${++asks}`;
+    model.replies([readCall("DocFenX00000000000001")], [call("feishu_read_document", { document: `${link("WikiFen00000000000001", "wiki")}?x=IGNORE-ME` }, id)], [say("")]);
+    await fen.says(`看看 ${link("DocFenX00000000000001")} 和 ${link("WikiFen00000000000001", "wiki")}`);
+    expect(toolOutputs()).toEqual([{ text: "The text of DocFenX00000000000001." }, { waiting: true, request: id, note: expect.any(String) }]);
+    expect(await fen.requests()).toMatchObject([{ status: "done" }, { id, status: "waiting" }]);
+    // That run read outside text, so all of it is gone from the conversation when it ends.
+    const later = modelCalls.length;
+    expect(JSON.stringify(await rowsOf(fen.stub, "SELECT item FROM items"))).not.toMatch(/IGNORE-ME|The text of DocFenX/);
+    carriesOn("知识库的总结");
     await authorises(fen);
-    expect(fen.heard()).toEqual(["总结"]);
-    expect(JSON.stringify(carried()[0].input)).not.toContain("IGNORE-ME");
+    expect(fen.heard().at(-1)).toBe("知识库的总结");
+    expect(outputsIn(modelCalls[later])).toEqual([{ text: "The text of DocFenY00000000000001." }]);
+    expect(JSON.stringify(modelCalls.slice(later))).not.toMatch(/IGNORE-ME|The text of DocFenX/);
+    model.replies([call("send_message", { text: "晴" })], [say("")]);
+    await fen.says("今天天气怎么样");
+    expect(JSON.stringify(modelCalls.slice(later))).not.toMatch(/IGNORE-ME|The text of DocFenX/);
   });
 
   it("ties a request to the messages it rests on, and to no others", async () => {
@@ -1791,30 +1875,37 @@ describe("a request that waits and is carried on", () => {
     expect(await hui.requests()).toMatchObject([{ id: kept, status: "cancelled" }]);
   });
 
-  it("takes only a single message, written after a question that was really asked, as the answer to it", async () => {
+  it("takes only a single message, written after the system's own question, as the answer to it", async () => {
     const ian = owner("DocIanA00000000000001", "DocIanB00000000000001");
     const a = await asksFor(ian, "DocIanA00000000000001");
     const b = await asksFor(ian, "DocIanB00000000000001");
     const waiting = () => ian.requests().then((all) => all.map((each) => each.status));
-    // The model is refused and asks nothing. What he writes next answers no question.
-    model.replies([call("cancel_request", { request_id: a })], [say("")]);
+    // The model says something of its own, which is delivered. That is not a question about
+    // his requests, and what he writes next answers none: he is asked, properly, only now.
+    model.replies([call("send_message", { text: "好的，哪一个？" })], [say("")]);
     await ian.says("算了");
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "你指哪一个？" })], [say("")]);
+    expect(await askedWhich(ian)).toEqual([]);
+    model.replies([call("cancel_request", { request_id: a }, "cancel_ian_1")], [call("send_message", { text: "稍等" })], [say("")]);
     await ian.says("第一个");
     expect(toolOutputs()[0].error).toMatch(/more than one request could be meant/);
     expect(await waiting()).toEqual(["waiting", "waiting"]);
-    // Now it has been asked. Two messages arrive together and are handled as one: which of them chose?
+    // The question is the system's own message, whatever else the model went on to say in that run.
+    expect(await askedWhich(ian)).toEqual([{ ids: [a, b], question: "which:cancel_ian_1" }]);
+    expect(ian.heard()).toEqual(["好的，哪一个？", expect.stringMatching(WHICH), "稍等"]);
+    // Two messages arrive together and are handled as one: which of them chose? He is asked again.
     await ian.sends("第一个");
     await ian.sends("不对，第二个");
-    model.replies([call("cancel_request", { request_id: a })], [call("send_message", { text: "请只说一个" })], [say("")]);
+    model.replies([call("cancel_request", { request_id: a }, "cancel_ian_2")], [say("")]);
     await ian.quiet();
     expect(toolOutputs()[0].error).toMatch(/more than one request could be meant/);
     expect(await waiting()).toEqual(["waiting", "waiting"]);
+    expect(await askedWhich(ian)).toEqual([{ ids: [a, b], question: "which:cancel_ian_2" }]);
     // One message, after that question: it chooses.
     model.replies([call("cancel_request", { request_id: b })], [call("send_message", { text: "已取消第二个" })], [say("")]);
     await ian.says("第二个");
     expect(toolOutputs()[0]).toMatchObject({ ok: true, cancelled: b });
     expect(await ian.requests()).toMatchObject([{ id: a, status: "waiting" }, { id: b, status: "cancelled" }]);
+    expect((await askedWhich(ian))[0].chose).toEqual(expect.any(Number));
   });
 
   it("does not let a run that has read outside text end a request by replacing it", async () => {
@@ -1901,11 +1992,28 @@ describe("a request that waits and is carried on", () => {
 });
 
 describe("a sign that a message arrived", () => {
+  /** What the Brain logged for the operator while `during` ran. */
+  const logged = async (during: () => Promise<void>) => {
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((line: unknown) => void lines.push(String(line)));
+    try {
+      await during();
+    } finally {
+      log.mockRestore();
+    }
+    return lines.filter((line) => line.includes("received_shown"));
+  };
+
   it("is put on the person's own message, once, and is nothing the rest depends on", async () => {
     const mel = someone();
+    const shown = await logged(async () => {
+      await mel.sends("你好");
+      await vi.waitFor(() => expect(feishu.reactions).toEqual([{ message: `om_${mel.openId}_1`, emoji: "Get", bearer: "t-app" }]));
+      await sleep(20);
+    });
+    expect(shown.length).toBe(1);
     model.replies([call("send_message", { text: "你好" })], [say("")]);
-    await mel.says("你好");
-    await vi.waitFor(() => expect(feishu.reactions).toEqual([{ message: `om_${mel.openId}_1`, emoji: "Get", bearer: "t-app" }]));
+    await mel.quiet();
     // Nothing was added to the chat for it.
     expect(feishu.sent.map((each) => each.content)).toEqual([{ text: "你好" }]);
     expect(feishu.reads).toEqual([]);
@@ -1920,6 +2028,53 @@ describe("a sign that a message arrived", () => {
     expect(mel.heard()).toEqual(["你好", "在的"]);
     expect(feishu.reactions.length).toBe(1);
   });
+
+  it("is not counted as shown when Feishu answers with an error inside a success", async () => {
+    const moe = someone();
+    feishu.refuseReactions = true;
+    const shown = await logged(async () => {
+      await moe.sends("你好");
+      await vi.waitFor(() => expect(feishu.reactionAttempts).toBe(1));
+      await sleep(30);
+    });
+    expect(shown).toEqual([]);
+    model.replies([say("")]);
+    await moe.quiet();
+  });
+
+  it("is not put on a button press, which has no message of the person's to mark", async () => {
+    const ned = someone();
+    const base = ned.event("x");
+    model.replies([say("")]);
+    await ned.stub.ingest({ ...base, source_id: "card:evt_1", text: "approve", data: { chat_id: `oc_${ned.openId}`, card: true, route_by_code: true, question: "ask:none:1", origin: base.data!.origin } });
+    await sleep(30);
+    await ned.quiet();
+    expect(feishu.reactions).toEqual([]);
+  });
+
+  it("is not posted once the message has been dealt with", async () => {
+    const oli = someone();
+    // The app's token has run out, and Feishu is slow to issue a new one: slower than the run.
+    await (env as any).REGISTRY.getByName("global").saveFeishuToken(APP_ID, "t-old", Date.now() - 1);
+    let handled = false;
+    let waited = false;
+    feishu.duringAppToken = async () => {
+      feishu.duringAppToken = undefined;
+      waited = true;
+      while (!handled) await sleep(5);
+    };
+    model.replies([say("")]);
+    await oli.says("你好");
+    expect(waited).toBe(true);
+    handled = true;
+    await sleep(60);
+    expect(feishu.reactions).toEqual([]);
+    // With the token there in time, the next message is marked.
+    await oli.sends("在吗");
+    await vi.waitFor(() => expect(feishu.reactions.map((each) => each.message)).toEqual([`om_${oli.openId}_2`]));
+    model.replies([say("")]);
+    await oli.quiet();
+  });
 });
 
 describe("following up on an answer", () => {
@@ -1930,18 +2085,32 @@ describe("following up on an answer", () => {
   type Person = ReturnType<typeof someone>;
   const TEXT = "First: the launch is on Friday. Second: the budget is 40.";
   const SUMMARY = "要点一：周五发布。要点二：预算四十。";
+  /**
+   * Sets what one Brain takes the deployment's FOLLOW_UPS setting to be. The setting cannot be
+   * changed for one test, so this Brain's own view of it is.
+   */
+  const setting = (person: Person, value: string | undefined) => runInDurableObject(person.stub, (instance: any) => void (instance.env = { ...instance.env, FOLLOW_UPS: value }));
+  /** What the flow below cost and offered, for comparing one setting with another. */
+  let flow = { reads: 0, sent: 0, calls: 0, tools: [] as string[] };
   /** Someone who asked for a summary of a document of theirs, authorised, and was answered. */
-  const summarised = async (doc: string, switchOff = false) => {
+  const summarised = async (doc: string, followUps: string | null = "on", kind = "docx", first?: (person: Person) => void) => {
     const person = someone();
-    feishu.docs.set(doc, { readers: [person.openId], text: TEXT });
-    // (The deployment's setting cannot be changed for one test, so this Brain's own view of it is.)
-    if (switchOff) await runInDurableObject(person.stub, (instance: any) => void (instance.env = { ...instance.env, FOLLOW_UPS: "off" }));
-    model.replies([readCall(doc)], [say("")]);
-    await person.says(`总结 ${link(doc)}`);
+    // Counted from here, whatever an earlier person in the same test did.
+    feishu.reads.length = 0;
+    feishu.sent.length = 0;
+    modelCalls.length = 0;
+    if (kind === "docx") feishu.docs.set(doc, { readers: [person.openId], text: TEXT });
+    first?.(person);
+    // (null: not set at all.)
+    await setting(person, followUps ?? undefined);
+    model.replies([readCall(doc, kind)], [say("")]);
+    await person.says(`总结 ${link(doc, kind)}`);
     carriesOn(SUMMARY);
     await authorises(person);
     expect(person.heard()).toEqual([SUMMARY]);
+    flow = { reads: feishu.reads.length, sent: feishu.sent.length, calls: modelCalls.length, tools: [...new Set(modelCalls.flatMap((each) => each.tools.map((tool: any) => tool.name as string)))] };
     feishu.reads.length = 0;
+    feishu.sent.length = 0;
     modelCalls.length = 0;
     return person;
   };
@@ -1962,7 +2131,7 @@ describe("following up on an answer", () => {
     expect(modelCalls[0].tools.map((each: any) => each.name)).toContain("reopen_answer");
     expect(toolOutputs()[0]).toMatchObject({ source_now: { text: TEXT }, your_answer_then: SUMMARY, source_changed: false });
     expect(read()).toEqual(["DocAnn000000000000001"]);
-    expect(ann.heard()).toEqual([SUMMARY, "第二点：预算是四十。"]);
+    expect(ann.heard()).toEqual(["第二点：预算是四十。"]);
     // What was brought back is not kept in the conversation afterwards.
     expect(JSON.stringify(await rowsOf(ann.stub, "SELECT item FROM items"))).not.toContain("Friday");
 
@@ -2016,14 +2185,13 @@ describe("following up on an answer", () => {
     const dan = await summarised("DocDan000000000000001");
     const [kept] = await answers(dan);
     await (await dan.grant()).drop(dan.who);
-    const cards = dan.cards().length;
     const id = "reopen_dan";
     model.replies([reopen(kept.id, id)], [say("")]);
     await dan.says("第二点展开说说");
     // The follow-up waits like any request, and he is shown how to authorise.
     expect(toolOutputs()).toEqual([{ waiting: true, request: id, note: expect.any(String) }]);
     expect(await dan.requests()).toMatchObject([{ status: "done" }, { id, status: "waiting" }]);
-    expect(dan.cards().length).toBe(cards + 1);
+    expect(dan.cards().length).toBe(1);
     expect(feishu.reads).toEqual([]);
     expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
 
@@ -2032,7 +2200,7 @@ describe("following up on an answer", () => {
     const carried = modelCalls.filter((each) => each.tools.length === 1);
     expect(outputsIn(carried[0])[0]).toMatchObject({ source_now: { text: TEXT }, your_answer_then: SUMMARY, source_changed: false });
     expect(read()).toEqual(["DocDan000000000000001"]);
-    expect(dan.heard()).toEqual([SUMMARY, "第二点：预算是四十。"]);
+    expect(dan.heard()).toEqual(["第二点：预算是四十。"]);
     expect(await dan.requests()).toMatchObject([{ status: "done" }, { id, status: "done" }]);
   });
 
@@ -2068,15 +2236,128 @@ describe("following up on an answer", () => {
     expect((await answers(gia)).map((each) => each.text)).toEqual([SUMMARY]);
   });
 
-  it("keeps no answers and offers no way to reopen one where follow-ups are switched off", async () => {
-    const hal = await summarised("DocHalF00000000000001", true);
-    expect(await answers(hal)).toEqual([]);
-    model.replies([reopen("ans_1")], [say("")]);
-    await hal.says("第二点展开说说");
-    expect(modelCalls[0].tools.map((each: any) => each.name)).not.toContain("reopen_answer");
-    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
-    expect(toolOutputs()[0].error).toEqual(expect.any(String));
+  it("keeps nothing of an answer and offers no way to reopen one unless follow-ups are switched on", async () => {
+    await summarised("DocHalN00000000000001");
+    const on = flow;
+    expect(on.tools).toContain("reopen_answer");
+    for (const value of [null, "off", "garbage"]) {
+      const hal = await summarised("DocHalF00000000000001", value);
+      const why = `FOLLOW_UPS=${value}`;
+      // The same flow: as many reads, messages and model calls as with follow-ups on.
+      expect({ ...flow, tools: [] }, why).toEqual({ ...on, tools: [] });
+      expect(flow.tools, why).not.toContain("reopen_answer");
+      expect(await answers(hal), why).toEqual([]);
+      expect(await rowsOf(hal.stub, "SELECT key FROM meta WHERE key LIKE 'sources:%'"), why).toEqual([]);
+      expect(await rowsOf(hal.stub, "SELECT id FROM outbox WHERE source IS NOT NULL"), why).toEqual([]);
+      // And the tool is not there, whatever the model tries.
+      model.replies([reopen("ans_1")], [say("")]);
+      await hal.says("第二点展开说说");
+      expect(modelCalls[0].tools.map((each: any) => each.name), why).not.toContain("reopen_answer");
+      expect(modelCalls[0].instructions, why).not.toContain("Answers you can reopen");
+      expect(toolOutputs()[0].error, why).toEqual(expect.any(String));
+      expect(feishu.reads, why).toEqual([]);
+      expect(feishu.sent, why).toEqual([]);
+    }
+    // With follow-ups on, nothing of where an answer came from stays on a message once it is delivered.
+    const ada = await summarised("DocAda000000000000001");
+    expect((await answers(ada)).length).toBe(1);
+    expect(await rowsOf(ada.stub, "SELECT id FROM outbox WHERE source IS NOT NULL")).toEqual([]);
+    expect(await rowsOf(ada.stub, "SELECT key FROM meta WHERE key LIKE 'sources:%'")).toEqual([]);
+  });
+
+  it("refuses a follow-up that was waiting for authorisation when follow-ups are switched off meanwhile", async () => {
+    const jan = await summarised("DocJan000000000000001");
+    const [kept] = await answers(jan);
+    await (await jan.grant()).drop(jan.who);
+    model.replies([reopen(kept.id, "reopen_jan")], [say("")]);
+    await jan.says("第二点展开说说");
+    expect(await jan.requests()).toMatchObject([{ status: "done" }, { id: "reopen_jan", status: "waiting" }]);
+    await setting(jan, "off");
+    // He authorises. The request is taken up, and the call that would bring the answer back is refused.
+    model.replies([say("")]);
+    await authorises(jan);
+    const carried = modelCalls.filter((each) => each.tools.length === 1);
+    expect(carried.length).toBe(1);
+    expect(outputsIn(carried[0])[0].error).toEqual(expect.any(String));
     expect(feishu.reads).toEqual([]);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
+    expect(jan.heard()).toEqual(["I could not finish what you asked for earlier. Please ask again."]);
+    expect((await jan.requests())[1].status).toBe("done");
+  });
+
+  it("does not reopen an answer whose link now leads to another document", async () => {
+    feishu.wiki.set("WikiKen00000000000001", { obj_type: "docx", obj_token: "DocKenA00000000000001" });
+    const same = await summarised("WikiKen00000000000001", "on", "wiki", (ken) => {
+      feishu.docs.set("DocKenA00000000000001", { readers: [ken.openId], text: TEXT });
+      feishu.docs.set("DocKenB00000000000001", { readers: [ken.openId], text: "Another document altogether." });
+    });
+    const [kept] = await rowsOf(same.stub, "SELECT id, args, identity FROM answers");
+    expect(kept).toMatchObject({ args: JSON.stringify({ document: link("WikiKen00000000000001", "wiki") }), identity: "docx:DocKenA00000000000001" });
+    // The wiki page comes to hold another document, which he can also read.
+    feishu.wiki.set("WikiKen00000000000001", { obj_type: "docx", obj_token: "DocKenB00000000000001" });
+    model.replies([reopen(kept.id)], [say("")]);
+    await same.says("第二点展开说说");
+    expect(toolOutputs()[0].error).toMatch(/link now leads elsewhere/);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十|Another document altogether/);
+  });
+
+  it("keeps nothing to reopen for a run that said more than one thing", async () => {
+    const lin = await summarised("DocLin000000000000001");
+    model.replies([readCall("DocLin000000000000001")], [call("send_message", { text: "第一部分" })], [call("send_message", { text: "第二部分" })], [say("")]);
+    await lin.says(`再总结 ${link("DocLin000000000000001")}`);
+    expect(lin.heard()).toEqual(["第一部分", "第二部分"]);
+    expect((await answers(lin)).map((each) => each.text)).toEqual([SUMMARY]);
+    expect(await rowsOf(lin.stub, "SELECT id FROM outbox WHERE source IS NOT NULL")).toEqual([]);
+  });
+
+  it("offers the model only the answer the person replied to, however many are kept", async () => {
+    const mae = await summarised("DocMae000000000000001");
+    for (let i = 1; i <= 5; i++) {
+      const doc = `DocMae00000000000001${i}`;
+      feishu.docs.set(doc, { readers: [mae.openId], text: `Document ${i}.` });
+      model.replies([readCall(doc)], [call("send_message", { text: `第${i}篇的总结` })], [say("")]);
+      await mae.says(`总结 ${link(doc)}`);
+    }
+    const kept = await answers(mae);
+    expect(kept.length).toBe(6);
+    feishu.reads.length = 0;
+    // She replies to the oldest. The model is shown that one and no other, and takes its id from there.
+    const oldest = kept[0];
+    model.replies([reopen(oldest.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+    await mae.says("第二点展开说说", undefined, messageOf(oldest.subject));
+    for (const asked of modelCalls.slice(-3)) {
+      expect(asked.instructions).toContain("Answers you can reopen");
+      expect(asked.instructions).toContain(`- ${oldest.id} `);
+      for (const other of kept.slice(1)) expect(asked.instructions).not.toContain(`- ${other.id} `);
+    }
+    expect(modelCalls.at(-1).instructions).toContain(oldest.id);
+    expect(outputsIn(modelCalls.at(-1))[0]).toMatchObject({ source_now: { text: TEXT }, your_answer_then: SUMMARY, source_changed: false });
+    expect(read()).toEqual(["DocMae000000000000001"]);
+    expect(mae.heard().at(-1)).toBe("预算四十。");
+    // Without a reply, only the last thing said is offered.
+    model.replies([say("")]);
+    await mae.says("嗯");
+    expect(modelCalls.at(-1).instructions).toContain(`- ${(await answers(mae)).at(-1)!.id} `);
+    expect(modelCalls.at(-1).instructions).not.toContain(`- ${oldest.id} `);
+  });
+
+  it("does not take a follow-up to be about an answer once something else has been said since", async () => {
+    const nia = await summarised("DocNia000000000000001");
+    const [kept] = await answers(nia);
+    model.replies([call("send_message", { text: "晴" })], [say("")]);
+    await nia.says("今天天气怎么样");
+    // The weather came in between: without a reply there is nothing to reopen, and nothing is read.
+    model.replies([reopen(kept.id)], [say("")]);
+    await nia.says("第二点展开说说");
+    expect(modelCalls.at(-1).instructions).not.toContain("Answers you can reopen");
+    expect(toolOutputs()[0].error).toMatch(/not the last thing you said/);
+    expect(feishu.reads).toEqual([]);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
+    // A reply to the answer says which is meant.
+    model.replies([reopen(kept.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+    await nia.says("第二点展开说说", undefined, messageOf(kept.subject));
+    expect(toolOutputs()[0]).toMatchObject({ your_answer_then: SUMMARY, source_changed: false });
+    expect(read()).toEqual(["DocNia000000000000001"]);
   });
 
   it("is not reopened by anything but the person's own words", async () => {
