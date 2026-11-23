@@ -2,7 +2,7 @@
 
 本文档按源码阅读顺序，梳理 `always-on-agents` 的整体心智模型、三个核心 Durable Object（`Registry`、`BrainAgent`、`TaskSandbox`）的协作契约、作用域（`Scope`）的设计边界，以及无状态入口与连接器的完整入站 / 出站逻辑。
 
-> 相关设计文档：[架构概览](architecture.zh-CN.md) · [连接器规范](connectors.zh-CN.md) · [审批机制](approvals.zh-CN.md)
+> 系列导读：[（二）BrainAgent 事件循环、持久化与发件箱](brain-walkthrough.zh-CN.md) · [架构概览](architecture.zh-CN.md) · [连接器规范](connectors.zh-CN.md) · [审批机制](approvals.zh-CN.md)
 
 ---
 

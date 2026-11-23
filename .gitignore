@@ -8,3 +8,4 @@ node_modules/
 .dev.vars
 .deploy.*
 .secrets.json
+.DS_Store
