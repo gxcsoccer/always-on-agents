@@ -666,4 +666,18 @@ describe("the outbox, by itself", () => {
       });
     });
   });
+  describe("the encoding a message is sent with", () => {
+    it("is fixed at its first attempt, and is the earlier version's for one whose sending began before there was a choice", async () => {
+      await within(async ({ outbox, row, set, delivered }) => {
+        outbox.enqueue("msg:new", SESSION, null, "new", undefined, undefined, { authored: true });
+        outbox.enqueue("msg:old", SESSION, null, "old", undefined, undefined, { authored: true });
+        // Begun under the earlier version: attempted, with no word back, and no encoding on record.
+        set("msg:old", { started: 1, uncertain: 1, wire: null });
+        await outbox.flush();
+        expect(delivered.map((each) => [each.message.idem, each.message.encoding])).toEqual([["msg:new", 1], ["msg:old", 0]]);
+        expect(row("msg:new").wire).toBe(1);
+        expect(row("msg:old").wire).toBe(0);
+      });
+    });
+  });
 });

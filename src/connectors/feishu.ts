@@ -354,26 +354,29 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // not sent at all: there is nothing left to act on.
   const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
   if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
-  // An approval question or an invitation goes out as a card; the agent's own words as Markdown
-  // (a post with one md element); the system's fixed words as text. Decided from the message
-  // alone, so every attempt sends the very same thing.
+  // An approval question or an invitation goes out as a card. The agent's own words go as
+  // Markdown (a post with one md element), or as text where a post would be too large; the
+  // system's fixed words as text. A message whose sending began under the earlier encoding (0)
+  // is sent exactly as it was then: as text, verbatim. Decided from the message alone, so every
+  // attempt sends the very same thing.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
-  const post = !card && message.authored ? JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } }) : undefined;
-  // Feishu takes a post of up to 30 KB, measured as sent: one that would be larger goes as text.
-  const fits = post !== undefined && new TextEncoder().encode(JSON.stringify({ receive_id: chatId, msg_type: "post", content: post, uuid })).length <= MAX_POST_BYTES;
-  const msgType = card ? "interactive" : fits ? "post" : "text";
-  const content = card ? JSON.stringify(card) : fits ? post! : JSON.stringify({ text: message.text });
+  const current = message.encoding !== 0;
+  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: chatId, msg_type: msgType, content, uuid });
+  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
+  // Feishu takes a post of up to 30 KB, measured as the request is sent.
+  const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
+  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text) : message.text }));
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ msg_type: msgType, content, uuid, reply_in_thread: thread === "1" }),
+        body: JSON.stringify(body),
       })
     : await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
+        body: JSON.stringify(body),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
   const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
@@ -391,12 +394,17 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
 const MAX_POST_BYTES = 29_000;
 
 /**
- * Markdown as Feishu renders it, minus its one way of acting: an <at> element notifies whoever it
- * names (everyone, even). Words the model wrote, or quoted, must not do that, so such markup is
- * shown as the text it is.
+ * The agent's words as Feishu shows them, minus their one way of acting: Feishu's mention markup
+ * (`<at user_id="…">`, `<at id=…>`, `</at>`) notifies whoever it names, everyone even. Such markup
+ * the model wrote or quoted is shown as the text it is (a zero-width space after the `<`).
+ * Nothing else is touched: other tags keep their names and case, and code (inline or fenced) is
+ * left exactly as written.
  */
-function quiet(markdown: string): string {
-  return markdown.replace(/<(\/?)at\b/gi, "<\u200b$1at");
+function quiet(text: string): string {
+  return text
+    .split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/)
+    .map((part, index) => (index % 2 === 1 ? part : part.replace(/<(\/?)(at)(?=[\s>])/gi, "<\u200b$1$2")))
+    .join("");
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */

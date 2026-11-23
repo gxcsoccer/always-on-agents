@@ -293,6 +293,12 @@ export interface OutboundMessage {
    * that can render formatting may render these; fixed words are plain.
    */
   authored?: boolean;
+  /**
+   * Which encoding to send it with, fixed at its first attempt so that every retry sends the very
+   * same thing under the same `idem`: 0 for the encoding before connectors could choose one (a
+   * message whose sending began then), 1 for the current one.
+   */
+  encoding?: number;
   /** When the message was written, in ms. */
   created_at?: number;
   /**

@@ -3047,7 +3047,7 @@ describe("how the bot's words are sent", () => {
   const dm = { connector: "feishu", address: { app_id: APP_ID, chat_id: "oc_words" } };
   const thread = { connector: "feishu", address: { app_id: APP_ID, chat_id: "oc_group", message_id: "om_parent", thread: "1" } };
   let n = 0;
-  const send = (text: string, authored: boolean, target: any = dm) => deliverFeishu(env as any, scope, target, { id: ++n, idem: `msg:words_${n}`, text, authored });
+  const send = (text: string, authored: boolean, target: any = dm) => deliverFeishu(env as any, scope, target, { id: ++n, idem: `msg:words_${n}`, text, authored, encoding: 1 });
   const sentAs = () => feishu.bodies.at(-1)!.body;
 
   it("sends the agent's own words as Markdown, in a private chat and as a reply in a thread", async () => {
@@ -3058,6 +3058,13 @@ describe("how the bot's words are sent", () => {
     await send(text, true, thread);
     expect(feishu.bodies.at(-1)!.path).toBe("/open-apis/im/v1/messages/om_parent/reply");
     expect(sentAs()).toMatchObject({ msg_type: "post", reply_in_thread: true });
+  });
+
+  it("sends a message whose sending began under the earlier version exactly as that version did", async () => {
+    // Its first attempt went out as text, with this uuid; whether it arrived is not known.
+    await deliverFeishu(env as any, scope, dm, { id: 900, idem: "msg:legacy", text: "**旧的**", authored: true, encoding: 0 });
+    expect(sentAs()).toMatchObject({ msg_type: "text" });
+    expect(JSON.parse(sentAs().content)).toEqual({ text: "**旧的**" });
   });
 
   it("sends what the model writes in a conversation as Markdown, end to end", async () => {
@@ -3080,14 +3087,28 @@ describe("how the bot's words are sent", () => {
     expect(md).toContain('user_id="all"');
   });
 
+  it("defuses only Feishu's own mention markup, and leaves code and other markup exactly as written", async () => {
+    const text = 'Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline `<at user_id="x">` and\n```xml\n<at id="y"></at><AT-KEY/>\n```';
+    await send(text, true);
+    const md = JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
+    expect(md).not.toContain('<at user_id="all">');
+    expect(md).toContain("<AT-KEY>speed</AT-KEY>");
+    expect(md).toContain('`<at user_id="x">`');
+    expect(md).toContain('```xml\n<at id="y"></at><AT-KEY/>\n```');
+    // Nothing else differs.
+    expect(md.replace(/\u200b/g, "")).toBe(text);
+  });
+
   it("sends as plain text what would be too large as a post, and the same way every time it is tried", async () => {
     // Within the 8,000 characters a message may have, but escaped twice over (inside the post, then inside the request) beyond Feishu's 30 KB for a post.
-    const long = '"\\'.repeat(3_950);
+    const long = '"\\'.repeat(3_940) + '<at user_id="all"></at>';
     expect(long.length).toBeLessThanOrEqual(8_000);
     await send(long, true);
     expect(sentAs().msg_type).toBe("text");
+    // Plain text recognises mentions too: still nobody is notified.
+    expect(JSON.parse(sentAs().content).text).not.toContain('<at user_id="all">');
     const idem = `msg:words_${n}`;
-    await deliverFeishu(env as any, scope, dm, { id: n, idem, text: long, authored: true });
+    await deliverFeishu(env as any, scope, dm, { id: n, idem, text: long, authored: true, encoding: 1 });
     expect(feishu.bodies.at(-1)!.body).toEqual(feishu.bodies.at(-2)!.body);
   });
 });

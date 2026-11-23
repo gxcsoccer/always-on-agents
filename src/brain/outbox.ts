@@ -195,10 +195,13 @@ export class Outbox implements Wakes {
     // Likewise that its outcome is not known: it stays so unless the channel says, of this very
     // attempt, that nothing was posted. An instance that dies after the channel took the message
     // leaves a row that says "may have arrived", not one that looks untouched.
-    this.#s.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?", Date.now(), row.id);
+    // Its encoding is fixed now, before anything is sent: the current one for a first attempt, the
+    // earlier one for a row whose sending began before there was a choice.
+    const wire = typeof row.wire === "number" ? row.wire : row.started ? 0 : 1;
+    this.#s.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?), wire = ? WHERE id = ?", Date.now(), wire, row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, authored: row.authored === 1, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
+      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, authored: row.authored === 1, encoding: wire, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       const sentAt = receipt?.posted_at ?? Date.now();
       this.#s.transaction(() => {

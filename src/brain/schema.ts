@@ -255,6 +255,10 @@ export const MIGRATIONS: string[] = [
    CREATE INDEX said_run ON said (run_id);
    ALTER TABLE outbox ADD COLUMN reads TEXT;
    ALTER TABLE outbox ADD COLUMN authored INTEGER NOT NULL DEFAULT 0;`,
+  // 24: the encoding a message was first sent with, fixed at its first attempt so that a retry
+  // sends the very same thing under the same idempotency key. A row whose sending began before
+  // this existed was sent with the earlier encoding (0).
+  `ALTER TABLE outbox ADD COLUMN wire INTEGER;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
