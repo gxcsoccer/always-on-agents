@@ -28,7 +28,7 @@
 
 ## 1. 一张数据库装下五大原语（`src/brain/schema.ts`）
 
-每个作用域（`tenant:kind:id`）对应一个独立的 `BrainAgent` Durable Object 与一份独享 SQLite 数据库。表结构采用只追加、事务化版本演进（目前 21 步 `MIGRATIONS`，对象首次唤醒时在 `constructor` 中由 `migrate()` 自动追平），共分为 4 组：
+每个作用域（`tenant:kind:id`）对应一个独立的 `BrainAgent` Durable Object 与一份独享 SQLite 数据库。表结构采用只追加、事务化版本演进（目前 23 步 `MIGRATIONS`，对象首次唤醒时在 `constructor` 中由 `migrate()` 自动追平），共分为 4 组：
 
 ### 1.1 事件与对话层（驱动核心循环）
 
@@ -50,7 +50,8 @@
 
 | 表名 | 核心字段 | 作用与关键约束 |
 |---|---|---|
-| **`outbox`** | `id`, `idem`, `run_id`, `target`, `text`, `status`, `attempts`, `next_at`, `started`, `receipt`, `ask`, `closed`, `review`, `private` | 严格按 `id` 升序投递的发件箱。`idem` 防重发；`started` 标记已发起投递；`receipt` / `ask` / `closed` 支撑审批卡片对账与关闭；`review` 支撑 PR 行级代码评审；`private` 标记含外部敏感文本的消息送达后立刻擦除。 |
+| **`outbox`** | `id`, `idem`, `run_id`, `target`, `text`, `status`, `attempts`, `next_at`, `started`, `receipt`, `ask`, `closed`, `review`, `private` | 严格按 `id` 升序投递的发件箱。`idem` 防重发；`started` 标记已发起投递；`receipt` / `ask` / `closed` 支撑审批卡片对账与关闭；`review` 支撑 PR 行级代码评审；`private` 标记含外部敏感文本的消息送达后立刻擦除；`reads` 记下写这条消息时这次 run 已经读过什么（迁移 23）。 |
+| **`said`** | `outbox_id`, `run_id`, `session_id`, `text`, `sent_at`, `receipt_subject`, `reads` | agent 在一个人私聊里送达的每条自己的消息（`idem` 以 `msg:` 或 `answer:` 开头，不含审批提问、系统提示和代码评审），按送达时的原样保存（迁移 23）。和把发件箱这一行标为 `sent` 在同一个事务里写入，在私密正文被擦除之前。`receipt_subject` 用来认出这个人回复的是哪一条。随所属 run 的对话条目一起清理，不随发件箱的行。 |
 | **`tasks`** / **`task_events`** | `tasks(id, op_id, status, requested_by, pending, answering, ...)`<br/>`task_events(task_id, seq, kind, body)` | 追踪派发给 `TaskSandbox` 的异步任务（`op_id = call_id` 保证工具重试不重复派活），按 `(task_id, seq)` 对沙箱回报去重。 |
 
 ### 1.4 审计与安全辅助层
@@ -92,7 +93,7 @@ alarm()
 
 **几个关键工程细节**：
 - **周期定时器不补发风暴**：`Timers.fire()` 计算下一次触发时间时取 `Math.max(due_at + every_s * 1000, now + every_s * 1000)`，休眠期间错过的多次周期全部跳过，绝不会醒来后瞬间连发几十条提醒。
-- **两段式数据清理（`#housekeeping`）**：30 天前的已完成 `inbox` 只清空 `text / data / reply_to` 释放空间，但保留 `(source, source_id)` 骨架满 365 天——GitHub 等签名 Webhook 的签名本身不带有效期，保留去重键才能持续防重放（飞书 Webhook 另有 10 分钟的时间戳窗口）；清理旧 `items` 时同样只从 `is_user = 1` 边界截断，保证留下的对话结构合法。
+- **两段式数据清理（`#housekeeping`）**：30 天前的已完成 `inbox` 只清空 `text / data / reply_to` 释放空间，但保留 `(source, source_id)` 骨架满 365 天——GitHub 等签名 Webhook 的签名本身不带有效期，保留去重键才能持续防重放（飞书 Webhook 另有 10 分钟的时间戳窗口）；清理旧 `items` 时同样只从 `is_user = 1` 边界截断，保证留下的对话结构合法；对话条目已被裁掉的 run，其 `said` 行在同一步删除（发件箱的行另按 30 天删除）。
 - **`#rearm()` 统一计算最早唤醒点**：自己看 `active_run`、`pending inbox` 和下次 `housekeeping_at`，其余交给各部件的 `nextWakeAt(now)`（`Timers` 报最早 `active timer`，`Outbox` 报队首 `pending` 与待对账 `reconciling`，`Tasks` 报待核对 `unsettled`，`Requests` 报等待中请求的 `until` / `check_at` 中较早者——已过期的每分钟复查一次，直到问过其条件的主人），取最小值（不早于 `now + 50ms`）设为下一次闹钟。没有任何候选时间时这段代码不设闹钟；对象何时休眠、是否计费由平台的 [Durable Object 生命周期](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/) 决定。
 
 ---
@@ -138,7 +139,11 @@ flowchart TD
 
 ### 3.3 对话窗口切分（`Runner#transcript`）
 
-模型每次最多读取最近 `MAX_TRANSCRIPT_ITEMS = 80` 条 `items`，但绝不能从工具输出或推理项中间截断（否则 API 会因缺少配对的 `function_call` 报错）。`#transcript()` 通过 `is_user = 1` 定位窗口起点之后的第一个用户轮次作为起始 `seq`；如果最新一轮本身工具调用就超过 80 条，则回退到最后一个 `is_user = 1`，宁可临时放宽窗口也不破坏单轮完整性。
+模型每次最多看到最近 `MAX_TRANSCRIPT_ITEMS = 80` 条，按实际存在的条目计数（清理留下的序号空洞不算），从 `said` 放回的条目也算在内。窗口绝不能从工具输出或推理项中间开始（否则 API 会因缺少配对的 `function_call` 报错），所以起点向后对齐到第一个用户轮次；如果最新一轮本身就超过 80 条，则从最后一个用户轮次开始，宁可临时放宽窗口也不破坏单轮完整性。
+
+有两样东西不存在 `items` 里，而是拼窗口时从 `said` 取来放进去：
+- 读过外部文本、已被清理成固定说明的那一轮，把它送达的话按顺序放在说明后面，作为助手消息。
+- 这个人回复了其中某一条时，存下的用户条目里只有一个指针（`_replied`），拼窗口时把被回复的原话作为 agent 自己的话放在他这一轮前面。
 
 ### 3.4 预算暂停与彻底放弃（防无限卡死）
 
@@ -176,11 +181,12 @@ flowchart TD
    - 本次 `run` 剩余步骤只能用 `send_message` 和该连接器的只读工具（`Runner.mayUse` 按允许清单判断，其余一律报错 `READ_OUTSIDE`），防止外部文本借提示词注入持久化篡改记忆或 `instructions.md`；
    - 本次 `run` 写入 `outbox` 的消息都会被标记 `private = 1`。
 3. **结束后的清理（`Runner#forgetOutside` + `Outbox.scrub`）**：
-   - `run` 结束时，`Runner#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
+   - `run` 结束时，`Runner#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**。说明里只多写一样东西：这一轮读了什么，取自工具自己的规范调用（比如文档链接），不取模型写的任何内容；并告诉模型追问时按自己说过的话回答，不够时才重读，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
    - 标记 `private = 1` 的 `outbox` 消息一旦进入终态（`sent`、`dead`、`unverified`），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
    - 因此：run 结束时对话记录已清理；但私密消息在仍为 `pending`（等待发送或重试）或 `reconciling`（对账中）期间，正文还在 `outbox` 里，进入终态才擦除。
-   - 以前在 `FOLLOW_UPS=on` 时，满足条件的回答会在擦除前复制到 `answers` 表，保留 24 小时供 `reopen_answer` 追问。这套做法已经下线：迁移 22 删除了 `answers` 表，并把还在进行的 `reopen_answer` 续办作废。现在送达的回答不在别处保留。取代它的设计见 [`design/follow-up-history.zh-CN.md`](design/follow-up-history.zh-CN.md)，还没有实现。
-   - 所以清理保证的是：对话记录里不留外部文本，发件箱里终态消息不留正文；不是整个数据库零残留。
+   - 私聊里 agent 自己的消息送达时，送达的原话写进 `said`，和把这一行标为 `sent` 在同一个事务里；之后才擦除发件箱正文。拼对话记录时，这些话放回被清理那一轮的说明后面（见 3.3）。只有自己读了外部文本的 run 受限制；之后看到这段历史的 run 不受限制（用户 2026-11-23 的决定）。
+   - 以前在 `FOLLOW_UPS=on` 时，满足条件的回答会在擦除前复制到 `answers` 表，保留 24 小时供 `reopen_answer` 追问。这套做法已经下线：迁移 22 删除了 `answers` 表，并把还在进行的 `reopen_answer` 续办作废。取代它的设计见 [`design/follow-up-history.zh-CN.md`](design/follow-up-history.zh-CN.md)：第 2 步（`said`）已在分支上写完，还没有部署；第 3 步（放宽能读的链接、回复某条答复时按它的 `reads` 收窄）还没做。
+   - 所以清理保证的是：对话记录里不留外部文本，发件箱里终态消息不留正文；送达给这个人的话保留在 `said` 里；不是整个数据库零残留。
 
 ---
 

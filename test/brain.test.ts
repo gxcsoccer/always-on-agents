@@ -296,6 +296,9 @@ describe("timers and memory", () => {
     const after = await runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => {
       const sql = state.storage.sql;
       // Back to version 21, with follow-up work in every state it could be in.
+      sql.exec("DROP TABLE said");
+      sql.exec("ALTER TABLE outbox DROP COLUMN reads");
+      sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("UPDATE meta SET value = '21' WHERE key = 'schema_version'");
       sql.exec("CREATE TABLE answers (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, outbox_id INTEGER NOT NULL, subject TEXT NOT NULL, target TEXT NOT NULL, connector TEXT NOT NULL, sources TEXT NOT NULL, quotes TEXT NOT NULL, text TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)");
       sql.exec("INSERT INTO answers VALUES ('ans_1', 's', 1, 'x', '{}', 'feishu', '[]', '[]', 'an old answer', 9e15, 1)");
@@ -386,6 +389,9 @@ describe("timers and memory", () => {
       sql.exec("DROP INDEX continuations_open");
       sql.exec("DROP TABLE continuations");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
+      sql.exec("DROP TABLE said");
+      sql.exec("ALTER TABLE outbox DROP COLUMN reads");
+      sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("UPDATE meta SET value = '18' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       // A message whose delivery was begun and never confirmed, one not yet tried, and an approval question.
@@ -1028,6 +1034,9 @@ describe("tasks and approvals", () => {
       sql.exec("ALTER TABLE outbox DROP COLUMN private");
       sql.exec("DROP TABLE continuations");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
+      sql.exec("DROP TABLE said");
+      sql.exec("ALTER TABLE outbox DROP COLUMN reads");
+      sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });
@@ -1575,6 +1584,37 @@ describe("records and limits", () => {
     const replay = await stub.ingest({ source: "t", source_id: "old-done", kind: "message", session_key: "old", principal: { kind: "human", id: "alice", explicit: true }, text: "replayed" });
     expect(replay.duplicate).toBe(true);
     expect(JSON.stringify(state.recent_events)).not.toContain("an old secret");
+  });
+
+  it("removes what a conversation was told along with that part of its transcript, not with the outbox rows", async () => {
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("recent"));
+    await wake(stub);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      const longAgo = Date.now() - 40 * 86_400_000;
+      sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('old', 'private:old', ?, ?)", longAgo, longAgo);
+      const item = (seq: number, runId: string, isUser: boolean) =>
+        sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES ('old', ?, ?, ?, ?, ?)", seq, runId, isUser ? 1 : 0, JSON.stringify({ role: isUser ? "user" : "assistant", content: "x" }), isUser ? 0 : 2);
+      item(1, "gone", true);
+      item(2, "gone", false);
+      for (let seq = 3; seq < 249; seq++) item(seq, "between", seq % 2 === 1);
+      item(249, "kept", true);
+      item(250, "kept", false);
+      for (const [id, runId] of [[1, "gone"], [2, "kept"]] as const) sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at) VALUES (?, ?, 'old', ?, ?)", id, runId, `told in ${runId}`, longAgo);
+      // The outbox row of what was told in the kept turn has aged out on its own schedule.
+      sql.exec("INSERT INTO outbox (id, idem, run_id, target, text, status, next_at, created_at) VALUES (2, 'msg:k', 'kept', '{}', '', 'sent', 0, ?)", longAgo);
+      sql.exec("DELETE FROM meta WHERE key = 'housekeeping_at'");
+    });
+    model.replies([say("")], [say("")]);
+    await stub.ingest(message("nudge"));
+    await wake(stub);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      expect(sql.exec("SELECT 1 FROM outbox WHERE idem = 'msg:k'").toArray()).toEqual([]);
+      expect(sql.exec("SELECT run_id FROM said ORDER BY outbox_id").toArray()).toEqual([{ run_id: "kept" }]);
+    });
   });
 
   it("pauses a scope when its tenant has used up the tenant's daily budget", async () => {

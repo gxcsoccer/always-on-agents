@@ -117,12 +117,12 @@ export class RunTools {
       sendMessage: (callId, text) => {
         const carried = this.#b.requests.continuationOf(run.id);
         if (!carried) {
-          return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text);
+          return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, { authored: true });
         }
         // Everything such a run says belongs to the request it carries on. That request has one
         // answer, kept as a draft until the run ends; one that is waiting again has none.
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
-        return this.#b.requests.draft(carried, run, text);
+        return this.#b.requests.draft(carried, run, text, true);
       },
       cancelRequest: (callId, requestId, ask) => {
         const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
@@ -133,7 +133,7 @@ export class RunTools {
         // The same review in words, for wherever comments cannot be attached to lines.
         const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
         if (said.length > MAX_MESSAGE_TEXT) throw new Error(`the review is too long: summary and comments together must stay within ${MAX_MESSAGE_TEXT} characters`);
-        return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
+        return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments }, { authored: true });
       },
 
       memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),

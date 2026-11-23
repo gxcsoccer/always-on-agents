@@ -406,6 +406,62 @@ describe("reading a Feishu document as the person who asked", () => {
     expect((stored as any).grant.sealed.length).toBeGreaterThan(20);
   });
 
+  it("records what was read by the link the person gave, whatever host the model wrote", async () => {
+    const bob = someone();
+    feishu.docs.set("DocHost00000000000001", { readers: [bob.openId], text: "Three items." });
+    await authorised(bob, "DocHost00000000000001");
+    model.replies([call("feishu_read_document", { document: "https://other.larkoffice.com/docx/DocHost00000000000001?from=model" })], [call("send_message", { text: "三项。" })], [say("")]);
+    await bob.says(`看看 ${link("DocHost00000000000001")}?from=chat#top 有几项`);
+    const said = await rowsOf(bob.stub, "SELECT reads FROM said WHERE text = '三项。'");
+    expect(said.map((each: any) => JSON.parse(each.reads).map((read: any) => read.args))).toEqual([[JSON.stringify({ document: "https://example.feishu.cn/docx/DocHost00000000000001" })]]);
+  });
+
+  it("records the link of the very message that named the document, when the person linked it twice under different hosts", async () => {
+    const doc = "DocTwice0000000000001";
+    const second = `https://second.larkoffice.com/docx/${doc}`;
+    const readsOf = async (person: ReturnType<typeof someone>, text: string) => (await rowsOf(person.stub, "SELECT reads FROM said WHERE text = ?", text)).map((each: any) => JSON.parse(each.reads).map((read: any) => read.args));
+    const recorded = [[JSON.stringify({ document: second })]];
+    feishu.docs.set(doc, { readers: [], text: "Three items." });
+
+    // Asked just after the message that linked it the second time.
+    const bob = someone();
+    feishu.docs.get(doc)!.readers.push(bob.openId);
+    await authorised(bob, doc);
+    model.replies([say("")]);
+    await bob.says(`先存一下 ${link(doc)}`);
+    model.replies([say("")]);
+    await bob.says(`还有这个 ${second}`);
+    model.replies([call("feishu_read_document", { document: second })], [call("send_message", { text: "三项（一）" })], [say("")]);
+    await bob.says("这个有几项");
+    expect(await readsOf(bob, "三项（一）")).toEqual(recorded);
+
+    // As a reply to that message, after the first host was linked again.
+    const cora = someone();
+    feishu.docs.get(doc)!.readers.push(cora.openId);
+    await authorised(cora, doc);
+    model.replies([say("")]);
+    await cora.says(`还有这个 ${second}`);
+    const named = await messageId(cora, `还有这个 ${second}`);
+    model.replies([say("")]);
+    await cora.says(`先存一下 ${link(doc)}`);
+    model.replies([call("feishu_read_document", { document: second })], [call("send_message", { text: "三项（二）" })], [say("")]);
+    await cora.says("这个有几项", undefined, named);
+    expect(await readsOf(cora, "三项（二）")).toEqual(recorded);
+
+    // Waiting for her to authorise first: carried on with the same link.
+    const dana = someone();
+    feishu.docs.get(doc)!.readers.push(dana.openId);
+    model.replies([say("")]);
+    await dana.says(`先存一下 ${link(doc)}`);
+    model.replies([say("")]);
+    await dana.says(`还有这个 ${second}`);
+    model.replies([call("feishu_read_document", { document: second })], [say("")]);
+    await dana.says("这个有几项");
+    carriesOn("三项（三）");
+    await authorises(dana);
+    expect(await readsOf(dana, "三项（三）")).toEqual(recorded);
+  });
+
   it("does not open for a person what only the bot or someone else could open, and keeps their authorisation", async () => {
     const bob = someone();
     feishu.docs.set("DocShared000000000001", { readers: ["ou_bot", "ou_somebody_else"], text: "Not for Bob." });
@@ -709,8 +765,12 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(none.map((each: any) => each.error)).toEqual([expect.stringMatching(/reply to a message that does not link a document/), expect.stringMatching(/reply to a message that does not link a document/)]);
     expect(names()).toEqual(["DocPiaA00000000000001", "DocPiaA00000000000001"]);
     const told = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
+    // One of the agent's own messages, as it reached her: shown to the model as its own words, just before her turn.
     expect(told).toMatch(/\(written as a reply to the message you sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z\)/);
     expect(told).not.toContain("their own earlier message");
+    const input = modelCalls.at(-1).input;
+    const turn = input.map((each: any) => each.role).lastIndexOf("user");
+    expect(input[turn - 1]).toMatchObject({ role: "assistant", content: expect.stringMatching(/^\[The message of yours they are replying to, sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z:\]\n/) });
   });
 
   it("reads nothing for a reply without a link to a message of the person's own that links several documents", async () => {

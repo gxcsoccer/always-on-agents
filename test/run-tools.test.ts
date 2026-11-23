@@ -245,7 +245,8 @@ describe("a run's tools", () => {
     it("are kept to be sent", async () => {
       await within(({ tools, calls }) => {
         expect(tools().sendMessage("c1", "hello")).toEqual({ ok: true });
-        expect(calls).toEqual([["enqueue", "msg:c1", SESSION, "r1", "hello"]]);
+        // Written by the model: the agent's own words.
+        expect(calls).toEqual([["enqueue", "msg:c1", SESSION, "r1", "hello", undefined, undefined, { authored: true }]]);
       });
     });
 
@@ -253,7 +254,7 @@ describe("a run's tools", () => {
       await within(({ tools, settings, of }) => {
         settings.carried = { id: "req_1", status: "resuming" };
         expect(tools().sendMessage("c1", "the answer")).toEqual({ ok: true });
-        expect(of("draft")).toMatchObject([[{ id: "req_1" }, { id: "r1" }, "the answer"]]);
+        expect(of("draft")).toMatchObject([[{ id: "req_1" }, { id: "r1" }, "the answer", true]]);
         settings.carried = { id: "req_1", status: "waiting" };
         expect(tools().sendMessage("c2", "more")).toEqual({ ok: true, note: "nothing was sent: the request is not being answered now" });
         expect(of("enqueue")).toEqual([]);
@@ -266,8 +267,8 @@ describe("a run's tools", () => {
         t.sendReview("c1", "fine", "abc", [{ path: "a.ts", line: 3, body: "typo" }]);
         t.sendReview("c2", "fine", null, []);
         expect(of("enqueue")).toEqual([
-          ["msg:c1", SESSION, "r1", "fine\n\na.ts:3\ntypo", undefined, { summary: "fine", commit: "abc", comments: [{ path: "a.ts", line: 3, body: "typo" }] }],
-          ["msg:c2", SESSION, "r1", "fine", undefined, { summary: "fine", comments: [] }],
+          ["msg:c1", SESSION, "r1", "fine\n\na.ts:3\ntypo", undefined, { summary: "fine", commit: "abc", comments: [{ path: "a.ts", line: 3, body: "typo" }] }, { authored: true }],
+          ["msg:c2", SESSION, "r1", "fine", undefined, { summary: "fine", comments: [] }, { authored: true }],
         ]);
         expect(() => t.sendReview("c3", "x".repeat(8_001), null, [])).toThrow("the review is too long: summary and comments together must stay within 8000 characters");
       });

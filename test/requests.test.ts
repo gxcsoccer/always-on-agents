@@ -301,9 +301,14 @@ describe("requests that wait, by themselves", () => {
       expect(requests.draft(carried, running, "first")).toEqual({ ok: true });
       // Where the request came from, not where the conversation points now.
       expect(sent("answer:r1")).toMatchObject({ status: "draft", text: "first", run_id: "run_1", continuation: "r1", target: ELSEWHERE, started: 0 });
-      requests.draft(carried, running, "second");
+      requests.draft(carried, running, "second", true);
       expect(store.rows("SELECT id FROM outbox")).toHaveLength(1);
-      expect(sent("answer:r1")).toMatchObject({ status: "draft", text: "second" });
+      // Written by the model: the agent's own words.
+      expect(sent("answer:r1")).toMatchObject({ status: "draft", text: "second", authored: 1 });
+      // The system's fixed words in its place: not the agent's, whatever was there before.
+      requests.draft(carried, running, "not answered");
+      expect(sent("answer:r1")).toMatchObject({ status: "draft", text: "not answered", authored: 0 });
+      requests.draft(carried, running, "second", true);
       // An attempt to hand it over has begun: what was written stands.
       store.sql.exec("UPDATE outbox SET status = 'pending', started = 1 WHERE idem = 'answer:r1'");
       requests.draft(carried, running, "third");
