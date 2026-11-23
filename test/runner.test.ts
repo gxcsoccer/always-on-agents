@@ -37,7 +37,6 @@ function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const log: [string, ...unknown[]][] = [];
   const settings = {
-    followUps: true,
     carried: undefined as Partial<Continuation> | undefined,
     allowed: true,
     mayNotDisclose: undefined as string | undefined | Error,
@@ -91,10 +90,8 @@ function bench(state: DurableObjectState) {
         if (settings.over instanceof Error) throw settings.over;
         return settings.over;
       },
-      followUps: () => settings.followUps,
       basis: (runId: string) => store.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId),
       resumed: () => undefined,
-      reopenable: () => [],
       cancellable: () => [],
       askedFor: () => "",
       resume: async (event: InboxRow) => (log.push(["resume", event.source_id]), undefined),
@@ -505,18 +502,54 @@ describe("the run loop, by itself", () => {
     });
   });
 
+  describe("a run an earlier version left after reopening a kept answer", () => {
+    it("is stopped as it is entered: no call it left is carried out, the model is not asked, and the person is told", async () => {
+      await within(async (b) => {
+        b.event("the second point?");
+        const id = (await b.runner.next())!;
+        const session = b.run(id).session_id;
+        b.runner.append(session, id, { type: "function_call", call_id: "c0", name: "reopen_answer", arguments: "{}" });
+        b.runner.append(session, id, { type: "function_call_output", call_id: "c0", output: "the old answer" }, true);
+        // Interrupted after asking for a read, before its output was recorded.
+        b.runner.append(session, id, { type: "function_call", call_id: "c1", name: "feishu_read_document", arguments: "{}" });
+        b.settings.guards = [{ connector: "feishu", condition: "c", generation: 1, retired: true }];
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.asked).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+        expect(b.of("notify")).toEqual([[`withheld:${id}`, session, null, "notice:retired"]]);
+        expect(b.items(id).map((each) => JSON.stringify(each)).join()).not.toContain("the old answer");
+      });
+    });
+
+    it("leaves a run that read under a grant alone, to the checks it always had", async () => {
+      await within(async (b) => {
+        b.event("hello");
+        const id = (await b.runner.next())!;
+        b.settings.guards = [{ connector: "feishu", condition: "c", generation: 1 }];
+        await b.runner.execute(id);
+        expect(b.asked).toHaveLength(1);
+        expect(b.of("notify")).toEqual([]);
+      });
+    });
+  });
+
   describe("ending a run in one step", () => {
     it("leaves the run as it was when ending it fails part way, and ends it once when tried again", async () => {
       await within(async ({ runner, event, host, store, run, inbox }) => {
         event("hello");
         const id = (await runner.next())!;
         runner.append(run(id).session_id, id, says("done"));
-        const followUps = host.requests.followUps;
+        // A run that read outside text: ending it empties what it wrote (scrub), inside the same step. That fails once.
+        runner.append(run(id).session_id, id, { type: "function_call_output", call_id: "c0", output: "read" }, true);
+        const scrub = host.outbox.scrub;
         let failed = false;
-        host.requests.followUps = () => {
-          if (failed) return followUps();
-          failed = true;
-          throw new Error("storage hiccup");
+        host.outbox.scrub = (which, value) => {
+          if (!failed) {
+            failed = true;
+            throw new Error("storage hiccup");
+          }
+          return scrub(which, value);
         };
         await expect(runner.execute(id)).rejects.toThrow("storage hiccup");
         expect(run(id).status).toBe("running");
@@ -571,29 +604,16 @@ describe("the run loop, by itself", () => {
       });
     });
 
-    it("keeps where a lone message came from, for a follow-up, only when the run read one thing and said one thing", async () => {
-      const source = { connector: "feishu", tool: "feishu_read_document", identity: "doc:1", args: "{}", events: { said: [1], recent: [] }, call: "c0", fingerprint: "f", condition: "g", generation: 1 };
-      const finish = async (b: ReturnType<typeof bench>, over: { sources?: unknown[]; messages?: number; followUps?: boolean } = {}) => {
-        b.settings.followUps = over.followUps ?? true;
+    it("forgets its own note of what it read once it ends, and ties nothing more to its messages", async () => {
+      await within(async (b) => {
         b.event("read this");
         const id = (await b.runner.next())!;
-        b.store.setMeta(`sources:${id}`, JSON.stringify(over.sources ?? [source]));
-        b.store.setMeta(`quotes:${id}`, JSON.stringify([{ point: "p", quote: "q" }]));
-        for (let i = 0; i < (over.messages ?? 1); i++) b.store.sql.exec("INSERT INTO outbox (idem, run_id, target, text, next_at, created_at) VALUES (?, ?, ?, 't', 0, 0)", `m${i}`, id, TARGET);
+        b.store.setMeta(`sources:${id}`, JSON.stringify([{ connector: "feishu", tool: "feishu_read_document", identity: "doc:1", args: "{}", condition: "g", generation: 1 }]));
+        b.store.sql.exec("INSERT INTO outbox (idem, run_id, target, text, next_at, created_at) VALUES ('m0', ?, ?, 't', 0, 0)", id, TARGET);
         await b.runner.execute(id);
-        const kept = b.store.rows<{ source: string | null }>("SELECT source FROM outbox ORDER BY id").map((each) => each.source && JSON.parse(each.source));
         expect(b.store.meta(`sources:${id}`)).toBeUndefined();
-        expect(b.store.meta(`quotes:${id}`)).toBeUndefined();
-        return kept;
-      };
-      await within(async (b) => expect(await finish(b)).toEqual([{ sources: [source], quotes: [{ point: "p", quote: "q" }] }]));
-      // The same thing read twice is one thing.
-      await within(async (b) => expect(await finish(b, { sources: [{ ...source, fingerprint: "old" }, source] })).toEqual([{ sources: [source], quotes: [{ point: "p", quote: "q" }] }]));
-      await within(async (b) => expect(await finish(b, { sources: [source, { ...source, identity: "doc:2" }] })).toEqual([null]));
-      await within(async (b) => expect(await finish(b, { messages: 2 })).toEqual([null, null]));
-      await within(async (b) => expect(await finish(b, { followUps: false })).toEqual([null]));
-      // A read noted while follow-ups were off keeps nothing.
-      await within(async (b) => expect(await finish(b, { sources: [{ connector: "feishu", condition: "g", generation: 1 }] })).toEqual([null]));
+        expect(b.store.rows<{ source: string | null }>("SELECT source FROM outbox")).toEqual([{ source: null }]);
+      });
     });
 
     it("turns the answer of a request it carried on into a message to deliver, or says it was not answered", async () => {

@@ -9,7 +9,7 @@ import { type ConnectorTool, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
-import { type Acting, HANDLING_LIMIT_MS, type Requests, WAITING_NOTE, fingerprint } from "./requests";
+import { type Acting, HANDLING_LIMIT_MS, type Requests, WAITING_NOTE } from "./requests";
 import type { BrainStore, Row, RunRow } from "./store";
 import type { Tasks } from "./tasks";
 import { MAX_MESSAGE_TEXT, type ToolHost } from "./tools";
@@ -32,7 +32,7 @@ export interface RunToolsHost {
   instructionEditors(runId: string): string[];
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
-  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "noteQuotes" | "draft" | "reopenAnswer">;
+  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft">;
   readonly outbox: Pick<Outbox, "enqueue">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel">;
 }
@@ -101,7 +101,7 @@ export class RunTools {
             // Only what the tool itself identified: its canonical call and the thing as resolved.
             const read = identified as { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
             if (read && typeof result === "object" && result !== null && !("error" in result)) {
-              this.#b.requests.noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), call: key, events: evidence(), fingerprint: await fingerprint(result), identity: read.identity, ...read.under });
+              this.#b.requests.noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), identity: read.identity, ...read.under });
             }
             return result;
           }
@@ -114,8 +114,7 @@ export class RunTools {
           if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
         }
       },
-      sendMessage: (callId, text, quotes) => {
-        this.#b.requests.noteQuotes(run.id, quotes);
+      sendMessage: (callId, text) => {
         const carried = this.#b.requests.continuationOf(run.id);
         if (!carried) {
           return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text);
@@ -125,7 +124,6 @@ export class RunTools {
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
         return this.#b.requests.draft(carried, run, text);
       },
-      reopenAnswer: (callId, answerId) => this.#b.requests.reopenAnswer(run, callId, answerId),
       cancelRequest: (callId, requestId, ask) => {
         const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
         this.#b.requests.cancel(chosen.record, callId, chosen.choosing);

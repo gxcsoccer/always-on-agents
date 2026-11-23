@@ -49,7 +49,7 @@ export class BrainAgent extends DurableObject<Env> {
   readonly #store: BrainStore;
   /** Calls in this invocation whose result came from a connector's tool, until they are recorded. */
   readonly #outside = new Set<string>();
-  /** Requests that wait, guards and follow-ups: the same database and transactions, in a file of their own. */
+  /** Requests that wait, and guards: the same database and transactions, in a file of their own. */
   readonly #requests: Requests;
   readonly #timers: Timers;
   /** Messages to deliver. */
@@ -228,7 +228,6 @@ export class BrainAgent extends DurableObject<Env> {
     try {
       this.#timers.fire(Date.now());
       this.#requests.deadlines(Date.now());
-      this.#store.sql.exec("DELETE FROM answers WHERE expires_at <= ?", Date.now());
       this.#housekeeping(Date.now());
       await this.#outbox.flush();
       await this.#tasks.settle();
@@ -309,7 +308,7 @@ export class BrainAgent extends DurableObject<Env> {
 
   // ------------------------------------------------------------------ runs
 
-  // ------------------------------------------------------------------ requests that wait, and answers that can be followed up
+  // ------------------------------------------------------------------ requests that wait
   //
   // Kept in ./requests. What is here is only what the wake cycle and the connectors call.
 

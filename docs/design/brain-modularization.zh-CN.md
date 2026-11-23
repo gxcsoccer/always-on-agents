@@ -7,6 +7,7 @@
 > - 实际拆出的文件：`store.ts`、`timers.ts`、`requests.ts`（即草案中的 `continuations.ts`）、`outbox.ts`、`revisions.ts`、`tasks.ts`、`approval.ts`（即草案中的 `approval-rules.ts`）、`run-tools.ts`、`runner.ts`。每一步一个 PR，均经 Codex 复核。第一步 #19（`requests.ts`）没有改测试，靠规整后逐行比对和当时已有的 339 个测试保证行为不变，`Requests` 的专门测试是之后补的；从 #20 起，每一步先写该部件的单元测试并确认失败，再搬代码，并用变异检查确认测试能抓住被搬动的行为。
 > - 多数部件是 `new Part(store, host)`，依赖通过显式 `host` 接口传入；`Timers` 只接收 `store`，`Tasks` 另外直接接收 `Revisions`；唤醒时间由 `Timers`、`Requests`、`Outbox`、`Tasks` 实现 `Wakes.nextWakeAt(now)` 报告（4.3 的调度部分已做）。
 > - **未做**（纯搬移以外的改动，留待需要时再单独做）：4.1 的 JSON 列类型化解析（`Row` 仍是 `Record<string, any>`）；4.3 的清理声明化（`#housekeeping` 仍在 `agent.ts`）；4.4 的 `RunContext`（`outside` 集合由 `BrainAgent` 持有、各部件共用）；4.5 的 `notices.ts` 与会话 `locale`（`NOTICES` 在 `outbox.ts`，仍按最后一条消息是否含汉字判定语言）。
+> - **之后的变化（2026-11-23）**：就保存的答复追问的做法已经下线，`src/brain/follow-up.ts`、`answers` 表和 `reopen_answer` 都已删除，取代它的设计见 [follow-up-history.zh-CN.md](follow-up-history.zh-CN.md)。下文提到它们的地方，描述的是当时的情况。
 
 这份文档回答一个问题：在不改变现有外部 RPC 契约、不削弱单线程 SQLite 事务一致性和安全不变量的前提下，如何将已经膨胀到 2,700+ 行的 `src/brain/agent.ts` 拆分为职责清晰、可独立单测、易于演进的内部模块，为后续功能（如 [task-continuation.zh-CN.md](task-continuation.zh-CN.md)）腾出干净的扩展面。
 
@@ -39,7 +40,7 @@
 
 1. **绝不破坏单线程 SQLite 同步事务模型**：不把一个 `BrainAgent` DO 拆成多个 DO，也不为每张表套一层异步 Repository 抽象。所有子模块共享同一个底层 `BrainStore`，随时可以在一次 `store.transactionSync(...)` 内原子修改多张表。
 2. **按“状态机子域”竖着切，不按 MVC / Service / DAO 横着切**：优先隔离高内聚的子域（版本管理、审批规则、挂起续办、任务管理、发件箱），让每个文件都有清晰的所有权和单一变更原因。
-3. **对齐项目已验证的纯函数模式**：延续 `src/brain/follow-up.ts` 的做法——把安全/决策规则抽成零 I/O、零 DB 依赖的纯函数，和副作用执行层分开。
+3. **对齐项目已验证的纯函数模式**：延续 `src/brain/follow-up.ts`（该文件已于 2026-11-23 删除）的做法——把安全/决策规则抽成零 I/O、零 DB 依赖的纯函数，和副作用执行层分开。
 4. **严格单向依赖（DAG），零循环引用**：底层底座 → 纯规则与基础子域 → 业务子域 → 执行引擎 → `BrainAgent` 薄壳编排。
 5. **外部契约 100% 兼容**：`BrainAgent` 的所有 public RPC 方法签名保持不变；现有测试依赖的导出（`readDecision`、`readTiedDecision`、`wantsStanding`、`messageText`）在 `src/brain/agent.ts` 中保持 re-export，保证重构期间无需大改测试。
 
@@ -55,7 +56,7 @@ src/brain/
 ├── store.ts            (~180 行)  SQLite 底座、meta/audit/log、统一类型化 Row 与 JSON 解析器
 ├── revisions.ts        (~200 行)  外部消息版本跟踪、standing/reconcile/refreshStanding
 ├── approval-rules.ts   (~220 行)  纯函数审批规则引擎（对齐 follow-up.ts）
-├── follow-up.ts        (已有)     纯函数追问重开规则引擎
+├── follow-up.ts        (已有)     纯函数追问重开规则引擎（2026-11-23 已删除）
 ├── notices.ts          (~90 行)   面向用户的系统文案收口（带参模板）与会话 locale 推断
 ├── outbox.ts           (~260 行)  可靠发件箱：入队、投递重试、对账、撤回清理
 ├── continuations.ts    (~480 行)  挂起等待（continuations）、回答重开（answers）与外发门禁（gate）

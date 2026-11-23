@@ -29,7 +29,7 @@ function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const woken: number[] = [];
   const appended: unknown[] = [];
-  const settings: { FOLLOW_UPS?: string } = { FOLLOW_UPS: "on" };
+  const settings: Record<string, string> = {};
   const host: RequestsHost & { acting: Acting | undefined } = {
     env: settings as unknown as Env,
     outside: new Set<string>(),
@@ -439,39 +439,15 @@ describe("requests that wait, by themselves", () => {
 });
 
 describe("what a run read under, by itself", () => {
-  const source: Source = { connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: "https://example.feishu.cn/docx/Doc1" }), call: "call_1", events: { said: [1], recent: [], bound: [1] }, fingerprint: "abc", identity: "docx:Doc1", condition: "cond_1", generation: 3 };
+  const source: Source = { connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: "https://example.feishu.cn/docx/Doc1" }), identity: "docx:Doc1", condition: "cond_1", generation: 3 };
   const guard: Guard = { connector: "feishu", condition: "cond_1", generation: 3 };
 
-  it("reads whether follow-ups are on from the deployment's setting each time it is asked", async () => {
-    await within(({ requests, host, settings }) => {
-      expect(requests.followUps()).toBe(true);
-      settings.FOLLOW_UPS = "off";
-      expect(requests.followUps()).toBe(false);
-      delete settings.FOLLOW_UPS;
-      expect(requests.followUps()).toBe(false);
-      settings.FOLLOW_UPS = "ON";
-      expect(requests.followUps()).toBe(false);
-      // The Brain's settings replaced as a whole, not only changed.
-      host.env = { FOLLOW_UPS: "on" } as unknown as Env;
-      expect(requests.followUps()).toBe(true);
-    });
-  });
-
-  it("notes only what a read was made under where nothing is kept for follow-ups, and the whole source where it is", async () => {
-    await within(({ store, requests, settings }) => {
-      const noted = (runId: string) => JSON.parse(store.meta(`sources:${runId}`) ?? "null") as unknown;
-      expect(noted("run_off")).toBeNull();
-      settings.FOLLOW_UPS = "off";
-      requests.noteSource("run_off", source);
-      // Not which document, not on whose message, not what it said.
-      expect(noted("run_off")).toEqual([guard]);
-      settings.FOLLOW_UPS = "on";
-      requests.noteSource("run_on", source);
-      requests.noteSource("run_on", { ...source, call: "call_2", identity: "docx:Doc2" });
-      expect(noted("run_on")).toEqual([source, { ...source, call: "call_2", identity: "docx:Doc2" }]);
-      // Either way, what the run stands under is the same.
-      expect(requests.guards("run_off")).toEqual([guard]);
-      expect(requests.guards("run_on")).toEqual([guard]);
+  it("notes which thing a read was of, and under what, and nothing of what it said", async () => {
+    await within(({ store, requests }) => {
+      requests.noteSource("run_1", source);
+      requests.noteSource("run_1", { ...source, identity: "docx:Doc2" });
+      expect(JSON.parse(store.meta("sources:run_1") ?? "null")).toEqual([source, { ...source, identity: "docx:Doc2" }]);
+      expect(requests.guards("run_1")).toEqual([guard]);
     });
   });
 
@@ -482,13 +458,19 @@ describe("what a run read under, by itself", () => {
       requests.noteSource("run_1", free);
       expect(requests.guards("run_1")).toEqual([]);
       requests.noteSource("run_1", source);
-      requests.noteSource("run_1", { ...source, call: "call_2" });
+      requests.noteSource("run_1", { ...source, identity: "docx:Doc2" });
       requests.noteSource("run_1", { ...source, generation: 4 });
-      // Read again to reopen a kept answer: also until that answer is no longer kept.
-      requests.noteSource("run_1", { ...source, until: 99 });
-      requests.noteSource("run_1", { ...source, until: 99 });
-      expect(requests.guards("run_1")).toEqual([guard, { ...guard, generation: 4 }, { ...guard, until: 99 }]);
+      expect(requests.guards("run_1")).toEqual([guard, { ...guard, generation: 4 }]);
       expect(requests.guards("run_other")).toEqual([]);
+    });
+  });
+
+  it("takes a read an earlier version noted for reopening a kept answer as no longer to be relied on, without asking anyone", async () => {
+    await within(async ({ store, requests }) => {
+      // Left by version 21 in a run that was paused part way: the answer was kept until a time.
+      store.setMeta("sources:run_old", JSON.stringify([{ ...source, until: 9e15 }]));
+      expect(requests.guards("run_old")).toEqual([{ ...guard, retired: true }]);
+      expect(await requests.over(requests.guards("run_old"))).toBe("it rested on an answer kept for follow-ups, which are retired");
     });
   });
 
@@ -518,21 +500,11 @@ describe("what a run read under, by itself", () => {
   });
 });
 
-describe("when requests and kept answers next need the Brain awake", () => {
+describe("when requests next need the Brain awake", () => {
   const NOW = 1_800_000_000_000;
-  const answer = (store: BrainStore, id: string, expires: number) =>
-    void store.sql.exec("INSERT INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) VALUES (?, ?, ?, ?, ?, 'feishu', '[]', '[]', 't', ?, ?)", id, SESSION, Number(id.replace(/\D/g, "")), `feishu:message:${id}`, TARGET, expires, NOW);
 
-  it("asks for nothing when nothing waits and nothing is kept", async () => {
+  it("asks for nothing when nothing waits", async () => {
     await within(({ requests }) => expect(requests.nextWakeAt(NOW)).toBeNull());
-  });
-
-  it("asks to be woken when the first kept answer runs out", async () => {
-    await within(({ requests, store }) => {
-      answer(store, "ans_2", NOW + 9_000);
-      answer(store, "ans_1", NOW + 4_000);
-      expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
-    });
   });
 
   it("asks to be woken at a waiting request's deadline, or at its next check if that comes first", async () => {
@@ -582,13 +554,6 @@ describe("when requests and kept answers next need the Brain awake", () => {
     });
   });
 
-  it("takes the earlier of the two", async () => {
-    await within(({ requests, request, store }) => {
-      request("a", { until: NOW + 60_000 });
-      answer(store, "ans_1", NOW + 4_000);
-      expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
-    });
-  });
 });
 
 describe("keeping a request that has to wait", () => {

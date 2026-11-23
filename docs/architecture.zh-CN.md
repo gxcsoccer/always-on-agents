@@ -15,7 +15,7 @@
 │ Brain（每个作用域一个 Durable Object）                │
 │ SQLite: inbox · sessions · items · memory · timers  │
 │         · tasks · outbox · runs · audit             │
-│         · continuations · answers                   │
+│         · continuations                             │
 │ alarm(): 触发定时器 → 投递发件箱 → 执行 run           │
 └───┬────────────────────────────────────┬───────────┘
     │ 派活 / 答复 / 取消                   │ 投递
@@ -43,7 +43,7 @@
 
 **对人只有一个出口。** 给人看的一切都经过发件箱，包括请他去完成请求所等的那件事的邀请。Brain 手里只有邀请的引用，从不持有它的内容：卡片和其中的链接由 connector 在发送的那一刻生成。绑定在某个请求上的消息，只有在这个请求仍然成立时才会发出，而且不会抢在这个人已经写下、还没被处理的消息前面。一次投递怎样收场，记为四种之一：已发送；从未交出（`void`）；被外部系统拒绝（`dead`）；可能已经送达但无法核实（`unverified`），这种情况下不会再发。在消息之外，connector 还可以在这个人自己的消息上表示“已收到”。
 
-**已送达的答复。** 一次 run 通过 connector 的工具读到的内容，以及它就此说的话，在 run 结束时会从对话记录里移除。运维打开追问功能之后（默认关闭），带着回执送达的答复，如果写它的 run 只读了一样东西、只说了一句话，会在 `answers` 表里单独保存 24 小时，连同它从读到的内容里逐字引用的句子。它只能通过一个工具取回：只给当初收到它的那个人，只在当初的那个对话里，而且要先以这个人的身份把来源重新读一遍，并确认读到的还是原来那样东西；然后模型会被告知保存下来的每个句子是没变、变了，还是无法核实。其中不属于判断的那些决定，是 `src/brain/follow-up.ts` 里的普通函数。这个人的话算不算追问，交给模型判断；可能指的是哪一条答复，由代码限定。
+**一次 run 读到的内容只留在这次 run 里。** 一次 run 从第一次使用 connector 的工具起，只能回复这个人，或者再读一次。它读到的内容，以及它就此说的话，在 run 结束时会从对话记录里移除，别处也不保存。以前有一种追问的做法：把答复单独保存一天，用一个工具重新取回。这种做法已经下线。取代它的设计见[追问看历史](design/follow-up-history.zh-CN.md)，还没有实现：agent 自己送达的回复留在对话历史里，只有新问题需要时才重读原文。
 
 ## 作用域和租户
 
@@ -103,7 +103,7 @@ worker 对自己的描述不可信：那只是容器里的一个进程在说话�
 | 收件箱、唤醒循环 | `src/brain/agent.ts` |
 | 一次 run：认领事件、调用模型、结束与重试 | `src/brain/runner.ts` |
 | Brain 的其他部分，各自一个文件，共用同一个数据库 | `src/brain/store.ts`（数据库）、`outbox.ts`、`tasks.ts`、`timers.ts`、`revisions.ts` |
-| 会等待的请求，以及可以追问的答复 | `src/brain/requests.ts`（Brain 的一部分，单独一个文件：同一个数据库、同一批事务），不需要判断的规则在 `src/brain/follow-up.ts`；`src/connectors/types.ts` 里的 `Waiting` 和 `holds` |
+| 会等待的请求 | `src/brain/requests.ts`（Brain 的一部分，单独一个文件：同一个数据库、同一批事务）；`src/connectors/types.ts` 里的 `Waiting` 和 `holds` |
 | 模型能做什么 | `src/brain/tools.ts`（告诉模型的）、`src/brain/run-tools.ts`（每个工具在一次 run 里做什么）、`src/brain/prompt.ts` |
 | 审批规则 | 判断本身和读消息的函数（`decidingReply`、`readDecision`）在 `src/brain/approval.ts`；判断前后的查询和动作在 `src/brain/tasks.ts` 的 `Tasks.answer`；可被修改的回复在 `src/brain/revisions.ts` |
 | 沙箱的边界 | `src/workers/sandbox/outbound.ts` |

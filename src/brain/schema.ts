@@ -219,6 +219,24 @@ export const MIGRATIONS: string[] = [
    );
    ALTER TABLE outbox ADD COLUMN source TEXT;
    ALTER TABLE outbox ADD COLUMN guard TEXT;`,
+  // 22: answers are no longer kept apart for follow-ups, and reopen_answer is gone (see
+  // docs/design/follow-up-history.zh-CN.md). What was under way on that footing is closed with
+  // what is true of it. A follow-up whose answer was being sent with no word back may have
+  // reached the person: it ends as unverified, and its answer is not sent again. Any other open
+  // follow-up ends as void, and its answer, not yet handed over, is not sent. A message tied to
+  // a reopened answer (its guard has `until`) is not sent either. A run still under way that
+  // reopened one is stopped by its guards (Requests.guards takes such a read as retired). The
+  // sources once copied onto queued messages are removed; nothing kept is turned into anything else.
+  `UPDATE continuations SET status = CASE WHEN status = 'answering' AND EXISTS (SELECT 1 FROM outbox o WHERE o.continuation = continuations.id AND o.started = 1 AND o.uncertain = 1 AND o.status IN ('pending', 'draft')) THEN 'unverified' ELSE 'void' END,
+       why = 'follow-ups on kept answers were retired', ended_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+     WHERE tool = 'reopen_answer' AND status IN ('waiting', 'resuming', 'answering');
+   UPDATE outbox SET status = CASE WHEN started = 1 AND uncertain = 1 THEN 'unverified' ELSE 'void' END, text = '', review = NULL, error = NULL, guard = NULL
+     WHERE status IN ('pending', 'draft')
+       AND (continuation IN (SELECT id FROM continuations WHERE tool = 'reopen_answer' AND why = 'follow-ups on kept answers were retired')
+            OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(outbox.guard) THEN outbox.guard ELSE '[]' END) WHERE json_extract(value, '$.until') IS NOT NULL));
+   UPDATE outbox SET source = NULL WHERE source IS NOT NULL;
+   DELETE FROM meta WHERE key LIKE 'quotes:%';
+   DROP TABLE answers;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
