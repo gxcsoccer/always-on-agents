@@ -324,7 +324,7 @@ describe("timers and memory", () => {
         answers: [...sql.exec("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'answers'")][0].n,
         quotes: [...sql.exec("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'quotes:%'")][0].n,
         requests: [...sql.exec("SELECT id, status, why FROM continuations ORDER BY id")],
-        sends: [...sql.exec("SELECT idem, status, text, source FROM outbox WHERE idem != 'msg:call_1' AND idem LIKE '%:%' AND target = '{}' ORDER BY idem")],
+        sends: [...sql.exec("SELECT idem, status, text, source, guard IS NOT NULL AS guarded FROM outbox WHERE idem != 'msg:call_1' AND idem LIKE '%:%' AND target = '{}' ORDER BY idem")],
       };
     });
     expect(after.answers).toBe(0);
@@ -337,13 +337,13 @@ describe("timers and memory", () => {
       { id: "reopen_waiting", status: "void", why: "follow-ups on kept answers were retired" },
     ]);
     expect(after.sends).toEqual([
-      { idem: "answer:reopen_answering", status: "void", text: "", source: null },
-      { idem: "answer:reopen_maybe_delivered", status: "unverified", text: "", source: null },
+      { idem: "answer:reopen_answering", status: "void", text: "", source: null, guarded: 0 },
+      { idem: "answer:reopen_maybe_delivered", status: "unverified", text: "", source: null, guarded: 0 },
       // An ordinary message keeps its words, its queue state and its grant guard; only the copied sources go.
-      { idem: "msg:ordinary", status: "pending", text: "words", source: null },
-      { idem: "msg:reopened", status: "void", text: "", source: null },
+      { idem: "msg:ordinary", status: "pending", text: "words", source: null, guarded: 1 },
+      { idem: "msg:reopened", status: "void", text: "", source: null, guarded: 0 },
       // Its sending was begun with no word back: it may have arrived, and is not sent again.
-      { idem: "msg:reopened_begun", status: "unverified", text: "", source: null },
+      { idem: "msg:reopened_begun", status: "unverified", text: "", source: null, guarded: 0 },
     ]);
   });
 

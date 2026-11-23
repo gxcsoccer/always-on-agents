@@ -14,7 +14,6 @@
     "GITHUB_WEBHOOK_SECRET": "test-webhook-secret",
     "GITHUB_TOKEN": "test-github-token",
     "PUBLIC_ORIGIN": "https://agent.test",
-    // Follow-ups are off unless switched on; the tests exercise them.
     "GRANTS_KEY": "test-grants-key-0123456789abcdef0123456789"
   },
   "durable_objects": {

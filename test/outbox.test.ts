@@ -539,6 +539,18 @@ describe("the outbox, by itself", () => {
     });
   });
 
+  it("leaves nothing that ties a message to what was read on a row that has ended, however it ended", async () => {
+    await within(async ({ outbox, row, store }) => {
+      for (const status of ["pending", "draft", "sent", "void", "dead", "unverified", "withdrawn"]) {
+        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, source, guard) VALUES (?, ?, 't', ?, ?, 0, '{}', '[]')", status, TARGET, status, Date.now() + 600_000);
+      }
+      await outbox.flush();
+      const tied = store.rows<{ idem: string }>("SELECT idem FROM outbox WHERE source IS NOT NULL OR guard IS NOT NULL ORDER BY id").map((each) => each.idem);
+      expect(tied).toEqual(["pending", "draft"]);
+      expect(row("pending").status).toBe("pending");
+    });
+  });
+
   describe("emptying what a run wrote", () => {
     it("removes the words of the run's private messages that will not be sent again, and of no others", async () => {
       await within(({ outbox, row, store }) => {

@@ -230,7 +230,7 @@ export const MIGRATIONS: string[] = [
   `UPDATE continuations SET status = CASE WHEN status = 'answering' AND EXISTS (SELECT 1 FROM outbox o WHERE o.continuation = continuations.id AND o.started = 1 AND o.uncertain = 1 AND o.status IN ('pending', 'draft')) THEN 'unverified' ELSE 'void' END,
        why = 'follow-ups on kept answers were retired', ended_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
      WHERE tool = 'reopen_answer' AND status IN ('waiting', 'resuming', 'answering');
-   UPDATE outbox SET status = CASE WHEN started = 1 AND uncertain = 1 THEN 'unverified' ELSE 'void' END, text = '', review = NULL
+   UPDATE outbox SET status = CASE WHEN started = 1 AND uncertain = 1 THEN 'unverified' ELSE 'void' END, text = '', review = NULL, error = NULL, guard = NULL
      WHERE status IN ('pending', 'draft')
        AND (continuation IN (SELECT id FROM continuations WHERE tool = 'reopen_answer' AND why = 'follow-ups on kept answers were retired')
             OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(outbox.guard) THEN outbox.guard ELSE '[]' END) WHERE json_extract(value, '$.until') IS NOT NULL));
