@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectorTool, ToolContext } from "../src/connectors";
 import type { Env } from "../src/env";
 import type { Acting, Continuation } from "../src/brain/requests";
-import { READ_OUTSIDE, RunTools, type RunToolsHost } from "../src/brain/run-tools";
+import { READ_OUTSIDE, RunTools, type RunToolsHost, eligibleSource } from "../src/brain/run-tools";
 import { BrainStore, type RunRow } from "../src/brain/store";
 import { Timers } from "../src/brain/timers";
 import type { ToolHost } from "../src/brain/tools";
@@ -469,5 +469,21 @@ describe("a run's tools", () => {
         });
       });
     });
+  });
+});
+
+describe("the one thing an answer was written from that the person can still point at", () => {
+  const read = (token: string) => ({ connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: token }), identity: `docx:${token}` });
+  const tool = { name: "feishu_read_document", links: (message: { text: string }, request: Record<string, unknown>) => message.text.includes(String(request.document)) } as unknown as ConnectorTool;
+  const acting = (...texts: string[]) => ({ connector: "feishu", person: "p", origin: {}, said: [], recent: texts.map((text) => ({ text, data: {} })), recentIds: [] }) as unknown as Acting;
+
+  it("is that one, when the answer rested on one thing and the person linked it", () => {
+    expect(eligibleSource([read("A"), read("A")], acting("see A"), () => [tool])?.identity).toBe("docx:A");
+    expect(eligibleSource([read("A")], acting("see B"), () => [tool])).toBeUndefined();
+    expect(eligibleSource([], acting("see A"), () => [tool])).toBeUndefined();
+  });
+
+  it("is none for an answer that rested on several, even when only one of them is still in reach", () => {
+    expect(eligibleSource([read("A"), read("B")], acting("see B"), () => [tool])).toBeUndefined();
   });
 });

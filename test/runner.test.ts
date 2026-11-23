@@ -138,6 +138,20 @@ function bench(state: DurableObjectState) {
 
 describe("the run loop, by itself", () => {
   describe("claiming", () => {
+    it("takes into one run only messages that reply to the same thing, leaving the next one pending", async () => {
+      await within(async ({ runner, event, inbox }) => {
+        const reply = (to: string | undefined) => ({ data: { direct: true, origin: ORIGIN, ...(to ? { replies_to: to } : {}) } });
+        const a1 = event("A 那份收到了", reply("feishu:message:om_bot_a"));
+        const a2 = event("谢谢", reply("feishu:message:om_bot_a"));
+        const b = event("请读我这条里 B 的标题", reply("feishu:message:om_mine_b"));
+        const plain = event("还有一件事", reply(undefined));
+        const first = (await runner.next())!;
+        expect(inbox().filter((each) => each.run_id === first).map((each) => each.id)).toEqual([a1, a2]);
+        expect(inbox().find((each) => each.id === b)?.status).toBe("pending");
+        expect(inbox().find((each) => each.id === plain)?.status).toBe("pending");
+      });
+    });
+
     it("takes the oldest conversation's pending events as one run, with a user turn that says who said what", async () => {
       await within(async ({ runner, store, event, inbox, items, run }) => {
         const first = event("hello");
@@ -608,6 +622,22 @@ describe("the run loop, by itself", () => {
         await b.go();
         expect(JSON.stringify(b.asked.at(-1)!.input)).not.toContain("_reads");
       });
+    });
+
+    it("does not work out whom a run acts for once per earlier turn when putting the transcript together", async () => {
+      const lookups = async (turns: number) =>
+        within(async (b) => {
+          b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', ?, 1, 1)", PRIVATE);
+          for (let i = 0; i < turns; i++) {
+            b.runner.append("s0", "old", { role: "user", content: `turn ${i}` });
+            b.runner.append("s0", "old", { role: "assistant", content: `answer ${i}` });
+          }
+          const actingFor = vi.spyOn(b.runner, "actingFor");
+          b.event("and now?");
+          await b.go();
+          return actingFor.mock.calls.length;
+        });
+      expect(await lookups(40)).toBe(await lookups(1));
     });
 
     it("counts the window by the items there are, not by the places scrubbed items left", async () => {

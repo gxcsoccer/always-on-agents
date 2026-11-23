@@ -219,16 +219,19 @@ export class RunTools {
 type Read = { connector: string; tool: string; args: string; identity: string };
 
 /**
- * Of the things an answer was written from, the one the person can still point at: linked by
- * them in the messages the run acts on or in their own earlier messages here (as the tool that
- * read it judges), if exactly one is. None for an answer written from nothing read, from
- * several, or from one they linked too long ago.
+ * The one thing an answer was written from, if it was written from exactly one, and the person
+ * can still point at it: linked by them in the messages the run acts on or in their own earlier
+ * messages here (as the tool that read it judges). None for an answer written from nothing read,
+ * from several (even if only one of them is still in reach), or from one they linked too long ago.
  */
 export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[]): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
   if (!acting) return undefined;
   const own = [...acting.said, ...acting.recent];
   const tools = toolsOf(acting.connector);
-  const distinct = [...new Map(reads.filter((each) => each.connector === acting.connector).map((each) => [each.identity, each])).values()];
+  // An answer written from several things rests on all of them: none of them alone is its source,
+  // whichever of them the person can still point at.
+  const distinct = [...new Map(reads.map((each) => [`${each.connector}\u0000${each.identity}`, each])).values()];
+  if (distinct.length !== 1 || distinct[0].connector !== acting.connector) return undefined;
   const eligible = distinct.flatMap((each) => {
     const tool = tools.find((candidate) => candidate.name === each.tool);
     let request: Record<string, unknown>;

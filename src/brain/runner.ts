@@ -102,6 +102,9 @@ export class Runner {
       for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind != 'request.ready' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
         bytes += (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
         if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
+        // A message that replies to something other than what the ones before it reply to is about
+        // something else: it starts a run of its own, in order, so each is read under its own binding.
+        if (events.length > 0 && repliesTo(event) !== repliesTo(events.at(-1)!)) break;
         events.push(event);
         this.#s.sql.exec("UPDATE inbox SET status = 'claimed', run_id = ? WHERE id = ?", runId, event.id);
       }
@@ -537,17 +540,17 @@ export class Runner {
     // What is kept beside an item for the system's own use (names starting with "_") is never shown.
     const shown = (item: Record<string, unknown>) => Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith("_"))) as Item;
     const entries: { item: Item; starts: boolean }[] = [];
-    let acting: ReturnType<Runner["actingFor"]> | null | undefined;
+    // Who the run acts for, worked out once and only if some answer is quoted: what they can still
+    // point at decides what an answer is shown as written from.
+    const acting = quotedOf.size > 0 && runId ? this.actingFor(runId) : undefined;
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
         const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
-        // Who the run acts for, once: what they can still point at decides what an answer is shown as written from.
-        acting ??= runId ? (this.actingFor(runId) ?? null) : null;
         quoted.forEach((each, at) => {
           // What it was written from, by the tool's canonical call, where that is the one thing the
           // person can still point at: what they are asking about, even once that turn is out of sight.
-          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting ?? undefined, this.#b.toolsOf);
+          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf);
           const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
           entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
         });
@@ -631,6 +634,12 @@ export class Runner {
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/** What a message replies to, if anything. */
+function repliesTo(event: InboxRow): string | null {
+  const to = event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
+  return typeof to === "string" ? to : null;
 }
 
 /** The strings in what some reads were made with (their canonical calls): what a person or a model can recognise them by. */
