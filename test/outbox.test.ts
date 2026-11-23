@@ -470,7 +470,38 @@ describe("the outbox, by itself", () => {
     });
   });
 
+  it("keeps the time of a message's first attempt through every retry: the channel's horizon for repeats is counted from it", async () => {
+    await within(async ({ outbox, row, set, channel }) => {
+      const first = Date.now() - 59 * 60_000;
+      outbox.enqueue("m1", SESSION, null, "one");
+      set("m1", { uncertain: 1, started: 1, first_attempt_at: first });
+      channel.m1 = fails(new Error("timeout"));
+      await outbox.flush();
+      expect(row("m1")).toMatchObject({ status: "pending", attempts: 1, first_attempt_at: first });
+    });
+  });
+
   describe("an approval question that was closed", () => {
+    it("holds the queue for the rest of the wake-up when it was closed while an attempt that failed was on its way, and leaves it at the next", async () => {
+      await within(async ({ outbox, row, set, channel, sent }) => {
+        outbox.enqueue("q", SESSION, null, "may I?", { code: "A1" } as never);
+        outbox.enqueue("m2", SESSION, null, "next");
+        // Answered elsewhere while the channel is being waited on; then the channel is not heard from.
+        channel.q = () => {
+          set("q", { closed: '{"how":"answered"}' });
+          throw new Error("timeout");
+        };
+        await outbox.flush();
+        expect(sent()).toEqual(["q"]);
+        expect([row("q").status, row("m2").status]).toEqual(["pending", "pending"]);
+        // The next wake-up takes it out of the queue, lets the message behind it through, and
+        // does not look for the question before its back-off is over.
+        await outbox.flush();
+        expect(sent()).toEqual(["q", "m2"]);
+        expect(row("q")).toMatchObject({ status: "reconciling", attempts: 1 });
+      });
+    });
+
     it("is not sent at all if no attempt was ever begun, whatever back-off it is in", async () => {
       await within(async ({ outbox, row, set, sent }) => {
         outbox.enqueue("q", SESSION, null, "may I?", { code: "A1" } as never);
