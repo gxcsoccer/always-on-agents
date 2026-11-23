@@ -19,7 +19,7 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import { API, hex, tenantAccessToken } from "./feishu-api";
+import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
 import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
@@ -77,7 +77,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -406,21 +406,40 @@ function quiet(text: string): string {
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */
-export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean> {
+export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<string | undefined> {
   const messageId = typeof event.data?.message_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(event.data.message_id) ? event.data.message_id : undefined;
   const appId = event.reply_to?.address.app_id;
   // Only a message a person wrote: a button press has no message of theirs to mark.
-  if (!messageId || !appId || event.data?.card !== undefined) return false;
+  if (!messageId || !appId || event.data?.card !== undefined) return undefined;
   const token = await tenantAccessToken(env, appId);
   // Too late to mean "it has arrived": nothing is posted.
-  if (!event.wanted()) return false;
+  if (!event.wanted()) return undefined;
   const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ reaction_type: { emoji_type: "Get" } }),
   });
+  const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { reaction_id?: unknown } };
+  // Which reaction it is, to take it off again: without that it cannot be.
+  const id = result.data?.reaction_id;
+  return response.ok && result.code === 0 && typeof id === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(id) ? id : undefined;
+}
+
+/** Takes the "got it" reaction off the person's message again, once it has been dealt with. Only the app that put it on can. */
+export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }, mark: string): Promise<"removed" | "retry" | "permanent"> {
+  const messageId = typeof event.data?.message_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(event.data.message_id) ? event.data.message_id : undefined;
+  const appId = event.reply_to?.address.app_id;
+  if (!messageId || !appId || !/^[A-Za-z0-9_-]{1,200}$/.test(mark)) return "permanent";
+  const token = await tenantAccessToken(env, appId);
+  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(mark)}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
   const result = (await response.json().catch(() => ({}))) as { code?: number };
-  return response.ok && result.code === 0;
+  // Off; or the message itself is gone (230110), and the reaction with it.
+  if ((response.ok && result.code === 0) || result.code === 230110) return "removed";
+  // Busy, limited, an earlier attempt still in progress (231015), the app's token just lapsed, or no answer: it may be taken off later. Anything else Feishu refused.
+  // A token Feishu says has lapsed is forgotten (unless renewed meanwhile), so the next try asks for a fresh one.
+  if (result.code === 99991663) await forgetTenantAccessToken(env, appId, token);
+  const later = response.status === 429 || response.status >= 500 || result.code === undefined || [231015, 99991400, 99991663].includes(result.code);
+  return later ? "retry" : "permanent";
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

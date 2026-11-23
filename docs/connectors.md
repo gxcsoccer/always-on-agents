@@ -97,7 +97,7 @@ The agent is a bot in direct chats and group chats. A direct chat is one scope p
 
 Approval questions are sent as a card with buttons. See [Approvals](approvals.md).
 
-As soon as a message addressed to the agent is stored, the bot puts a "Get" reaction on it, so the person can see it arrived. It is a sign and not a message: if it fails, nothing else changes, and it is left out when it would come too late to mean anything (the message has already been dealt with, or 15 seconds have passed).
+As soon as a message addressed to the agent is stored, the bot puts a "Get" reaction on it, so the person can see it arrived. It is a sign and not a message: if it fails, nothing else changes, and it is left out when it would come too late to mean anything (the message has already been dealt with, or 15 seconds have passed). It means "being handled": once the message has been dealt with (answered, or nothing to say, or handed on to an authorisation card), the reaction is taken off again. If Feishu is busy it is tried again a few times; reactions put on before this was in place stay.
 
 ### Register the app
 
@@ -236,7 +236,8 @@ Each part is optional and independent. A connector that only reports events (a C
 | `channel.deliver` | Send one message. Throw if it was not delivered. It will be retried, so use the message's `idem` key to avoid sending twice. Return a `Receipt` that names the message it became where the system can say; throw the specific errors below where they apply. |
 | `channel.amend` | Optional. Show a delivered approval question as closed. |
 | `channel.standing` | Required if people can edit or delete what they said in that system. See below. |
-| `channel.received` | Optional. Show the person, on the message they wrote, that it has arrived (a reaction, say). Called once per message a person addressed to the agent, as soon as it is stored. It must never add a message to the conversation. Call `event.wanted()` last of all, just before posting, and post nothing if it says no: the sign would come too late to mean anything. Resolve to `true` only if the outside system confirmed the sign, `false` if there was nothing to mark or it was skipped. Nothing waits for it, and if it throws nothing else changes. |
+| `channel.received` | Optional. Show the person, on the message they wrote, that it has arrived (a reaction, say). Called once per message a person addressed to the agent, as soon as it is stored. It must never add a message to the conversation. Call `event.wanted()` last of all, just before posting, and post nothing if it says no: the sign would come too late to mean anything. Resolve to an opaque mark (the reaction's id, say) only if the outside system confirmed the sign, `undefined` if there was nothing to mark or it was skipped. Nothing waits for it, and if it throws nothing else changes. |
+| `channel.unreceived` | Optional. Take a mark `received` put on off again, once the message has been dealt with. Resolve to `"removed"` (also if it was already gone), `"retry"` when the outside system could not say, or `"permanent"` when it will not come off. The Brain keeps the mark until then and asks again later on `"retry"`. |
 | `channel.dedupeMs` | Optional. For how long the outside system drops a repeat of the same `idem` (one hour for Feishu). See below. |
 | `holds` | Required if a tool of this connector can answer with a `Waiting`. See [A tool that has to wait](#a-tool-that-has-to-wait). |
 

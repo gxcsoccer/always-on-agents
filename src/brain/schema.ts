@@ -259,6 +259,12 @@ export const MIGRATIONS: string[] = [
   // sends the very same thing under the same idempotency key. A row whose sending began before
   // this existed was sent with the earlier encoding (0).
   `ALTER TABLE outbox ADD COLUMN wire INTEGER;`,
+  // 25: the mark a channel put on a person's message to say it arrived (a reaction's id, say),
+  // kept until it has been taken off again once the message was dealt with, and when to try that next.
+  `ALTER TABLE inbox ADD COLUMN mark TEXT;
+   ALTER TABLE inbox ADD COLUMN mark_attempts INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE inbox ADD COLUMN mark_next_at INTEGER;
+   CREATE INDEX inbox_mark ON inbox (status, mark_next_at) WHERE mark IS NOT NULL;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -18,6 +18,11 @@ export const TOKEN_V3 = "https://accounts.feishu.cn/oauth/v3/token";
  */
 export const TOKEN_V2 = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
 
+/** Forgets a tenant_access_token Feishu no longer takes, so that the next one asked for is fresh. A newer one is kept. */
+export async function forgetTenantAccessToken(env: Env, appId: string, token: string): Promise<void> {
+  await registry(env).forgetFeishuToken(appId, token);
+}
+
 /** The app's tenant_access_token, cached in the registry until shortly before it expires. */
 export async function tenantAccessToken(env: Env, appId: string): Promise<string> {
   const app = await registry(env).feishuApp(appId);
