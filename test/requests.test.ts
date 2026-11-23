@@ -184,61 +184,68 @@ describe("requests that wait, by themselves", () => {
     });
   });
 
-  it("asks once more about a wait whose time is up or whose next look is due, and about no other", async () => {
+  it("asks once about a passed deadline and once about each re-ask whose time has come, and about no other", async () => {
     await within(({ requests, request, kept, hints }) => {
       const now = 5_000_000_000;
-      const minute = Math.floor(now / 60_000);
       request("r_until", { until: now });
-      // Past its deadline and already looked at; its owner is to be asked again soon: left to that.
-      request("r_retry", { until: now - 30_000, check_at: now + 9 });
       request("r_check", { until: now + 10_000, check_at: now });
       request("r_later", { until: now + 1, check_at: now + 1 });
       request("r_plain", { until: now + 1 });
       request("r_ended", { until: now - 1, check_at: now - 1, status: "expired" });
       request("r_resuming", { until: now - 1, status: "resuming" });
       requests.deadlines(now);
-      expect(hints()).toEqual([`r_until:due:${minute}`, `r_check:due:${minute}`]);
+      expect(hints()).toEqual([`r_until:deadline:${now}:cond_1:1`, `r_check:check:${now}`]);
       expect(kept("r_until").check_at).toBeNull();
       expect(kept("r_check").check_at).toBeNull();
-      expect(kept("r_retry").check_at).toBe(now + 9);
       expect(kept("r_later").check_at).toBe(now + 1);
       expect(kept("r_ended").check_at).toBe(now - 1);
       // It only gave a reason to ask: nothing has ended.
       expect(kept("r_until").status).toBe("waiting");
-      // Again within the same minute: the same reason, kept once.
+      // Looked at again: each reason is kept once.
+      requests.deadlines(now);
       requests.deadlines(now + 1);
-      expect(hints()).toEqual([`r_until:due:${minute}`, `r_check:due:${minute}`, `r_later:due:${minute}`, `r_plain:due:${minute}`]);
+      expect(hints()).toEqual([
+        `r_until:deadline:${now}:cond_1:1`,
+        `r_check:check:${now}`,
+        `r_later:check:${now + 1}`,
+        `r_later:deadline:${now + 1}:cond_1:1`,
+        `r_plain:deadline:${now + 1}:cond_1:1`,
+      ]);
       expect(kept("r_later").check_at).toBeNull();
     });
   });
 
   it("keeps a wait's scheduled re-ask when another wait wakes the Brain first", async () => {
-    await within(({ requests, request, hints }) => {
+    await within(({ store, requests, request, hints }) => {
       const now = 5_000_000_000;
-      // A's deadline has passed and was looked at; its owner could not be asked, so it is asked
-      // again at the next minute's :05. B's next look comes first.
-      request("a", { until: now - 20_000, check_at: now + 40_000 });
+      // A's deadline passed and was looked at; its owner could not be asked, so it is asked again later.
+      request("a", { until: now - 20_000 });
+      requests.deadlines(now - 20_000);
+      store.sql.exec("UPDATE continuations SET check_at = ? WHERE id = 'a'", now + 40_000);
       request("b", { until: now + 90_000, check_at: now });
       requests.deadlines(now);
-      expect(hints()).toEqual([`b:due:${Math.floor(now / 60_000)}`]);
+      expect(hints()).toEqual([`a:deadline:${now - 20_000}:cond_1:1`, `b:check:${now}`]);
       expect(requests.nextWakeAt(now)).toBe(now + 40_000);
       requests.deadlines(now + 40_000);
-      expect(hints()).toContain(`a:due:${Math.floor((now + 40_000) / 60_000)}`);
+      expect(hints()).toContain(`a:check:${now + 40_000}`);
     });
   });
 
-  it("asks again about a wait whose owner could not be asked in a minute, but no later than its deadline", async () => {
-    await within(async ({ requests, request, kept }) => {
+  it("still looks at the deadline when a re-ask just before it used its minute, or was set beyond it", async () => {
+    await within(async ({ requests, request, kept, hints }) => {
       const now = 5_000_000_000;
-      vi.spyOn(Date, "now").mockReturnValue(now);
-      // No connector of that name can say whether anything holds: asking fails.
-      request("soon", { connector: "unknown", until: now + 20_000 });
-      request("later", { connector: "unknown", until: now + 600_000 });
-      request("past", { connector: "unknown", until: now - 1_000 });
-      for (const id of ["soon", "later", "past"]) await requests.resume({ id: 0, data: JSON.stringify({ request: id }) } as InboxRow);
-      expect(kept("soon").check_at).toBe(now + 20_000);
-      expect(kept("later").check_at).toBe(now + 60_000);
-      expect(kept("past").check_at).toBe(now + 60_000);
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      // Its scheduled re-ask comes 20 s before its deadline; no connector of that name can say
+      // whether anything holds, so asking fails and it is put off a minute, past the deadline.
+      request("r", { connector: "unknown", until: now + 20_000, check_at: now });
+      requests.deadlines(now);
+      await requests.resume({ id: 0, data: JSON.stringify({ request: "r" }) } as InboxRow);
+      expect(kept("r").check_at).toBe(now + 60_000);
+      expect(requests.nextWakeAt(now)).toBe(now + 20_000);
+      clock.mockReturnValue(now + 20_000);
+      requests.deadlines(now + 20_000);
+      expect(hints()).toEqual([`r:check:${now}`, `r:deadline:${now + 20_000}:cond_1:1`]);
+      expect(kept("r").check_at).toBe(now + 60_000);
     });
   });
 
