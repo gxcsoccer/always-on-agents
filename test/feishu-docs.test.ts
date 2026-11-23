@@ -159,8 +159,8 @@ function installFakeFeishu() {
     // "Got it" on a message the person wrote. Nothing is said, and no document is asked for.
     const unreacting = url.host === "open.feishu.cn" && init?.method === "DELETE" ? /\/im\/v1\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname) : undefined;
     if (unreacting) {
-      if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
       feishu.unreactAttempts.push({ message: unreacting[1], reaction: unreacting[2] });
+      if (bearer !== "t-app") return Response.json({ code: 99991663, msg: "invalid access token" }, { status: 400 });
       if (feishu.failUnreacts > 0) return (feishu.failUnreacts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
       const answer = feishu.unreactAnswers.shift();
       if (answer) return Response.json({ code: answer.code, msg: "not now" }, { status: answer.status });
@@ -2658,6 +2658,21 @@ describe("a sign that a message arrived", () => {
     await wake(sid.stub);
     expect(feishu.unreactAttempts).toHaveLength(4);
     expect(await rowsOf(sid.stub, "SELECT mark FROM inbox WHERE mark IS NOT NULL")).toEqual([]);
+  });
+
+  it("is taken off with a fresh app token when Feishu says the one it had has lapsed", async () => {
+    const tom = someone();
+    await tom.sends("你好");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(1));
+    // The token kept for the app still looks good for two hours, but Feishu no longer takes it.
+    await (env as any).REGISTRY.getByName("global").saveFeishuToken(APP_ID, "t-lapsed", Date.now() + 2 * 3_600_000);
+    model.replies([say("")]);
+    await tom.quiet();
+    await rowsOf(tom.stub, "UPDATE inbox SET mark_next_at = 0 WHERE mark IS NOT NULL");
+    await wake(tom.stub);
+    const one = { message: `om_${tom.openId}_1`, reaction: "ZCaCIjUBVVWSrm5L-3ZTw1" };
+    expect(feishu.unreacted).toEqual([one]);
+    expect(feishu.unreactAttempts).toEqual([one, one]);
   });
 
   it("is not counted as shown when Feishu answers with an error inside a success", async () => {

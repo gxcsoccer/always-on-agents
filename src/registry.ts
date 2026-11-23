@@ -191,6 +191,11 @@ export class Registry extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<{ app_id: string }>("SELECT app_id FROM feishu_apps WHERE transport = 'long_connection'").toArray().map((row) => row.app_id);
   }
 
+  /** Forgets the app's token, but only if it is still this one: one renewed meanwhile is kept. */
+  async forgetFeishuToken(appId: string, token: string): Promise<void> {
+    this.ctx.storage.sql.exec("UPDATE feishu_apps SET token = NULL, token_expires_at = NULL WHERE app_id = ? AND token = ?", appId, token);
+  }
+
   async saveFeishuToken(appId: string, token: string, expiresAt: number): Promise<void> {
     this.ctx.storage.sql.exec("UPDATE feishu_apps SET token = ?, token_expires_at = ? WHERE app_id = ?", token, expiresAt, appId);
   }

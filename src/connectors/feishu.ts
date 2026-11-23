@@ -19,7 +19,7 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import { API, hex, tenantAccessToken } from "./feishu-api";
+import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
 import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
@@ -436,6 +436,8 @@ export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: 
   // Off; or the message itself is gone (230110), and the reaction with it.
   if ((response.ok && result.code === 0) || result.code === 230110) return "removed";
   // Busy, limited, an earlier attempt still in progress (231015), the app's token just lapsed, or no answer: it may be taken off later. Anything else Feishu refused.
+  // A token Feishu says has lapsed is forgotten (unless renewed meanwhile), so the next try asks for a fresh one.
+  if (result.code === 99991663) await forgetTenantAccessToken(env, appId, token);
   const later = response.status === 429 || response.status >= 500 || result.code === undefined || [231015, 99991400, 99991663].includes(result.code);
   return later ? "retry" : "permanent";
 }
