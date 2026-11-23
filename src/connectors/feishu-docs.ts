@@ -150,15 +150,18 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // the person's own that do, those are the documents meant, not whatever they linked last. The
   // person points at it afresh each time, so nothing is used up.
   const repliedTo = context.said.map((message) => message.data.replies_to).filter((each): each is string => typeof each === "string");
-  const pointedAt = now.length > 0 || repliedTo.length === 0 ? [] : context.recent.filter((message) => typeof message.data.message_id === "string" && repliedTo.includes(`feishu:message:${message.data.message_id}`) && documents(message).length > 0);
-  if (pointedAt.length > 0) {
-    chosen = pointedAt.flatMap(documents);
-    for (const each of pointedAt) context.relied?.("recent", context.recent.indexOf(each));
+  if (now.length === 0 && repliedTo.length > 0) {
+    // Every message they replied to has to be one of their own, on record, and together they
+    // have to name one document. Anything less does not say which document is meant, and what
+    // they linked last is not read in its place.
+    const parents = [...new Set(repliedTo)].map((subject) => context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`));
+    const named = parents.flatMap((message) => (message ? documents(message) : []));
+    const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
+    if (parents.some((message) => !message || documents(message).length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
+    if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
+    chosen = distinct;
+    for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
     if (context.said.length === 1) context.relied?.("said", 0);
-  } else if (now.length === 0 && repliedTo.length > 0) {
-    // They pointed at something, and it is not a message of theirs that links a document. What
-    // they linked last is then not what they pointed at, and is not read in its place.
-    return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
   } else if (now.length === 0) {
     const last = [...context.recent].reverse().find((message) => documents(message).length > 0);
     const id = typeof last?.data.message_id === "string" ? last.data.message_id : "";
@@ -258,7 +261,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // "almost empty" is not mistaken for "could not be opened". Failing to learn it changes nothing.
   let unread: { holds: string[]; note: string } | undefined;
   if (String(raw.data?.content ?? "").length < SPARSE_TEXT) {
-    const blocks = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/blocks?page_size=500`);
+    // Optional: if Feishu cannot be reached for this, the text read stands as it is.
+    const blocks = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/blocks?page_size=500`).catch(() => ({ status: 0, code: undefined, data: undefined, gone: false }));
     if (blocks.gone) return superseded;
     if (blocks.status === 200 && blocks.code === 0 && Array.isArray(blocks.data?.items)) {
       const counts = new Map<string, number>();
@@ -287,7 +291,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   return {
     text: text.slice(0, MAX_DOCUMENT_TEXT),
     ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}),
-    ...(unread ? { ...(unread.holds.length > 0 ? { not_read: unread.holds } : {}), not_read_note: unread.note } : {}),
+    // Said about the document, not read from it: kept apart (see ToolResultAside).
+    ...(unread ? { aside: { ...(unread.holds.length > 0 ? { not_read: unread.holds } : {}), note: unread.note } } : {}),
   };
 }
 

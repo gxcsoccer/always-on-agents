@@ -139,6 +139,17 @@ interface InboxRow {
 
 type Said = { text: string; data: Record<string, unknown> };
 /** One thing a run read for the person: which tool, with what, on which of their messages, and what it said (as a fingerprint). */
+/** A delivered answer kept for follow-ups: see the `answers` table. */
+interface AnswerRow {
+  id: string;
+  session_id: string;
+  sources: string;
+  created_at: number;
+  expires_at: number;
+  subject: string;
+  outbox_id: number;
+  target: string;
+}
 interface Source {
   connector: string;
   tool: string;
@@ -163,7 +174,10 @@ function textsIn(value: unknown): string[] {
   return typeof value === "object" && value !== null ? Object.values(value).flatMap(textsIn) : [];
 }
 async function fingerprint(value: unknown): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value))));
+  // What a tool says about the thing, as against what it read from it, is left out: whether a
+  // look-up of that kind worked this time says nothing about whether the thing has changed.
+  const read = typeof value === "object" && value !== null && !Array.isArray(value) && "aside" in value ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== "aside")) : value;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(read))));
   return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 /** How far back a person's earlier messages still count as part of what they are asking now. */
@@ -456,12 +470,26 @@ export class BrainAgent extends DurableObject<Env> {
    * message of the same person's in this conversation is quoted (their own words, as stored);
    * one of the agent's is only named by when it was sent, since what it said may not be kept.
    */
+  /** The stored message another was written in reply to: the very one, earlier, in the same conversation and through the same connector. */
+  #parentOf(event: InboxRow, subject: string): InboxRow | undefined {
+    const prefix = `${event.source}:message:`;
+    if (!subject.startsWith(prefix)) return undefined;
+    return this.#rows<InboxRow>("SELECT * FROM inbox WHERE source = ? AND source_id = ? AND kind = 'message' AND session_key = ? AND id < ?", event.source, subject.slice(prefix.length), event.session_key, event.id)[0];
+  }
+
   #repliedTo(event: InboxRow): string {
     const subject = event.kind === "message" && event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
     if (typeof subject !== "string") return "";
-    const theirs = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND id < ? AND principal = ? ORDER BY id DESC LIMIT 200", event.session_key, event.id, event.principal).find((each) => subjectsOfEvent(each).includes(subject));
-    if (theirs) return `\n  (written as a reply to their own earlier message: ${JSON.stringify((theirs.text ?? "").slice(0, 500))})`;
-    const yours = this.#rows<{ sent_at: number | null }>("SELECT sent_at FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject)[0];
+    const parent = this.#parentOf(event, subject);
+    const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
+    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))})`;
+    // One of the agent's own, sent in this conversation.
+    const yours = this.#rows<{ sent_at: number | null }>(
+      "SELECT o.sent_at FROM outbox o WHERE json_extract(o.receipt, '$.subject') = ? AND (o.run_id IN (SELECT r.id FROM runs r JOIN sessions s ON s.id = r.session_id WHERE s.session_key = ?) OR o.continuation IN (SELECT c.id FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE s.session_key = ?)) LIMIT 1",
+      subject,
+      event.session_key,
+      event.session_key,
+    )[0];
     return yours?.sent_at ? `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})` : "";
   }
 
@@ -770,7 +798,7 @@ export class BrainAgent extends DurableObject<Env> {
       // they wrote it: their own, by the same test, in this conversation.
       const pointed = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
       if (pointed.length > 0) {
-        const older = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND id < ? ORDER BY id DESC LIMIT 500", conversation, source, first.id).filter((each) => own(each) && each.text !== null && subjectsOfEvent(each).some((subject) => pointed.includes(subject)) && !recent.some((seen) => seen.id === each.id));
+        const older = [...new Set(pointed)].flatMap((subject) => this.#parentOf(first, subject) ?? []).filter((each, index, all) => own(each) && each.text !== null && all.findIndex((other) => other.id === each.id) === index && !recent.some((seen) => seen.id === each.id));
         recent = [...older, ...recent].sort((a, b) => a.id - b.id);
       }
     }
@@ -1679,28 +1707,44 @@ export class BrainAgent extends DurableObject<Env> {
    */
   #subjectsOf(answer: { subject: string; sources: string }): string[] {
     // Only the messages the tool tied the read to: the whole batch that started the run says nothing about which of them asked for this.
-    const ids = (JSON.parse(answer.sources) as Source[]).flatMap((source) => source.events.bound ?? []);
+    let ids: number[] = [];
+    try {
+      ids = (JSON.parse(answer.sources) as Partial<Source>[]).flatMap((source) => (Array.isArray(source.events?.bound) ? source.events.bound : []));
+    } catch {
+      // A record that is not whole has no messages tied to it.
+    }
     const asked = ids.length === 0 ? [] : this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids);
     return [answer.subject, ...asked.flatMap((each) => subjectsOfEvent(each))];
   }
 
-  #reopenable(runId: string): { id: string; asked: string; at: number }[] {
-    if (!this.#followUps() || this.#continuationOf(runId) || !this.#actingFor(runId)) return [];
-    const sessionId = this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "";
-    const repliedTo = this.#basis(runId).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
-    const kept = this.#rows<{ id: string; sources: string; created_at: number; subject: string; outbox_id: number; target: string }>("SELECT * FROM answers WHERE session_id = ? AND expires_at > ? ORDER BY created_at DESC", sessionId, Date.now());
-    // An answer whose record is not whole is not offered.
-    const complete = (each: { sources: string }) => {
+  /**
+   * Which kept answers of a conversation a run could mean, worked out in one place for both
+   * what is offered and what is then allowed. Records that are not whole are left out one by
+   * one. `fits`: those the messages replied to belong to. `named`: the one a reply names (the
+   * answer's own message names it exactly; a message of the person's that exactly one answer was
+   * read for names that one; two, neither). `last`: the one that is the last thing said here.
+   */
+  #eligible(sessionId: string, repliedTo: string[]): { fits: AnswerRow[]; named?: AnswerRow; last?: AnswerRow } {
+    const whole = (each: AnswerRow) => {
       try {
         return (JSON.parse(each.sources) as Source[]).every((source) => Array.isArray(source.events?.said) && typeof source.identity === "string");
       } catch {
         return false;
       }
     };
-    const fits = repliedTo.length > 0 ? kept.filter(complete).filter((each) => repliedTo.every((subject) => this.#subjectsOf(each).includes(subject))) : [];
-    // A reply to the answer's own message names it. A reply to a message two answers were read for names neither.
+    const kept = this.#rows<AnswerRow>("SELECT * FROM answers WHERE session_id = ? AND expires_at > ? ORDER BY created_at DESC", sessionId, Date.now()).filter(whole);
+    const fits = repliedTo.length > 0 ? kept.filter((each) => repliedTo.every((subject) => this.#subjectsOf(each).includes(subject))) : [];
     const named = fits.find((each) => repliedTo.every((subject) => subject === each.subject)) ?? (fits.length === 1 ? fits[0] : undefined);
-    const candidate = repliedTo.length > 0 ? named : kept.filter(complete).find((each) => this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", each.target)[0]?.id === each.outbox_id);
+    const last = kept.find((each) => this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", each.target)[0]?.id === each.outbox_id);
+    return { fits, named, last };
+  }
+
+  #reopenable(runId: string): { id: string; asked: string; at: number }[] {
+    if (!this.#followUps() || this.#continuationOf(runId) || !this.#actingFor(runId)) return [];
+    const sessionId = this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "";
+    const repliedTo = this.#basis(runId).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    const { named, last } = this.#eligible(sessionId, repliedTo);
+    const candidate = repliedTo.length > 0 ? named : last;
     if (!candidate) return [];
     // What the person asked when it was first read: the request behind its first source.
     const ids = (JSON.parse(candidate.sources) as Source[])[0].events.said;
@@ -1734,6 +1778,7 @@ export class BrainAgent extends DurableObject<Env> {
     };
     const proposed = row();
     const repliedTo = this.#basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    const eligible = this.#eligible(run.session_id, repliedTo);
     // Everything about this that is not a matter of judgement is decided by one plain function
     // (see ./follow-up), from what is on record.
     const verdict = followUpDecision({
@@ -1743,7 +1788,7 @@ export class BrainAgent extends DurableObject<Env> {
       repliedTo,
       now: Date.now(),
       carriedOn: carried !== undefined,
-      ...(proposed ? { answer: { session: proposed.session_id, expiresAt: proposed.expires_at, subjects: this.#subjectsOf(proposed as { subject: string; sources: string }), shared: repliedTo.length > 0 && !repliedTo.every((subject) => subject === proposed.subject) && this.#rows<{ id: string; subject: string; sources: string }>("SELECT id, subject, sources FROM answers WHERE session_id = ? AND expires_at > ? AND id != ?", run.session_id, Date.now(), proposed.id).some((other) => repliedTo.every((subject) => this.#subjectsOf(other).includes(subject))), isLastThingSaid: this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", proposed.target)[0]?.id === proposed.outbox_id } } : {}),
+      ...(proposed ? { answer: { session: proposed.session_id, expiresAt: proposed.expires_at, subjects: this.#subjectsOf(proposed as AnswerRow), shared: eligible.fits.some((each) => each.id === proposed.id) && eligible.named?.id !== proposed.id, isLastThingSaid: eligible.last?.id === proposed.id } } : {}),
     });
     if (!verdict.allow) {
       throw new Error(
