@@ -21,7 +21,8 @@ describe("the next wake-up", () => {
         sql.exec("INSERT INTO timers (id, due_at, session_key, note, created_at) VALUES ('t1', ?, 'dm', 'n', ?)", at("timer"), now);
         sql.exec("INSERT INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) VALUES ('ans_1', 's1', 1, 'feishu:message:1', ?, 'feishu', '[]', '[]', 't', ?, ?)", TARGET, at("answer"), now);
         sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at) VALUES ('m1', ?, 'hello', ?, ?)", TARGET, at("outbox"), now);
-        await state.storage.setAlarm(now + 5);
+        // Far enough ahead that the clock cannot reach it first: the test runs it by hand.
+        await state.storage.setAlarm(now + 10_000);
       });
       expect(await runDurableObjectAlarm(stub)).toBe(true);
       const alarm = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.getAlarm());
