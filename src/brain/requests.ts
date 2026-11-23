@@ -145,9 +145,14 @@ export class Requests implements Wakes {
     const candidates: number[] = [];
     const forget = this.#s.rows<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM answers")[0]?.at;
     if (forget != null) candidates.push(forget);
-    // A wait that has run out is looked at once a minute until its owner has been asked.
-    const waitUntil = this.#s.rows<{ until: number | null }>("SELECT MIN(MIN(until, COALESCE(check_at, until))) AS until FROM continuations WHERE status = 'waiting'")[0]?.until;
-    if (waitUntil != null) candidates.push(waitUntil > now ? waitUntil : now + 60_000);
+    // Each wait by itself, without holding back the others: at its deadline and at its scheduled
+    // re-ask, whichever comes first. One with a look whose time has passed is looked at again in a
+    // minute (until its owner has been asked), but not after a look still to come.
+    for (const wait of this.#s.rows<{ until: number; check_at: number | null }>("SELECT until, check_at FROM continuations WHERE status = 'waiting'")) {
+      const looks = [wait.until, wait.check_at].filter((at): at is number => at != null);
+      const ahead = looks.filter((at) => at > now);
+      candidates.push(ahead.length === looks.length ? Math.min(...ahead) : Math.min(now + 60_000, ...ahead));
+    }
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
@@ -266,11 +271,20 @@ export class Requests implements Wakes {
     return { ok: true };
   }
 
-  /** A wait whose time is up is asked about once more, and ends there if the answer is still no. */
+  /**
+   * A wait whose time is up is asked about once more, and ends there if the answer is still no.
+   * One whose owner could not be asked is asked again when its re-ask is due. Each look is its own
+   * reason, named by its time: the same look given again is kept once, and a re-ask and the
+   * deadline never stand in for each other, whichever comes first.
+   */
   deadlines(now: number): void {
-    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE status = 'waiting' AND (until <= ? OR check_at <= ?)", now, now)) {
-      this.#s.sql.exec("UPDATE continuations SET check_at = NULL WHERE id = ?", waiting.id);
-      this.hint(waiting, `due:${Math.floor(now / 60_000)}`);
+    for (const waiting of this.#s.rows<Continuation & { check_at: number | null }>("SELECT * FROM continuations WHERE status = 'waiting' AND (until <= ? OR check_at <= ?)", now, now)) {
+      if (waiting.check_at != null && waiting.check_at <= now) {
+        this.#s.sql.exec("UPDATE continuations SET check_at = NULL WHERE id = ?", waiting.id);
+        this.hint(waiting, `check:${waiting.check_at}`);
+      }
+      // The deadline of the request as it now stands: one waiting again on something else has its own.
+      if (waiting.until <= now) this.hint(waiting, `deadline:${waiting.until}:${waiting.condition}:${waiting.generation}`);
     }
   }
 
