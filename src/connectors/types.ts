@@ -134,12 +134,19 @@ export interface ToolContext {
    */
   said: { text: string; data: Record<string, unknown> }[];
   /**
-   * What the same person wrote in this private conversation shortly before (the last few
-   * messages, within ten minutes), by the same test as `said` and in the same form. A link in
-   * one message and "summarise it" in the next are one request to a person. These are their own
-   * messages as they arrived; nothing a run wrote or read is among them.
+   * What the same person wrote in this private conversation before (their messages over the last
+   * day, at most fifty), by the same test as `said` and in the same form. A link in one message
+   * and "summarise it", or a question about it later, are one request to a person. These are
+   * their own messages as they arrived; nothing a run wrote or read is among them.
    */
   recent: { text: string; data: Record<string, unknown> }[];
+  /**
+   * Set when the person's message is a reply to one of the agent's own answers in this
+   * conversation, as it reached them: what that answer was written from, as this connector's
+   * tools identified it when they read it (their canonical calls). Empty when it was written
+   * from nothing read.
+   */
+  answering?: { reads: Record<string, unknown>[] };
   /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
   /**

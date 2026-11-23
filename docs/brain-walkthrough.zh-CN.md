@@ -185,7 +185,7 @@ flowchart TD
    - 标记 `private = 1` 的 `outbox` 消息一旦进入终态（`sent`、`dead`、`unverified`），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
    - 因此：run 结束时对话记录已清理；但私密消息在仍为 `pending`（等待发送或重试）或 `reconciling`（对账中）期间，正文还在 `outbox` 里，进入终态才擦除。
    - 私聊里 agent 自己的消息送达时，送达的原话写进 `said`，和把这一行标为 `sent` 在同一个事务里；之后才擦除发件箱正文。拼对话记录时，这些话放回被清理那一轮的说明后面（见 3.3）。只有自己读了外部文本的 run 受限制；之后看到这段历史的 run 不受限制（用户 2026-11-23 的决定）。
-   - 以前在 `FOLLOW_UPS=on` 时，满足条件的回答会在擦除前复制到 `answers` 表，保留 24 小时供 `reopen_answer` 追问。这套做法已经下线：迁移 22 删除了 `answers` 表，并把还在进行的 `reopen_answer` 续办作废。取代它的设计见 [`design/follow-up-history.zh-CN.md`](design/follow-up-history.zh-CN.md)：第 2 步（`said`）已在分支上写完，还没有部署；第 3 步（放宽能读的链接、回复某条答复时按它的 `reads` 收窄）还没做。
+   - 以前在 `FOLLOW_UPS=on` 时，满足条件的回答会在擦除前复制到 `answers` 表，保留 24 小时供 `reopen_answer` 追问。这套做法已经下线：迁移 22 删除了 `answers` 表，并把还在进行的 `reopen_answer` 续办作废。取代它的设计见 [`design/follow-up-history.zh-CN.md`](design/follow-up-history.zh-CN.md)：第 2 步（`said`）已合并，还没有部署；第 3 步（放宽能读的链接、回复某条答复时按它的 `reads` 收窄）已在分支上写完，还没有部署。
    - 所以清理保证的是：对话记录里不留外部文本，发件箱里终态消息不留正文；送达给这个人的话保留在 `said` 里；不是整个数据库零残留。
 
 ---

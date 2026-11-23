@@ -150,25 +150,22 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const { env, origin } = context;
   const target = documentOf(String(args.document ?? "").trim());
   if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
-  // The document is the person's choice, and what they chose now. If this request links
-  // documents, those are the choice, whatever they linked before. If it links none, it can only
-  // be about the one document they linked last ("summarise it" after a link): there must be
-  // exactly one, and it must not have been read on that footing already. Text the agent has read
-  // cannot widen any of this, and neither can a word that merely looks like a document's id.
+  // The document is the person's choice: one they linked themselves, in this request or in their
+  // own messages here over the last day (which of those is the model's to say). A reply to one of
+  // their own messages names what it is about exactly; a reply to one of the agent's answers can
+  // only be about what that answer was written from. Text the agent has read or written cannot
+  // widen any of this, and neither can a word that merely looks like a document's id.
   const documents = (message: { data: Record<string, unknown> }) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]).filter(Boolean) : []);
+  const matches = (each: DocumentRef) => each.kind === target.kind && each.token === target.token;
   const now = context.said.flatMap(documents);
   let chosen = now;
   // The messages that named the document read: the link recorded for it is the one written there.
-  let naming: { text: string }[] = context.said;
-  let carriedFrom: string | undefined;
-  // A reply names what it is about: if this request links nothing but is a reply to messages of
-  // the person's own that do, those are the documents meant, not whatever they linked last. The
-  // person points at it afresh each time, so nothing is used up.
+  let naming: { text: string; data: Record<string, unknown> }[] = context.said;
   const repliedTo = context.said.map((message) => message.data.replies_to).filter((each): each is string => typeof each === "string");
-  if (now.length === 0 && repliedTo.length > 0) {
+  if (now.length === 0 && repliedTo.length > 0 && !context.answering) {
     // Every message they replied to has to be one of their own, on record, and together they
     // have to name one document. Anything less does not say which document is meant, and what
-    // they linked last is not read in its place.
+    // they linked last is not read in its place. They point at it afresh each time.
     const parents = [...new Set(repliedTo)].map((subject) => context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`));
     const named = parents.flatMap((message) => (message ? documents(message) : []));
     const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
@@ -178,25 +175,32 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     naming = parents.flatMap((each) => (each ? [each] : []));
     for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
     if (context.said.length === 1) context.relied?.("said", 0);
-  } else if (now.length === 0) {
-    const last = [...context.recent].reverse().find((message) => documents(message).length > 0);
-    const id = typeof last?.data.message_id === "string" ? last.data.message_id : "";
-    if (!last || !id) return { error: "the person has not linked a document in this request or just before it; ask them to send the link" };
-    if (documents(last).length > 1) return { error: "the person linked several documents and this request does not say which; ask them to send the one they mean together with what they want" };
-    chosen = documents(last);
-    naming = [last];
-    carriedFrom = id;
-    // This earlier message, and no other, is part of what the request rests on.
-    context.relied?.("recent", context.recent.indexOf(last));
-    // And the one message that asked for it now ("总结"), where there is exactly one: a reply to
-    // that is about this request too. With several, which of them asked is not known.
-    if (context.said.length === 1) context.relied?.("said", 0);
+  } else {
+    // A reply to one of the agent's answers: what that answer was written from, and nothing else.
+    // (One written from nothing read narrows nothing.)
+    const from = (context.answering?.reads ?? []).flatMap((each) => documentOf(String(each.document ?? "")) ?? []);
+    if (from.length > 0 && !from.some(matches)) return { error: "the person replied to an answer written from another document; read that one, or ask them which they mean" };
+    // Linked in this request, or in their own earlier messages here, latest first.
+    const linking = [...context.said, ...context.recent].filter((message) => documents(message).some(matches));
+    if (linking.length > 0 && now.length === 0) {
+      chosen = [target];
+      naming = linking;
+      // The latest of their earlier messages that links it is part of what the request rests on.
+      const latest = [...context.recent].reverse().find((message) => documents(message).some(matches));
+      if (latest) context.relied?.("recent", context.recent.indexOf(latest));
+      // And the one message that asked for it now ("总结"), where there is exactly one: a reply to
+      // that is about this request too. With several, which of them asked is not known.
+      if (context.said.length === 1) context.relied?.("said", 0);
+    } else if (linking.length > 0) {
+      chosen = [...now, target];
+      naming = linking;
+    }
   }
   // Which of the messages just written name this document: a reply to one of those is about it.
   context.said.forEach((message, index) => {
     if (documents(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
   });
-  if (!chosen.some((each) => each.kind === target.kind && each.token === target.token)) return { error: "only a document the person linked in this request can be read (or, if this request links none, the one they linked just before)" };
+  if (!chosen.some(matches)) return { error: "only a document the person linked themselves can be read: in this request, or in their own messages here over the last day; ask them to send the link" };
 
   const redirect = redirectUri(env);
   // Which of the two settings is missing or malformed is said apart, so the operator can tell.
@@ -216,7 +220,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const theirs = [...naming].reverse().flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
   const canonical = theirs?.link ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
   const grant = env.FEISHU_GRANTS.getByName(name);
-  const { generation, credential, unreadable, answered } = await grant.held();
+  const { generation, credential, unreadable } = await grant.held();
   // The authorisation was taken away, or replaced, while this read was under way: what the old
   // token fetched is not handed on, and this read does not ask for a new one.
   const superseded = { error: "the person's authorisation changed while this was being read; nothing was read. They can ask again" };
@@ -224,9 +228,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // Past either, it is over: nothing is read, and it is not started again under a newer one.
   const lapsed = () => context.resuming !== undefined && Date.now() > context.resuming.notAfter;
   if (context.resuming && (generation !== context.resuming.generation || lapsed())) return superseded;
-  const alreadyRead = { error: "the document the person linked earlier has already been read for them once; for more, ask them to send the link again with what they want" };
   // By another call, that is. This same call may be running again after an interruption.
-  if (carriedFrom !== undefined && answered?.message === carriedFrom && answered.by !== context.callId) return alreadyRead;
   // What this request needs the person to have allowed: documents, and wiki pages only for one.
   // Where the operator has turned it on for this app, also leave to renew the token without them.
   const needed = [...(target.kind === "wiki" ? ["docx:document:readonly", "wiki:node:read"] : ["docx:document:readonly"]), ...(app.oauth_offline ? [OFFLINE] : [])];
@@ -303,8 +305,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   }
   // Asked last of all, just before the text is handed on. A link taken from an earlier message
   // is used up here.
-  const end = await grant.finish(credential.version, carriedFrom === undefined ? undefined : { message: carriedFrom, by: context.callId });
-  if (end !== "ok") return end === "taken" ? alreadyRead : superseded;
+  const end = await grant.finish(credential.version);
+  if (end !== "ok") return superseded;
   // What was read, as Feishu resolved it: a wiki page can come to hold another document.
   context.identified?.({ document: canonical }, `docx:${documentId}`, { condition: conditionOf(name, needed), generation });
   const text = String(raw.data?.content ?? "");

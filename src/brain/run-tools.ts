@@ -47,6 +47,19 @@ export class RunTools {
   }
 
   /** The tools of this run. */
+  /**
+   * Whether the person's messages reply to one of the agent's own answers in this conversation,
+   * as it reached them, and if so what those answers were written from, by this connector's tools.
+   */
+  #answering(run: RunRow, connector: string): { answering?: { reads: Record<string, unknown>[] } } {
+    const subjects = this.#b.requests.basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    if (subjects.length === 0) return {};
+    const answers = this.#s.rows<{ reads: string }>("SELECT reads FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
+    if (answers.length === 0) return {};
+    const reads = answers.flatMap((each) => (JSON.parse(each.reads) as { connector: string; args: string }[]).filter((read) => read.connector === connector).map((read) => JSON.parse(read.args) as Record<string, unknown>));
+    return { answering: { reads } };
+  }
+
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
@@ -94,7 +107,7 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting.connector), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           if (!isWaiting(result)) {
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.

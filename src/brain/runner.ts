@@ -40,8 +40,9 @@ const ERROR_WITHHELD = "failed after reading outside text; the details are not k
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 export type Said = { text: string; data: Record<string, unknown> };
 /** How far back a person's earlier messages still count as part of what they are asking now. */
-const RECENT_REQUEST_MS = 10 * 60_000;
-const MAX_RECENT_REQUESTS = 5;
+/** How far back a person's own earlier messages count as part of what they ask now: a day, and at most fifty. */
+const RECENT_REQUEST_MS = 24 * 3_600_000;
+const MAX_RECENT_REQUESTS = 50;
 
 /** What the run loop needs from the Brain it is part of. */
 export interface RunnerHost {
@@ -484,13 +485,7 @@ export class Runner {
     if (this.#s.rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
     // Fixed words, and what the tool said it read. Nothing the model wrote is carried over, not even what it asked a tool for.
-    const links = [...new Set(read.flatMap((each) => {
-      try {
-        return Object.values(JSON.parse(each.args) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
-      } catch {
-        return [];
-      }
-    }))];
+    const links = linksOf(read);
     // Also as a record (never shown to the model as such): what this turn read, whether or not anything it said reached the person.
     this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(links), ...(read.length > 0 ? { _reads: read } : {}) } as Item);
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
@@ -535,7 +530,7 @@ export class Runner {
     // The words people replied to, for every reply in the window, in one query.
     const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
     const quotedOf = new Map(
-      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number }>("SELECT outbox_id, text, sent_at FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
@@ -546,7 +541,11 @@ export class Runner {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
         const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
-        quoted.forEach((each, at) => entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}:]\n${each.text}` }, starts: at === 0 }));
+        quoted.forEach((each, at) => {
+          // What it was written from, by the tool's canonical call: what they are asking about, even once that turn is out of sight.
+          const from = linksOf(JSON.parse(each.reads) as { args: string }[]);
+          entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
+        });
         entries.push({ item: shown(item), starts: quoted.length === 0 });
       } else entries.push({ item: shown(item), starts: false });
       if (row.run_id && lastOf.get(row.run_id) === index) for (const words of wordsOf.get(row.run_id) ?? []) entries.push({ item: words, starts: false });
@@ -627,6 +626,21 @@ export class Runner {
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/** The strings in what some reads were made with (their canonical calls): what a person or a model can recognise them by. */
+function linksOf(read: { args: string }[]): string[] {
+  return [
+    ...new Set(
+      read.flatMap((each) => {
+        try {
+          return Object.values(JSON.parse(each.args) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
+        } catch {
+          return [];
+        }
+      }),
+    ),
+  ];
 }
 
 /** Function calls in the transcript that have no output yet. */

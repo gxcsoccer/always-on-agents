@@ -939,15 +939,23 @@ describe("the run loop, by itself", () => {
       }, "chat:oc_1");
     });
 
-    it("counts as what came shortly before only the person's own messages here, within ten minutes, with the same verified origin", async () => {
+    it("counts as what came before only the person's own messages here, over the last day and at most fifty, with the same verified origin", async () => {
       await within(async ({ runner, event, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
-        event("too old", { status: "done", received_at: Date.now() - 11 * 60_000 });
+        event("too old", { status: "done", received_at: Date.now() - 25 * 3_600_000 });
+        const earlier = event("this morning", { status: "done", received_at: Date.now() - 5 * 3_600_000 });
         event("no origin", { status: "done", received_at: Date.now() - 60_000, data: { direct: true } });
         const kept = event("just now", { status: "done", received_at: Date.now() - 30_000 });
         event("summarise it");
         const id = (await runner.next())!;
-        expect(runner.actingFor(id)?.recentIds).toEqual([kept]);
+        expect(runner.actingFor(id)?.recentIds).toEqual([earlier, kept]);
+      });
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        const all = Array.from({ length: 52 }, (_, i) => event(`message ${i}`, { status: "done", received_at: Date.now() - 60_000 }));
+        event("summarise it");
+        const id = (await runner.next())!;
+        expect(runner.actingFor(id)?.recentIds).toEqual(all.slice(-50));
       });
     });
 
