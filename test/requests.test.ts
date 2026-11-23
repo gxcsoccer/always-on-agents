@@ -473,3 +473,39 @@ describe("what a run read under, by itself", () => {
     });
   });
 });
+
+describe("keeping a request that has to wait", () => {
+  const waiting = { on: "authorisation", subject: "grant_1", condition: "cond_1", generation: 1, until: Date.now() + 600_000, interaction: "grant_1.nonce", request: { document: "docx:abc" } };
+
+  it("keeps the record, puts the way in before the person and asks once whether it already holds, together", async () => {
+    await within(({ requests, store, run, message, audited, hints }) => {
+      const active = run("r1");
+      const said = message("总结一下", {}, "r1");
+      const result = requests.wait(active, { connector: "feishu", events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", waiting);
+      expect(result).toMatchObject({ waiting: true, request: "call_1" });
+      expect(store.rows("SELECT id, status, args FROM continuations")).toEqual([{ id: "call_1", status: "waiting", args: JSON.stringify(waiting.request) }]);
+      expect(store.rows("SELECT idem, interaction FROM outbox")).toEqual([{ idem: "invite:grant_1.nonce", interaction: "grant_1.nonce" }]);
+      expect(audited("request.waiting")).toHaveLength(1);
+      expect(hints()).toHaveLength(1);
+    });
+  });
+
+  it("keeps nothing at all if any part of that step fails", async () => {
+    await within(({ requests, store, host, run, message, audited, hints }) => {
+      const active = run("r1");
+      const said = message("总结一下", {}, "r1");
+      // The invitation is written, and then the step fails: the record must not be left behind
+      // without the message that shows the way in, nor the message without the record.
+      const enqueue = host.enqueueMessage;
+      host.enqueueMessage = (...args) => {
+        enqueue(...args);
+        throw new Error("stop");
+      };
+      expect(() => requests.wait(active, { connector: "feishu", events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", waiting)).toThrow("stop");
+      expect(store.rows("SELECT id FROM continuations")).toEqual([]);
+      expect(store.rows("SELECT idem FROM outbox")).toEqual([]);
+      expect(audited("request.waiting")).toEqual([]);
+      expect(hints()).toEqual([]);
+    });
+  });
+});
