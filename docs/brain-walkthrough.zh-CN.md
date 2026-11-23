@@ -61,7 +61,7 @@
 - **`used_codes`**：作用域内所有用过的 4 位确认码，永不重复分配。
 - **`unsettled`**：记录已离开等待态但尚未确认沙箱是否收到决定的审批问题，交由后台定时向沙箱核对终态。
 - **`continuations`**：暂时不能执行、等条件满足后再继续的请求（`Requests` 负责）。
-- **`answers`**：只在 `FOLLOW_UPS=on` 时使用。私聊里基于外部来源写出、已送达的回答，连同正文、引用的原句和来源指纹保留 24 小时，供跟进时用 `reopen_answer` 重新读取核对；过期后查询不再返回，并在下次 `alarm()` 时物理删除（`Requests` 负责）。
+- **`answers`**：只在 `FOLLOW_UPS=on` 时使用。满足条件的回答（见 4.2 第 3 点）连同正文、引用的原句和来源指纹保留 24 小时，供跟进时用 `reopen_answer` 重新读取核对；过期后查询不再返回，并在下次 `alarm()` 时物理删除（`Requests` 负责）。
 
 ---
 
@@ -103,7 +103,7 @@ alarm()
 flowchart TD
   N["Runner.next()"] -->|"存在 active_run 且已到重试时间"| B["复用旧 runId"]
   N -->|"active_run 尚未到 retry_at"| Z["本次无事可做"]
-  N -->|"最早 pending 是 request.ready"| Q["Requests.resume()<br/>可能直接消费提示而不开 run"]
+  N -->|"最早 pending 是 request.ready"| Q["Requests.resume()<br/>重新询问条件；不成立则<br/>消费提示而不开 run"]
   N -->|"最早 pending 是普通事件"| C["#claim() 同步事务<br/>合并同会话 <=40 条、约 120,000 单位的事件<br/>渲染成一条 user item 写入 items<br/>写入 meta.active_run"]
   Q -->|"续办该请求"| D
   B --> D["Runner.execute(runId): entries + 1"]
@@ -115,7 +115,7 @@ flowchart TD
   L -->|"末尾非 user/tool_output<br/>或 steps >= 16"| F["#finish('done')<br/>清理 outside 痕迹<br/>清除 active_run"]
   L -->|"需要调用模型"| R["预扣租户 20k Token<br/>检查租户 & 作用域日预算"]
   R -->|"超预算：普通 run"| P["退还预扣, entries - 1<br/>retry_at = 次日 UTC 00:00:30<br/>不丢事件"]
-  R -->|"超预算：续办的请求"| PC["退还预扣，请求就此结束<br/>正在续办的告知额度用完"]
+  R -->|"超预算：续办的请求"| PC["退还预扣，本 run 结束<br/>请求转入 answering，排队一条额度用完的通知<br/>通知送达后请求结束"]
   R -->|"预算充足"| M["调用 respond() (store: false)"]
   M -->|"可重试错误"| RT["#retryLater(): 5s/30s/2m/5m 退避"]
   M -->|"成功"| S["事务落盘 response.output<br/>累加 steps & tokens<br/>向 Registry 多退少补"]
@@ -125,7 +125,7 @@ flowchart TD
 ### 3.1 批处理窗口与同步事务认领（`ingest` + `Runner.next` / `#claim`）
 
 - 外部事件写入 `inbox` 时，`ingest()` 设一个 `BATCH_WINDOW_MS = 2_000`（2 秒）后的闹钟，让连续发出的多条消息有机会聚合成同一批处理。
-- `Runner.next()` 是入口：有 `active_run` 时，到了 `retry_at` 就续跑它，没到就本次无事可做；否则看最早一条 `pending` 事件——若是 `request.ready`（等待中的请求条件已满足，或 `Requests.deadlines` 写入的内部提示），交给 `Requests.resume()`，它可能续办该请求，也可能只消费掉这条提示而不开 run；只有普通事件才进入 `#claim()`。
+- `Runner.next()` 是入口：有 `active_run` 时，到了 `retry_at` 就续跑它，没到就本次无事可做；否则看最早一条 `pending` 事件——若是 `request.ready`，交给 `Requests.resume()`。`request.ready` 只是「该重新问一下条件了」的提示，不代表条件已满足：`Requests.deadlines` 会写它，用户在请求等待期间发来任何一条普通消息也会写它。`resume()` 向条件的主人重新询问，成立才续办该请求，否则只消费掉这条提示而不开 run（期限已过则结束该请求）；只有普通事件才进入 `#claim()`。
 - `#claim()` 在单个事务中锁定最早一条 `pending` 事件所属的 `session_key`，把该会话下最多 `40` 条（不含 `request.ready`）待处理事件标记为 `claimed`；体积按 `text` 与 `data` 的 JS 字符串长度加每条 300 估算，累计约 120,000 为止，但第一条无论多大都会收下。然后按 `[时间戳] 类型 from 身份: 文本` 拼成一条 `role: "user"` 记录写入 `items`，同时把最近一条带 `reply_to` 的地址更新为 `sessions.target`，最后写下 `meta.active_run = runId`。
 
 ### 3.2 「对话记录即进度」的崩溃续跑（`danglingCalls`）
@@ -142,7 +142,7 @@ flowchart TD
 
 ### 3.4 预算暂停与彻底放弃（防无限卡死）
 
-- **超日预算**：作用域每日上限 200 万 Token、租户每日上限 2,000 万 Token。一旦触顶，先退还刚才预扣的 20k 额度。普通 `run` 将 `entries` 减 1（不算故障），把 `retry_at` 设为次日 UTC `00:00:30` 暂停等待，消息一条不丢；正在续办的等待请求等不到明天（它有期限），就在这个 run 里结束，若已在续办则告诉用户额度用完。
+- **超日预算**：作用域每日上限 200 万 Token、租户每日上限 2,000 万 Token。一旦触顶，先退还刚才预扣的 20k 额度。普通 `run` 将 `entries` 减 1（不算故障），把 `retry_at` 设为次日 UTC `00:00:30` 暂停等待，消息一条不丢；续办等待请求的 run 等不到明天（请求有期限），这个 run 就此结束；若请求正处于续办中（`resuming`），它转入 `answering`，排队一条「额度用完」的固定通知代替回答，通知投递完成后请求才结束。
 - **失败退避与 `#abandon()`**：模型可重试错误（429 / 5xx / 网络断连）按 `5s → 30s → 2m → 5m` 退避重试；超过 `MAX_RUN_ENTRIES = 5` 次重入或遇到不可重试错误时触发 `#abandon()`：
   1. 为所有悬空的 `function_call` 补写错误 `function_call_output`，保持对话历史合法、不拖累后续 `run`；
   2. 把本会话仍停留在 `dispatching` 的任务标记为 `failed`；
@@ -172,13 +172,15 @@ flowchart TD
    - 当前是私人单聊作用域（`scope.kind === "user"`）；
    - 本次 `run` 认领的**全部事件**均来自同一个受信任连接器、同一个私聊会话 `privateSessionKey(source, origin)`、同一验证来源 `origin`，且全部是该用户本人直接发出的普通消息（`data.direct === true`，不含按钮点击、卡片回复、跨话题路由、定时器或 Worker 回报）。
 2. **运行时污点拦截（`Runner.sawOutside(runId)`）**：
-   一旦本次 `run` 调用了连接器工具，`outside` 集合（由 `BrainAgent` 持有、各部件共用）与 `items.outside = 1` 会立即被标记（即便工具报错也可能引用了外部文本，同样视为已读外部内容）。例外：连接器回复「需要等待」（例如还没授权）时什么也没读到，标记会在写入输出前撤销，这次调用本身不污染本 run。被标记后：
+   本次 `run` 调用连接器工具时，先在内存里的 `outside` 集合（由 `BrainAgent` 持有、各部件共用）记下这次调用；工具返回后，若 run 仍是当前 run，`Runner` 写入输出时同时落盘 `items.outside = 1`（即便工具报错也可能引用了外部文本，同样视为已读外部内容）。例外：连接器回复「需要等待」（例如还没授权）时什么也没读到，内存标记会在写入输出前撤销，这次调用本身不污染本 run。被标记后：
    - 本次 `run` 剩余步骤只能用 `send_message` 和该连接器的只读工具（`Runner.mayUse` 按允许清单判断，其余一律报错 `READ_OUTSIDE`），防止外部文本借提示词注入持久化篡改记忆或 `instructions.md`；
    - 本次 `run` 写入 `outbox` 的消息都会被标记 `private = 1`。
 3. **结束后的清理（`Runner#forgetOutside` + `Outbox.scrub`）**：
    - `run` 结束时，`Runner#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
-   - 标记 `private = 1` 的 `outbox` 消息一旦成功送达（或进入 `dead` 终态），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
-   - 例外：`FOLLOW_UPS=on` 时，私聊里基于外部来源、已送达的回答会在擦除前复制到 `answers`（正文、引用原句、来源信息），保留 24 小时供跟进，过期后不再可查并在下次 `alarm()` 时删除。所以清理保证的是对话记录与发件箱里不留外部文本，不是整个数据库零残留。
+   - 标记 `private = 1` 的 `outbox` 消息一旦进入终态（`sent`、`dead`、`unverified`），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
+   - 因此：run 结束时对话记录已清理；但私密消息在仍为 `pending`（等待发送或重试）或 `reconciling`（对账中）期间，正文还在 `outbox` 里，进入终态才擦除。
+   - 例外：满足条件的回答会在擦除前复制到 `answers`（正文、引用原句、来源信息），保留 24 小时供跟进，过期后不再可查并在下次 `alarm()` 时删除。条件：`FOLLOW_UPS=on`；本次 run 正常结束（`done`）；本 run 读到的外部来源恰好一个且都已完整记录；本 run 只写出一条消息；它在私聊中送达并拿到回执。例如一条综合了两个来源的回答不会保留。
+   - 所以清理保证的是：对话记录里不留外部文本，发件箱里终态消息不留正文；不是整个数据库零残留。
 
 ---
 

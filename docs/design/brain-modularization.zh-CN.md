@@ -1,11 +1,11 @@
 # 设计：`BrainAgent` 模块化拆分与内部架构抽象
 
-状态：拆分已完成（代码搬移在 PR #19–#25、#27、#28；#26 只改文档；2026-11-23），`agent.ts` 从约 2,800 行降到 452 行。下文保留为当时的草案；实际做法与草案的差别见下。
+状态：拆分已完成（代码搬移在 PR #19–#25、#27、#28；#26 无运行时改动，只改文档与 `.gitignore`；2026-11-23），`agent.ts` 从约 2,800 行降到 452 行。下文保留为当时的草案；实际做法与草案的差别见下。
 
 > **实施结果**
 >
 > - 实际拆出的文件：`store.ts`、`timers.ts`、`requests.ts`（即草案中的 `continuations.ts`）、`outbox.ts`、`revisions.ts`、`tasks.ts`、`approval.ts`（即草案中的 `approval-rules.ts`）、`run-tools.ts`、`runner.ts`。每一步一个 PR，均经 Codex 复核。第一步 #19（`requests.ts`）没有改测试，靠规整后逐行比对和当时已有的 339 个测试保证行为不变，`Requests` 的专门测试是之后补的；从 #20 起，每一步先写该部件的单元测试并确认失败，再搬代码，并用变异检查确认测试能抓住被搬动的行为。
-> - 每个部件是 `new Part(store, host)`，依赖通过显式 `host` 接口传入；唤醒时间由 `Timers`、`Requests`、`Outbox`、`Tasks` 实现 `Wakes.nextWakeAt(now)` 报告（4.3 的调度部分已做）。
+> - 多数部件是 `new Part(store, host)`，依赖通过显式 `host` 接口传入；`Timers` 只接收 `store`，`Tasks` 另外直接接收 `Revisions`；唤醒时间由 `Timers`、`Requests`、`Outbox`、`Tasks` 实现 `Wakes.nextWakeAt(now)` 报告（4.3 的调度部分已做）。
 > - **未做**（纯搬移以外的改动，留待需要时再单独做）：4.1 的 JSON 列类型化解析（`Row` 仍是 `Record<string, any>`）；4.3 的清理声明化（`#housekeeping` 仍在 `agent.ts`）；4.4 的 `RunContext`（`outside` 集合由 `BrainAgent` 持有、各部件共用）；4.5 的 `notices.ts` 与会话 `locale`（`NOTICES` 在 `outbox.ts`，仍按最后一条消息是否含汉字判定语言）。
 
 这份文档回答一个问题：在不改变现有外部 RPC 契约、不削弱单线程 SQLite 事务一致性和安全不变量的前提下，如何将已经膨胀到 2,700+ 行的 `src/brain/agent.ts` 拆分为职责清晰、可独立单测、易于演进的内部模块，为后续功能（如 [task-continuation.zh-CN.md](task-continuation.zh-CN.md)）腾出干净的扩展面。
