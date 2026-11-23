@@ -56,7 +56,7 @@ export interface Source {
 }
 
 /** What a message written after reading may go out under. */
-export type Guard = { connector: string; condition: string; generation: number };
+export type Guard = { connector: string; condition: string; generation: number; retired?: true };
 
 /** Every piece of text in a value, however nested. */
 export function textsIn(value: unknown): string[] {
@@ -481,8 +481,10 @@ export class Requests implements Wakes {
 
   /** What this run's reads were made under. */
   guards(runId: string): Guard[] {
-    const noted = JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as Source[];
-    const guards = noted.flatMap((each) => (each.condition !== undefined && each.generation !== undefined ? [{ connector: each.connector, condition: each.condition, generation: each.generation }] : []));
+    const noted = JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as (Source & { until?: unknown })[];
+    // A read noted by an earlier version, to reopen an answer kept for follow-ups (it carried
+    // until when that answer was kept), rests on something that is retired: what it read goes no further.
+    const guards: Guard[] = noted.flatMap((each) => (each.condition !== undefined && each.generation !== undefined ? [{ connector: each.connector, condition: each.condition, generation: each.generation, ...(each.until !== undefined ? { retired: true as const } : {}) }] : []));
     return [...new Map(guards.map((each) => [JSON.stringify(each), each])).values()];
   }
 
@@ -494,6 +496,7 @@ export class Requests implements Wakes {
 
   /** Why what was read under these may go no further, if so: asked of each condition's owner, now. Throws if one cannot be asked. */
   async over(guards: Guard[]): Promise<string | undefined> {
+    if (guards.some((each) => each.retired)) return "it rested on an answer kept for follow-ups, which are retired";
     for (const each of guards) {
       if ((await holds(this.#b.env, each.connector, this.#s.scope(), each.condition, each.generation)).state !== "holds") return "what it was read under no longer holds";
     }

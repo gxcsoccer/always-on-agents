@@ -310,19 +310,21 @@ describe("timers and memory", () => {
         );
       request("reopen_waiting", "reopen_answer", "waiting");
       request("reopen_answering", "reopen_answer", "answering");
+      request("reopen_maybe_delivered", "reopen_answer", "answering");
       request("read_waiting", "feishu_read_document", "waiting");
-      const out = (idem: string, fields: { continuation?: string; guard?: unknown; started?: number; uncertain?: number }) =>
-        sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, continuation, guard, started, uncertain) VALUES (?, '{}', 'words', 0, 0, ?, ?, ?, ?)", idem, fields.continuation ?? null, fields.guard ? JSON.stringify(fields.guard) : null, fields.started ?? 0, fields.uncertain ?? 0);
+      const out = (idem: string, fields: { continuation?: string; guard?: unknown; started?: number; uncertain?: number; source?: string }) =>
+        sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, continuation, guard, started, uncertain, source) VALUES (?, '{}', 'words', 0, 0, ?, ?, ?, ?, ?)", idem, fields.continuation ?? null, fields.guard ? JSON.stringify(fields.guard) : null, fields.started ?? 0, fields.uncertain ?? 0, fields.source ?? null);
       out("answer:reopen_answering", { continuation: "reopen_answering" });
+      out("answer:reopen_maybe_delivered", { continuation: "reopen_maybe_delivered", started: 1, uncertain: 1 });
       out("msg:reopened", { guard: [{ connector: "feishu", condition: "c", generation: 1, until: 9e15 }] });
       out("msg:reopened_begun", { guard: [{ connector: "feishu", condition: "c", generation: 1, until: 9e15 }], started: 1, uncertain: 1 });
-      out("msg:ordinary", { guard: [{ connector: "feishu", condition: "c", generation: 1 }] });
+      out("msg:ordinary", { guard: [{ connector: "feishu", condition: "c", generation: 1 }], source: JSON.stringify({ quotes: [{ quote: "a sentence of the document" }] }) });
       migrate(state.storage);
       return {
         answers: [...sql.exec("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'answers'")][0].n,
         quotes: [...sql.exec("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'quotes:%'")][0].n,
         requests: [...sql.exec("SELECT id, status, why FROM continuations ORDER BY id")],
-        sends: [...sql.exec("SELECT idem, status, text FROM outbox WHERE idem != 'msg:call_1' AND idem LIKE '%:%' AND target = '{}' ORDER BY idem")],
+        sends: [...sql.exec("SELECT idem, status, text, source FROM outbox WHERE idem != 'msg:call_1' AND idem LIKE '%:%' AND target = '{}' ORDER BY idem")],
       };
     });
     expect(after.answers).toBe(0);
@@ -330,15 +332,47 @@ describe("timers and memory", () => {
     expect(after.requests).toEqual([
       { id: "read_waiting", status: "waiting", why: null },
       { id: "reopen_answering", status: "void", why: "follow-ups on kept answers were retired" },
+      // Its answer was being sent with no word back: it may have reached the person.
+      { id: "reopen_maybe_delivered", status: "unverified", why: "follow-ups on kept answers were retired" },
       { id: "reopen_waiting", status: "void", why: "follow-ups on kept answers were retired" },
     ]);
     expect(after.sends).toEqual([
-      { idem: "answer:reopen_answering", status: "void", text: "" },
-      { idem: "msg:ordinary", status: "pending", text: "words" },
-      { idem: "msg:reopened", status: "void", text: "" },
+      { idem: "answer:reopen_answering", status: "void", text: "", source: null },
+      { idem: "answer:reopen_maybe_delivered", status: "unverified", text: "", source: null },
+      // An ordinary message keeps its words, its queue state and its grant guard; only the copied sources go.
+      { idem: "msg:ordinary", status: "pending", text: "words", source: null },
+      { idem: "msg:reopened", status: "void", text: "", source: null },
       // Its sending was begun with no word back: it may have arrived, and is not sent again.
-      { idem: "msg:reopened_begun", status: "unverified", text: "" },
+      { idem: "msg:reopened_begun", status: "unverified", text: "", source: null },
     ]);
+  });
+
+  it("stops a run left part way by the earlier version after it reopened a kept answer, before the model sees that again", async () => {
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("hello"));
+    await wake(stub);
+    const calls = modelCalls.length;
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      const session = [...sql.exec("SELECT id FROM sessions LIMIT 1")][0].id as string;
+      // Paused (a spent budget, say) after reopening an answer and before writing anything: no outbox row yet.
+      sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES ('paused', ?, 'running', 1)", session);
+      sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES (?, 1000, 'paused', 1, ?, 0)", session, JSON.stringify({ role: "user", content: "the second point?" }));
+      sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES (?, 1001, 'paused', 0, ?, 0)", session, JSON.stringify({ type: "function_call", call_id: "c9", name: "reopen_answer", arguments: "{}" }));
+      sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES (?, 1002, 'paused', 0, ?, 1)", session, JSON.stringify({ type: "function_call_output", call_id: "c9", output: "the old answer and the document now" }));
+      sql.exec("INSERT INTO meta (key, value) VALUES ('sources:paused', ?)", JSON.stringify([{ connector: "feishu", tool: "feishu_read_document", args: "{}", identity: "docx:x", condition: "c", generation: 1, until: 9e15 }]));
+      sql.exec("INSERT INTO meta (key, value) VALUES ('active_run', 'paused') ON CONFLICT(key) DO UPDATE SET value = 'paused'");
+    });
+    await wake(stub);
+    expect(modelCalls.length).toBe(calls);
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      expect([...sql.exec("SELECT status FROM runs WHERE id = 'paused'")][0].status).toBe("done");
+      expect([...sql.exec("SELECT COUNT(*) AS n FROM items WHERE run_id = 'paused' AND item LIKE '%the old answer%'")][0].n).toBe(0);
+      // The person is told, in fixed words, that what they asked for was not sent.
+      expect([...sql.exec("SELECT idem FROM outbox WHERE idem = 'withheld:paused'")]).toHaveLength(1);
+    });
   });
 
   it("brings a scope with data in it, as the version before requests could wait left it, up to date", async () => {

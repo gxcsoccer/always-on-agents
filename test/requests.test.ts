@@ -465,6 +465,15 @@ describe("what a run read under, by itself", () => {
     });
   });
 
+  it("takes a read an earlier version noted for reopening a kept answer as no longer to be relied on, without asking anyone", async () => {
+    await within(async ({ store, requests }) => {
+      // Left by version 21 in a run that was paused part way: the answer was kept until a time.
+      store.setMeta("sources:run_old", JSON.stringify([{ ...source, until: 9e15 }]));
+      expect(requests.guards("run_old")).toEqual([{ ...guard, retired: true }]);
+      expect(await requests.over(requests.guards("run_old"))).toBe("it rested on an answer kept for follow-ups, which are retired");
+    });
+  });
+
   it("ties to what a run read under only that run's messages not yet handed over", async () => {
     await within(({ store, requests, outgoing, sent }) => {
       outgoing("pending", { run_id: "run_1" });
