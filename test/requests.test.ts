@@ -520,6 +520,7 @@ describe("when requests and kept answers next need the Brain awake", () => {
       request("a", { until: NOW + 60_000 });
       answer(store, "ans_1", NOW + 4_000);
       expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
+});
 
 describe("keeping a request that has to wait", () => {
   const waiting = { on: "authorisation", subject: "grant_1", condition: "cond_1", generation: 1, until: Date.now() + 600_000, interaction: "grant_1.nonce", request: { document: "docx:abc" } };
