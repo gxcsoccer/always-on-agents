@@ -230,9 +230,37 @@ describe("messages that can change, by themselves", () => {
         expect(revisions.saidSinceWhereTyped(reply, 0)).toBe(false);
       });
     });
+
+    it("takes two messages said at the same moment in the order they arrived", async () => {
+      await within(({ revisions, message }) => {
+        // Said at the same moment as the reply, and stored before it: not later, however late it was received.
+        message({ session: "pr:2", subject: "c0", revision: 500, received_at: 9_000 });
+        revisions.revise("c0", 500, false, "h1");
+        const reply = message({ session: "task", routed_from: "pr:2", subject: "c1", revision: 500, received_at: 2_000 });
+        expect(revisions.saidSinceWhereTyped(reply, 0)).toBe(false);
+        // Stored after it: later, however early it was received.
+        message({ session: "pr:2", subject: "c2", revision: 500, received_at: 1_000 });
+        revisions.revise("c2", 500, false, "h1");
+        expect(revisions.saidSinceWhereTyped(reply, 0)).toBe(true);
+      });
+    });
   });
 
   describe("looking again at the sources before an approval counts", () => {
+    it("asks each subject of the source it came through", async () => {
+      await within(async ({ revisions, message, now, asked, settings, known }) => {
+        settings.revisable.add("gitlab");
+        const a = message({ source: "github", subject: "github:c1" });
+        const again = message({ source: "github", subject: "github:c1" });
+        const b = message({ source: "gitlab", subject: "gitlab:c1" });
+        now["github:c1"] = { revision: 2, holder: "h2", deleted: false, edited: true };
+        now["gitlab:c1"] = { revision: 3, holder: "h3", deleted: false, edited: true };
+        await revisions.refreshStanding([a, b, again]);
+        expect(asked).toEqual(["github:github:c1", "gitlab:gitlab:c1"]);
+        expect([known("github:c1").revision, known("gitlab:c1").revision]).toEqual([2, 3]);
+      });
+    });
+
     it("asks each subject's source once and records what it says now", async () => {
       await within(async ({ revisions, message, now, asked, known }) => {
         const a = message({ subject: "c1", revision: 5, holder: "h5" });

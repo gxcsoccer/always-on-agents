@@ -5,6 +5,9 @@
  * identifies the text of that revision). This part keeps what is known of each subject and says
  * whether a message read earlier still says what it said, so that nothing is approved on words
  * that are no longer there. The Brain builds it on its own database.
+ *
+ * A subject belongs to one connector: what is known of it is kept by the subject alone, so a
+ * connector names its subjects in a way no other connector's can equal (by its own prefix, say).
  */
 import type { Standing } from "../connectors";
 import { NOT_FOR_THE_AGENT, type Principal } from "../events";
