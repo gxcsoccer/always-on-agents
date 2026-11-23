@@ -198,7 +198,7 @@ export class Outbox implements Wakes {
     this.#s.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?", Date.now(), row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
+      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, authored: row.authored === 1, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       const sentAt = receipt?.posted_at ?? Date.now();
       this.#s.transaction(() => {

@@ -288,6 +288,11 @@ export interface OutboundMessage {
   /** Stable across retries, so a connector can avoid sending the same message twice. */
   idem: string;
   text: string;
+  /**
+   * The agent's own words (written by the model), as against the system's fixed words. A channel
+   * that can render formatting may render these; fixed words are plain.
+   */
+  authored?: boolean;
   /** When the message was written, in ms. */
   created_at?: number;
   /**

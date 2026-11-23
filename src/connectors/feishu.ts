@@ -354,10 +354,15 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // not sent at all: there is nothing left to act on.
   const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
   if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
-  // An approval question or an invitation goes out as a card; everything else as text.
+  // An approval question or an invitation goes out as a card; the agent's own words as Markdown
+  // (a post with one md element); the system's fixed words as text. Decided from the message
+  // alone, so every attempt sends the very same thing.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
-  const msgType = card ? "interactive" : "text";
-  const content = JSON.stringify(card ?? { text: message.text });
+  const post = !card && message.authored ? JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } }) : undefined;
+  // Feishu takes a post of up to 30 KB, measured as sent: one that would be larger goes as text.
+  const fits = post !== undefined && new TextEncoder().encode(JSON.stringify({ receive_id: chatId, msg_type: "post", content: post, uuid })).length <= MAX_POST_BYTES;
+  const msgType = card ? "interactive" : fits ? "post" : "text";
+  const content = card ? JSON.stringify(card) : fits ? post! : JSON.stringify({ text: message.text });
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
@@ -380,6 +385,18 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // something to count as delivered.
   if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
   return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** Feishu's limit for a post, in bytes of the request, with a margin. */
+const MAX_POST_BYTES = 29_000;
+
+/**
+ * Markdown as Feishu renders it, minus its one way of acting: an <at> element notifies whoever it
+ * names (everyone, even). Words the model wrote, or quoted, must not do that, so such markup is
+ * shown as the text it is.
+ */
+function quiet(markdown: string): string {
+  return markdown.replace(/<(\/?)at\b/gi, "<\u200b$1at");
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */
