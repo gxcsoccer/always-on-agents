@@ -63,6 +63,10 @@ const feishu = {
   unreacted: [] as { message: string; reaction: string }[],
   /** How many of the bot's next attempts to take a reaction off Feishu fails, without saying what became of it. */
   failUnreacts: 0,
+  /** What Feishu answers the bot's next attempts to take a reaction off with, in order, instead of taking it off. */
+  unreactAnswers: [] as { status: number; code: number }[],
+  /** Every attempt to take a reaction off: on which message, which one. */
+  unreactAttempts: [] as { message: string; reaction: string }[],
   /** Runs while a reaction is being put on, before Feishu answers. */
   duringReaction: undefined as undefined | (() => Promise<void>),
   /** How often the bot tried to put a reaction on a message. */
@@ -102,6 +106,8 @@ function installFakeFeishu() {
   feishu.reactions.length = 0;
   feishu.unreacted.length = 0;
   feishu.failUnreacts = 0;
+  feishu.unreactAnswers.length = 0;
+  feishu.unreactAttempts.length = 0;
   feishu.duringReaction = undefined;
   feishu.failReactions = false;
   feishu.reactionAttempts = 0;
@@ -154,7 +160,10 @@ function installFakeFeishu() {
     const unreacting = url.host === "open.feishu.cn" && init?.method === "DELETE" ? /\/im\/v1\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname) : undefined;
     if (unreacting) {
       if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
+      feishu.unreactAttempts.push({ message: unreacting[1], reaction: unreacting[2] });
       if (feishu.failUnreacts > 0) return (feishu.failUnreacts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
+      const answer = feishu.unreactAnswers.shift();
+      if (answer) return Response.json({ code: answer.code, msg: "not now" }, { status: answer.status });
       feishu.unreacted.push({ message: unreacting[1], reaction: unreacting[2] });
       return Response.json({ code: 0, data: {} });
     }
@@ -2624,6 +2633,31 @@ describe("a sign that a message arrived", () => {
     }
     expect(feishu.unreacted).toEqual([{ message: `om_${rae.openId}_1`, reaction: "ZCaCIjUBVVWSrm5L-3ZTw1" }]);
     expect(await rowsOf(rae.stub, "SELECT mark FROM inbox WHERE mark IS NOT NULL")).toEqual([]);
+  });
+
+  it("is taken off later, the same one, when Feishu says the last attempt is still in progress or it is limited; and counts as off when the message is gone", async () => {
+    const sid = someone();
+    feishu.unreactAnswers.push({ status: 400, code: 231015 }, { status: 400, code: 99991400 });
+    await sid.sends("你好");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(1));
+    model.replies([say("")]);
+    await sid.quiet();
+    for (let i = 0; i < 3; i++) {
+      await rowsOf(sid.stub, "UPDATE inbox SET mark_next_at = 0 WHERE mark IS NOT NULL");
+      await wake(sid.stub);
+    }
+    const one = { message: `om_${sid.openId}_1`, reaction: "ZCaCIjUBVVWSrm5L-3ZTw1" };
+    expect(feishu.unreactAttempts).toEqual([one, one, one]);
+    expect(feishu.unreacted).toEqual([one]);
+    // The person deleted the message meanwhile: nothing left to take off, and nothing tried again.
+    feishu.unreactAnswers.push({ status: 400, code: 230110 });
+    await sid.sends("再见");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(2));
+    model.replies([say("")]);
+    await sid.quiet();
+    await wake(sid.stub);
+    expect(feishu.unreactAttempts).toHaveLength(4);
+    expect(await rowsOf(sid.stub, "SELECT mark FROM inbox WHERE mark IS NOT NULL")).toEqual([]);
   });
 
   it("is not counted as shown when Feishu answers with an error inside a success", async () => {

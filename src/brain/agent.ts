@@ -247,9 +247,11 @@ export class BrainAgent extends DurableObject<Env> {
         if (!runId) break;
         await this.#runner.execute(runId);
         await this.#outbox.flush();
+        // Messages this run dealt with no longer show that they are being handled: at once, not after the runs that follow.
+        await this.#marks.clear(Date.now());
         if (this.#store.meta("active_run")) break;
       }
-      // Messages dealt with no longer show that they are being handled.
+      // And any whose removal is due again, also when no run was made.
       await this.#marks.clear(Date.now());
     } finally {
       await this.#rearm();

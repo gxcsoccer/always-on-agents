@@ -263,7 +263,8 @@ export const MIGRATIONS: string[] = [
   // kept until it has been taken off again once the message was dealt with, and when to try that next.
   `ALTER TABLE inbox ADD COLUMN mark TEXT;
    ALTER TABLE inbox ADD COLUMN mark_attempts INTEGER NOT NULL DEFAULT 0;
-   ALTER TABLE inbox ADD COLUMN mark_next_at INTEGER;`,
+   ALTER TABLE inbox ADD COLUMN mark_next_at INTEGER;
+   CREATE INDEX inbox_mark ON inbox (status, mark_next_at) WHERE mark IS NOT NULL;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

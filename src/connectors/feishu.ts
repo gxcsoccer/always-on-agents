@@ -433,9 +433,11 @@ export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: 
   const token = await tenantAccessToken(env, appId);
   const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(mark)}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
   const result = (await response.json().catch(() => ({}))) as { code?: number };
-  if (response.ok && result.code === 0) return "removed";
-  // Busy, limited or not answering: it may be taken off later. Anything else Feishu refused.
-  return response.status === 429 || response.status >= 500 || result.code === undefined ? "retry" : "permanent";
+  // Off; or the message itself is gone (230110), and the reaction with it.
+  if ((response.ok && result.code === 0) || result.code === 230110) return "removed";
+  // Busy, limited, an earlier attempt still in progress (231015), the app's token just lapsed, or no answer: it may be taken off later. Anything else Feishu refused.
+  const later = response.status === 429 || response.status >= 500 || result.code === undefined || [231015, 99991400, 99991663].includes(result.code);
+  return later ? "retry" : "permanent";
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

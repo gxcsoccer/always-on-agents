@@ -94,4 +94,14 @@ describe("the marks on people's messages, by themselves", () => {
       expect(asked.filter((each) => each.mark === "r_stuck").length).toBeLessThanOrEqual(6);
     });
   });
+
+  it("finds the marks due without going through every message there is", async () => {
+    await within(({ store }) => {
+      const plan = (query: string) => store.rows<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`).map((each) => each.detail).join(" | ");
+      for (const query of [
+        "SELECT MIN(COALESCE(mark_next_at, 0)) AS at FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead')",
+        "SELECT id FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead') AND COALESCE(mark_next_at, 0) <= 1 ORDER BY id LIMIT 20",
+      ]) expect(plan(query)).toContain("inbox_mark");
+    });
+  });
 });

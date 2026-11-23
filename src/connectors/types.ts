@@ -231,8 +231,9 @@ export interface Channel {
   /**
    * `wanted` is asked last of all, just before anything is posted: it says no once the sign
    * would come too late to mean anything (the message has been dealt with, or time has passed).
-   * Resolves to whether the outside system confirmed the sign; false when there was nothing to
-   * mark or it was skipped.
+   * Resolves to an opaque mark for the sign (a reaction's id, say), only when the outside system
+   * confirmed it; undefined when there was nothing to mark or it was skipped. The Brain keeps the
+   * mark and hands it to `unreceived` once the message has been dealt with.
    */
   received?(env: Env, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<string | undefined>;
   /**
