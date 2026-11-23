@@ -174,6 +174,19 @@ describe("a run's tools", () => {
       });
     });
 
+    it("tells a replayed call when the timer it set fires, not a time counted from the replay", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        const first = tools().setTimer("c1", 60, "n", null) as { id: string; fires_at: string };
+        // The run is picked up again after a crash, 40 seconds later, and the same call made again.
+        clock.mockReturnValue(now + 40_000);
+        const again = tools().setTimer("c1", 60, "n", null) as { id: string; fires_at: string };
+        expect(again).toEqual({ ok: true, id: first.id, fires_at: new Date(now + 60_000).toISOString() });
+        expect(store.rows<{ due_at: number }>("SELECT due_at FROM timers")).toEqual([{ due_at: now + 60_000 }]);
+      });
+    });
+
     it("refuses delays and repeats out of bounds", async () => {
       await within(({ tools }) => {
         const t = tools();
