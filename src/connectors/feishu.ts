@@ -362,10 +362,10 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
   const current = message.encoding !== 0;
   const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: chatId, msg_type: msgType, content, uuid });
-  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
+  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text, true) }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
-  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text) : message.text }));
+  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text, false) : message.text }));
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
@@ -396,14 +396,18 @@ const MAX_POST_BYTES = 29_000;
 /**
  * The agent's words as Feishu shows them, minus their one way of acting: Feishu's mention markup
  * (`<at user_id="…">`, `<at id=…>`, `</at>`) notifies whoever it names, everyone even. Such markup
- * the model wrote or quoted is shown as the text it is (a zero-width space after the `<`).
- * Nothing else is touched: other tags keep their names and case, and code (inline or fenced) is
- * left exactly as written.
+ * the model wrote or quoted is shown as the text it is (a zero-width space after the `<`). Other
+ * tags keep their names and case. In Markdown, code is left exactly as written: a run of backticks
+ * closed by a run of the same length (a fenced block too). Backticks never closed make no code,
+ * so what follows them is defused; plain text has no code at all, so there all of it is.
  */
-function quiet(text: string): string {
+function quiet(text: string, markdown: boolean): string {
+  const defuse = (part: string) => part.replace(/<(\/?)(at)(?=[\s>])/gi, "<\u200b$1$2");
+  if (!markdown) return defuse(text);
   return text
-    .split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/)
-    .map((part, index) => (index % 2 === 1 ? part : part.replace(/<(\/?)(at)(?=[\s>])/gi, "<\u200b$1$2")))
+    .split(/((`+)(?!`)[\s\S]*?(?<!`)\2(?!`))/)
+    .filter((part, index) => index % 3 !== 2)
+    .map((part, index) => (index % 2 === 1 ? part : defuse(part)))
     .join("");
 }
 

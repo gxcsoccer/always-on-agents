@@ -3088,20 +3088,27 @@ describe("how the bot's words are sent", () => {
   });
 
   it("defuses only Feishu's own mention markup, and leaves code and other markup exactly as written", async () => {
-    const text = 'Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline `<at user_id="x">` and\n```xml\n<at id="y"></at><AT-KEY/>\n```';
+    const text = 'Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline `<at user_id="x">`, ``a <at id="z"></at> b`` and\n```xml\n<at id="y"></at><AT-KEY/>\n```';
     await send(text, true);
     const md = JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
     expect(md).not.toContain('<at user_id="all">');
     expect(md).toContain("<AT-KEY>speed</AT-KEY>");
     expect(md).toContain('`<at user_id="x">`');
+    expect(md).toContain('``a <at id="z"></at> b``');
     expect(md).toContain('```xml\n<at id="y"></at><AT-KEY/>\n```');
     // Nothing else differs.
     expect(md.replace(/\u200b/g, "")).toBe(text);
+    // A run of backticks that is never closed is no code: what follows it is defused, wherever it starts.
+    for (const open of ["三个反引号 ``` 用于代码块，请通知 ", "说明：\n```\n"]) {
+      await send(`${open}<at user_id="all">所有人</at>`, true);
+      expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).not.toContain('<at user_id="all">');
+    }
   });
 
   it("sends as plain text what would be too large as a post, and the same way every time it is tried", async () => {
     // Within the 8,000 characters a message may have, but escaped twice over (inside the post, then inside the request) beyond Feishu's 30 KB for a post.
-    const long = '"\\'.repeat(3_940) + '<at user_id="all"></at>';
+    // Ends in what reads as code in Markdown, but as text there is no such thing: a mention there would notify.
+    const long = '"\\'.repeat(3_930) + '`<at user_id="all"></at>`';
     expect(long.length).toBeLessThanOrEqual(8_000);
     await send(long, true);
     expect(sentAs().msg_type).toBe("text");
