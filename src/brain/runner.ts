@@ -32,7 +32,10 @@ const MAX_EVENT_BYTES_PER_RUN = 120_000;
 const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
 const MODEL_CALL_RESERVE = 20_000;
-const OUTSIDE_REMOVED = "[In this turn you answered using a tool that read text from outside. What it returned, and what you said and did with it, are not kept here. If the content is needed again, read it again from what the person themselves pointed to.]";
+/** The note left in place of a turn that read outside text. Fixed words, but for what the tool itself said it read. */
+function outsideRemoved(read: string[]): string {
+  return `[In this turn you used a tool that read text from outside. What it returned, and what you made of it, are not kept here.${read.length > 0 ? ` Read in this turn: ${read.join(", ")}.` : ""} What you said to the person in this turn, as it reached them, follows this note: answer a follow-up from that, and read the source again (one the person pointed to) only if you need more than you said.]`;
+}
 const ERROR_WITHHELD = "failed after reading outside text; the details are not kept";
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 export type Said = { text: string; data: Record<string, unknown> };
@@ -107,7 +110,10 @@ export class Runner {
       if (target) this.#s.sql.exec("UPDATE sessions SET target = ? WHERE id = ?", target, session.id);
 
       this.#s.sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES (?, ?, 'running', ?)", runId, session.id, now);
-      this.append(session.id, runId, { role: "user", content: events.map((each) => renderEvent(each) + this.#repliedTo(each)).join("\n") });
+      // A reply to one of the agent's own delivered messages points at those words (see #transcript); it does not hold them.
+      const replied: number[] = [];
+      const content = events.map((each) => renderEvent(each) + this.#repliedTo(each, session.id, replied)).join("\n");
+      this.append(session.id, runId, { role: "user", content, ...(replied.length > 0 ? { _replied: replied } : {}) } as Item);
       this.#s.setMeta("active_run", runId);
       return runId;
     });
@@ -125,12 +131,19 @@ export class Runner {
     return this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE source = ? AND source_id = ? AND kind = 'message' AND session_key = ? AND id < ?", event.source, subject.slice(prefix.length), event.session_key, event.id)[0];
   }
 
-  #repliedTo(event: InboxRow): string {
+  #repliedTo(event: InboxRow, sessionId: string, replied: number[]): string {
     const subject = event.kind === "message" && event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
     if (typeof subject !== "string") return "";
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
     if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))})`;
+    // Words of the agent's that reached the person in this very conversation: shown to the model
+    // as the agent's own, from where they are kept, when the transcript is put together.
+    const words = this.#s.rows<{ outbox_id: number }>("SELECT outbox_id FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
+    if (words) {
+      replied.push(words.outbox_id);
+      return "\n  (written as a reply to a message of yours, shown just before this)";
+    }
     // One of the agent's own, sent in this conversation.
     const yours = this.#s.rows<{ sent_at: number | null }>(
       "SELECT o.sent_at FROM outbox o WHERE json_extract(o.receipt, '$.subject') = ? AND (o.run_id IN (SELECT r.id FROM runs r JOIN sessions s ON s.id = r.session_id WHERE s.session_key = ?) OR o.continuation IN (SELECT c.id FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE s.session_key = ?)) LIMIT 1",
@@ -366,6 +379,14 @@ export class Runner {
       // answered. Until here the answer was a draft that nothing would send. A request that is
       // no longer being carried on (told to wait again, ended) leaves no answer behind.
       // What the run read under is on every message it wrote by now (outbox.guard); the run's own note of it goes.
+      // What the run read, by the tool's own canonical call (never anything the model wrote, nor what came back): named in the note below.
+      const read = [...new Set((JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as { args?: unknown }[]).flatMap((each) => {
+        try {
+          return Object.values(JSON.parse(String(each.args)) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
+        } catch {
+          return [];
+        }
+      }))];
       this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") {
@@ -374,7 +395,7 @@ export class Runner {
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
-      this.#forgetOutside(run);
+      this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
     });
   }
@@ -465,11 +486,11 @@ export class Runner {
    * not handed the content, in the original or retold, nor anything else the model wrote.
    * Messages the run wrote are emptied once they have been delivered or given up.
    */
-  #forgetOutside(run: RunRow): void {
+  #forgetOutside(run: RunRow, read: string[] = []): void {
     if (this.#s.rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
-    // Fixed words only. Nothing the model wrote is carried over, not even what it asked a tool for.
-    this.append(run.session_id, run.id, { role: "assistant", content: OUTSIDE_REMOVED });
+    // Fixed words, and what the tool said it read. Nothing the model wrote is carried over, not even what it asked a tool for.
+    this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(read) });
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
     this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
     this.#b.outbox.scrub("run_id = ?", run.id);
@@ -481,25 +502,53 @@ export class Runner {
   }
 
   /**
-   * The items the model sees. The window always starts at a user turn: starting anywhere else would
-   * hand the model a tool output without its call, or a reasoning item without its message. If the
-   * most recent turns alone exceed the window, the window grows to hold the whole latest turn.
+   * The items the model sees, at most the last MAX_TRANSCRIPT_ITEMS of them as they stand (places
+   * left by scrubbed items do not count). The window always starts at a user turn: starting
+   * anywhere else would hand the model a tool output without its call, or a reasoning item without
+   * its message. If the most recent turns alone exceed the window, the window grows to hold the
+   * whole latest turn.
+   *
+   * Two things are put in from where they are kept rather than stored with the transcript:
+   * - After a turn that read outside text (scrubbed down to its fixed note), what that turn said
+   *   to the person, as it was delivered (`said`), in order.
+   * - Before a person's turn that replied to one of those messages, the words replied to, as the
+   *   agent's own.
    */
   #transcript(sessionId: string): Item[] {
-    const last = this.#s.rows<{ seq: number }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ?", sessionId)[0]?.seq;
-    if (last == null) return [];
-    const floor = Math.max(1, last - MAX_TRANSCRIPT_ITEMS + 1);
-    const start =
-      this.#s.rows<{ seq: number }>("SELECT MIN(seq) AS seq FROM items WHERE session_id = ? AND seq >= ? AND is_user = 1", sessionId, floor)[0]?.seq ??
-      this.#s.rows<{ seq: number }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq ??
-      floor;
-    return this.#s.rows<{ item: string }>("SELECT item FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, start).map((r) => JSON.parse(r.item) as Item);
+    const lastUser = this.#s.rows<{ seq: number | null }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq;
+    const floor = this.#s.rows<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM (SELECT seq FROM items WHERE session_id = ? ORDER BY seq DESC LIMIT ?)", sessionId, MAX_TRANSCRIPT_ITEMS * 4)[0]?.seq;
+    if (floor == null) return [];
+    const from = lastUser != null ? Math.min(lastUser, floor) : floor;
+    const rows = this.#s.rows<{ run_id: string | null; is_user: number; item: string; outside: number }>("SELECT run_id, is_user, item, outside FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, from);
+    // Each scrubbed turn's delivered words go after the last of its kept items.
+    const scrubbed = [...new Set(rows.filter((each) => each.is_user === 0 && each.outside === 2 && each.run_id).map((each) => each.run_id as string))];
+    const wordsOf = new Map<string, Item[]>();
+    for (const runId of scrubbed) {
+      const words = this.#s.rows<{ text: string }>("SELECT text FROM said WHERE run_id = ? AND session_id = ? ORDER BY outbox_id", runId, sessionId);
+      if (words.length > 0) wordsOf.set(runId, words.map((each) => ({ role: "assistant", content: each.text })));
+    }
+    const lastOf = new Map<string, number>();
+    rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
+    const entries: { item: Item; starts: boolean }[] = [];
+    rows.forEach((row, index) => {
+      const item = JSON.parse(row.item) as Item & { _replied?: number[] };
+      if (row.is_user === 1) {
+        const { _replied, ...plain } = item;
+        const quoted = (_replied ?? []).flatMap((id) => this.#s.rows<{ text: string; sent_at: number }>("SELECT text, sent_at FROM said WHERE outbox_id = ? AND session_id = ?", id, sessionId));
+        quoted.forEach((each, at) => entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}:]\n${each.text}` }, starts: at === 0 }));
+        entries.push({ item: plain as Item, starts: quoted.length === 0 });
+      } else entries.push({ item, starts: false });
+      if (row.run_id && lastOf.get(row.run_id) === index) for (const words of wordsOf.get(row.run_id) ?? []) entries.push({ item: words, starts: false });
+    });
+    let start = Math.max(0, entries.length - MAX_TRANSCRIPT_ITEMS);
+    while (start < entries.length && !entries[start].starts) start++;
+    if (start >= entries.length) {
+      const last = entries.map((each) => each.starts).lastIndexOf(true);
+      start = last >= 0 ? last : Math.max(0, entries.length - MAX_TRANSCRIPT_ITEMS);
+    }
+    return entries.slice(start).map((each) => each.item);
   }
 
-  /**
-   * The Brain's own tools, and a connector's where this run acts for one person through it. Once
-   * the run has read outside text, only what it may still use (see mayUse).
-   */
   #toolsFor(runId: string): ToolDefinition[] {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");

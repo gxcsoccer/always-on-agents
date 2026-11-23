@@ -35,6 +35,7 @@ function bench(state: DurableObjectState) {
   const channel: Record<string, (message: OutboundMessage) => Receipt | void> = {};
   /** What the requests part says of a message before each attempt, by its key. */
   const gates: Record<string, "send" | "hold" | "wait" | "void" | "unasked"> = {};
+  const settings = { sessionKey: 'private:feishu:[["app_id","cli_1"]]', reads: {} as Record<string, unknown[]> };
   const host: OutboxHost = {
     deliver: async (target, message) => {
       delivered.push({ target, message });
@@ -46,6 +47,8 @@ function bench(state: DurableObjectState) {
       stampGuards: (runId) => void stamped.push(runId),
       gate: async (row) => gates[row.idem as string] ?? "send",
       endRequest: (id, status, why) => void ended.push({ id, status, why }),
+      sessionKeyOf: () => settings.sessionKey,
+      readsOf: (runId) => settings.reads[runId] ?? [],
     },
   };
   const outbox = new Outbox(store, host);
@@ -60,7 +63,9 @@ function bench(state: DurableObjectState) {
   };
   const sent = () => delivered.map((each) => each.message.idem);
   const said = (text: string) => void store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('feishu', ?, 'message', 'dm', '{}', ?, 'done', 1)", `om_${text}`, text);
-  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, run, row, set, sent, said };
+  /** What was recorded as said to the person, in order. */
+  const kept = () => store.rows<Record<string, any>>("SELECT * FROM said ORDER BY outbox_id").map(({ sent_at, ...rest }) => ({ ...rest, reads: JSON.parse(rest.reads) }));
+  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said, kept };
 }
 
 const fails = (err: Error) => () => {
@@ -601,6 +606,61 @@ describe("the outbox, by itself", () => {
       await within(({ outbox, store }) => {
         for (const status of ["draft", "sent", "void", "dead", "unverified", "withdrawn"]) store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at) VALUES (?, ?, 't', ?, 1, 0)", status, TARGET, status);
         expect(outbox.nextWakeAt(0)).toBeNull();
+      });
+    });
+  });
+
+  describe("what was said", () => {
+    const READ_A = { connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: "https://x.feishu.cn/docx/AAAAAAAAAA" }), identity: "docx:AAAAAAAAAA" };
+
+    it("keeps the words the person was actually sent, once, with what had been read when they were written", async () => {
+      await within(async ({ outbox, run, row, settings, outside, kept }) => {
+        run("r1");
+        outside.add("r1");
+        settings.reads.r1 = [READ_A];
+        outbox.enqueue("msg:c1", SESSION, "r1", "A has three items");
+        // Read later in the same run: not what the first message was written from.
+        settings.reads.r1 = [READ_A, { ...READ_A, identity: "docx:BBBBBBBBBB" }];
+        outbox.enqueue("msg:c2", SESSION, "r1", "B has two");
+        await outbox.flush();
+        await outbox.flush();
+        expect(kept()).toEqual([
+          { outbox_id: row("msg:c1").id, run_id: "r1", session_id: SESSION, text: "A has three items", receipt_subject: RECEIPT.subject, reads: [READ_A] },
+          { outbox_id: row("msg:c2").id, run_id: "r1", session_id: SESSION, text: "B has two", receipt_subject: RECEIPT.subject, reads: [READ_A, { ...READ_A, identity: "docx:BBBBBBBBBB" }] },
+        ]);
+        // The outbox's own copy of a private message is still emptied once it has gone out.
+        expect(row("msg:c1")).toMatchObject({ status: "sent", text: "" });
+      });
+    });
+
+    it("keeps the words as they finally went out, not as first written", async () => {
+      await within(async ({ outbox, run, set, kept }) => {
+        run("r1");
+        outbox.enqueue("answer:q1", SESSION, "r1", "first draft");
+        set("answer:q1", { text: "final words" });
+        await outbox.flush();
+        expect(kept().map((each) => each.text)).toEqual(["final words"]);
+      });
+    });
+
+    it("keeps nothing that did not reach the person, nothing that was not the agent's own message, and nothing outside a private conversation", async () => {
+      await within(async ({ outbox, run, set, channel, gates, settings, kept }) => {
+        run("r1");
+        outbox.enqueue("msg:void", SESSION, "r1", "withheld");
+        gates["msg:void"] = "void";
+        outbox.enqueue("msg:dead", SESSION, "r1", "refused");
+        channel["msg:dead"] = fails(new DeliveryRejected("no"));
+        set("msg:dead", { attempts: 5 });
+        outbox.enqueue("msg:gone", SESSION, "r1", "nothing to send");
+        channel["msg:gone"] = fails(new DeliveryVoid());
+        outbox.enqueue("ask:q1", SESSION, "r1", "may I?", { code: "A1" } as never);
+        outbox.notify("budget:r1", SESSION, "r1", "paused until tomorrow");
+        await outbox.flush();
+        expect(kept()).toEqual([]);
+        settings.sessionKey = "chat:oc_9";
+        outbox.enqueue("msg:group", SESSION, "r1", "in a group");
+        await outbox.flush();
+        expect(kept()).toEqual([]);
       });
     });
   });

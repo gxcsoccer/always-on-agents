@@ -210,7 +210,7 @@ export class Requests implements Wakes {
    */
   draft(carried: Continuation, run: RunRow, text: string): { ok: true } {
     this.#b.enqueueMessage(`answer:${carried.id}`, run.session_id, run.id, text, undefined, undefined, { continuation: carried });
-    this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, `answer:${carried.id}`);
+    this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ?, reads = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, JSON.stringify(this.readsOf(run.id)), `answer:${carried.id}`);
     return { ok: true };
   }
 
@@ -477,6 +477,18 @@ export class Requests implements Wakes {
     const noted = JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as Source[];
     this.#s.setMeta(`sources:${runId}`, JSON.stringify([...noted, source]));
     this.stampGuards(runId);
+  }
+
+  /** The conversation a run belongs to, by its key. */
+  sessionKeyOf(_target: string, runId: string | null): string {
+    return this.#s.rows<{ session_key: string }>("SELECT s.session_key FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?", runId ?? "")[0]?.session_key ?? "";
+  }
+
+  /** What this run has read so far, each thing once: its connector, tool, canonical call and identity. */
+  readsOf(runId: string): { connector: string; tool: string; args: string; identity: string }[] {
+    const noted = JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as Partial<Source>[];
+    const whole = noted.filter((each): each is Source => typeof each.tool === "string" && typeof each.args === "string" && typeof each.identity === "string");
+    return [...new Map(whole.map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()];
   }
 
   /** What this run's reads were made under. */

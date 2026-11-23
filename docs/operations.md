@@ -203,6 +203,7 @@ A memory file longer than its limit is stored whole; the run is told that the re
 | Delivered messages and finished timers and tasks | 30 days |
 | An ended request (the record of a wait) | 30 days |
 | A conversation's transcript | Kept in full while the conversation is in use. Once a conversation has been quiet for 30 days it is cut back to roughly its latest 200 items (the cut lands on a user turn, so slightly fewer may remain). There is no upper limit on how long an active conversation's text is kept. |
+| What the agent said in a private conversation (`said`) | Removed with its conversation's transcript: when a run's items are cut, that run's `said` rows go too. Not tied to the outbox row, which goes after 30 days on its own. |
 | Audit entries | 365 days |
 
 ## Cost notes

@@ -709,8 +709,12 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(none.map((each: any) => each.error)).toEqual([expect.stringMatching(/reply to a message that does not link a document/), expect.stringMatching(/reply to a message that does not link a document/)]);
     expect(names()).toEqual(["DocPiaA00000000000001", "DocPiaA00000000000001"]);
     const told = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
-    expect(told).toMatch(/\(written as a reply to the message you sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z\)/);
+    // One of the agent's own messages, as it reached her: shown to the model as its own words, just before her turn.
+    expect(told).toContain("(written as a reply to a message of yours, shown just before this)");
     expect(told).not.toContain("their own earlier message");
+    const input = modelCalls.at(-1).input;
+    const turn = input.map((each: any) => each.role).lastIndexOf("user");
+    expect(input[turn - 1]).toMatchObject({ role: "assistant", content: expect.stringMatching(/^\[The message of yours they are replying to, sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z:\]\n/) });
   });
 
   it("reads nothing for a reply without a link to a message of the person's own that links several documents", async () => {

@@ -301,6 +301,8 @@ export class BrainAgent extends DurableObject<Env> {
           RETAIN_ITEMS_PER_SESSION,
         )[0]?.seq;
         if (keepFrom != null) this.#store.sql.exec("DELETE FROM items WHERE session_id = ? AND seq < ?", session.id, keepFrom);
+        // What the person was told in turns no longer kept goes with them (and not with the outbox rows, which age out on their own).
+        this.#store.sql.exec("DELETE FROM said WHERE session_id = ? AND (run_id IS NULL OR run_id NOT IN (SELECT DISTINCT run_id FROM items WHERE session_id = ? AND run_id IS NOT NULL))", session.id, session.id);
       }
     });
   }

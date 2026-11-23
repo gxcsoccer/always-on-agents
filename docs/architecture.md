@@ -15,7 +15,7 @@ Feishu / GitHub / console / timers / worker reports
 │ Brain  (one Durable Object per scope)               │
 │ SQLite: inbox · sessions · items · memory · timers  │
 │         · tasks · outbox · runs · audit             │
-│         · continuations                             │
+│         · continuations · said                      │
 │ alarm(): fire timers → deliver outbox → run         │
 └───┬────────────────────────────────────┬───────────┘
     │ dispatch / answer / cancel         │ deliver
@@ -43,7 +43,7 @@ Three things are built on these. The reasoning for each is in the [design](desig
 
 **One way out to people.** Everything a person is shown goes through the outbox, including the invitation to do what a request waits for. The Brain holds a reference to the invitation and never its content: the connector makes the card and its link at the moment of sending. A message tied to a request goes out only while that request still stands, and never ahead of something the person has written that has not been handled. How a delivery ended is recorded as one of four things: sent, never handed over (`void`), refused by the outside system (`dead`), or possibly arrived and not checkable (`unverified`), in which case it is not sent again. Separately from messages, a connector can show on a person's own message that it has arrived.
 
-**What a run read stays in that run.** From its first use of a connector's tool, a run can only reply to the person and read again. What it read, and what it said about it, is removed from the conversation's record when the run ends, and nothing of it is kept anywhere else. An earlier way to follow up on an answer, by keeping it apart for a day and reopening it with a tool, has been retired. Its replacement is designed in [follow-up history](design/follow-up-history.zh-CN.md) (in Chinese) and not built yet: the agent's own delivered replies stay in the conversation's history, and a source is read again only when a new question needs it.
+**What a run read stays in that run.** From its first use of a connector's tool, a run can only reply to the person and read again. When the run ends, what it read, its tool calls and its reasoning are removed from the conversation's record and replaced by a fixed note. The note names what the turn read (by the tool's own call, such as the document's link) and nothing the model wrote. What the agent said to the person is kept apart from this. Each of its own messages delivered in a person's private conversation is kept in the `said` table, as it was delivered. When the transcript is put together, the words of a scrubbed turn follow its note, and a reply to one of them is shown after the words it replies to. The note tells the model to answer a follow-up from what it said, and to read the source again only if it needs more. Only a run that itself reads outside text is restricted; later runs that see this history are not. An earlier way to follow up, by keeping an answer apart for a day and reopening it with a tool, has been retired. This is step 2 of [follow-up history](design/follow-up-history.zh-CN.md) (in Chinese). It is built on a branch and not deployed. Step 3, which widens which links may be read and limits a reply to what its answer read, is not built.
 
 ## Scopes and tenants
 

@@ -237,6 +237,22 @@ export const MIGRATIONS: string[] = [
    UPDATE outbox SET source = NULL WHERE source IS NOT NULL;
    DELETE FROM meta WHERE key LIKE 'quotes:%';
    DROP TABLE answers;`,
+  // 23: what the agent actually said to a person in their private conversation: the words of each
+  // of its own messages as they were delivered, kept with the conversation's history rather than
+  // with the outbox row, and what the run had read by the time the message was written.
+  // `outbox.reads` carries the latter from when the message is written to when it is delivered.
+  `CREATE TABLE said (
+     outbox_id INTEGER PRIMARY KEY,
+     run_id TEXT,
+     session_id TEXT NOT NULL,
+     text TEXT NOT NULL,
+     sent_at INTEGER NOT NULL,
+     receipt_subject TEXT,
+     reads TEXT NOT NULL DEFAULT '[]'
+   );
+   CREATE INDEX said_receipt ON said (receipt_subject);
+   CREATE INDEX said_run ON said (run_id);
+   ALTER TABLE outbox ADD COLUMN reads TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

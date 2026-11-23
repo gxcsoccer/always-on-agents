@@ -118,7 +118,7 @@ describe("a connector's tools", () => {
     expect(await fresh.stub.readMemory("instructions.md")).toBe("Be brief.");
   });
 
-  it("leave nothing of what was read in the conversation's record once the run has ended, in the original or retold", async () => {
+  it("leave nothing of what was read, nor what the model made of it, in the conversation's record once the run has ended: only what the person was actually told", async () => {
     const { stub } = brain();
     model.replies([call("notes_read", { page: "plan" })], [call("send_message", { text: "You ship on Friday." })], [say("So: Friday.")]);
     await stub.ingest(own("when do we ship? see my plan page"));
@@ -137,13 +137,15 @@ describe("a connector's tools", () => {
     expect(stored.outbox).toEqual([{ text: "", status: "sent", private: 1 }]);
     expect(JSON.stringify(await stub.inspect())).not.toMatch(/Friday/);
 
-    // A later run is told that something was read, by which call, and can read it again. Having
+    // A later run is told that something was read, and what the person was told about it (as
+    // delivered, kept apart from the record above), and nothing else the model made of it. Having
     // read nothing itself, it may change memory.
     model.replies([call("memory_write", { path: "notes/style.md", content: "brief" })], [say("")]);
     await stub.ingest(own("remember I like brief answers"));
     await wake(stub);
     const shown = JSON.stringify(modelCalls.at(-1)!.input);
-    expect(shown).not.toMatch(/Friday/);
+    expect(shown).toContain("You ship on Friday.");
+    expect(shown).not.toContain("So: Friday.");
     expect(shown).toContain("not kept here");
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true });
   });

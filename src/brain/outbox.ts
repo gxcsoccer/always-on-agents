@@ -7,7 +7,7 @@
  * rest of the Brain it is handed (OutboxHost).
  */
 import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Receipt, dedupeWindow } from "../connectors";
-import type { Target } from "../events";
+import { type Target, isPrivateSession } from "../events";
 import type { Continuation, Requests } from "./requests";
 import type { BrainStore, Row, Wakes } from "./store";
 
@@ -53,7 +53,7 @@ export interface OutboxHost {
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
-  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest">;
+  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf">;
 }
 
 export class Outbox implements Wakes {
@@ -81,7 +81,7 @@ export class Outbox implements Wakes {
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
     this.#s.sql.exec(
-      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction, reads) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       idem,
       runId,
       target,
@@ -92,6 +92,8 @@ export class Outbox implements Wakes {
       review ? JSON.stringify(review) : null,
       bound?.continuation?.id ?? null,
       bound?.interaction ?? null,
+      // What the run had read by now: what these words can have been written from.
+      runId ? JSON.stringify(this.#b.requests.readsOf(runId)) : null,
     );
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
@@ -197,7 +199,26 @@ export class Outbox implements Wakes {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
       const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
-      this.#s.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
+      const sentAt = receipt?.posted_at ?? Date.now();
+      this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", sentAt, receipt ? JSON.stringify(receipt) : null, row.id, status);
+        // What the person was told, in their private conversation, as it reached them: part of
+        // the conversation's history from now on, whatever becomes of this row. Only the agent's
+        // own messages (not questions, notices or reviews), and only the words that went out.
+        const nowSent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE id = ?", row.id)[0]?.status === "sent";
+        if (nowSent && this.#isOwnPrivateMessage(row)) {
+          this.#s.sql.exec(
+            "INSERT OR IGNORE INTO said (outbox_id, run_id, session_id, text, sent_at, receipt_subject, reads) SELECT ?, ?, session_id, ?, ?, ?, ? FROM runs WHERE id = ?",
+            row.id,
+            row.run_id,
+            row.text,
+            sentAt,
+            receipt?.subject ?? null,
+            row.reads ?? "[]",
+            row.run_id,
+          );
+        }
+      });
       this.scrub("id = ?", row.id);
       if (row.continuation) {
         // From the request being taken up (its condition holding) to its answer being handed over.
@@ -248,6 +269,12 @@ export class Outbox implements Wakes {
    * removed; what is needed to know they were sent, and where, stays. While a message is still to
    * be delivered or reconciled it is kept, since it cannot be sent otherwise.
    */
+  /** One of the agent's own messages (written with send_message, or a request's answer), to a person in their private conversation. */
+  #isOwnPrivateMessage(row: Row): boolean {
+    const own = typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
+    return own && !row.ask && !row.review && typeof row.run_id === "string" && isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id));
+  }
+
   scrub(which: "id = ?" | "run_id = ?", value: number | string): void {
     this.#s.sql.exec(
       `UPDATE outbox SET text = '', review = NULL, error = CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE ${which} AND private = 1 AND status IN ('sent', 'dead', 'unverified') AND (text != '' OR review IS NOT NULL OR (error IS NOT NULL AND error != ?))`,
