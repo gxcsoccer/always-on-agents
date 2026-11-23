@@ -220,6 +220,8 @@ export class Tasks implements Wakes {
     }
     // An answer already given to this question that may have reached the worker.
     let before: Intent["before"];
+    // The message an approval of this question rested on, if that approval has just been set aside.
+    let setAside: number | undefined;
     // A question gets one decision. If one is already on record for the question still shown as
     // pending (its delivery to the worker was not confirmed), this call delivers that same decision
     // again; it does not get to make a new one.
@@ -242,6 +244,7 @@ export class Tasks implements Wakes {
         (approver !== undefined && this.#r.saidSinceWhereTyped(approver, task.created_at ?? 0));
       if (decision === "deny" || against || !approver || !this.#r.stillStands(approver)) {
         before = { decision: intent.decision, decided_by: intent.decided_by };
+        setAside = intent.deciding_event;
         intent = undefined;
       }
     }
@@ -273,6 +276,7 @@ export class Tasks implements Wakes {
           ),
         // One message approves one question.
         used: () => new Set(this.#s.rows<{ event: number | null }>("SELECT json_extract(answering, '$.deciding_event') AS event FROM tasks WHERE answering IS NOT NULL").map((r) => r.event)),
+        setAside,
         shared: this.#s.scope().kind !== "user",
         requestedBy: task.requested_by,
         // Anything of theirs that arrived after this run started and is still in the inbox. And,

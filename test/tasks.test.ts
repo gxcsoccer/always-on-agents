@@ -1042,9 +1042,9 @@ describe("tasks, by themselves", () => {
           worker.answer = async () => ({ ok: false, error: "busy" });
           await expect(answer("t1", "allow", "call_1")).rejects.toThrow("busy");
           reply("hold on");
-          // The approval on record is dropped. Judged afresh, the same message cannot approve: it
-          // is the one already on record for a question (this one), which is what the refusal says.
-          await expect(answer("t1", "allow", "call_2")).rejects.toThrow("that reply was already used to approve another question");
+          // The approval on record is dropped. Judged afresh, the same message cannot approve again,
+          // and the refusal says why: not that it approved something else, but that it was set aside.
+          await expect(answer("t1", "allow", "call_2")).rejects.toThrow(`alice's earlier approval of this was set aside because of what was said since; ask them to confirm by sending just "approve ${open.code}" again`);
           expect(worker.answered).toHaveLength(1);
         });
         await within(async ({ task, asks, reply, answer, worker }) => {

@@ -109,6 +109,17 @@ describe("whose message decides an approval question", () => {
       expect(decidingReply("allow", ASKED, facts([approval, again], { used: () => new Set([approval.event.id]) }))).toMatchObject({ event: again.event });
     });
 
+    it("does not rest again on its own approval once that was set aside, and asks for a fresh one", () => {
+      const approval = said("approve ABCD");
+      // On record for this very question, then set aside by what was said since. Still one message
+      // for one question: it cannot approve again, and the reason says so truly.
+      expect(() => decidingReply("allow", ASKED, facts([approval], { used: () => new Set([approval.event.id]), setAside: approval.event.id }))).toThrow(
+        'alice\'s earlier approval of this was set aside because of what was said since; ask them to confirm by sending just "approve ABCD" again',
+      );
+      const again = said("approve ABCD");
+      expect(decidingReply("allow", ASKED, facts([approval, again], { used: () => new Set([approval.event.id]), setAside: approval.event.id }))).toMatchObject({ event: again.event });
+    });
+
     it("in a shared conversation is only the requester's to give, and nobody's when no person asked", () => {
       const bob = said("approve ABCD", { person: "bob" });
       expect(() => decidingReply("allow", ASKED, facts([bob]))).toThrow("only alice, who requested this task, can approve it");

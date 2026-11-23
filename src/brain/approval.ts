@@ -30,6 +30,8 @@ export interface Facts {
   queued(): { events: InboxRow[]; unresolved: boolean };
   /** The messages already on record as deciding a question. */
   used(): Set<number | null>;
+  /** This question's own approval, on record until what was said since set it aside, if so. */
+  setAside?: number;
   /** Whether the conversation is one that several people are in. */
   shared: boolean;
   /** The one person who asked for the task, if there was exactly one. */
@@ -81,8 +83,14 @@ export function decidingReply(decision: "allow" | "deny", asked: Asked, facts: F
     if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${asked.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
     // One message approves one question.
     const used = facts.used();
-    approvals = approvals.filter(({ event }) => !used.has(event.id));
-    if (approvals.length === 0) throw new Error("that reply was already used to approve another question");
+    const unused = approvals.filter(({ event }) => !used.has(event.id));
+    if (unused.length === 0) {
+      // The message is the one this question's own approval rested on, until it was set aside.
+      const own = approvals.find(({ event }) => event.id === facts.setAside);
+      if (own) throw new Error(`${own.principal.id}'s earlier approval of this was set aside because of what was said since; ask them to confirm by sending just "approve ${asked.code}" again`);
+      throw new Error("that reply was already used to approve another question");
+    }
+    approvals = unused;
     if (facts.shared) {
       if (!facts.requestedBy) throw new Error("this task was not started by a person, so nobody can approve this; it can only be refused");
       approvals = approvals.filter(({ principal }) => principal.id === facts.requestedBy);
