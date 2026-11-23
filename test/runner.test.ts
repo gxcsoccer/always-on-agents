@@ -446,6 +446,70 @@ describe("the run loop, by itself", () => {
     });
   });
 
+  describe("a run that stopped being the active one while it waited", () => {
+    it("does not record what the model said once another run is active", async () => {
+      await within(async ({ runner, event, host, store, items, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        host.respond = async () => {
+          store.setMeta("active_run", "another");
+          return answer([says("too late")], 500);
+        };
+        await runner.execute(id);
+        expect(items(id).map((each) => each.role ?? each.type)).toEqual(["user"]);
+        expect(run(id)).toMatchObject({ steps: 0, input_tokens: 0, output_tokens: 0 });
+        expect(runner.tokensToday()).toBe(0);
+      });
+    });
+  });
+
+  describe("ending a run in one step", () => {
+    it("leaves the run as it was when ending it fails part way, and ends it once when tried again", async () => {
+      await within(async ({ runner, event, host, store, run, inbox }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        runner.append(run(id).session_id, id, says("done"));
+        const followUps = host.requests.followUps;
+        let failed = false;
+        host.requests.followUps = () => {
+          if (failed) return followUps();
+          failed = true;
+          throw new Error("storage hiccup");
+        };
+        await expect(runner.execute(id)).rejects.toThrow("storage hiccup");
+        expect(run(id).status).toBe("running");
+        expect(inbox()[0].status).toBe("claimed");
+        expect(store.meta("active_run")).toBe(id);
+        await runner.execute(id);
+        expect(run(id).status).toBe("done");
+        expect(inbox()[0].status).toBe("done");
+        expect(store.meta("active_run")).toBeUndefined();
+      });
+    });
+
+    it("leaves the run as it was when abandoning it fails part way, and closes an open call once when tried again", async () => {
+      await within(async ({ runner, event, host, store, run, items }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        runner.append(run(id).session_id, id, calls("memory_list", "call_9"));
+        store.sql.exec("UPDATE runs SET entries = 5 WHERE id = ?", id);
+        const notify = host.outbox.notify;
+        let failed = false;
+        host.outbox.notify = ((...args: Parameters<typeof notify>) => {
+          if (failed) return notify(...args);
+          failed = true;
+          throw new Error("storage hiccup");
+        }) as typeof notify;
+        await expect(runner.execute(id)).rejects.toThrow("storage hiccup");
+        expect(items(id).filter((each) => each.type === "function_call_output")).toEqual([]);
+        expect(run(id).status).toBe("running");
+        await runner.execute(id);
+        expect(items(id).filter((each) => each.type === "function_call_output").map((each) => each.call_id)).toEqual(["call_9"]);
+        expect(run(id).status).toBe("failed");
+      });
+    });
+  });
+
   describe("ending a run", () => {
     it("replaces everything a run that read outside text said or did by one fixed note, and empties its messages", async () => {
       await within(async ({ runner, event, store, items, of }) => {
