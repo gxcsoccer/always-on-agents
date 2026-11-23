@@ -44,7 +44,6 @@ export interface Continuation {
 /** Why a request the person called off ended, naming the call that did it so that a replay of that call is recognised. */
 export const calledOff = (by: string) => `the person called it off (${by})`;
 
-/** One thing a run read for the person: which tool, with what, on which of their messages, and what it said (as a fingerprint). */
 /** Whether a kept answer's record is one that can be used: exactly one source, with what it was read for and what it was. */
 export function wholeAnswer(answer: { sources: string }): boolean {
   try {
@@ -67,6 +66,7 @@ export interface AnswerRow {
   target: string;
 }
 
+/** One thing a run read for the person: which tool, with what, on which of their messages, and what it said (as a fingerprint). */
 export interface Source {
   connector: string;
   tool: string;
@@ -563,10 +563,6 @@ export class Requests {
   }
 
   /**
-   * The answer a run could be following up, if there is one: the one the person replied to, or
-   * else the one that is the last thing the agent said to them here. At most one is ever offered.
-   */
-  /**
    * The messages a reply to which is about this answer: the answer's own, and the person's
    * messages its source was read for, where the tool tied the read to particular ones.
    */
@@ -597,6 +593,10 @@ export class Requests {
     return { kept, fits, named, last };
   }
 
+  /**
+   * The answer a run could be following up, if there is one: the one the person replied to, or
+   * else the one that is the last thing the agent said to them here. At most one is ever offered.
+   */
   reopenable(runId: string): { id: string; asked: string; at: number }[] {
     if (!this.followUps() || this.continuationOf(runId) || !this.#b.actingFor(runId)) return [];
     const sessionId = this.#s.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "";
