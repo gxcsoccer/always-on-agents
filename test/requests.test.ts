@@ -1,10 +1,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Env } from "../src/env";
 import { type Acting, type Continuation, type Guard, Requests, type RequestsHost, type Source, calledOff } from "../src/brain/requests";
-import { BrainStore, type RunRow } from "../src/brain/store";
+import { BrainStore, type InboxRow, type RunRow } from "../src/brain/store";
 
 /**
  * Requests that wait, guards and follow-ups, by themselves: the part is built on a real Brain's
@@ -17,6 +17,8 @@ const SESSION_KEY = "dm";
 const TARGET = JSON.stringify({ connector: "feishu", address: { chat_id: "oc_1" } });
 const ELSEWHERE = JSON.stringify({ connector: "feishu", address: { chat_id: "oc_then" } });
 const PERSON: Acting = { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" }, said: [], recent: [], recentIds: [] };
+
+afterEach(() => vi.restoreAllMocks());
 
 let scopes = 0;
 function within<T>(use: (bench: ReturnType<typeof bench>) => T | Promise<T>): Promise<T> {
@@ -186,7 +188,9 @@ describe("requests that wait, by themselves", () => {
     await within(({ requests, request, kept, hints }) => {
       const now = 5_000_000_000;
       const minute = Math.floor(now / 60_000);
-      request("r_until", { until: now, check_at: now + 9 });
+      request("r_until", { until: now });
+      // Past its deadline and already looked at; its owner is to be asked again soon: left to that.
+      request("r_retry", { until: now - 30_000, check_at: now + 9 });
       request("r_check", { until: now + 10_000, check_at: now });
       request("r_later", { until: now + 1, check_at: now + 1 });
       request("r_plain", { until: now + 1 });
@@ -196,6 +200,7 @@ describe("requests that wait, by themselves", () => {
       expect(hints()).toEqual([`r_until:due:${minute}`, `r_check:due:${minute}`]);
       expect(kept("r_until").check_at).toBeNull();
       expect(kept("r_check").check_at).toBeNull();
+      expect(kept("r_retry").check_at).toBe(now + 9);
       expect(kept("r_later").check_at).toBe(now + 1);
       expect(kept("r_ended").check_at).toBe(now - 1);
       // It only gave a reason to ask: nothing has ended.
@@ -204,6 +209,36 @@ describe("requests that wait, by themselves", () => {
       requests.deadlines(now + 1);
       expect(hints()).toEqual([`r_until:due:${minute}`, `r_check:due:${minute}`, `r_later:due:${minute}`, `r_plain:due:${minute}`]);
       expect(kept("r_later").check_at).toBeNull();
+    });
+  });
+
+  it("keeps a wait's scheduled re-ask when another wait wakes the Brain first", async () => {
+    await within(({ requests, request, hints }) => {
+      const now = 5_000_000_000;
+      // A's deadline has passed and was looked at; its owner could not be asked, so it is asked
+      // again at the next minute's :05. B's next look comes first.
+      request("a", { until: now - 20_000, check_at: now + 40_000 });
+      request("b", { until: now + 90_000, check_at: now });
+      requests.deadlines(now);
+      expect(hints()).toEqual([`b:due:${Math.floor(now / 60_000)}`]);
+      expect(requests.nextWakeAt(now)).toBe(now + 40_000);
+      requests.deadlines(now + 40_000);
+      expect(hints()).toContain(`a:due:${Math.floor((now + 40_000) / 60_000)}`);
+    });
+  });
+
+  it("asks again about a wait whose owner could not be asked in a minute, but no later than its deadline", async () => {
+    await within(async ({ requests, request, kept }) => {
+      const now = 5_000_000_000;
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      // No connector of that name can say whether anything holds: asking fails.
+      request("soon", { connector: "unknown", until: now + 20_000 });
+      request("later", { connector: "unknown", until: now + 600_000 });
+      request("past", { connector: "unknown", until: now - 1_000 });
+      for (const id of ["soon", "later", "past"]) await requests.resume({ id: 0, data: JSON.stringify({ request: id }) } as InboxRow);
+      expect(kept("soon").check_at).toBe(now + 20_000);
+      expect(kept("later").check_at).toBe(now + 60_000);
+      expect(kept("past").check_at).toBe(now + 60_000);
     });
   });
 
@@ -522,6 +557,13 @@ describe("when requests and kept answers next need the Brain awake", () => {
       // Its owner could not be asked; it is to be asked again in half a minute.
       request("late", { until: NOW - 5_000, check_at: NOW + 30_000 });
       expect(requests.nextWakeAt(NOW)).toBe(NOW + 30_000);
+    });
+  });
+
+  it("does not let a missed check put off the same wait's coming deadline", async () => {
+    await within(({ requests, request }) => {
+      request("w", { until: NOW + 10_000, check_at: NOW - 1 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 10_000);
     });
   });
 
