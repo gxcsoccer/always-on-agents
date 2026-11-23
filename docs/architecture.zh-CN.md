@@ -100,10 +100,11 @@ worker 对自己的描述不可信：那只是容器里的一个进程在说话�
 | 想了解 | 读 |
 |---|---|
 | 事件、作用域、身份 | `src/events.ts` |
-| 收件箱、run、任务、发件箱 | `src/brain/agent.ts` |
+| 收件箱、唤醒循环、run | `src/brain/agent.ts` |
+| Brain 的其他部分，各自一个文件，共用同一个数据库 | `src/brain/store.ts`（数据库）、`outbox.ts`、`tasks.ts`、`timers.ts`、`revisions.ts` |
 | 会等待的请求，以及可以追问的答复 | `src/brain/requests.ts`（Brain 的一部分，单独一个文件：同一个数据库、同一批事务），不需要判断的规则在 `src/brain/follow-up.ts`；`src/connectors/types.ts` 里的 `Waiting` 和 `holds` |
 | 模型能做什么 | `src/brain/tools.ts`、`src/brain/prompt.ts` |
-| 审批规则 | `src/brain/agent.ts` 里的 `#answerTask` 和 `readDecision` |
+| 审批规则 | `src/brain/tasks.ts` 里的 `Tasks.answer` 和 `readDecision`，以及处理可被修改的回复的 `src/brain/revisions.ts` |
 | 沙箱的边界 | `src/workers/sandbox/outbound.ts` |
 | 一个任务的一生 | `src/workers/sandbox/task.ts` |
 | 外部系统怎么接入 | `src/connectors/` |
