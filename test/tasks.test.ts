@@ -1167,6 +1167,24 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("does not name the author of an earlier approval as the author of a refusal the worker holds", async () => {
+      await within(async ({ task, asks, reply, answer, worker, kept, audited }) => {
+        task("t1");
+        const open = await asks("t1", 1);
+        reply(`approve ${open.code}`);
+        worker.answer = async () => ({ ok: false, error: "busy" });
+        await expect(answer("t1", "allow", "call_1")).rejects.toThrow("busy");
+        // A fresh approval for the same question; the worker turns out to hold a refusal.
+        reply(`approve ${open.code}`);
+        worker.answer = async () => ({ ok: true, decision: "deny" });
+        const result = (await answer("t1", "allow", "call_2")) as Record<string, unknown>;
+        expect(JSON.parse(kept("t1").answering).before).toEqual({ decision: "allow", decided_by: "alice" });
+        expect(result).toMatchObject({ ok: true, decision: "deny" });
+        expect(result).not.toHaveProperty("decided_by");
+        expect(audited("task.answer_too_late")).toMatchObject([{ in_force: "deny", in_force_by: null }]);
+      });
+    });
+
     it("clears only the question it answered: a newer one that arrived meanwhile stays open", async () => {
       await within(async ({ tasks, task, asks, reply, answer, worker, kept, pendingOf, closed }) => {
         task("t1");
