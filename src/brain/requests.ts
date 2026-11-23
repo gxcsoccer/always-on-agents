@@ -7,7 +7,7 @@
 import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds, isWaiting, toolsOf } from "../connectors";
 import type { Env } from "../env";
 import type { Item } from "../model/openai";
-import type { Said } from "./agent";
+import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
 import { type Passage, followUpDecision, locate, passageNow } from "./follow-up";
 import type { BrainStore, InboxRow, Row, RunRow, Wakes } from "./store";

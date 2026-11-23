@@ -100,7 +100,8 @@ A connector owns three things for one outside system: verifying an inbound reque
 | To understand | Read |
 |---|---|
 | Events, scopes, principals | `src/events.ts` |
-| The inbox, the wake cycle, runs | `src/brain/agent.ts` |
+| The inbox and the wake cycle | `src/brain/agent.ts` |
+| A run: claiming events, calling the model, ending, retrying | `src/brain/runner.ts` |
 | The Brain's other parts, each in a file of its own on the same database | `src/brain/store.ts` (the database), `outbox.ts`, `tasks.ts`, `timers.ts`, `revisions.ts` |
 | Requests that wait, and answers that can be followed up | `src/brain/requests.ts` (a part of the Brain in a file of its own: same database, same transactions), the rules that need no judgement in `src/brain/follow-up.ts`; `Waiting` and `holds` in `src/connectors/types.ts` |
 | What the model can do | `src/brain/tools.ts` (what it is told), `src/brain/run-tools.ts` (what each tool does in a run), `src/brain/prompt.ts` |
