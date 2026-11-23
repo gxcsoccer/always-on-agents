@@ -178,7 +178,8 @@ export class Runner {
       const reservedOn = tenant.day;
       /** Gives the reservation back: the call it was made for is not going to happen. */
       const release = () => this.#b.registry().adjustUsage(this.#s.scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
-      if (!this.#stillActive(runId)) return;
+      // From here, a run that stops being this object's while waiting gives the reservation back.
+      if (!this.#stillActive(runId)) return void (await release());
       if (!tenant.allowed || this.tokensToday() >= DAILY_TOKEN_BUDGET) {
         await release();
         if (!this.#stillActive(runId)) return;
@@ -213,7 +214,7 @@ export class Runner {
           await release();
           return this.#retryLater(runId, err);
         }
-        if (!this.#stillActive(runId)) return;
+        if (!this.#stillActive(runId)) return void (await release());
         if (why || !this.actingFor(runId)) {
           await release();
           if (!this.#stillActive(runId)) return;
@@ -235,7 +236,7 @@ export class Runner {
           await release();
           return this.#retryLater(runId, err);
         }
-        if (!this.#stillActive(runId)) return;
+        if (!this.#stillActive(runId)) return void (await release());
         if (over) {
           await release();
           if (!this.#stillActive(runId)) return;
@@ -276,7 +277,12 @@ export class Runner {
         await release();
         return this.#retryLater(runId, err);
       }
-      if (!this.#stillActive(runId)) return;
+      // The call was made: what it spent is counted, here and for the tenant, even if the run is no longer this object's.
+      const trueUp = () => this.#b.registry().adjustUsage(this.#s.scope().tenant, response.usage.total_tokens - MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+      if (!this.#stillActive(runId)) {
+        this.spend(response.usage.total_tokens);
+        return void (await trueUp());
+      }
       this.#s.transaction(() => {
         for (const item of response.output) this.append(run.session_id, runId, item);
         this.#s.sql.exec(
@@ -288,7 +294,7 @@ export class Runner {
         this.#s.setMeta(`tokens:${today()}`, String(this.tokensToday() + response.usage.total_tokens));
       });
       // After the commit: if this is lost the tenant is under-counted by one call, never blocked.
-      await this.#b.registry().adjustUsage(this.#s.scope().tenant, response.usage.total_tokens - MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+      await trueUp();
     }
     this.#finish(runId, "done");
   }

@@ -276,6 +276,47 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("gives the reservation back when the run stops being this object's while the reservation is made", async () => {
+      await within(async ({ go, event, host, store, asked, log, tenant }) => {
+        event("hello");
+        const registry = host.registry;
+        host.registry = () => ({
+          ...registry(),
+          recordUsage: async (name: string, tokens: number) => {
+            const made = await registry().recordUsage(name, tokens);
+            store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+            return made;
+          },
+        });
+        await go();
+        expect(asked).toHaveLength(0);
+        expect(log.filter(([name]) => name === "recordUsage" || name === "adjustUsage")).toEqual([
+          ["recordUsage", tenant, 20_000],
+          ["adjustUsage", tenant, -20_000, "2026-11-23"],
+        ]);
+      });
+    });
+
+    it("counts what a model call spent when the run stops being this object's while the call is made", async () => {
+      await within(async ({ go, event, host, store, model, log, tenant, runner }) => {
+        event("hello");
+        model.push(answer([says("hi")], 250));
+        const respond = host.respond;
+        host.respond = async (request) => {
+          const response = await respond(request);
+          store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+          return response;
+        };
+        await go();
+        expect(log.filter(([name]) => name === "recordUsage" || name === "adjustUsage")).toEqual([
+          ["recordUsage", tenant, 20_000],
+          ["adjustUsage", tenant, 250 - 20_000, "2026-11-23"],
+        ]);
+        // And in this scope's own count: the tokens were spent.
+        expect(runner.tokensToday()).toBe(250);
+      });
+    });
+
     it("carries out the tool calls the model asked for, records their outputs, and asks again", async () => {
       await within(async ({ go, event, model, asked, results, items, of }) => {
         event("hello");
@@ -458,7 +499,8 @@ describe("the run loop, by itself", () => {
         await runner.execute(id);
         expect(items(id).map((each) => each.role ?? each.type)).toEqual(["user"]);
         expect(run(id)).toMatchObject({ steps: 0, input_tokens: 0, output_tokens: 0 });
-        expect(runner.tokensToday()).toBe(0);
+        // What it said is not this run's to record; what it spent was spent all the same.
+        expect(runner.tokensToday()).toBe(500);
       });
     });
   });
@@ -627,6 +669,20 @@ describe("the run loop, by itself", () => {
         expect(b.asked).toEqual([]);
         expect(b.run(id)).toMatchObject({ status: "running", error: "failed after reading outside text; the details are not kept" });
       });
+    });
+
+    it("gives the reservation back when the run stops being this object's while a condition's owner is asked", async () => {
+      for (const asking of ["mayNotDisclose", "over"] as const) {
+        await within(async (b) => {
+          const id = await carrying(b);
+          b.settings.guards = [{ condition: "c" }];
+          const lose = async () => void b.store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+          (b.host.requests as unknown as Record<string, unknown>)[asking] = lose;
+          await b.runner.execute(id);
+          expect(b.asked).toEqual([]);
+          expect(b.of("adjustUsage")).toEqual([[b.tenant, -20_000, "2026-11-23"]]);
+        });
+      }
     });
 
     it("ends once its time is up, before the model is called", async () => {
