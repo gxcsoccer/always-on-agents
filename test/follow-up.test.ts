@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { type FollowUpCase, type Verdict, followUpDecision, locate, passageNow, strictDecision } from "../src/brain/follow-up";
 
 const NOW = 1_000_000;
-const kept = { session: "s1", expiresAt: NOW + 1, subject: "msg:answer", isLastThingSaid: true };
+const kept = { session: "s1", expiresAt: NOW + 1, subjects: ["msg:answer"], isLastThingSaid: true };
 const base: FollowUpCase = { enabled: true, actingForPerson: true, session: "s1", repliedTo: [], now: NOW, answer: kept };
 
 /** Each case: what it is, whether the person has the authority for it at all, and what the proposed behaviour must decide. */
@@ -20,6 +20,10 @@ const cases: { name: string; input: FollowUpCase; inAuthority: boolean; proposed
   { name: "a reply to the answer's own message, later", input: { ...base, repliedTo: ["msg:answer"], answer: { ...kept, isLastThingSaid: false } }, inAuthority: true, proposed: { allow: true }, why: "the reply names the answer" },
   { name: "a follow-up that waited for authorisation and is carried on", input: { ...base, carriedOn: true, answer: { ...kept, isLastThingSaid: false } }, inAuthority: true, proposed: { allow: true }, why: "which answer was settled when it was first asked; everything else is checked again" },
   { name: "something else was said since, and no reply", input: { ...base, answer: { ...kept, isLastThingSaid: false } }, inAuthority: true, proposed: { allow: false, reason: "not_the_last_thing_said" } },
+  { name: "a reply to the person's own message the answer was read for", input: { ...base, repliedTo: ["msg:asked"], answer: { ...kept, subjects: ["msg:answer", "msg:linked", "msg:asked"], isLastThingSaid: false } }, inAuthority: true, proposed: { allow: true }, why: "the reply names a message of the person's own that this answer's source was tied to, and no other answer's" },
+  { name: "a reply to a message two kept answers were read for", input: { ...base, repliedTo: ["msg:asked"], answer: { ...kept, subjects: ["msg:answer", "msg:asked"], shared: true } }, inAuthority: true, proposed: { allow: false, reason: "reply_fits_several" } },
+  { name: "a reply to a message the answer was not read for, though another answer shares one that it was", input: { ...base, repliedTo: ["msg:other"], answer: { ...kept, subjects: ["msg:answer", "msg:asked"], shared: true } }, inAuthority: true, proposed: { allow: false, reason: "replied_to_something_else" } },
+  { name: "no reply at all, though another answer was read for the same message", input: { ...base, answer: { ...kept, subjects: ["msg:answer", "msg:asked"], shared: true } }, inAuthority: true, proposed: { allow: true }, ruleA: true, why: "nothing was replied to, so what two answers share is not in question: it is the last thing said" },
   { name: "a reply to some other message", input: { ...base, repliedTo: ["msg:other"] }, inAuthority: true, proposed: { allow: false, reason: "replied_to_something_else" } },
   { name: "a reply to the answer and to something else at once", input: { ...base, repliedTo: ["msg:answer", "msg:other"] }, inAuthority: true, proposed: { allow: false, reason: "replied_to_something_else" } },
   { name: "the answer is no longer kept", input: { ...base, answer: { ...kept, expiresAt: NOW } }, inAuthority: true, proposed: { allow: false, reason: "expired" } },
@@ -41,10 +45,10 @@ describe("following up: the strict and the proposed decision on the same inputs"
     const outOfAuthorityAllows = cases.filter((each) => !each.inAuthority && followUpDecision(each.input).allow);
     expect(outOfAuthorityAllows).toEqual([]);
     const deltas = cases.filter((each) => !strictDecision(each.input).allow && followUpDecision(each.input).allow);
-    expect(deltas.map((each) => each.name)).toEqual(["a plain follow-up right after the answer", "a reply to the answer's own message, later", "a follow-up that waited for authorisation and is carried on"]);
+    expect(deltas.map((each) => each.name)).toEqual(["a plain follow-up right after the answer", "a reply to the answer's own message, later", "a follow-up that waited for authorisation and is carried on", "a reply to the person's own message the answer was read for", "no reply at all, though another answer was read for the same message"]);
     expect(deltas.every((each) => typeof each.why === "string")).toBe(true);
     // The one allowance that still rests on the model's reading of the person's words.
-    expect(deltas.filter((each) => each.ruleA).map((each) => each.name)).toEqual(["a plain follow-up right after the answer"]);
+    expect(deltas.filter((each) => each.ruleA).map((each) => each.name)).toEqual(["a plain follow-up right after the answer", "no reply at all, though another answer was read for the same message"]);
   });
 });
 

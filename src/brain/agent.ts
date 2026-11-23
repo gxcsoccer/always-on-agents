@@ -445,10 +445,24 @@ export class BrainAgent extends DurableObject<Env> {
       if (target) this.#sql.exec("UPDATE sessions SET target = ? WHERE id = ?", target, session.id);
 
       this.#sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES (?, ?, 'running', ?)", runId, session.id, now);
-      this.#append(session.id, runId, { role: "user", content: events.map(renderEvent).join("\n") });
+      this.#append(session.id, runId, { role: "user", content: events.map((each) => renderEvent(each) + this.#repliedTo(each)).join("\n") });
       this.#setMeta("active_run", runId);
       return runId;
     });
+  }
+
+  /**
+   * What a message was written in reply to, for the model: the text alone does not say. A
+   * message of the same person's in this conversation is quoted (their own words, as stored);
+   * one of the agent's is only named by when it was sent, since what it said may not be kept.
+   */
+  #repliedTo(event: InboxRow): string {
+    const subject = event.kind === "message" && event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
+    if (typeof subject !== "string") return "";
+    const theirs = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND id < ? AND principal = ? ORDER BY id DESC LIMIT 200", event.session_key, event.id, event.principal).find((each) => subjectsOfEvent(each).includes(subject));
+    if (theirs) return `\n  (written as a reply to their own earlier message: ${JSON.stringify((theirs.text ?? "").slice(0, 500))})`;
+    const yours = this.#rows<{ sent_at: number | null }>("SELECT sent_at FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject)[0];
+    return yours?.sent_at ? `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})` : "";
   }
 
   async #execute(runId: string): Promise<void> {
@@ -752,6 +766,13 @@ export class BrainAgent extends DurableObject<Env> {
         .filter(own)
         .slice(0, MAX_RECENT_REQUESTS)
         .reverse();
+      // A message the person replied to is part of what they are saying now, however long ago
+      // they wrote it: their own, by the same test, in this conversation.
+      const pointed = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+      if (pointed.length > 0) {
+        const older = this.#rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND id < ? ORDER BY id DESC LIMIT 500", conversation, source, first.id).filter((each) => own(each) && each.text !== null && subjectsOfEvent(each).some((subject) => pointed.includes(subject)) && !recent.some((seen) => seen.id === each.id));
+        recent = [...older, ...recent].sort((a, b) => a.id - b.id);
+      }
     }
     return { connector: source, person: scope.id, origin, said: events.map(said), recent: recent.map(said), recentIds: recent.map((each) => each.id) };
   }
@@ -1562,10 +1583,7 @@ export class BrainAgent extends DurableObject<Env> {
     // no message is taken to be about it: a reply then says nothing about which request is meant.
     const ids = (JSON.parse(record.events) as { bound?: number[] }).bound ?? [];
     if (ids.length === 0) return false;
-    return this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids).some((each) => {
-      const data = JSON.parse(each.data ?? "{}") as { subject?: unknown; message_id?: unknown };
-      return data.subject === subject || (typeof data.message_id === "string" && `${each.source}:message:${data.message_id}` === subject);
-    });
+    return this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids).some((each) => subjectsOfEvent(each).includes(subject));
   }
 
   // ---- answers that can be followed up
@@ -1655,6 +1673,17 @@ export class BrainAgent extends DurableObject<Env> {
    * The answer a run could be following up, if there is one: the one the person replied to, or
    * else the one that is the last thing the agent said to them here. At most one is ever offered.
    */
+  /**
+   * The messages a reply to which is about this answer: the answer's own, and the person's
+   * messages its source was read for, where the tool tied the read to particular ones.
+   */
+  #subjectsOf(answer: { subject: string; sources: string }): string[] {
+    // Only the messages the tool tied the read to: the whole batch that started the run says nothing about which of them asked for this.
+    const ids = (JSON.parse(answer.sources) as Source[]).flatMap((source) => source.events.bound ?? []);
+    const asked = ids.length === 0 ? [] : this.#rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids);
+    return [answer.subject, ...asked.flatMap((each) => subjectsOfEvent(each))];
+  }
+
   #reopenable(runId: string): { id: string; asked: string; at: number }[] {
     if (!this.#followUps() || this.#continuationOf(runId) || !this.#actingFor(runId)) return [];
     const sessionId = this.#rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "";
@@ -1668,7 +1697,10 @@ export class BrainAgent extends DurableObject<Env> {
         return false;
       }
     };
-    const candidate = repliedTo.length > 0 ? kept.filter(complete).find((each) => repliedTo.every((subject) => subject === each.subject)) : kept.filter(complete).find((each) => this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", each.target)[0]?.id === each.outbox_id);
+    const fits = repliedTo.length > 0 ? kept.filter(complete).filter((each) => repliedTo.every((subject) => this.#subjectsOf(each).includes(subject))) : [];
+    // A reply to the answer's own message names it. A reply to a message two answers were read for names neither.
+    const named = fits.find((each) => repliedTo.every((subject) => subject === each.subject)) ?? (fits.length === 1 ? fits[0] : undefined);
+    const candidate = repliedTo.length > 0 ? named : kept.filter(complete).find((each) => this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", each.target)[0]?.id === each.outbox_id);
     if (!candidate) return [];
     // What the person asked when it was first read: the request behind its first source.
     const ids = (JSON.parse(candidate.sources) as Source[])[0].events.said;
@@ -1711,7 +1743,7 @@ export class BrainAgent extends DurableObject<Env> {
       repliedTo,
       now: Date.now(),
       carriedOn: carried !== undefined,
-      ...(proposed ? { answer: { session: proposed.session_id, expiresAt: proposed.expires_at, subject: proposed.subject, isLastThingSaid: this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", proposed.target)[0]?.id === proposed.outbox_id } } : {}),
+      ...(proposed ? { answer: { session: proposed.session_id, expiresAt: proposed.expires_at, subjects: this.#subjectsOf(proposed as { subject: string; sources: string }), shared: repliedTo.length > 0 && !repliedTo.every((subject) => subject === proposed.subject) && this.#rows<{ id: string; subject: string; sources: string }>("SELECT id, subject, sources FROM answers WHERE session_id = ? AND expires_at > ? AND id != ?", run.session_id, Date.now(), proposed.id).some((other) => repliedTo.every((subject) => this.#subjectsOf(other).includes(subject))), isLastThingSaid: this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", proposed.target)[0]?.id === proposed.outbox_id } } : {}),
     });
     if (!verdict.allow) {
       throw new Error(
@@ -1722,6 +1754,7 @@ export class BrainAgent extends DurableObject<Env> {
           another_conversation: "there is no such answer here, or it is no longer kept. If the person wants it again, they can ask for it anew",
           expired: "there is no such answer here, or it is no longer kept. If the person wants it again, they can ask for it anew",
           replied_to_something_else: "the message the person replied to is not that answer",
+          reply_fits_several: "more than one of your answers was read for the message the person replied to, so it is not clear which they mean. Ask them, or they can reply to the answer itself",
           not_the_last_thing_said: "that answer is not the last thing you said to them, so it is not clear they mean it. Ask them, or they can reply to the answer they mean",
         }[verdict.reason],
       );
@@ -2602,6 +2635,12 @@ function danglingCalls(items: Item[]): ToolCall[] {
 }
 
 /** One line per event, saying when it happened and who caused it, so the model can tell people from machines. */
+/** The names a message goes by when another message is a reply to it. */
+function subjectsOfEvent(event: InboxRow): string[] {
+  const data = JSON.parse(event.data ?? "{}") as { subject?: unknown; message_id?: unknown };
+  return [...(typeof data.subject === "string" ? [data.subject] : []), ...(typeof data.message_id === "string" ? [`${event.source}:message:${data.message_id}`] : [])];
+}
+
 function renderEvent(event: InboxRow): string {
   const principal = JSON.parse(event.principal) as Principal;
   const who =
