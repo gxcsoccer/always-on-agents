@@ -437,8 +437,10 @@ export class Tasks implements Wakes {
       if (!applied) return { known: true, wake: false, terminal: false };
 
       // What the worker spent counts against the same daily budget as the Brain's own calls.
-      const spent = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);
-      if (Number.isFinite(spent) && spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
+      const said = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);
+      // Anything that is not a positive number of tokens is nothing spent, here and in the registry.
+      const spent = Number.isFinite(said) && said > 0 ? said : 0;
+      if (spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
       if (kind === "lost" || kind === "failed") this.#s.log(`task_${kind}`, { task: taskId, error: String(body.error ?? "").slice(0, 300) });
 
       this.#s.insertEvent({
