@@ -300,6 +300,7 @@ describe("timers and memory", () => {
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");
+      for (const column of ["mark", "mark_attempts", "mark_next_at"]) sql.exec(`ALTER TABLE inbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '21' WHERE key = 'schema_version'");
       sql.exec("CREATE TABLE answers (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, outbox_id INTEGER NOT NULL, subject TEXT NOT NULL, target TEXT NOT NULL, connector TEXT NOT NULL, sources TEXT NOT NULL, quotes TEXT NOT NULL, text TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)");
       sql.exec("INSERT INTO answers VALUES ('ans_1', 's', 1, 'x', '{}', 'feishu', '[]', '[]', 'an old answer', 9e15, 1)");
@@ -394,6 +395,7 @@ describe("timers and memory", () => {
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");
+      for (const column of ["mark", "mark_attempts", "mark_next_at"]) sql.exec(`ALTER TABLE inbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '18' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       // A message whose delivery was begun and never confirmed, one not yet tried, and an approval question.
@@ -1040,6 +1042,7 @@ describe("tasks and approvals", () => {
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");
+      for (const column of ["mark", "mark_attempts", "mark_next_at"]) sql.exec(`ALTER TABLE inbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });

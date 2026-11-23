@@ -57,8 +57,14 @@ const feishu = {
   duringRead: undefined as undefined | (() => Promise<void>),
   /** Consents waiting to be exchanged, by code. */
   codes: new Map<string, { open_id: string; tenant_key: string; challenge: string; redirect: string }>(),
-  /** The reactions the bot put on people's messages. */
+  /** The reactions the bot put on people's messages (ever: one taken off again stays listed here). */
   reactions: [] as { message: string; emoji: string; bearer: string }[],
+  /** The reactions the bot took off again: on which message, which one. */
+  unreacted: [] as { message: string; reaction: string }[],
+  /** How many of the bot's next attempts to take a reaction off Feishu fails, without saying what became of it. */
+  failUnreacts: 0,
+  /** Runs while a reaction is being put on, before Feishu answers. */
+  duringReaction: undefined as undefined | (() => Promise<void>),
   /** How often the bot tried to put a reaction on a message. */
   reactionAttempts: 0,
   /** Feishu fails every reaction. */
@@ -94,6 +100,9 @@ function installFakeFeishu() {
   feishu.failTexts = 0;
   feishu.rejectTexts = 0;
   feishu.reactions.length = 0;
+  feishu.unreacted.length = 0;
+  feishu.failUnreacts = 0;
+  feishu.duringReaction = undefined;
   feishu.failReactions = false;
   feishu.reactionAttempts = 0;
   feishu.refuseReactions = false;
@@ -142,13 +151,21 @@ function installFakeFeishu() {
       return Response.json({ code: 0, data: { message_id: `om_sent_${body.uuid}` } });
     }
     // "Got it" on a message the person wrote. Nothing is said, and no document is asked for.
+    const unreacting = url.host === "open.feishu.cn" && init?.method === "DELETE" ? /\/im\/v1\/messages\/([^/]+)\/reactions\/([^/]+)$/.exec(url.pathname) : undefined;
+    if (unreacting) {
+      if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
+      if (feishu.failUnreacts > 0) return (feishu.failUnreacts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
+      feishu.unreacted.push({ message: unreacting[1], reaction: unreacting[2] });
+      return Response.json({ code: 0, data: {} });
+    }
     const reactedTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reactions$/.exec(url.pathname)?.[1] : undefined;
     if (reactedTo) {
       feishu.reactionAttempts++;
       if (feishu.failReactions) return Response.json({ code: 230001, msg: "busy" }, { status: 500 });
       if (feishu.refuseReactions) return Response.json({ code: 231003, msg: "not allowed" });
       feishu.reactions.push({ message: reactedTo, emoji: body.reaction_type?.emoji_type, bearer });
-      return Response.json({ code: 0, data: {} });
+      await feishu.duringReaction?.();
+      return Response.json({ code: 0, data: { reaction_id: `ZCaCIjUBVVWSrm5L-3ZTw${feishu.reactions.length}`, operator: { operator_id: "cli_x", operator_type: "app" }, action_time: String(Date.now()), reaction_type: { emoji_type: body.reaction_type?.emoji_type } } });
     }
     const tokenEndpoint = url.host === "accounts.feishu.cn" && url.pathname === "/oauth/v3/token" ? "v3" : url.host === "open.feishu.cn" && url.pathname === "/open-apis/authen/v2/oauth/token" ? "v2" : undefined;
     if (tokenEndpoint) {
@@ -2559,6 +2576,54 @@ describe("a sign that a message arrived", () => {
     await sleep(20);
     expect(mel.heard()).toEqual(["你好", "在的"]);
     expect(feishu.reactions.length).toBe(1);
+  });
+
+  it("is taken off once the message has been dealt with, whether or not anything was said", async () => {
+    const pat = someone();
+    await pat.sends("你好");
+    await vi.waitFor(() => expect(feishu.reactions.map((each) => each.message)).toEqual([`om_${pat.openId}_1`]));
+    model.replies([call("send_message", { text: "你好" })], [say("")]);
+    await pat.quiet();
+    await vi.waitFor(() => expect(feishu.unreacted).toEqual([{ message: `om_${pat.openId}_1`, reaction: "ZCaCIjUBVVWSrm5L-3ZTw1" }]));
+    // Nothing to say: dealt with all the same.
+    await pat.sends("嗯");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(2));
+    model.replies([say("")]);
+    await pat.quiet();
+    await vi.waitFor(() => expect(feishu.unreacted.map((each) => each.message)).toEqual([`om_${pat.openId}_1`, `om_${pat.openId}_2`]));
+  });
+
+  it("is taken off at once when Feishu confirms it only after the message was dealt with", async () => {
+    const quinn = someone();
+    let handled = false;
+    feishu.duringReaction = async () => {
+      while (!handled) await sleep(5);
+    };
+    model.replies([say("")]);
+    await quinn.sends("你好");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(1));
+    await quinn.quiet();
+    handled = true;
+    await vi.waitFor(async () => {
+      await wake(quinn.stub);
+      expect(feishu.unreacted.map((each) => each.message)).toEqual([`om_${quinn.openId}_1`]);
+    });
+  });
+
+  it("keeps trying to take it off while Feishu is busy, and takes it off once", async () => {
+    const rae = someone();
+    feishu.failUnreacts = 2;
+    await rae.sends("你好");
+    await vi.waitFor(() => expect(feishu.reactions).toHaveLength(1));
+    model.replies([say("")]);
+    await rae.quiet();
+    // Its next try is not yet due: brought forward here rather than waited for.
+    for (let i = 0; i < 3; i++) {
+      await rowsOf(rae.stub, "UPDATE inbox SET mark_next_at = 0 WHERE mark IS NOT NULL");
+      await wake(rae.stub);
+    }
+    expect(feishu.unreacted).toEqual([{ message: `om_${rae.openId}_1`, reaction: "ZCaCIjUBVVWSrm5L-3ZTw1" }]);
+    expect(await rowsOf(rae.stub, "SELECT mark FROM inbox WHERE mark IS NOT NULL")).toEqual([]);
   });
 
   it("is not counted as shown when Feishu answers with an error inside a success", async () => {

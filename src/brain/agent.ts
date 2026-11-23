@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, canRevisit, deliver, received, standingOf, toolsOf, trusts } from "../connectors";
+import { amend, canRevisit, deliver, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -28,6 +28,7 @@ import { Outbox } from "./outbox";
 import { Revisions } from "./revisions";
 import { quotes } from "./approval";
 import { Tasks } from "./tasks";
+import { Marks } from "./marks";
 import { Timers } from "./timers";
 import { type Continuation, Requests } from "./requests";
 import { RunTools } from "./run-tools";
@@ -52,6 +53,7 @@ export class BrainAgent extends DurableObject<Env> {
   /** Requests that wait, and guards: the same database and transactions, in a file of their own. */
   readonly #requests: Requests;
   readonly #timers: Timers;
+  readonly #marks: Marks;
   /** Messages to deliver. */
   readonly #outbox: Outbox;
   /** What is known of messages that can change after they were said. */
@@ -69,6 +71,7 @@ export class BrainAgent extends DurableObject<Env> {
     super(ctx, env);
     this.#store = new BrainStore(ctx);
     this.#timers = new Timers(this.#store);
+    this.#marks = new Marks(this.#store, { unmark: (source, event, mark) => unreceived(this.env, source, this.#store.scope(), event, mark) });
     const brain = this;
     this.#revisions = new Revisions(this.#store, {
       isDecider: (principal, source) => this.#isDecider(principal, source),
@@ -153,7 +156,7 @@ export class BrainAgent extends DurableObject<Env> {
       enqueueMessage: (...args) => this.#outbox.enqueue(...args),
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
     });
-    this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks];
+    this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks, this.#marks];
     migrate(ctx.storage);
     // If an invocation died between committing work and scheduling the wake-up for it, nothing else
     // would ever schedule it. Any activation of this object repairs that.
@@ -209,7 +212,14 @@ export class BrainAgent extends DurableObject<Env> {
       const at = Date.now();
       // Wanted only while it still says something: soon, and before the message has been dealt with.
       const wanted = () => Date.now() - at < 15_000 && this.#store.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ? AND status IN ('pending', 'claimed')", event.source, event.source_id).length > 0;
-      this.ctx.waitUntil(received(this.env, event.source, this.#store.scope(), { source_id: event.source_id, data: event.data, reply_to: event.reply_to, wanted }).then((shown) => void (shown && this.#store.log("received_shown", { ms: Date.now() - at }))));
+      this.ctx.waitUntil(
+        received(this.env, event.source, this.#store.scope(), { source_id: event.source_id, data: event.data, reply_to: event.reply_to, wanted }).then(async (mark) => {
+          if (!mark) return;
+          this.#store.log("received_shown", { ms: Date.now() - at });
+          // Kept with the message, to take off once it has been dealt with: at once if it already has.
+          if (this.#marks.keep(event.source, event.source_id, mark)) await this.#wakeBy(Date.now());
+        }),
+      );
     }
     // Someone who writes while a request of theirs waits may be saying that the wait is over
     // ("done"). That is not taken from their words: the condition's owner is asked again.
@@ -239,6 +249,8 @@ export class BrainAgent extends DurableObject<Env> {
         await this.#outbox.flush();
         if (this.#store.meta("active_run")) break;
       }
+      // Messages dealt with no longer show that they are being handled.
+      await this.#marks.clear(Date.now());
     } finally {
       await this.#rearm();
     }

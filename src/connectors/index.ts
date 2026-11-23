@@ -85,9 +85,16 @@ export function dedupeWindow(name: string): number | undefined {
   return byName.get(name)?.channel?.dedupeMs;
 }
 
-/** Shows a person that their message has arrived, where the connector can. Never throws; true only if the outside system confirmed it. */
-export async function received(env: Env, name: string, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean> {
+/** Shows a person that their message has arrived, where the connector can. Never throws; the mark it put on, only if the outside system confirmed it. */
+export async function received(env: Env, name: string, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<string | undefined> {
   const show = byName.get(name)?.channel?.received;
-  if (!show) return false;
-  return show(env, scope, event).catch(() => false);
+  if (!show) return undefined;
+  return show(env, scope, event).catch(() => undefined);
+}
+
+/** Takes off a mark `received` put on. Never throws. */
+export async function unreceived(env: Env, name: string, scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }, mark: string): Promise<"removed" | "retry" | "permanent"> {
+  const take = byName.get(name)?.channel?.unreceived;
+  if (!take) return "permanent";
+  return take(env, scope, event, mark).catch(() => "retry" as const);
 }
