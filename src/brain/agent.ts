@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Holds, type Outcome, type Receipt, DeliveryRejected, DeliveryVoid, type Waiting, amend, canRevisit, dedupeWindow, deliver, holds, received, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, DeliveryRejected, DeliveryVoid, amend, canRevisit, dedupeWindow, deliver, received, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, isPrivateSession, privateSessionKey, type Scope, type Target, type WorkerEventKind, parseScope } from "../events";
 import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
@@ -26,8 +26,8 @@ import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS, buildInstructions } from "./prompt";
 import { migrate } from "./schema";
-import { type Passage, followUpDecision, locate, passageNow } from "./follow-up";
-import { type Continuation, HANDLING_LIMIT_MS, Requests, type Source, WAITING_NOTE, calledOff, fingerprint, subjectsOfEvent, textsIn } from "./requests";
+import type { Passage } from "./follow-up";
+import { type Continuation, HANDLING_LIMIT_MS, Requests, type Source, WAITING_NOTE, fingerprint } from "./requests";
 import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, describeTool, executeTool, withoutQuotes } from "./tools";
 
 /** Events arriving within this window are answered in one run. */
@@ -2013,7 +2013,7 @@ function danglingCalls(items: Item[]): ToolCall[] {
   return items.filter((i) => i.type === "function_call" && !answered.has(i.call_id)).map((i) => ({ call_id: i.call_id, name: i.name, arguments: i.arguments ?? "{}" }));
 }
 
-
+/** One line per event, saying when it happened and who caused it, so the model can tell people from machines. */
 function renderEvent(event: InboxRow): string {
   const principal = JSON.parse(event.principal) as Principal;
   const who =

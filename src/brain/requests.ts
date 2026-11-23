@@ -6,7 +6,7 @@
  */
 import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds, isWaiting, toolsOf } from "../connectors";
 import type { Env } from "../env";
-import { type InboundEvent, type Scope, isPrivateSession } from "../events";
+import type { InboundEvent, Scope } from "../events";
 import type { Item } from "../model/openai";
 import type { InboxRow, NoticeKey, Row, RunRow, Said } from "./agent";
 import { type Passage, followUpDecision, locate, passageNow } from "./follow-up";
@@ -101,7 +101,6 @@ export async function fingerprint(value: unknown): Promise<string> {
   return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** One line per event, saying when it happened and who caused it, so the model can tell people from machines. */
 /** The names a message goes by when another message is a reply to it. */
 export function subjectsOfEvent(event: InboxRow): string[] {
   const data = JSON.parse(event.data ?? "{}") as { subject?: unknown; message_id?: unknown };
