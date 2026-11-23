@@ -91,6 +91,8 @@ const NOTICES = {
   which: { en: "More than one of your requests could be meant. Which one?", zh: "你指的可能不止一件事，是哪一件？" },
   unchecked: { en: "I did not send what I had written for you: I could not confirm that the authorisation for what I had read still stands. Please ask again.", zh: "我写好的内容没有发给你：我没能确认读取所依据的授权是否仍然有效。请再问一次。" },
   invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
+  tomorrow: { en: "I have reached today's usage limit here and will pick this up tomorrow.", zh: "我今天的用量已经用完，明天接着处理。" },
+  failed: { en: "Something went wrong on my side and I could not finish handling that. Please try again.", zh: "我这边出了问题，没能处理完。请再试一次。" },
 } as const;
 /** How often a message whose condition's owner cannot be asked is put off before it is given up. */
 const MAX_UNASKED = 8;
@@ -483,9 +485,11 @@ export class BrainAgent extends DurableObject<Env> {
       const tenant = await registry(this.env).recordUsage(this.#scope().tenant, MODEL_CALL_RESERVE);
       // The day the registry charged, which is not necessarily today as seen from here.
       const reservedOn = tenant.day;
+      /** Gives the reservation back: the call it was made for is not going to happen. */
+      const release = () => registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
       if (!this.#stillActive(runId)) return;
       if (!tenant.allowed || this.#tokensToday() >= DAILY_TOKEN_BUDGET) {
-        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+        await release();
         if (!this.#stillActive(runId)) return;
         // A request that was being carried on cannot wait until tomorrow: its time would be up.
         // It ends here, and the person is told, in place of its answer.
@@ -497,7 +501,7 @@ export class BrainAgent extends DurableObject<Env> {
         }
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
-        this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, "I have reached today's usage limit here and will pick this up tomorrow.");
+        this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, this.#notice("tomorrow", run.session_id));
         this.#log("budget_exhausted", { run: runId, tokens_today: this.#tokensToday() });
         const midnight = new Date();
         midnight.setUTCHours(24, 0, 30, 0);
@@ -515,12 +519,12 @@ export class BrainAgent extends DurableObject<Env> {
         try {
           why = carried.status === "resuming" ? await this.#mayNotDisclose(carried) : "the request has ended";
         } catch (err) {
-          await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+          await release();
           return this.#retryLater(runId, err);
         }
         if (!this.#stillActive(runId)) return;
         if (why || !this.#actingFor(runId)) {
-          await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+          await release();
           if (!this.#stillActive(runId)) return;
           this.#endRequest(carried.id, "void", why ?? "it is no longer the person's to ask here");
           // They were waiting for this: told, in fixed words, that it stopped.
@@ -537,12 +541,12 @@ export class BrainAgent extends DurableObject<Env> {
         try {
           over = await this.#over(guards);
         } catch (err) {
-          await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+          await release();
           return this.#retryLater(runId, err);
         }
         if (!this.#stillActive(runId)) return;
         if (over) {
-          await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+          await release();
           if (!this.#stillActive(runId)) return;
           // Nothing more of it goes out; the person is told, in fixed words, that it stopped.
           this.#sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status = 'pending' AND started = 0", runId);
@@ -557,7 +561,7 @@ export class BrainAgent extends DurableObject<Env> {
       if (carried) {
         const still = this.#continuationOf(runId);
         if (!still || still.status !== "resuming" || Date.now() - (still.claimed_at ?? 0) > HANDLING_LIMIT_MS) {
-          await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+          await release();
           if (!this.#stillActive(runId)) return;
           if (still?.status === "resuming") {
             this.#endRequest(still.id, "void", "it was not finished in time");
@@ -578,7 +582,7 @@ export class BrainAgent extends DurableObject<Env> {
           tools: this.#toolsFor(runId),
         });
       } catch (err) {
-        await registry(this.env).adjustUsage(this.#scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
+        await release();
         return this.#retryLater(runId, err);
       }
       if (!this.#stillActive(runId)) return;
@@ -627,10 +631,10 @@ export class BrainAgent extends DurableObject<Env> {
       this.#sql.exec("UPDATE tasks SET status = 'failed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", Date.now(), run.session_id);
       // For a request that was being carried on, this takes the place of its answer: one or the other.
       const carried = this.#continuationOf(runId);
-      if (carried?.status === "resuming") this.#draft(carried, run, "Something went wrong on my side and I could not finish handling that. Please try again.");
+      if (carried?.status === "resuming") this.#draft(carried, run, this.#notice("failed", run.session_id));
       // One that went back to waiting, or ended, has nothing to say here: its answer, if it gets
       // one, is the request's.
-      else if (!carried) this.#notify(`abandoned:${runId}`, run.session_id, runId, "Something went wrong on my side and I could not finish handling that. Please try again.");
+      else if (!carried) this.#notify(`abandoned:${runId}`, run.session_id, runId, this.#notice("failed", run.session_id));
       this.#finish(runId, "failed", reason);
     });
     this.#log("run_abandoned", { run: runId, reason: outside ? ERROR_WITHHELD : reason.slice(0, 300) });
