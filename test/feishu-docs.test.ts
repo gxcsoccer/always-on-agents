@@ -3087,18 +3087,20 @@ describe("how the bot's words are sent", () => {
     expect(md).toContain('user_id="all"');
   });
 
-  it("defuses only Feishu's own mention markup, and leaves code and other markup exactly as written", async () => {
-    const text = 'Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline `<at user_id="x">`, ``a <at id="z"></at> b`` and\n```xml\n<at id="y"></at><AT-KEY/>\n```';
+  it("defuses every piece of Feishu's own mention markup, in code too, and changes nothing else", async () => {
+    // Code included: telling for certain where Markdown code begins and ends is not worth a chance
+    // that a mention in prose notifies someone. In code, such markup gains one invisible character.
+    const yaml = "```yaml\nquote: \"```\"\n```";
+    const text = `Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline \`<at user_id="x">\`, \`\`a <at id="z"></at> b\`\` and\n${yaml}\n<at id="y"></at><AT-KEY/>\n\`\`\`\n<sample/>\n\`\`\``;
     await send(text, true);
     const md = JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
-    expect(md).not.toContain('<at user_id="all">');
+    expect(md).not.toMatch(/<\/?at[\s>]/i);
     expect(md).toContain("<AT-KEY>speed</AT-KEY>");
-    expect(md).toContain('`<at user_id="x">`');
-    expect(md).toContain('``a <at id="z"></at> b``');
-    expect(md).toContain('```xml\n<at id="y"></at><AT-KEY/>\n```');
+    expect(md).toContain("<AT-KEY/>");
+    expect(md).toContain("<sample/>");
+    expect(md).toContain(yaml);
     // Nothing else differs.
     expect(md.replace(/\u200b/g, "")).toBe(text);
-    // A run of backticks that is never closed is no code: what follows it is defused, wherever it starts.
     for (const open of ["三个反引号 ``` 用于代码块，请通知 ", "说明：\n```\n"]) {
       await send(`${open}<at user_id="all">所有人</at>`, true);
       expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).not.toContain('<at user_id="all">');

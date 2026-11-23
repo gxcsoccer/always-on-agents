@@ -200,7 +200,7 @@ The invitation card says, before the person agrees, that this authorisation rene
 
 ### How messages look
 
-What the agent writes itself goes out as a Feishu post with one Markdown element, so bold, lists, links, code and tables render. Mention markup in it (`<at …>`) is shown as text and notifies nobody. The system's own fixed words go out as plain text, and questions and invitations as cards. A post that would exceed Feishu's 30 KB is sent as plain text instead. The form is decided from the message alone, so a retry sends exactly the same thing.
+What the agent writes itself goes out as a Feishu post with one Markdown element, so bold, lists, links, code and tables render. Mention markup in it (`<at …>`), in code too, is shown as text and notifies nobody (it gains one invisible character). The system's own fixed words go out as plain text, and questions and invitations as cards. A post that would exceed Feishu's 30 KB is sent as plain text instead. The form is decided from the message alone, so a retry sends exactly the same thing.
 
 ### Language
 
