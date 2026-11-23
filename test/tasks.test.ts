@@ -398,8 +398,8 @@ describe("tasks, by themselves", () => {
         await tasks.event("t2", 1, "result", { usage: { total_tokens: "many" } });
         await tasks.event("t3", 1, "result", { usage: { total_tokens: -5 } });
         expect(spent).toEqual([50_000_000]);
-        expect(slots.usage.map(([, tokens]) => tokens)).toContain(9e9);
-        expect(slots.usage.map(([, tokens]) => tokens)).not.toContain("many");
+        // The registry bounds what it is told by itself; nothing is sent for nothing spent.
+        expect(slots.usage).toEqual([["acme", 9e9]]);
       });
     });
 
