@@ -17,7 +17,13 @@ const APP: FeishuApp = { app_id: APP_ID, tenant: TENANT, app_secret: "app-secret
 /** Feishu, as far as these tests need it. */
 const feishu = {
   /** Documents: who may open each, and what it says. */
-  docs: new Map<string, { readers: string[]; text: string }>(),
+  docs: new Map<string, { readers: string[]; text: string; blocks?: number[] }>(),
+  /** Look-ups of what a document is made of (not reads of its content). */
+  looks: [] as { path: string; bearer: string }[],
+  /** Whether those look-ups fail. */
+  blocksFail: false,
+  /** Whether those look-ups get no answer at all. */
+  blocksThrow: false,
   wiki: new Map<string, { obj_type: string; obj_token: string }>(),
   /** User tokens Feishu has issued, and whether each is still good. */
   tokens: new Map<string, { open_id: string; tenant_key: string; good: boolean; scope: string }>(),
@@ -77,6 +83,9 @@ function installFakeFeishu() {
   feishu.codes.clear();
   feishu.sent.length = 0;
   feishu.reads.length = 0;
+  feishu.looks.length = 0;
+  feishu.blocksFail = false;
+  feishu.blocksThrow = false;
   feishu.consented.clear();
   feishu.failSends = 0;
   feishu.failTexts = 0;
@@ -178,6 +187,16 @@ function installFakeFeishu() {
     if (url.host !== "open.feishu.cn") throw new Error(`unexpected fetch to ${url.href}`);
     const user = feishu.tokens.get(bearer);
     if (url.pathname.endsWith("/authen/v1/user_info")) return user?.good ? Response.json({ code: 0, data: { open_id: user.open_id, tenant_key: user.tenant_key } }) : Response.json({ code: 99991668 }, { status: 401 });
+    // What a document is made of, looked up when it holds little text. Not a read of its content,
+    // so it is counted apart; the same person's token and the same access apply.
+    const looked = /\/docx\/v1\/documents\/([^/]+)\/blocks$/.exec(url.pathname)?.[1];
+    if (looked) {
+      feishu.looks.push({ path: url.pathname, bearer });
+      if (feishu.blocksThrow) throw new Error("network");
+      const doc = feishu.docs.get(looked);
+      if (!user?.good || !doc || !doc.readers.includes(user.open_id) || feishu.blocksFail) return Response.json({ code: 1770032 }, { status: 403 });
+      return Response.json({ code: 0, data: { items: [{ block_type: 1 }, ...(doc.blocks ?? [2]).map((block_type) => ({ block_type }))], has_more: false } });
+    }
     feishu.reads.push({ path: url.pathname, bearer });
     await feishu.duringRead?.();
     // Documents are read as a person. The app's own token opens nothing here.
@@ -307,6 +326,8 @@ async function consent(authorize: URL, as: { openId: string; org?: string }, out
   }
   return (exports as any).default.fetch(new Request(back));
 }
+/** The id Feishu gave the newest message of the person's that says exactly this: what a reply to it names. */
+const messageId = async (person: ReturnType<typeof someone>, text: string): Promise<string> => String((await rowsOf(person.stub, "SELECT json_extract(data, '$.message_id') AS id FROM inbox WHERE text = ? ORDER BY id DESC LIMIT 1", text))[0].id);
 const readCall = (doc: string, kind = "docx", id?: string) => call("feishu_read_document", { document: link(doc, kind) }, id);
 /** Scripts the model for requests that are carried on: each is answered in one message and the run ends. */
 const carriesOn = (...answers: string[]) => {
@@ -598,6 +619,157 @@ describe("reading a Feishu document as the person who asked", () => {
     await olga.says("读一下你推荐的");
     expect(toolOutputs().find((each: any) => each.error)?.error).toMatch(/has not linked a document/);
     expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaB0000000000001"]);
+  });
+
+  it("says what a document with little text holds besides text, and looks that up only then", async () => {
+    const wren = someone();
+    const long = "A sentence of the plan. ".repeat(30);
+    feishu.docs.set("DocBoard0000000000001", { readers: [wren.openId], text: "Roadmap", blocks: [43] });
+    feishu.docs.set("DocPlain0000000000001", { readers: [wren.openId], text: "Only words." });
+    feishu.docs.set("DocLong00000000000001", { readers: [wren.openId], text: long, blocks: [43] });
+    await authorised(wren, "DocPlain0000000000001");
+    feishu.looks.length = 0;
+    const token = "u-" + feishu.issued;
+    const ask = async (doc: string) => {
+      feishu.reads.length = 0;
+      feishu.looks.length = 0;
+      model.replies([readCall(doc)], [call("send_message", { text: "好的" })], [say("")]);
+      await wren.says(`读一下 ${link(doc)}`);
+      return toolOutputs()[0];
+    };
+
+    // Only a title in words, and a whiteboard: the model is told that there is one, and that it was not read.
+    const board = await ask("DocBoard0000000000001");
+    expect(board).toEqual({ text: "Roadmap", aside: { not_read: ["1 whiteboard"], note: expect.stringMatching(/content that is not text.*not a matter of permissions/) } });
+    // One read of the content and one look at what it is made of, both as her.
+    expect(feishu.reads).toEqual([{ path: "/open-apis/docx/v1/documents/DocBoard0000000000001/raw_content", bearer: token }]);
+    expect(feishu.looks).toEqual([{ path: "/open-apis/docx/v1/documents/DocBoard0000000000001/blocks", bearer: token }]);
+
+    // Little text and nothing else: looked up, and nothing to say.
+    expect(await ask("DocPlain0000000000001")).toEqual({ text: "Only words." });
+    expect(feishu.looks.length).toBe(1);
+
+    // What else it holds could not be found out: the text is handed on all the same, and that is said.
+    feishu.blocksFail = true;
+    const unknown = await ask("DocBoard0000000000001");
+    expect(unknown).toEqual({ text: "Roadmap", aside: { note: expect.stringMatching(/could not be found out/) } });
+    expect(feishu.reads.length).toBe(1);
+    expect(feishu.looks).toEqual([{ path: "/open-apis/docx/v1/documents/DocBoard0000000000001/blocks", bearer: token }]);
+    feishu.blocksFail = false;
+
+    // Feishu could not be reached for it at all: the same, and no error.
+    feishu.blocksThrow = true;
+    const unreached = await ask("DocBoard0000000000001");
+    expect(unreached).toEqual({ text: "Roadmap", aside: { note: expect.stringMatching(/could not be found out/) } });
+    expect(feishu.reads.length).toBe(1);
+    expect(feishu.looks.length).toBe(1);
+    expect(wren.heard().at(-1)).toBe("好的");
+    feishu.blocksThrow = false;
+
+    // Enough text: nothing is looked up, whatever else the document holds.
+    expect(long.length).toBeGreaterThanOrEqual(500);
+    expect(await ask("DocLong00000000000001")).toEqual({ text: long });
+    expect(feishu.reads.length).toBe(1);
+    expect(feishu.looks).toEqual([]);
+  });
+
+  it("takes a request without a link, written as a reply to the person's own message, to be about the document that message linked", async () => {
+    const pia = someone();
+    for (const id of ["DocPiaA00000000000001", "DocPiaB00000000000001"]) feishu.docs.set(id, { readers: [pia.openId], text: `text of ${id}` });
+    await authorised(pia, "DocPiaA00000000000001");
+    const names = () => feishu.reads.map((each) => each.path.split("/").at(-2));
+    const ask = async (text: string, replyingTo: string | undefined, ...ids: string[]) => {
+      model.replies(ids.map((id) => readCall(id)), [call("send_message", { text: "好的" })], [say("")]);
+      await pia.says(text, undefined, replyingTo);
+      return toolOutputs().slice(0, ids.length);
+    };
+    await ask(`总结 ${link("DocPiaA00000000000001")}`, undefined, "DocPiaA00000000000001");
+    await ask(`总结 ${link("DocPiaB00000000000001")}`, undefined, "DocPiaB00000000000001");
+    const aboutA = await messageId(pia, `总结 ${link("DocPiaA00000000000001")}`);
+    feishu.reads.length = 0;
+
+    // B was linked last, and she points at the message that linked A: A is read, and B is not.
+    const first = await ask("这个再看一下", aboutA, "DocPiaA00000000000001", "DocPiaB00000000000001");
+    expect(first[0]).toEqual({ text: "text of DocPiaA00000000000001" });
+    expect(first[1].error).toMatch(/only a document the person linked/);
+    expect(names()).toEqual(["DocPiaA00000000000001"]);
+    // The model is shown what the message was written in reply to, in her own words.
+    const shown = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
+    expect(shown).toContain("这个再看一下");
+    expect(shown).toContain(`(written as a reply to their own earlier message: ${JSON.stringify(`总结 ${link("DocPiaA00000000000001")}`)})`);
+
+    // She points at it afresh each time: nothing was used up.
+    const second = await ask("再来一次", aboutA, "DocPiaA00000000000001");
+    expect(second[0]).toEqual({ text: "text of DocPiaA00000000000001" });
+    expect(names()).toEqual(["DocPiaA00000000000001", "DocPiaA00000000000001"]);
+
+    // A reply to a message that links nothing (here, one of the agent's): what she linked last is not read in its place.
+    const said = `om_sent_${feishu.sent.filter((each) => each.to === `oc_${pia.openId}` && each.type === "text").at(-1)!.uuid}`;
+    const none = await ask("读一下这个", said, "DocPiaB00000000000001", "DocPiaA00000000000001");
+    expect(none.map((each: any) => each.error)).toEqual([expect.stringMatching(/reply to a message that does not link a document/), expect.stringMatching(/reply to a message that does not link a document/)]);
+    expect(names()).toEqual(["DocPiaA00000000000001", "DocPiaA00000000000001"]);
+    const told = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
+    expect(told).toMatch(/\(written as a reply to the message you sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z\)/);
+    expect(told).not.toContain("their own earlier message");
+  });
+
+  it("reads nothing for a reply without a link to a message of the person's own that links several documents", async () => {
+    const rosa = someone();
+    for (const id of ["DocRosaA0000000000001", "DocRosaB0000000000001"]) feishu.docs.set(id, { readers: [rosa.openId], text: `text of ${id}` });
+    await authorised(rosa, "DocRosaA0000000000001");
+    const both = `${link("DocRosaA0000000000001")} ${link("DocRosaB0000000000001")}`;
+    model.replies([say("你希望我做什么？")]);
+    await rosa.says(both);
+    feishu.reads.length = 0;
+    feishu.looks.length = 0;
+
+    model.replies([readCall("DocRosaB0000000000001"), readCall("DocRosaA0000000000001")], [call("send_message", { text: "你指哪一篇？" })], [say("")]);
+    await rosa.says("这篇写了什么", undefined, await messageId(rosa, both));
+    const refused = expect.stringMatching(/replied to links several documents/);
+    expect(toolOutputs().slice(0, 2).map((each: any) => each.error)).toEqual([refused, refused]);
+    expect(feishu.reads).toEqual([]);
+    expect(feishu.looks).toEqual([]);
+    expect(JSON.stringify(modelCalls)).not.toContain("text of DocRosaB");
+
+    // The same link twice in the message replied to is still one document.
+    const twice = `${link("DocRosaB0000000000001")} 和 ${link("DocRosaB0000000000001")}`;
+    model.replies([say("你希望我做什么？")]);
+    await rosa.says(twice);
+    model.replies([readCall("DocRosaB0000000000001")], [call("send_message", { text: "好的" })], [say("")]);
+    await rosa.says("这篇写了什么", undefined, await messageId(rosa, twice));
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocRosaB0000000000001" });
+    expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocRosaB0000000000001"]);
+  });
+
+  it("reads the document of a replied-to message of the person's own however long ago it was written and however much was said since", async () => {
+    const quin = someone();
+    for (const id of ["DocQuinA0000000000001", "DocQuinB0000000000001"]) feishu.docs.set(id, { readers: [quin.openId], text: `text of ${id}` });
+    await authorised(quin, "DocQuinA0000000000001");
+    const ask = async (text: string, replyingTo: string | undefined, ...ids: string[]) => {
+      model.replies(ids.map((id) => readCall(id)), [call("send_message", { text: "好的" })], [say("")]);
+      await quin.says(text, undefined, replyingTo);
+      return toolOutputs().slice(0, ids.length);
+    };
+    await ask(`总结 ${link("DocQuinA0000000000001")}`, undefined, "DocQuinA0000000000001");
+    await ask(`总结 ${link("DocQuinB0000000000001")}`, undefined, "DocQuinB0000000000001");
+    const aboutA = await messageId(quin, `总结 ${link("DocQuinA0000000000001")}`);
+    // A dozen messages of hers since: more than are ever looked back over.
+    for (let i = 1; i <= 12; i++) {
+      model.replies([say("")]);
+      await quin.says(`闲聊 ${i}`);
+    }
+    expect((await rowsOf(quin.stub, "SELECT COUNT(*) AS n FROM inbox WHERE id > (SELECT id FROM inbox WHERE text = ?)", `总结 ${link("DocQuinA0000000000001")}`))[0].n).toBe(13);
+    await rowsOf(quin.stub, "UPDATE inbox SET received_at = received_at - 11 * 60000");
+    feishu.reads.length = 0;
+
+    // Without a reply, nothing linked that long ago counts.
+    expect((await ask("总结", undefined, "DocQuinB0000000000001"))[0].error).toMatch(/has not linked a document/);
+    // As a reply, the message pointed at is part of what she says now.
+    const pointed = await ask("这个再看一下", aboutA, "DocQuinA0000000000001", "DocQuinB0000000000001");
+    expect(pointed[0]).toEqual({ text: "text of DocQuinA0000000000001" });
+    expect(pointed[1].error).toMatch(/only a document the person linked/);
+    expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocQuinA0000000000001"]);
+    expect(modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1)).toContain(`(written as a reply to their own earlier message: ${JSON.stringify(`总结 ${link("DocQuinA0000000000001")}`)})`);
   });
 
   it("lets the same call finish again after an interruption, and no other call take the same link", async () => {
@@ -2960,6 +3132,153 @@ describe("following up on an answer", () => {
     expect(toolOutputs()[0].error).toMatch(/only be reopened when the person themselves asks/);
     expect(feishu.reads).toEqual([]);
     expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布/);
+  });
+
+  it("offers the answer read for a message of the person's own when they reply to that message", async () => {
+    const zoe = await summarised("DocZoeA00000000000001");
+    feishu.docs.set("DocZoeB00000000000001", { readers: [zoe.openId], text: "B says nine." });
+    model.replies([readCall("DocZoeB00000000000001")], [call("send_message", { text: "B 说九。" })], [say("")]);
+    await zoe.says(`总结 ${link("DocZoeB00000000000001")}`);
+    const [older, newer] = await answers(zoe);
+    expect([older.text, newer.text]).toEqual([SUMMARY, "B 说九。"]);
+    const askedA = await messageId(zoe, `总结 ${link("DocZoeA00000000000001")}`);
+    feishu.reads.length = 0;
+    modelCalls.length = 0;
+
+    // A's answer is not the last thing said, and she replied to her own message that asked for A.
+    model.replies([reopen(newer.id)], [reopen(older.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+    await zoe.says("第二点展开说说", undefined, askedA);
+    expect(modelCalls[0].instructions).toContain("Answers you can reopen");
+    expect(modelCalls[0].instructions).toContain(`- ${older.id} `);
+    expect(modelCalls[0].instructions).not.toContain(newer.id);
+    expect(modelCalls[0].input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1)).toContain("written as a reply to their own earlier message");
+    // The other answer was not read for that message.
+    expect(toolOutputs()[0].error).toMatch(/replied to is not that answer/);
+    expect(toolOutputs()[1]).toMatchObject({ sources_now: [{ text: TEXT }], your_answer_then: SUMMARY, source_changed: false });
+    expect(read()).toEqual(["DocZoeA00000000000001"]);
+    expect(JSON.stringify(modelCalls)).not.toContain("B says nine");
+    expect(zoe.heard().at(-1)).toBe("预算四十。");
+  });
+
+  it("does not take a source to have changed because what it holds besides text could not be looked up this time", async () => {
+    const bea = await summarised("DocBea000000000000001", "on", "docx", (person) => void feishu.docs.set("DocBea000000000000001", { readers: [person.openId], text: TEXT, blocks: [43] }));
+    const [kept] = await answers(bea);
+    // The text is short, so what else it holds was looked up when it was read, and found.
+    expect(feishu.looks.length).toBeGreaterThan(0);
+    feishu.looks.length = 0;
+
+    for (const fault of ["blocksFail", "blocksThrow"] as const) {
+      feishu[fault] = true;
+      model.replies([reopen(kept.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+      await bea.says("第二点展开说说", undefined, messageOf(kept.subject));
+      expect(toolOutputs()[0], fault).toMatchObject({ sources_now: [{ text: TEXT, aside: { note: expect.stringMatching(/could not be found out/) } }], your_answer_then: SUMMARY, source_changed: false });
+      expect(toolOutputs()[0].sources_now[0].aside.not_read, fault).toBeUndefined();
+      feishu[fault] = false;
+    }
+    expect(feishu.looks.length).toBe(2);
+
+    // The text itself changing is still a change.
+    feishu.docs.get("DocBea000000000000001")!.text = "First: the launch is on Monday.";
+    model.replies([reopen(kept.id)], [call("send_message", { text: "改到周一。" })], [say("")]);
+    await bea.says("第一点现在怎么说", undefined, messageOf(kept.subject));
+    expect(toolOutputs()[0]).toMatchObject({ sources_now: [{ text: "First: the launch is on Monday.", aside: { not_read: ["1 whiteboard"] } }], source_changed: true });
+  });
+
+  it("compares the source's text only, and gives what it holds besides text as it is now", async () => {
+    const dee = await summarised("DocDee000000000000001", "on", "docx", (person) => void feishu.docs.set("DocDee000000000000001", { readers: [person.openId], text: "Roadmap", blocks: [43] }));
+    const [kept] = await answers(dee);
+    // A whiteboard when it was answered, a sheet now; the words are the same.
+    feishu.docs.get("DocDee000000000000001")!.blocks = [30];
+    model.replies([reopen(kept.id)], [call("send_message", { text: "现在是表格。" })], [say("")]);
+    await dee.says("里面还有什么");
+    const now = toolOutputs()[0];
+    expect(now).toMatchObject({ sources_now: [{ text: "Roadmap", aside: { not_read: ["1 sheet"] } }], your_answer_then: SUMMARY, source_changed: false, compared: "the source's text only", besides_text: expect.any(String) });
+    expect(JSON.stringify(now)).toContain("The source's text reads as it did when you answered.");
+    expect(JSON.stringify(now.sources_now)).not.toContain("whiteboard");
+
+    // Nothing is said about that where the source is all text.
+    const long = "A sentence of the plan. ".repeat(30);
+    const eli = await summarised("DocEli000000000000001", "on", "docx", (person) => void feishu.docs.set("DocEli000000000000001", { readers: [person.openId], text: long, blocks: [43] }));
+    const [plain] = await answers(eli);
+    model.replies([reopen(plain.id)], [call("send_message", { text: "好的" })], [say("")]);
+    await eli.says("再说说");
+    expect(toolOutputs()[0]).toMatchObject({ sources_now: [{ text: long }], source_changed: false, compared: "the source's text only" });
+    expect(toolOutputs()[0].sources_now[0].aside).toBeUndefined();
+    expect(toolOutputs()[0].besides_text).toBeUndefined();
+  });
+
+  it("carries on as usual when the newest kept answer has no source on record, and does not reopen it", async () => {
+    const flo = await summarised("DocFlo000000000000001");
+    const [kept] = await answers(flo);
+    await rowsOf(flo.stub, "UPDATE answers SET sources = '[]' WHERE id = ?", kept.id);
+
+    // Something else entirely: an ordinary run, with nothing offered.
+    model.replies([call("send_message", { text: "在" })], [say("")]);
+    await flo.says("在吗");
+    expect(flo.heard().at(-1)).toBe("在");
+    expect(modelCalls.length).toBe(2);
+    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
+    expect(model.remaining()).toBe(0);
+    expect((await rowsOf(flo.stub, "SELECT status, error, retry_at FROM runs ORDER BY rowid DESC LIMIT 1"))[0]).toEqual({ status: "done", error: null, retry_at: null });
+
+    // Asked for by its id all the same: refused, with nothing of it handed over and nothing read.
+    modelCalls.length = 0;
+    model.replies([reopen(kept.id)], [say("")]);
+    await flo.says("第二点展开说说");
+    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
+    expect(toolOutputs()).toEqual([{ error: expect.any(String) }]);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
+    expect(feishu.reads).toEqual([]);
+    expect((await rowsOf(flo.stub, "SELECT status, error FROM runs ORDER BY rowid DESC LIMIT 1"))[0]).toEqual({ status: "done", error: null });
+  });
+
+  it("offers and reopens a whole answer beside kept answers whose records are not whole", async () => {
+    const cy = await summarised("DocCy0000000000000001");
+    const [kept] = await answers(cy);
+    const asked = await messageId(cy, `总结 ${link("DocCy0000000000000001")}`);
+    // Other answers kept in the same conversation, newer, whose record of what they were read from is broken in one way or another.
+    // (Among them: none at all, and two where an answer has exactly one.)
+    const [whole] = JSON.parse((await rowsOf(cy.stub, "SELECT sources FROM answers WHERE id = ?", kept.id))[0].sources);
+    const broken = ["[{}]", JSON.stringify([{ identity: "docx:x", tool: "feishu_read_document" }]), "not json", "null", "[]", JSON.stringify([whole, whole])];
+    for (const [index, sources] of broken.entries()) {
+      await rowsOf(cy.stub, "INSERT INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) SELECT ?, session_id, outbox_id + 1000 + ?, ?, target, connector, ?, quotes, '别的', expires_at, created_at + 1 + ? FROM answers WHERE id = ?", `broken_${index}`, index, `feishu:message:om_other_${index}`, sources, index, kept.id);
+    }
+    expect((await answers(cy)).length).toBe(1 + broken.length);
+
+    model.replies([reopen("broken_0")], [reopen(kept.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+    await cy.says("第二点展开说说", undefined, asked);
+    expect(modelCalls[0].instructions).toContain("Answers you can reopen");
+    expect(modelCalls[0].instructions).toContain(`- ${kept.id} `);
+    expect(modelCalls[0].instructions).not.toContain("broken_");
+    expect(toolOutputs()[0].error).toEqual(expect.any(String));
+    expect(toolOutputs()[1]).toMatchObject({ sources_now: [{ text: TEXT }], your_answer_then: SUMMARY, source_changed: false });
+    expect(read()).toEqual(["DocCy0000000000000001"]);
+    expect(cy.heard().at(-1)).toBe("预算四十。");
+  });
+
+  it("offers neither of two answers read for the same message of the person's when they reply to it", async () => {
+    const abe = await summarised("DocAbe000000000000001");
+    const asked = await messageId(abe, `总结 ${link("DocAbe000000000000001")}`);
+    // A second answer read for that same message: asked for as a reply to it, with no link.
+    model.replies([readCall("DocAbe000000000000001")], [call("send_message", { text: "再说一遍：周五，四十。" })], [say("")]);
+    await abe.says("再总结一次", undefined, asked);
+    const [first, second] = await answers(abe);
+    expect([first.text, second.text]).toEqual([SUMMARY, "再说一遍：周五，四十。"]);
+    feishu.reads.length = 0;
+    modelCalls.length = 0;
+
+    model.replies([reopen(first.id)], [reopen(second.id)], [say("")]);
+    await abe.says("第二点展开说说", undefined, asked);
+    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
+    expect(toolOutputs().map((each: any) => each.error)).toEqual([expect.stringMatching(/more than one of your answers was read for the message/), expect.stringMatching(/more than one of your answers was read for the message/)]);
+    expect(feishu.reads).toEqual([]);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布/);
+
+    // A reply to one of the answers itself still names it.
+    model.replies([reopen(first.id)], [call("send_message", { text: "预算四十。" })], [say("")]);
+    await abe.says("第二点展开说说", undefined, messageOf(first.subject));
+    expect(toolOutputs()[0]).toMatchObject({ sources_now: [{ text: TEXT }], your_answer_then: SUMMARY });
+    expect(read()).toEqual(["DocAbe000000000000001"]);
   });
 });
 

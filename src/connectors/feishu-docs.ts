@@ -22,6 +22,10 @@ import { type ConnectorTool, type Holds, type ToolContext, type Waiting, isWaiti
 
 /** How much of a document one read returns. */
 export const MAX_DOCUMENT_TEXT = 40_000;
+/** Below this much text, what else a document holds is looked up and reported. */
+const SPARSE_TEXT = 500;
+/** Kinds of block whose content is not in a document's text (Feishu's block_type numbers). */
+const NOT_TEXT: Record<number, string> = { 18: "table (bitable)", 21: "diagram", 23: "file", 26: "embedded page", 27: "image", 29: "mind map", 30: "sheet", 40: "add-on", 43: "whiteboard" };
 /** Feishu's codes for "this user token is no good": invalid, expired, or lacking what the person must grant. */
 const REAUTHORISE = new Set([99991668, 99991677, 99991679]);
 /** Feishu's code for "the person has not granted the permission this call needs". */
@@ -142,7 +146,23 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const now = context.said.flatMap(documents);
   let chosen = now;
   let carriedFrom: string | undefined;
-  if (now.length === 0) {
+  // A reply names what it is about: if this request links nothing but is a reply to messages of
+  // the person's own that do, those are the documents meant, not whatever they linked last. The
+  // person points at it afresh each time, so nothing is used up.
+  const repliedTo = context.said.map((message) => message.data.replies_to).filter((each): each is string => typeof each === "string");
+  if (now.length === 0 && repliedTo.length > 0) {
+    // Every message they replied to has to be one of their own, on record, and together they
+    // have to name one document. Anything less does not say which document is meant, and what
+    // they linked last is not read in its place.
+    const parents = [...new Set(repliedTo)].map((subject) => context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`));
+    const named = parents.flatMap((message) => (message ? documents(message) : []));
+    const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
+    if (parents.some((message) => !message || documents(message).length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
+    if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
+    chosen = distinct;
+    for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
+    if (context.said.length === 1) context.relied?.("said", 0);
+  } else if (now.length === 0) {
     const last = [...context.recent].reverse().find((message) => documents(message).length > 0);
     const id = typeof last?.data.message_id === "string" ? last.data.message_id : "";
     if (!last || !id) return { error: "the person has not linked a document in this request or just before it; ask them to send the link" };
@@ -236,6 +256,31 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const raw = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/raw_content`);
   if (raw.gone) return superseded;
   if (raw.status !== 200 || raw.code !== 0) return failed(raw, "docx");
+  // A document can hold things that are not text (a whiteboard, a sheet, images), and the text
+  // says nothing of them. Where there is little text, what else is there is looked up, so that
+  // "almost empty" is not mistaken for "could not be opened". Failing to learn it changes nothing.
+  let unread: { holds: string[]; note: string } | undefined;
+  if (String(raw.data?.content ?? "").length < SPARSE_TEXT) {
+    // Optional: if Feishu cannot be reached for this, the text read stands as it is.
+    const blocks = await asPerson(`/docx/v1/documents/${encodeURIComponent(documentId)}/blocks?page_size=500`).catch(() => ({ status: 0, code: undefined, data: undefined, gone: false }));
+    if (blocks.gone) return superseded;
+    if (blocks.status === 200 && blocks.code === 0 && Array.isArray(blocks.data?.items)) {
+      const counts = new Map<string, number>();
+      for (const each of blocks.data.items as { block_type?: unknown }[]) {
+        const kind = NOT_TEXT[Number(each.block_type)];
+        if (kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      }
+      const more = blocks.data.has_more === true;
+      if (counts.size > 0 || more) {
+        unread = {
+          holds: [...counts].map(([kind, count]) => `${count} ${kind}`),
+          note: `The document was opened, and this is all the text in it.${counts.size > 0 ? " It also holds content that is not text, which this tool cannot read: if the text does not answer the person, say that the rest is in that form. It is not a matter of permissions." : ""}${more ? " Only the first part of the document's structure was looked at, so there may be more that is not text." : ""}`,
+        };
+      }
+    } else {
+      unread = { holds: [], note: "The document was opened, and this is all the text in it. Whether it also holds content that is not text (a whiteboard, a sheet, images) could not be found out." };
+    }
+  }
   // Asked last of all, just before the text is handed on. A link taken from an earlier message
   // is used up here.
   const end = await grant.finish(credential.version, carriedFrom === undefined ? undefined : { message: carriedFrom, by: context.callId });
@@ -243,7 +288,12 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // What was read, as Feishu resolved it: a wiki page can come to hold another document.
   context.identified?.({ document: canonical }, `docx:${documentId}`, { condition: conditionOf(name, needed), generation });
   const text = String(raw.data?.content ?? "");
-  return { text: text.slice(0, MAX_DOCUMENT_TEXT), ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}) };
+  return {
+    text: text.slice(0, MAX_DOCUMENT_TEXT),
+    ...(text.length > MAX_DOCUMENT_TEXT ? { truncated: true, note: `only the first ${MAX_DOCUMENT_TEXT} characters are shown` } : {}),
+    // Said about the document, not read from it: kept apart (see ToolResultAside).
+    ...(unread ? { aside: { ...(unread.holds.length > 0 ? { not_read: unread.holds } : {}), note: unread.note } } : {}),
+  };
 }
 
 /** What a read waits on: this person's grant covering these scopes. */

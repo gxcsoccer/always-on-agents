@@ -19,12 +19,12 @@ export interface FollowUpCase {
   repliedTo: string[];
   now: number;
   /** The answer proposed, if there is one by that id. */
-  answer?: { session: string; expiresAt: number; subject: string; isLastThingSaid: boolean };
+  answer?: { session: string; expiresAt: number; /** The messages that are this answer's: the answer itself, and the person's own messages its source was tied to. */ subjects: string[]; /** Another kept answer here is tied to what the person replied to as well. */ shared?: boolean; isLastThingSaid: boolean };
   /** A follow-up that waited and is being carried on: which answer it is about was settled when it was first made. */
   carriedOn?: boolean;
 }
 
-export type Verdict = { allow: true } | { allow: false; reason: "off" | "not_the_person" | "no_such_answer" | "another_conversation" | "expired" | "replied_to_something_else" | "not_the_last_thing_said" };
+export type Verdict = { allow: true } | { allow: false; reason: "off" | "not_the_person" | "no_such_answer" | "another_conversation" | "expired" | "replied_to_something_else" | "reply_fits_several" | "not_the_last_thing_said" };
 
 /** Before follow-ups: nothing of an answer is kept, so nothing is ever reopened. */
 export function strictDecision(_: FollowUpCase): Verdict {
@@ -38,7 +38,9 @@ export function followUpDecision(c: FollowUpCase): Verdict {
   if (c.answer.session !== c.session) return { allow: false, reason: "another_conversation" };
   if (c.answer.expiresAt <= c.now) return { allow: false, reason: "expired" };
   // A reply names what it is about; nothing else does once the person has replied to something.
-  if (c.repliedTo.length > 0) return c.repliedTo.every((subject) => subject === c.answer!.subject) ? { allow: true } : { allow: false, reason: "replied_to_something_else" };
+  // A reply to the answer itself names it; a reply to a message of the person's own that two
+  // answers were read for does not say which of the two.
+  if (c.repliedTo.length > 0) return !c.repliedTo.every((subject) => c.answer!.subjects.includes(subject)) ? { allow: false, reason: "replied_to_something_else" } : c.answer.shared ? { allow: false, reason: "reply_fits_several" } : { allow: true };
   if (c.carriedOn) return { allow: true };
   return c.answer.isLastThingSaid ? { allow: true } : { allow: false, reason: "not_the_last_thing_said" };
 }

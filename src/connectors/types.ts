@@ -110,6 +110,16 @@ export interface ConnectorTool {
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
 }
 
+/**
+ * A tool's result may carry `aside`: what the tool says about the thing it read, as against what
+ * it read from it (what could not be read, whether a look-up of its structure worked). The model
+ * is given it like the rest. It is left out when a result is compared with an earlier one to
+ * tell whether the thing has changed.
+ */
+export interface ToolResultAside {
+  aside?: Record<string, unknown>;
+}
+
 export interface ToolContext {
   env: Env;
   scope: Scope;
