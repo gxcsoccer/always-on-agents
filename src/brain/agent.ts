@@ -228,7 +228,6 @@ export class BrainAgent extends DurableObject<Env> {
     try {
       this.#timers.fire(Date.now());
       this.#requests.deadlines(Date.now());
-      this.#store.sql.exec("DELETE FROM answers WHERE expires_at <= ?", Date.now());
       this.#housekeeping(Date.now());
       await this.#outbox.flush();
       await this.#tasks.settle();

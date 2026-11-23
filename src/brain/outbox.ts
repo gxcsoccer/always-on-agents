@@ -7,9 +7,8 @@
  * rest of the Brain it is handed (OutboxHost).
  */
 import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Receipt, dedupeWindow } from "../connectors";
-import { type Target, isPrivateSession } from "../events";
-import type { Passage } from "./follow-up";
-import type { Continuation, Requests, Source } from "./requests";
+import type { Target } from "../events";
+import type { Continuation, Requests } from "./requests";
 import type { BrainStore, Row, Wakes } from "./store";
 
 const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
@@ -24,8 +23,6 @@ const DELIVERY_WITHHELD = "delivery failed; the details are not kept";
 const HELD_MS = 3_000;
 /** The same, when what it waits on will not change within this wake-up. */
 const HELD_LONG_MS = 60_000;
-/** How long a delivered answer can be reopened for a follow-up. */
-const ANSWER_KEPT_MS = 24 * 60 * 60_000;
 /**
  * What the system itself says to a person about a request of theirs, in fixed words. Said in the
  * language they last wrote in here, as far as that can be told without a model: Chinese if their
@@ -55,7 +52,7 @@ export interface OutboxHost {
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
-  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "followUps" | "sessionKeyOf">;
+  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest">;
 }
 
 export class Outbox implements Wakes {
@@ -200,26 +197,6 @@ export class Outbox implements Wakes {
       const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       this.#s.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
-      // Delivered, with a receipt to know it by, and from one source: kept for a while, so the
-      // person can ask about it. Its words are taken before they are removed from the outbox.
-      if (row.source && receipt && this.#b.requests.followUps() && isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id))) {
-        const kept = JSON.parse(row.source) as { sources: Source[]; quotes: Passage[] };
-        this.#s.sql.exec(
-          "INSERT OR IGNORE INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) VALUES (?, (SELECT session_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          `ans_${row.id}`,
-          row.run_id,
-          row.id,
-          receipt.subject,
-          row.target,
-          kept.sources[0].connector,
-          JSON.stringify(kept.sources),
-          JSON.stringify(kept.quotes),
-          row.text,
-          Date.now() + ANSWER_KEPT_MS,
-          Date.now(),
-        );
-      }
-      this.#s.sql.exec("UPDATE outbox SET source = NULL WHERE id = ?", row.id);
       this.scrub("id = ?", row.id);
       if (row.continuation) {
         // From the request being taken up (its condition holding) to its answer being handed over.

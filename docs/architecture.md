@@ -15,7 +15,7 @@ Feishu / GitHub / console / timers / worker reports
 │ Brain  (one Durable Object per scope)               │
 │ SQLite: inbox · sessions · items · memory · timers  │
 │         · tasks · outbox · runs · audit             │
-│         · continuations · answers                   │
+│         · continuations                             │
 │ alarm(): fire timers → deliver outbox → run         │
 └───┬────────────────────────────────────┬───────────┘
     │ dispatch / answer / cancel         │ deliver
@@ -43,7 +43,7 @@ Three things are built on these. The reasoning for each is in the [design](desig
 
 **One way out to people.** Everything a person is shown goes through the outbox, including the invitation to do what a request waits for. The Brain holds a reference to the invitation and never its content: the connector makes the card and its link at the moment of sending. A message tied to a request goes out only while that request still stands, and never ahead of something the person has written that has not been handled. How a delivery ended is recorded as one of four things: sent, never handed over (`void`), refused by the outside system (`dead`), or possibly arrived and not checkable (`unverified`), in which case it is not sent again. Separately from messages, a connector can show on a person's own message that it has arrived.
 
-**Delivered answers.** What a run read through a connector's tool, and what it said about it, is removed from the conversation's record when the run ends. Where an operator has turned follow-ups on (they are off by default), an answer that was delivered with a receipt, from a run that read exactly one thing and said exactly one thing, is kept apart in the `answers` table for 24 hours, with the sentences it quoted word for word from what was read. It comes back only through one tool, for the person it was given to, in the conversation it was given in, and only after the source has been read again as that person and found to be the same thing; the model is then told, for each kept sentence, whether it is unchanged, changed, or cannot be verified. The decisions that are not a matter of judgement are plain functions in `src/brain/follow-up.ts`. Whether the person's words are a follow-up is left to the model; which answer can be meant is bounded by code.
+**What a run read stays in that run.** From its first use of a connector's tool, a run can only reply to the person and read again. What it read, and what it said about it, is removed from the conversation's record when the run ends, and nothing of it is kept anywhere else. An earlier way to follow up on an answer, by keeping it apart for a day and reopening it with a tool, has been retired. Its replacement is designed in [follow-up history](design/follow-up-history.zh-CN.md) (in Chinese) and not built yet: the agent's own delivered replies stay in the conversation's history, and a source is read again only when a new question needs it.
 
 ## Scopes and tenants
 
@@ -103,7 +103,7 @@ A connector owns three things for one outside system: verifying an inbound reque
 | The inbox and the wake cycle | `src/brain/agent.ts` |
 | A run: claiming events, calling the model, ending, retrying | `src/brain/runner.ts` |
 | The Brain's other parts, each in a file of its own on the same database | `src/brain/store.ts` (the database), `outbox.ts`, `tasks.ts`, `timers.ts`, `revisions.ts` |
-| Requests that wait, and answers that can be followed up | `src/brain/requests.ts` (a part of the Brain in a file of its own: same database, same transactions), the rules that need no judgement in `src/brain/follow-up.ts`; `Waiting` and `holds` in `src/connectors/types.ts` |
+| Requests that wait | `src/brain/requests.ts` (a part of the Brain in a file of its own: same database, same transactions); `Waiting` and `holds` in `src/connectors/types.ts` |
 | What the model can do | `src/brain/tools.ts` (what it is told), `src/brain/run-tools.ts` (what each tool does in a run), `src/brain/prompt.ts` |
 | The approval rules | the judgement and the readers of a message (`decidingReply`, `readDecision`) in `src/brain/approval.ts`; what is looked up and done around it in `Tasks.answer` (`src/brain/tasks.ts`); replies that can change in `src/brain/revisions.ts` |
 | The sandbox's boundary | `src/workers/sandbox/outbound.ts` |

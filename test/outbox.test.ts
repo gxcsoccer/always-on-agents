@@ -35,7 +35,6 @@ function bench(state: DurableObjectState) {
   const channel: Record<string, (message: OutboundMessage) => Receipt | void> = {};
   /** What the requests part says of a message before each attempt, by its key. */
   const gates: Record<string, "send" | "hold" | "wait" | "void" | "unasked"> = {};
-  const settings = { followUps: true, sessionKey: 'private:feishu:[["app_id","cli_1"]]' };
   const host: OutboxHost = {
     deliver: async (target, message) => {
       delivered.push({ target, message });
@@ -47,8 +46,6 @@ function bench(state: DurableObjectState) {
       stampGuards: (runId) => void stamped.push(runId),
       gate: async (row) => gates[row.idem as string] ?? "send",
       endRequest: (id, status, why) => void ended.push({ id, status, why }),
-      followUps: () => settings.followUps,
-      sessionKeyOf: () => settings.sessionKey,
     },
   };
   const outbox = new Outbox(store, host);
@@ -63,7 +60,7 @@ function bench(state: DurableObjectState) {
   };
   const sent = () => delivered.map((each) => each.message.idem);
   const said = (text: string) => void store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('feishu', ?, 'message', 'dm', '{}', ?, 'done', 1)", `om_${text}`, text);
-  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said };
+  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, run, row, set, sent, said };
 }
 
 const fails = (err: Error) => () => {
@@ -539,56 +536,6 @@ describe("the outbox, by itself", () => {
         await outbox.flush();
         expect(closed).toEqual(["q"]);
       });
-    });
-  });
-
-  describe("an answer that can be followed up", () => {
-    const SOURCE = JSON.stringify({ sources: [{ connector: "feishu", tool: "feishu_read_document" }], quotes: [{ text: "a passage" }] });
-    const answers = (store: BrainStore) => store.rows<Record<string, any>>("SELECT * FROM answers");
-
-    it("is kept for a day once delivered with a receipt, from one source, in a private conversation", async () => {
-      await within(async ({ outbox, row, set, run, store }) => {
-        run("run_1");
-        outbox.enqueue("m1", SESSION, "run_1", "the summary");
-        set("m1", { source: SOURCE });
-        const before = Date.now();
-        await outbox.flush();
-        const [kept] = answers(store);
-        expect(kept).toMatchObject({ id: `ans_${row("m1").id}`, session_id: SESSION, outbox_id: row("m1").id, subject: RECEIPT.subject, target: TARGET, connector: "feishu", text: "the summary" });
-        expect(JSON.parse(kept.sources)).toEqual([{ connector: "feishu", tool: "feishu_read_document" }]);
-        expect(JSON.parse(kept.quotes)).toEqual([{ text: "a passage" }]);
-        expect(kept.expires_at).toBeGreaterThanOrEqual(before + 24 * 60 * 60_000);
-        expect(row("m1").source).toBeNull();
-      });
-    });
-
-    it("is not kept when follow-ups are off, the conversation is shared, or the channel gave no receipt", async () => {
-      for (const change of ["off", "shared", "no receipt"] as const) {
-        await within(async ({ outbox, row, set, run, store, settings, channel }) => {
-          run("run_1");
-          outbox.enqueue("m1", SESSION, "run_1", "the summary");
-          set("m1", { source: SOURCE });
-          if (change === "off") settings.followUps = false;
-          if (change === "shared") settings.sessionKey = "chat:oc_1";
-          if (change === "no receipt") channel.m1 = () => undefined;
-          await outbox.flush();
-          expect(row("m1").status).toBe("sent");
-          expect(answers(store)).toEqual([]);
-          expect(row("m1").source).toBeNull();
-        });
-      }
-    });
-  });
-
-  it("leaves nothing that ties a message to what was read on a row that has ended, however it ended", async () => {
-    await within(async ({ outbox, row, store }) => {
-      for (const status of ["pending", "draft", "sent", "void", "dead", "unverified", "withdrawn"]) {
-        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, source, guard) VALUES (?, ?, 't', ?, ?, 0, '{}', '[]')", status, TARGET, status, Date.now() + 600_000);
-      }
-      await outbox.flush();
-      const tied = store.rows<{ idem: string }>("SELECT idem FROM outbox WHERE source IS NOT NULL OR guard IS NOT NULL ORDER BY id").map((each) => each.idem);
-      expect(tied).toEqual(["pending", "draft"]);
-      expect(row("pending").status).toBe("pending");
     });
   });
 

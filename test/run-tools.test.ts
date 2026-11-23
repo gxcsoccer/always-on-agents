@@ -65,9 +65,7 @@ function bench(state: DurableObjectState) {
       endRequest: note("endRequest"),
       noteSource: note("noteSource"),
       wait: (...args: unknown[]) => (calls.push(["wait", ...args]), { waiting: "kept" }),
-      noteQuotes: note("noteQuotes"),
       draft: (...args: unknown[]) => (calls.push(["draft", ...args]), { ok: true as const }),
-      reopenAnswer: async (...args: unknown[]) => (calls.push(["reopenAnswer", ...args]), { reopened: true }),
     } as RunToolsHost["requests"],
     outbox: { enqueue: (...args: unknown[]) => (calls.push(["enqueue", ...args]), { ok: true as const }) } as RunToolsHost["outbox"],
     tasks: {
@@ -244,23 +242,20 @@ describe("a run's tools", () => {
   });
 
   describe("messages", () => {
-    it("are kept to be sent, after the quotes they rest on are noted", async () => {
+    it("are kept to be sent", async () => {
       await within(({ tools, calls }) => {
-        expect(tools().sendMessage("c1", "hello", [{ point: "p", quote: "q" }])).toEqual({ ok: true });
-        expect(calls).toEqual([
-          ["noteQuotes", "r1", [{ point: "p", quote: "q" }]],
-          ["enqueue", "msg:c1", SESSION, "r1", "hello"],
-        ]);
+        expect(tools().sendMessage("c1", "hello")).toEqual({ ok: true });
+        expect(calls).toEqual([["enqueue", "msg:c1", SESSION, "r1", "hello"]]);
       });
     });
 
     it("in a run that carries a request on, are that request's answer, kept as a draft, or nothing once it waits again", async () => {
       await within(({ tools, settings, of }) => {
         settings.carried = { id: "req_1", status: "resuming" };
-        expect(tools().sendMessage("c1", "the answer", [])).toEqual({ ok: true });
+        expect(tools().sendMessage("c1", "the answer")).toEqual({ ok: true });
         expect(of("draft")).toMatchObject([[{ id: "req_1" }, { id: "r1" }, "the answer"]]);
         settings.carried = { id: "req_1", status: "waiting" };
-        expect(tools().sendMessage("c2", "more", [])).toEqual({ ok: true, note: "nothing was sent: the request is not being answered now" });
+        expect(tools().sendMessage("c2", "more")).toEqual({ ok: true, note: "nothing was sent: the request is not being answered now" });
         expect(of("enqueue")).toEqual([]);
       });
     });
@@ -289,15 +284,13 @@ describe("a run's tools", () => {
     });
   });
 
-  it("hands follow-ups and tasks to their parts, in this conversation", async () => {
+  it("hands tasks to their part, in this conversation", async () => {
     await within(async ({ tools, of, run }) => {
       const t = tools();
-      await t.reopenAnswer("c1", "ans_1");
       await t.dispatchTask("c2", "title", "brief", null);
       await t.taskStatus("t1");
       await t.answerTask("c3", "t1", "allow", "ok");
       await t.cancelTask("t1");
-      expect(of("reopenAnswer")).toEqual([[run, "c1", "ans_1"]]);
       expect(of("dispatch")).toEqual([[run, SESSION_KEY, "c2", "title", "brief", null]]);
       expect(of("status")).toEqual([["t1"]]);
       expect(of("answer")).toEqual([[run, SESSION_KEY, "c3", "t1", "allow", "ok"]]);
@@ -344,7 +337,7 @@ describe("a run's tools", () => {
       });
     });
 
-    it("notes what was read, for a follow-up, only when the tool identified it and it is not an error", async () => {
+    it("notes what was read only when the tool identified it and it is not an error", async () => {
       await within(async ({ tools, tool, of }) => {
         tool.answer = async (context) => {
           context.relied("said", 1);
@@ -356,8 +349,7 @@ describe("a run's tools", () => {
         await tools().connectorTool("c1", "feishu_read_document", { url: "u" });
         const [[runId, source]] = of("noteSource");
         expect(runId).toBe("r1");
-        expect(source).toMatchObject({ connector: "feishu", tool: "feishu_read_document", args: '{"doc":"d1"}', call: "c1", identity: "doc:d1", condition: "grant", generation: 4, events: { said: [7, 8], recent: [41], bound: [8, 41] } });
-        expect(typeof (source as { fingerprint: unknown }).fingerprint).toBe("string");
+        expect(source).toEqual({ connector: "feishu", tool: "feishu_read_document", args: '{"doc":"d1"}', identity: "doc:d1", condition: "grant", generation: 4 });
       });
       for (const answer of [async () => ({ error: "not found" }), async () => "plain text"]) {
         await within(async ({ tools, tool, of }) => {

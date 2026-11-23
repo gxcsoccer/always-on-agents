@@ -20,7 +20,7 @@
 | `tasks.ts` | `Tasks` | 派发与跟踪沙箱任务、回答审批、核对未决问题 |
 | `approval.ts` | 纯函数 | 从消息中读出审批决定、判断后来的话是否推翻先前的决定（「谁有资格批准」由 `BrainAgent#isDecider` 判断） |
 | `revisions.ts` | `Revisions` | 可编辑评论的修订记录与「这句话是否仍然有效」 |
-| `requests.ts` | `Requests` | 等待后继续的请求、守卫与跟进 |
+| `requests.ts` | `Requests` | 等待后继续的请求与守卫 |
 
 `Timers`、`Requests`、`Outbox`、`Tasks` 四个部件实现 `Wakes.nextWakeAt(now)`，报告自己下次要做事的时间；`#rearm()` 汇总这些时间统一设闹钟，另有 `#wakeBy(at)` 在需要时把闹钟单独提前（只会提前，不会推后）。
 
@@ -61,7 +61,7 @@
 - **`used_codes`**：作用域内所有用过的 4 位确认码，永不重复分配。
 - **`unsettled`**：记录已离开等待态但尚未确认沙箱是否收到决定的审批问题，交由后台定时向沙箱核对终态。
 - **`continuations`**：暂时不能执行、等条件满足后再继续的请求（`Requests` 负责）。
-- **`answers`**：只在 `FOLLOW_UPS=on` 时使用。满足条件的回答（见 4.2 第 3 点）连同正文、引用的原句和来源指纹保留 24 小时，供跟进时用 `reopen_answer` 重新读取核对；过期后查询不再返回，并在下次 `alarm()` 时物理删除（`Requests` 负责）。
+- 原来的 `answers` 表（为追问保留的回答）已由迁移 22 删除，见 4.2 第 3 点。
 
 ---
 
@@ -79,7 +79,7 @@ Cloudflare 每个 Durable Object 只有一个 `alarm`。`BrainAgent` 将所有�
 alarm()
  ├── 1. timers.fire(now)        到期定时器转为 inbox 事件（跳过休眠期错过的周期）
  ├── 2. requests.deadlines(now) 到期或该复查的等待请求，向 inbox 写一条内部提示
- ├── 3. 删除过期的 answers；#housekeeping(now) 每日清理 30 天前已完成记录（inbox 去重键保留 1 年）
+ ├── 3. #housekeeping(now)      每日清理 30 天前已完成记录（inbox 去重键保留 1 年）
  ├── 4. outbox.flush()          严格按序投递待发消息 + 旁路对账已关闭的审批提问
  ├── 5. tasks.settle()          向沙箱核对 unsettled 表中未决审批的真实结局
  ├── 6. 循环最多 3 次：
@@ -93,7 +93,7 @@ alarm()
 **几个关键工程细节**：
 - **周期定时器不补发风暴**：`Timers.fire()` 计算下一次触发时间时取 `Math.max(due_at + every_s * 1000, now + every_s * 1000)`，休眠期间错过的多次周期全部跳过，绝不会醒来后瞬间连发几十条提醒。
 - **两段式数据清理（`#housekeeping`）**：30 天前的已完成 `inbox` 只清空 `text / data / reply_to` 释放空间，但保留 `(source, source_id)` 骨架满 365 天——GitHub 等签名 Webhook 的签名本身不带有效期，保留去重键才能持续防重放（飞书 Webhook 另有 10 分钟的时间戳窗口）；清理旧 `items` 时同样只从 `is_user = 1` 边界截断，保证留下的对话结构合法。
-- **`#rearm()` 统一计算最早唤醒点**：自己看 `active_run`、`pending inbox` 和下次 `housekeeping_at`，其余交给各部件的 `nextWakeAt(now)`（`Timers` 报最早 `active timer`，`Outbox` 报队首 `pending` 与待对账 `reconciling`，`Tasks` 报待核对 `unsettled`，`Requests` 报等待中请求的 `until` / `check_at` 中较早者——已过期的每分钟复查一次，直到问过其条件的主人——以及 `answers` 的最早过期时间），取最小值（不早于 `now + 50ms`）设为下一次闹钟。没有任何候选时间时这段代码不设闹钟；对象何时休眠、是否计费由平台的 [Durable Object 生命周期](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/) 决定。
+- **`#rearm()` 统一计算最早唤醒点**：自己看 `active_run`、`pending inbox` 和下次 `housekeeping_at`，其余交给各部件的 `nextWakeAt(now)`（`Timers` 报最早 `active timer`，`Outbox` 报队首 `pending` 与待对账 `reconciling`，`Tasks` 报待核对 `unsettled`，`Requests` 报等待中请求的 `until` / `check_at` 中较早者——已过期的每分钟复查一次，直到问过其条件的主人），取最小值（不早于 `now + 50ms`）设为下一次闹钟。没有任何候选时间时这段代码不设闹钟；对象何时休眠、是否计费由平台的 [Durable Object 生命周期](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/) 决定。
 
 ---
 
@@ -155,13 +155,13 @@ flowchart TD
 ### 4.1 「消息即工具」与内置工具集（`src/brain/tools.ts` & `prompt.ts`）
 
 - **静默默认**：系统提示词明确约定，模型直接输出的文本只是内部笔记，不会展示给任何人；**模型只有显式调用 `send_message` 或 `send_review` 才会写入 `outbox`**（系统自己的固定通知和审批提问另外入队）。这使得 Agent 面对大量无需回复的 CI / PR 事件时可以自然沉默。
-- **15 个内置工具**（`tools.ts`）：
+- **14 个内置工具**（`tools.ts`）：
   - 沟通：`send_message`、`send_review`（支持绑定 40 位 commit SHA 与最多 30 条行级评论，不支持行级评论的渠道自动降级为纯文本）。
   - 记忆：`memory_list`、`memory_read`、`memory_write`、`memory_delete`。其中 `instructions.md` 写入/删除受 `#instructionEditors()` 保护——必须是纯由受信任渠道真人明确发言触发的 `run` 才能修改。
   - 定时：`set_timer`（延迟 5 秒至 1 年，周期最小 60 秒）、`list_timers`、`cancel_timer`。
   - 任务：`dispatch_task`、`task_status`、`answer_task`、`cancel_task`。
-  - 请求：`cancel_request`（取消仍在等待或进行中的请求）、`reopen_answer`（重新读取一条保留的回答，规则见 `follow-up.ts`，由 `Requests` 执行）。
-- 提供给模型哪些工具由 `Runner#toolsFor` 决定：`reopen_answer` 只在 Worker 变量 `FOLLOW_UPS=on` 且本 run 代表某人行事时提供；续办等待请求的 run 只拿到 `send_message`，它要重做的那次调用由系统另行放入。每次调用先经 `Runner.mayUse` 的通用检查，再由 `RunTools.for(run)`（`run-tools.ts`）提供的宿主执行。
+  - 请求：`cancel_request`（取消仍在等待或进行中的请求）。
+- 提供给模型哪些工具由 `Runner#toolsFor` 决定：本 run 代表某人行事时，另外提供该连接器的工具；续办等待请求的 run 只拿到 `send_message`，它要重做的那次调用由系统另行放入。每次调用先经 `Runner.mayUse` 的通用检查，再由 `RunTools.for(run)`（`run-tools.ts`）提供的宿主执行。
 
 ### 4.2 连接器只读外部工具的双重隔离（`actingFor` + `outside` + `private`）
 
@@ -179,7 +179,7 @@ flowchart TD
    - `run` 结束时，`Runner#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
    - 标记 `private = 1` 的 `outbox` 消息一旦进入终态（`sent`、`dead`、`unverified`），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
    - 因此：run 结束时对话记录已清理；但私密消息在仍为 `pending`（等待发送或重试）或 `reconciling`（对账中）期间，正文还在 `outbox` 里，进入终态才擦除。
-   - 例外：满足条件的回答会在擦除前复制到 `answers`（正文、引用原句、来源信息），保留 24 小时供跟进，过期后不再可查并在下次 `alarm()` 时删除。条件：`FOLLOW_UPS=on`；本次 run 正常结束（`done`）；本 run 读到的外部来源恰好一个且都已完整记录；本 run 只写出一条消息；它在私聊中送达并拿到回执。例如一条综合了两个来源的回答不会保留。
+   - 以前在 `FOLLOW_UPS=on` 时，满足条件的回答会在擦除前复制到 `answers` 表，保留 24 小时供 `reopen_answer` 追问。这套做法已经下线：迁移 22 删除了 `answers` 表，并把还在进行的 `reopen_answer` 续办作废。现在送达的回答不在别处保留。取代它的设计见 [`design/follow-up-history.zh-CN.md`](design/follow-up-history.zh-CN.md)，还没有实现。
    - 所以清理保证的是：对话记录里不留外部文本，发件箱里终态消息不留正文；不是整个数据库零残留。
 
 ---

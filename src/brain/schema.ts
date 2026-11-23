@@ -219,6 +219,19 @@ export const MIGRATIONS: string[] = [
    );
    ALTER TABLE outbox ADD COLUMN source TEXT;
    ALTER TABLE outbox ADD COLUMN guard TEXT;`,
+  // 22: answers are no longer kept apart for follow-ups, and reopen_answer is gone (see
+  // docs/design/follow-up-history.zh-CN.md). What was under way on that footing is closed with
+  // what is true of it: a reopened answer not yet handed over is not sent (one whose sending was
+  // begun with no word back stays "may have arrived", and is not sent again), and a follow-up
+  // that was waiting or being carried on ends. Nothing kept is turned into anything else.
+  `UPDATE outbox SET status = CASE WHEN started = 1 AND uncertain = 1 THEN 'unverified' ELSE 'void' END, text = '', review = NULL
+     WHERE status IN ('pending', 'draft')
+       AND (continuation IN (SELECT id FROM continuations WHERE tool = 'reopen_answer' AND status IN ('waiting', 'resuming', 'answering'))
+            OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(outbox.guard) THEN outbox.guard ELSE '[]' END) WHERE json_extract(value, '$.until') IS NOT NULL));
+   UPDATE continuations SET status = 'void', why = 'follow-ups on kept answers were retired', ended_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+     WHERE tool = 'reopen_answer' AND status IN ('waiting', 'resuming', 'answering');
+   DELETE FROM meta WHERE key LIKE 'quotes:%';
+   DROP TABLE answers;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

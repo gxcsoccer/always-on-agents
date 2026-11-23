@@ -288,6 +288,59 @@ describe("timers and memory", () => {
     expect(given).toContain("index.md is longer than what is loaded into a run");
   });
 
+  it("closes what was under way on kept answers when follow-ups on them are retired, as what is true of it", async () => {
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("hello"));
+    await wake(stub);
+    const after = await runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      // Back to version 21, with follow-up work in every state it could be in.
+      sql.exec("UPDATE meta SET value = '21' WHERE key = 'schema_version'");
+      sql.exec("CREATE TABLE answers (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, outbox_id INTEGER NOT NULL, subject TEXT NOT NULL, target TEXT NOT NULL, connector TEXT NOT NULL, sources TEXT NOT NULL, quotes TEXT NOT NULL, text TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)");
+      sql.exec("INSERT INTO answers VALUES ('ans_1', 's', 1, 'x', '{}', 'feishu', '[]', '[]', 'an old answer', 9e15, 1)");
+      sql.exec("INSERT INTO meta (key, value) VALUES ('quotes:run_x', '[]')");
+      const request = (id: string, tool: string, status: string) =>
+        sql.exec(
+          "INSERT INTO continuations (id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, 's', '{\"said\":[]}', 'feishu', ?, '{}', '{}', 'g', 'c', 1, ?, 9e15, ?, 1)",
+          id,
+          tool,
+          `int:${id}`,
+          status,
+        );
+      request("reopen_waiting", "reopen_answer", "waiting");
+      request("reopen_answering", "reopen_answer", "answering");
+      request("read_waiting", "feishu_read_document", "waiting");
+      const out = (idem: string, fields: { continuation?: string; guard?: unknown; started?: number; uncertain?: number }) =>
+        sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, continuation, guard, started, uncertain) VALUES (?, '{}', 'words', 0, 0, ?, ?, ?, ?)", idem, fields.continuation ?? null, fields.guard ? JSON.stringify(fields.guard) : null, fields.started ?? 0, fields.uncertain ?? 0);
+      out("answer:reopen_answering", { continuation: "reopen_answering" });
+      out("msg:reopened", { guard: [{ connector: "feishu", condition: "c", generation: 1, until: 9e15 }] });
+      out("msg:reopened_begun", { guard: [{ connector: "feishu", condition: "c", generation: 1, until: 9e15 }], started: 1, uncertain: 1 });
+      out("msg:ordinary", { guard: [{ connector: "feishu", condition: "c", generation: 1 }] });
+      migrate(state.storage);
+      return {
+        answers: [...sql.exec("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'answers'")][0].n,
+        quotes: [...sql.exec("SELECT COUNT(*) AS n FROM meta WHERE key LIKE 'quotes:%'")][0].n,
+        requests: [...sql.exec("SELECT id, status, why FROM continuations ORDER BY id")],
+        sends: [...sql.exec("SELECT idem, status, text FROM outbox WHERE idem != 'msg:call_1' AND idem LIKE '%:%' AND target = '{}' ORDER BY idem")],
+      };
+    });
+    expect(after.answers).toBe(0);
+    expect(after.quotes).toBe(0);
+    expect(after.requests).toEqual([
+      { id: "read_waiting", status: "waiting", why: null },
+      { id: "reopen_answering", status: "void", why: "follow-ups on kept answers were retired" },
+      { id: "reopen_waiting", status: "void", why: "follow-ups on kept answers were retired" },
+    ]);
+    expect(after.sends).toEqual([
+      { idem: "answer:reopen_answering", status: "void", text: "" },
+      { idem: "msg:ordinary", status: "pending", text: "words" },
+      { idem: "msg:reopened", status: "void", text: "" },
+      // Its sending was begun with no word back: it may have arrived, and is not sent again.
+      { idem: "msg:reopened_begun", status: "unverified", text: "" },
+    ]);
+  });
+
   it("brings a scope with data in it, as the version before requests could wait left it, up to date", async () => {
     const { stub } = brain();
     model.replies([call("send_message", { text: "hi" })], [say("")]);
@@ -296,7 +349,6 @@ describe("timers and memory", () => {
     const after = await runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => {
       const sql = state.storage.sql;
       // Put the store back to version 18: what a deployment of main has, with its rows in place.
-      sql.exec("DROP TABLE answers");
       sql.exec("DROP INDEX continuations_open");
       sql.exec("DROP TABLE continuations");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
@@ -315,7 +367,7 @@ describe("timers and memory", () => {
         version: [...sql.exec("SELECT value FROM meta WHERE key = 'schema_version'")][0].value,
         counts: { inbox: [...sql.exec("SELECT COUNT(*) AS n FROM inbox")][0].n, items: [...sql.exec("SELECT COUNT(*) AS n FROM items")][0].n, outbox: [...sql.exec("SELECT COUNT(*) AS n FROM outbox")][0].n },
         rows: [...sql.exec("SELECT idem, status, text, started, uncertain, first_attempt_at, continuation, interaction, source, guard FROM outbox WHERE idem IN ('msg:begun', 'msg:fresh', 'ask:t:1') ORDER BY idem")],
-        tables: [...sql.exec("SELECT COUNT(*) AS n FROM continuations")][0].n + [...sql.exec("SELECT COUNT(*) AS n FROM answers")][0].n,
+        tables: [...sql.exec("SELECT COUNT(*) AS n FROM continuations")][0].n + [...sql.exec("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'answers'")][0].n,
       };
     });
     expect(after.version).toBe(String(MIGRATIONS.length));
@@ -941,7 +993,6 @@ describe("tasks and approvals", () => {
       sql.exec("ALTER TABLE items DROP COLUMN outside");
       sql.exec("ALTER TABLE outbox DROP COLUMN private");
       sql.exec("DROP TABLE continuations");
-      sql.exec("DROP TABLE answers");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });

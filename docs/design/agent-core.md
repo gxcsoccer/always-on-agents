@@ -147,6 +147,9 @@ Long-term memory, timers, sending to someone else and handing over to a worker: 
 
 ### 5.4 Delivered answers
 
+> **Note, 2026-11-23**: keeping delivered answers and reopening them through `reopen_answer` is superseded by [follow-up-history.zh-CN.md](follow-up-history.zh-CN.md); `reopen_answer` and the answers table were removed. A follow-up reads what the agent actually delivered from the conversation's history and reads the source again only when needed. After access is revoked the document is not read again, but what was already said in that private chat may be referred to.
+
+
 After the summary is sent, a **delivered answer** record is kept so that a follow-up can be picked up. It sits next to the existing record of sent messages:
 
 - it belongs only to the original direct chat, and has a deadline;

@@ -13,13 +13,12 @@ import type { Env } from "../env";
 import { type Principal, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
-import type { Passage } from "./follow-up";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
-import { HANDLING_LIMIT_MS, type Requests, type Source } from "./requests";
+import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
-import { TOOLS, type ToolCall, describeTool, executeTool, withoutQuotes } from "./tools";
+import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
 const MAX_STEPS_PER_RUN = 16;
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
@@ -54,7 +53,7 @@ export interface RunnerHost {
   registry(): Pick<ReturnType<typeof registry>, "recordUsage" | "adjustUsage">;
   /** One call to the model. */
   respond(request: ModelRequest): Promise<ModelResponse>;
-  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "followUps" | "basis" | "resumed" | "reopenable" | "cancellable" | "askedFor" | "resume">;
+  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
 }
@@ -351,25 +350,8 @@ export class Runner {
       // step: its one answer becomes a message to deliver, and the request one that is being
       // answered. Until here the answer was a draft that nothing would send. A request that is
       // no longer being carried on (told to wait again, ended) leaves no answer behind.
-      // A run that read exactly one thing for the person: its messages carry where they came
-      // from, so that one delivered can be reopened for a follow-up. One that drew on several
-      // things carries nothing: reading one of them again would not vouch for the rest.
-      const sources = JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as Source[];
-      const quotes = JSON.parse(this.#s.meta(`quotes:${runId}`) ?? "[]") as Passage[];
-      this.#s.sql.exec("DELETE FROM meta WHERE key IN (?, ?)", `sources:${runId}`, `quotes:${runId}`);
-      // And only when the run said one thing: with several messages there is no telling which is the answer.
-      const written = this.#s.rows<{ id: number; status: string }>("SELECT id, status FROM outbox WHERE run_id = ?", runId);
-      // (With follow-ups off these notes hold only what the run read under, and nothing is kept.)
-      // Each thing once, as it was last read in this run. An answer that drew on several things
-      // is not kept (the contract, 5.2): only one source, read again, vouches for the whole of it.
-      const each = [...new Map(sources.map((source) => [source.identity, source])).values()];
-      // Every read must have been noted in full: one made while follow-ups were off (the switch
-      // was turned on during a pause) left only what it was read under, and keeps nothing.
-      const whole = sources.every((source) => typeof source.identity === "string" && typeof source.args === "string" && Array.isArray(source.events?.said));
-      // "One thing" counts everything the run said, also what has already gone out.
-      if (this.#b.requests.followUps() && status === "done" && whole && written.length === 1 && ["pending", "draft"].includes(written[0].status) && each.length === 1) {
-        this.#s.sql.exec("UPDATE outbox SET source = ? WHERE id = ?", JSON.stringify({ sources: each, quotes }), written[0].id);
-      }
+      // What the run read under is on every message it wrote by now (outbox.guard); the run's own note of it goes.
+      this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
@@ -505,10 +487,9 @@ export class Runner {
    */
   #toolsFor(runId: string): ToolDefinition[] {
     // A run that carries a request on answers it, and does nothing else.
-    if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message").map((each) => (this.#b.requests.followUps() ? each : withoutQuotes(each)));
+    if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
     const acting = this.actingFor(runId);
-    const keeps = acting !== undefined && this.#b.requests.followUps();
-    const own = TOOLS.filter((each) => each.name !== "reopen_answer" || keeps).map((each) => (each.name === "send_message" && !keeps ? withoutQuotes(each) : each));
+    const own = TOOLS;
     const all = acting ? [...own, ...this.#b.toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
   }
@@ -542,7 +523,6 @@ export class Runner {
       instructions: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
       tasks: this.#s.rows<Row>("SELECT id, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at") as any,
-      answers: this.#b.requests.reopenable(runId),
       requests: this.#b.requests.cancellable(this.#s.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "").map((each) => ({ id: each.id, asked: this.#b.requests.askedFor(each) })),
     });
   }

@@ -44,7 +44,8 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `PUBLIC_ORIGIN` | secret or variable | Where the deployment is reached from outside, such as `https://agent.example.com`. Needed for reading people's Feishu documents: it is where Feishu sends them back after they authorise. |
 | `GRANTS_KEY` | secret | Seals the tokens people's authorisations produce. 32 or more random characters. Changing it makes every stored authorisation unreadable, and people are invited to authorise again. |
 | `GATE_HOLD_PATTERN` | secret or variable | Optional regular expression for shell commands inside the sandbox that a person must approve. Default: none. |
-| `FOLLOW_UPS` | variable | Optional. `on` keeps a delivered answer for 24 hours and gives the agent a way to reopen it for a follow-up (see [Connectors](connectors.md)). Any other value, or none, is the strict behaviour and the default: nothing a run read, or said about it, outlives the run; a run that reads notes only under which condition and generation it read, for the length of the run; `send_message` is offered without `quotes`; and the tool does not exist. It is not set in `wrangler.jsonc`. Answers already kept when it is turned off again are not offered any more, a follow-up under way at that moment is stopped at its next model call or send, and the kept answers are deleted when their 24 hours are up. |
+
+`FOLLOW_UPS` is no longer read: following up on a kept answer has been retired. A deployment that set it as a secret can delete it with `wrangler secret delete FOLLOW_UPS`.
 
 The sandboxed coding agent and its version are fixed in the `Dockerfile`.
 
@@ -131,14 +132,14 @@ An entry in `outbox` has one of these statuses.
 | `pending` | To be sent, or being retried. |
 | `draft` | The answer of a request being carried on, while its run is still under way. Nothing sends a draft. |
 | `sent` | Handed over, and the outside system confirmed it. |
-| `void` | Never handed over: the request it belonged to was called off or no longer stood, what the run that wrote it had read may no longer be passed on (the authorisation ended, or a reopened answer was no longer kept), or the invitation it was to show could no longer be used. Its text is removed. |
+| `void` | Never handed over: the request it belonged to was called off or no longer stood, what the run that wrote it had read may no longer be passed on (the authorisation ended), or the invitation it was to show could no longer be used. Its text is removed. |
 | `dead` | Given up, and it is certain nothing was posted: every attempt was refused by the outside system. Also the ending for any failed message on a connector that states no window for repeats. |
 | `unverified` | Not sent (again), though an attempt may have arrived and that cannot be checked. This is what a message becomes when its retries are used up after an attempt with no clear answer, or when its first attempt is older than the window in which the system drops repeats (one hour for Feishu). Its text is removed. It is never sent again. |
 | `withdrawn`, `reconciling` | Approval questions only. See [Approvals](approvals.md). |
 
-Two columns tie a pending message to what its run read, and neither is returned by the admin API. `guard` holds what the message may go out under: the connector, the condition and generation the read was made under, and for a follow-up the time until which the answer is kept. It holds no document text. `source` is different, and should be read plainly: it holds document text. It is written only with `FOLLOW_UPS=on`, and holds the call that would read the same document again (its link), the document's id, a hash of what was read, the ids of the person's messages the read rests on, and up to 20 passages: for each, a few words for the point, the sentence quoted from the document, and up to 40 characters of the text on either side of it. That text stays on the row until the message leaves the queue. Both columns are cleared as soon as the message is no longer `pending` or `draft`, however it ended; for an answer that was delivered, the passages then live in `answers` for its 24 hours.
+Two columns tie a pending message to what its run read, and neither is returned by the admin API. `guard` holds what the message may go out under: the connector, and the condition and generation the read was made under. It holds no document text. `source` is no longer written; it was used only for follow-ups on kept answers, which have been retired. A row written before that can still hold document text in it until the message leaves the queue. Both columns are cleared as soon as the message is no longer `pending` or `draft`, however it ended.
 
-With `FOLLOW_UPS` not `on`, none of that is kept. A run that reads notes only the connector, condition and generation it read under, for the length of the run, so that the checks before each model call and each send can be made: no link, no document id, no message ids, no hash. `send_message` is offered to the model without `quotes`.
+A run that reads notes, for the length of the run only, what it read and what it read under: the call that reads it (which holds the document's link), the document's id, and the connector, condition and generation. This is so that the checks before each model call and each send can be made. The note is removed when the run ends. No message ids, hashes or passages of text are noted.
 
 ### Fixed messages from the system
 
@@ -200,7 +201,6 @@ A memory file longer than its limit is stored whole; the run is told that the re
 | A finished task's container, checkpoints and records | 24 hours |
 | The text of handled events | 30 days (the record itself, without its text, for 365 days so that a late redelivery is still recognised) |
 | Delivered messages and finished timers and tasks | 30 days |
-| A delivered answer kept for follow-ups, with the sentences it quoted from what was read | 24 hours from delivery, then deleted. None are kept unless `FOLLOW_UPS=on`. |
 | An ended request (the record of a wait) | 30 days |
 | A conversation's transcript | Kept in full while the conversation is in use. Once a conversation has been quiet for 30 days it is cut back to roughly its latest 200 items (the cut lands on a user turn, so slightly fewer may remain). There is no upper limit on how long an active conversation's text is kept. |
 | Audit entries | 365 days |
