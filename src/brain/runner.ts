@@ -16,7 +16,7 @@ import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
-import { READ_OUTSIDE, type RunTools } from "./run-tools";
+import { READ_OUTSIDE, type RunTools, eligibleSource } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
@@ -166,7 +166,7 @@ export class Runner {
     for (;;) {
       const run = this.#stillActive(runId);
       if (!run) return;
-      const items = this.#transcript(run.session_id);
+      const items = this.#transcript(run.session_id, runId);
 
       // Tool calls without a recorded output: either the model just asked for them, or an earlier
       // attempt died mid-call. Either way, execute and record. Tools are idempotent per call id.
@@ -326,7 +326,7 @@ export class Runner {
     const run = this.#stillActive(runId);
     if (!run) return;
     this.#s.transaction(() => {
-      for (const call of danglingCalls(this.#transcript(run.session_id))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+      for (const call of danglingCalls(this.#transcript(run.session_id, runId))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
       this.#s.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status IN ('pending', 'draft') AND started = 0", runId);
       this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("retired", run.session_id));
     });
@@ -349,7 +349,7 @@ export class Runner {
     const outside = this.sawOutside(runId);
     this.#s.transaction(() => {
       // Close any open tool call so the transcript stays well-formed for the next run.
-      for (const call of danglingCalls(this.#transcript(run.session_id))) {
+      for (const call of danglingCalls(this.#transcript(run.session_id, runId))) {
         this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "the run was abandoned before this finished" }) });
       }
       // A task that never got past "dispatching" in this run will not be picked up by anything else.
@@ -511,7 +511,7 @@ export class Runner {
    * - Before a person's turn that replied to one of those messages, the words replied to, as the
    *   agent's own.
    */
-  #transcript(sessionId: string): Item[] {
+  #transcript(sessionId: string, runId?: string): Item[] {
     const lastUser = this.#s.rows<{ seq: number | null }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq;
     const floor = this.#s.rows<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM (SELECT seq FROM items WHERE session_id = ? ORDER BY seq DESC LIMIT ?)", sessionId, MAX_TRANSCRIPT_ITEMS * 4)[0]?.seq;
     if (floor == null) return [];
@@ -537,13 +537,18 @@ export class Runner {
     // What is kept beside an item for the system's own use (names starting with "_") is never shown.
     const shown = (item: Record<string, unknown>) => Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith("_"))) as Item;
     const entries: { item: Item; starts: boolean }[] = [];
+    let acting: ReturnType<Runner["actingFor"]> | null | undefined;
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
         const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
+        // Who the run acts for, once: what they can still point at decides what an answer is shown as written from.
+        acting ??= runId ? (this.actingFor(runId) ?? null) : null;
         quoted.forEach((each, at) => {
-          // What it was written from, by the tool's canonical call: what they are asking about, even once that turn is out of sight.
-          const from = linksOf(JSON.parse(each.reads) as { args: string }[]);
+          // What it was written from, by the tool's canonical call, where that is the one thing the
+          // person can still point at: what they are asking about, even once that turn is out of sight.
+          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting ?? undefined, this.#b.toolsOf);
+          const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
           entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
         });
         entries.push({ item: shown(item), starts: quoted.length === 0 });

@@ -108,6 +108,12 @@ export interface ConnectorTool {
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
+  /**
+   * Whether one of the person's own messages links the thing one of this tool's canonical calls
+   * (as it identified a read) names. Lets the Brain tell, without knowing the tool, which of the
+   * things an earlier answer was written from the person can still point at.
+   */
+  links?(message: { text: string; data: Record<string, unknown> }, request: Record<string, unknown>): boolean;
 }
 
 /**
@@ -141,12 +147,13 @@ export interface ToolContext {
    */
   recent: { text: string; data: Record<string, unknown> }[];
   /**
-   * Set when the person's message is a reply to one of the agent's own answers in this
-   * conversation, as it reached them: what that answer was written from, as this connector's
-   * tools identified it when they read it (their canonical calls). Empty when it was written
-   * from nothing read.
+   * Set when the person's message replies to one of the agent's own answers in this conversation,
+   * as it reached them. `source`: the one thing that answer (or every answer replied to) was
+   * written from that the person linked themselves among `said` and `recent`, as this tool's
+   * canonical call; absent when there is no such single thing (written from nothing read, from
+   * several, or from one no longer in reach), in which case nothing is to be read on its strength.
    */
-  answering?: { reads: Record<string, unknown>[] };
+  answering?: { source?: Record<string, unknown> };
   /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
   /**

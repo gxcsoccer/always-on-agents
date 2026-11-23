@@ -673,6 +673,78 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaA0000000000001", "DocOlgaB0000000000001", "DocOld000000000000001"]);
   });
 
+  it("carries on a read of a document linked earlier, alongside one linked now, once the person has authorised", async () => {
+    const rosa = someone();
+    for (const id of ["DocRosaA0000000000001", "DocRosaB0000000000001"]) feishu.docs.set(id, { readers: [rosa.openId], text: `text of ${id}` });
+    model.replies([say("")]);
+    await rosa.says(`先存一下 ${link("DocRosaA0000000000001")}`);
+    const earlier = Number((await rowsOf(rosa.stub, "SELECT id FROM inbox WHERE text = ?", `先存一下 ${link("DocRosaA0000000000001")}`))[0].id);
+    model.replies([readCall("DocRosaA0000000000001")], [say("")]);
+    await rosa.says(`把前面那篇的标题和 ${link("DocRosaB0000000000001")} 对比一下`);
+    expect(toolOutputs()[0].waiting).toBe(true);
+    // What the request rests on is kept: the earlier message that linked A.
+    const [request] = await rosa.requests();
+    expect(JSON.parse((await rowsOf(rosa.stub, "SELECT events FROM continuations WHERE id = ?", request.id))[0].events).recent).toContain(earlier);
+    carriesOn("对比好了");
+    await authorises(rosa);
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocRosaA0000000000001" });
+    expect(rosa.heard()).toEqual(["对比好了"]);
+  });
+
+  it("records the link pasted now over an older one for the same document", async () => {
+    const sam = someone();
+    const doc = "DocSamA00000000000001";
+    const second = `https://second.larkoffice.com/docx/${doc}`;
+    feishu.docs.set(doc, { readers: [sam.openId], text: "Three items." });
+    await authorised(sam, doc);
+    model.replies([say("")]);
+    await sam.says(`先存一下 ${link(doc)}`);
+    model.replies([call("feishu_read_document", { document: second })], [call("send_message", { text: "三项（直接贴）" })], [say("")]);
+    await sam.says(`看看 ${second} 有几项`);
+    expect((await rowsOf(sam.stub, "SELECT reads FROM said WHERE text = '三项（直接贴）'")).map((each: any) => JSON.parse(each.reads).map((read: any) => read.args))).toEqual([[JSON.stringify({ document: second })]]);
+  });
+
+  it("does not read on the strength of a reply to an answer that rests on no one document still in reach, and reads a link pasted in the reply itself", async () => {
+    const tess = someone();
+    for (const id of ["DocTessA0000000000001", "DocTessB0000000000001", "DocTessC0000000000001"]) feishu.docs.set(id, { readers: [tess.openId], text: `text of ${id}` });
+    await authorised(tess, "DocTessA0000000000001");
+    const sentText = (text: string) => `om_sent_${feishu.sent.filter((each) => each.to === `oc_${tess.openId}` && each.type === "text" && each.content.text === text).at(-1)!.uuid}`;
+    model.replies([say("")]);
+    await tess.says(`存一下 ${link("DocTessA0000000000001")} 和 ${link("DocTessB0000000000001")}`);
+    // An answer from what was said before, reading nothing; and one that read both A and B.
+    model.replies([call("send_message", { text: "凭印象：A 有三项" })], [say("")]);
+    await tess.says("A 大概有几项？");
+    model.replies([readCall("DocTessA0000000000001"), readCall("DocTessB0000000000001")], [call("send_message", { text: "A 三项，B 两项" })], [say("")]);
+    await tess.says("A 和 B 各几项");
+    feishu.reads.length = 0;
+    for (const answer of ["凭印象：A 有三项", "A 三项，B 两项"]) {
+      model.replies([readCall("DocTessA0000000000001")], [call("send_message", { text: "需要链接" })], [say("")]);
+      await tess.says("第二项展开说说", undefined, sentText(answer));
+      expect(toolOutputs()[0].error).toMatch(/does not rest on one document/);
+    }
+    expect(feishu.reads).toEqual([]);
+    // A link pasted in the reply itself is hers to have read, whatever the answer rested on.
+    model.replies([readCall("DocTessC0000000000001")], [call("send_message", { text: "C 也看了" })], [say("")]);
+    await tess.says(`和 ${link("DocTessC0000000000001")} 对比下`, undefined, sentText("A 三项，B 两项"));
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocTessC0000000000001" });
+  });
+
+  it("shows a replied-to answer as written from a link only while that link is still the person's to point at", async () => {
+    const uma = someone();
+    feishu.docs.set("DocUmaA00000000000001", { readers: [uma.openId], text: "text of A" });
+    await authorised(uma, "DocUmaA00000000000001");
+    model.replies([readCall("DocUmaA00000000000001")], [call("send_message", { text: "A 有三项（乌）" })], [say("")]);
+    await uma.says(`总结 ${link("DocUmaA00000000000001")}`);
+    const aboutA = `om_sent_${feishu.sent.filter((each) => each.to === `oc_${uma.openId}` && each.type === "text" && each.content.text === "A 有三项（乌）").at(-1)!.uuid}`;
+    await rowsOf(uma.stub, "UPDATE inbox SET received_at = received_at - 25 * 3600000");
+    model.replies([say("")]);
+    await uma.says("第二项是什么来着", undefined, aboutA);
+    const input = modelCalls.at(-1).input;
+    const turn = input.map((each: any) => each.role).lastIndexOf("user");
+    expect(input[turn - 1].content).toContain("A 有三项（乌）");
+    expect(input[turn - 1].content).not.toContain("written from");
+  });
+
   it("reads, for a reply to one of its answers, only what that answer was written from", async () => {
     const pete = someone();
     for (const id of ["DocPeteA0000000000001", "DocPeteB0000000000001"]) feishu.docs.set(id, { readers: [pete.openId], text: `text of ${id}` });
