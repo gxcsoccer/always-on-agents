@@ -139,6 +139,16 @@ interface InboxRow {
 
 type Said = { text: string; data: Record<string, unknown> };
 /** One thing a run read for the person: which tool, with what, on which of their messages, and what it said (as a fingerprint). */
+/** Whether a kept answer's record is one that can be used: exactly one source, with what it was read for and what it was. */
+function wholeAnswer(answer: { sources: string }): boolean {
+  try {
+    const sources = JSON.parse(answer.sources) as Partial<Source>[];
+    return Array.isArray(sources) && sources.length === 1 && sources.every((source) => source !== null && typeof source === "object" && Array.isArray(source.events?.said) && Array.isArray(source.events?.recent) && typeof source.identity === "string" && typeof source.args === "string" && typeof source.tool === "string");
+  } catch {
+    return false;
+  }
+}
+
 /** A delivered answer kept for follow-ups: see the `answers` table. */
 interface AnswerRow {
   id: string;
@@ -1724,19 +1734,12 @@ export class BrainAgent extends DurableObject<Env> {
    * answer's own message names it exactly; a message of the person's that exactly one answer was
    * read for names that one; two, neither). `last`: the one that is the last thing said here.
    */
-  #eligible(sessionId: string, repliedTo: string[]): { fits: AnswerRow[]; named?: AnswerRow; last?: AnswerRow } {
-    const whole = (each: AnswerRow) => {
-      try {
-        return (JSON.parse(each.sources) as Source[]).every((source) => Array.isArray(source.events?.said) && typeof source.identity === "string");
-      } catch {
-        return false;
-      }
-    };
-    const kept = this.#rows<AnswerRow>("SELECT * FROM answers WHERE session_id = ? AND expires_at > ? ORDER BY created_at DESC", sessionId, Date.now()).filter(whole);
+  #eligible(sessionId: string, repliedTo: string[]): { kept: AnswerRow[]; fits: AnswerRow[]; named?: AnswerRow; last?: AnswerRow } {
+    const kept = this.#rows<AnswerRow>("SELECT * FROM answers WHERE session_id = ? AND expires_at > ? ORDER BY created_at DESC", sessionId, Date.now()).filter(wholeAnswer);
     const fits = repliedTo.length > 0 ? kept.filter((each) => repliedTo.every((subject) => this.#subjectsOf(each).includes(subject))) : [];
     const named = fits.find((each) => repliedTo.every((subject) => subject === each.subject)) ?? (fits.length === 1 ? fits[0] : undefined);
     const last = kept.find((each) => this.#rows<{ id: number }>("SELECT id FROM outbox WHERE status = 'sent' AND target = ? ORDER BY sent_at DESC, id DESC LIMIT 1", each.target)[0]?.id === each.outbox_id);
-    return { fits, named, last };
+    return { kept, fits, named, last };
   }
 
   #reopenable(runId: string): { id: string; asked: string; at: number }[] {
@@ -1776,9 +1779,12 @@ export class BrainAgent extends DurableObject<Env> {
       const found = row();
       return found && found.session_id === run.session_id && found.expires_at > Date.now() ? found : undefined;
     };
-    const proposed = row();
     const repliedTo = this.#basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
     const eligible = this.#eligible(run.session_id, repliedTo);
+    // The record acted on is the one that was checked: among those this conversation can use
+    // now, or, for a follow-up that waited, the answer it was made about, if still whole.
+    const pinned = carried ? row() : undefined;
+    const proposed: Row | undefined = carried ? (pinned && wholeAnswer(pinned as AnswerRow) ? pinned : undefined) : (eligible.kept.find((each) => each.id === id) as Row | undefined);
     // Everything about this that is not a matter of judgement is decided by one plain function
     // (see ./follow-up), from what is on record.
     const verdict = followUpDecision({
@@ -1860,13 +1866,18 @@ export class BrainAgent extends DurableObject<Env> {
       // something that can be verified.
       const passages = quotes.map((each) => ({ point: each.point, quote: each.quote, ...passageNow(each, texts, partial) }));
       const changed = now.some((each) => each.print !== each.source.fingerprint);
+      const besides = now.some((each) => typeof each.result === "object" && each.result !== null && "aside" in each.result);
       return {
         sources_now: now.map((each) => each.result),
         your_answer_then: still.text,
         source_changed: changed,
+        // Only what was read as text is compared. What a source holds besides text was not
+        // recorded with the answer, so nothing is claimed about it either way.
+        compared: "the source's text only",
+        ...(besides ? { besides_text: "What the source holds besides its text is given under sources_now as it is now (aside). It was not recorded when you answered and is not compared: if your earlier answer said anything about such content (that there is a whiteboard, a sheet, an image), check that against what is there now, and do not present it as unchanged." } : {}),
         passages: passages.length > 0 ? passages : "no passages were recorded with that answer, so which of its points still hold cannot be checked one by one",
         note: !changed
-          ? "The source says what it said when you answered."
+          ? "The source's text reads as it did when you answered."
           : passages.length > 0
             ? "The source has changed since you answered. A passage reported as unchanged means its sentence still stands where it stood, not that your point still follows: read the point again against the text around it as it is now. For one that is changed, say that the source has changed there and answer from what it says now. For one that cannot be verified, and for any point of the old answer with no passage, say that you cannot tell whether it still holds and answer from what the source says now."
             : "The source has changed since you answered, and which parts cannot be told. Say so, and answer from what it says now; do not present the old answer's points as what it says now.",

@@ -3184,12 +3184,62 @@ describe("following up on an answer", () => {
     expect(toolOutputs()[0]).toMatchObject({ sources_now: [{ text: "First: the launch is on Monday.", aside: { not_read: ["1 whiteboard"] } }], source_changed: true });
   });
 
+  it("compares the source's text only, and gives what it holds besides text as it is now", async () => {
+    const dee = await summarised("DocDee000000000000001", "on", "docx", (person) => void feishu.docs.set("DocDee000000000000001", { readers: [person.openId], text: "Roadmap", blocks: [43] }));
+    const [kept] = await answers(dee);
+    // A whiteboard when it was answered, a sheet now; the words are the same.
+    feishu.docs.get("DocDee000000000000001")!.blocks = [30];
+    model.replies([reopen(kept.id)], [call("send_message", { text: "现在是表格。" })], [say("")]);
+    await dee.says("里面还有什么");
+    const now = toolOutputs()[0];
+    expect(now).toMatchObject({ sources_now: [{ text: "Roadmap", aside: { not_read: ["1 sheet"] } }], your_answer_then: SUMMARY, source_changed: false, compared: "the source's text only", besides_text: expect.any(String) });
+    expect(JSON.stringify(now)).toContain("The source's text reads as it did when you answered.");
+    expect(JSON.stringify(now.sources_now)).not.toContain("whiteboard");
+
+    // Nothing is said about that where the source is all text.
+    const long = "A sentence of the plan. ".repeat(30);
+    const eli = await summarised("DocEli000000000000001", "on", "docx", (person) => void feishu.docs.set("DocEli000000000000001", { readers: [person.openId], text: long, blocks: [43] }));
+    const [plain] = await answers(eli);
+    model.replies([reopen(plain.id)], [call("send_message", { text: "好的" })], [say("")]);
+    await eli.says("再说说");
+    expect(toolOutputs()[0]).toMatchObject({ sources_now: [{ text: long }], source_changed: false, compared: "the source's text only" });
+    expect(toolOutputs()[0].sources_now[0].aside).toBeUndefined();
+    expect(toolOutputs()[0].besides_text).toBeUndefined();
+  });
+
+  it("carries on as usual when the newest kept answer has no source on record, and does not reopen it", async () => {
+    const flo = await summarised("DocFlo000000000000001");
+    const [kept] = await answers(flo);
+    await rowsOf(flo.stub, "UPDATE answers SET sources = '[]' WHERE id = ?", kept.id);
+
+    // Something else entirely: an ordinary run, with nothing offered.
+    model.replies([call("send_message", { text: "在" })], [say("")]);
+    await flo.says("在吗");
+    expect(flo.heard().at(-1)).toBe("在");
+    expect(modelCalls.length).toBe(2);
+    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
+    expect(model.remaining()).toBe(0);
+    expect((await rowsOf(flo.stub, "SELECT status, error, retry_at FROM runs ORDER BY rowid DESC LIMIT 1"))[0]).toEqual({ status: "done", error: null, retry_at: null });
+
+    // Asked for by its id all the same: refused, with nothing of it handed over and nothing read.
+    modelCalls.length = 0;
+    model.replies([reopen(kept.id)], [say("")]);
+    await flo.says("第二点展开说说");
+    expect(modelCalls[0].instructions).not.toContain("Answers you can reopen");
+    expect(toolOutputs()).toEqual([{ error: expect.any(String) }]);
+    expect(JSON.stringify(modelCalls)).not.toMatch(/Friday|周五发布|预算四十/);
+    expect(feishu.reads).toEqual([]);
+    expect((await rowsOf(flo.stub, "SELECT status, error FROM runs ORDER BY rowid DESC LIMIT 1"))[0]).toEqual({ status: "done", error: null });
+  });
+
   it("offers and reopens a whole answer beside kept answers whose records are not whole", async () => {
     const cy = await summarised("DocCy0000000000000001");
     const [kept] = await answers(cy);
     const asked = await messageId(cy, `总结 ${link("DocCy0000000000000001")}`);
     // Other answers kept in the same conversation, newer, whose record of what they were read from is broken in one way or another.
-    const broken = ["[{}]", JSON.stringify([{ identity: "docx:x", tool: "feishu_read_document" }]), "not json", "null"];
+    // (Among them: none at all, and two where an answer has exactly one.)
+    const [whole] = JSON.parse((await rowsOf(cy.stub, "SELECT sources FROM answers WHERE id = ?", kept.id))[0].sources);
+    const broken = ["[{}]", JSON.stringify([{ identity: "docx:x", tool: "feishu_read_document" }]), "not json", "null", "[]", JSON.stringify([whole, whole])];
     for (const [index, sources] of broken.entries()) {
       await rowsOf(cy.stub, "INSERT INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) SELECT ?, session_id, outbox_id + 1000 + ?, ?, target, connector, ?, quotes, '别的', expires_at, created_at + 1 + ? FROM answers WHERE id = ?", `broken_${index}`, index, `feishu:message:om_other_${index}`, sources, index, kept.id);
     }
