@@ -157,6 +157,38 @@ describe("whose message decides an approval question", () => {
       const dated = said("approve ABCD", { subject: "c3", revision: 70_000 });
       const undated = said("ok", { received_at: 70_000, id: dated.event.id - 1_000 });
       expect(decidingReply("allow", ASKED, facts([undated, dated]))).toMatchObject({ event: dated.event });
+      // Nor the other way round: a remark with its source's time, then an approval with only its arrival time.
+      const remark = said("ok", { subject: "c4", revision: 80_000, id: 9_010 });
+      const plain = said("approve ABCD", { received_at: 80_000, id: 9_011 });
+      expect(decidingReply("allow", ASKED, facts([remark, plain]))).toMatchObject({ event: plain.event });
+    });
+
+    it("looks up only what the rules need, in their order", () => {
+      const trace = (over: Partial<Facts> = {}) => {
+        const asked: string[] = [];
+        const record =
+          <T>(name: string, value: T) =>
+          () => (asked.push(name), value);
+        const base: Partial<Facts> = {
+          queued: record("queued", { events: [], unresolved: false }),
+          used: record("used", new Set<number | null>()),
+          saidMore: record("saidMore", false),
+          stillStands: record("stillStands", true),
+        };
+        return { asked, facts: (replies: Reply[]) => facts(replies, { ...base, ...over }) };
+      };
+      const truncated = trace();
+      expect(() => decidingReply("allow", { ...ASKED, truncated: true }, truncated.facts([said("approve ABCD")]))).toThrow();
+      expect(truncated.asked).toEqual([]);
+      const none = trace();
+      expect(() => decidingReply("allow", ASKED, none.facts([said("hmm")]))).toThrow("no reply so far is an approval");
+      expect(none.asked).toEqual(["queued"]);
+      const instant = trace();
+      expect(() => decidingReply("allow", ASKED, instant.facts([said("and thanks", { subject: "c1", revision: 5 }), said("approve ABCD", { subject: "c2", revision: 5 })]))).toThrow("at the same moment");
+      expect(instant.asked).toEqual(["queued", "used"]);
+      const approved = trace();
+      decidingReply("allow", ASKED, approved.facts([said("approve ABCD")]));
+      expect(approved.asked).toEqual(["queued", "used", "saidMore", "stillStands"]);
     });
 
     it("has to be what they still say", () => {
