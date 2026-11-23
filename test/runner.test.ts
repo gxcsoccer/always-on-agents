@@ -502,6 +502,38 @@ describe("the run loop, by itself", () => {
     });
   });
 
+  describe("a run an earlier version left after reopening a kept answer", () => {
+    it("is stopped as it is entered: no call it left is carried out, the model is not asked, and the person is told", async () => {
+      await within(async (b) => {
+        b.event("the second point?");
+        const id = (await b.runner.next())!;
+        const session = b.run(id).session_id;
+        b.runner.append(session, id, { type: "function_call", call_id: "c0", name: "reopen_answer", arguments: "{}" });
+        b.runner.append(session, id, { type: "function_call_output", call_id: "c0", output: "the old answer" }, true);
+        // Interrupted after asking for a read, before its output was recorded.
+        b.runner.append(session, id, { type: "function_call", call_id: "c1", name: "feishu_read_document", arguments: "{}" });
+        b.settings.guards = [{ connector: "feishu", condition: "c", generation: 1, retired: true }];
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.asked).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+        expect(b.of("notify")).toEqual([[`withheld:${id}`, session, null, "notice:retired"]]);
+        expect(b.items(id).map((each) => JSON.stringify(each)).join()).not.toContain("the old answer");
+      });
+    });
+
+    it("leaves a run that read under a grant alone, to the checks it always had", async () => {
+      await within(async (b) => {
+        b.event("hello");
+        const id = (await b.runner.next())!;
+        b.settings.guards = [{ connector: "feishu", condition: "c", generation: 1 }];
+        await b.runner.execute(id);
+        expect(b.asked).toHaveLength(1);
+        expect(b.of("notify")).toEqual([]);
+      });
+    });
+  });
+
   describe("ending a run in one step", () => {
     it("leaves the run as it was when ending it fails part way, and ends it once when tried again", async () => {
       await within(async ({ runner, event, host, store, run, inbox }) => {

@@ -31,6 +31,7 @@ const HELD_LONG_MS = 60_000;
 export type NoticeKey = keyof typeof NOTICES;
 const NOTICES = {
   withheld: { en: "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.", zh: "我在完成之前停下了：读取所依据的授权已经结束。请再问一次。" },
+  retired: { en: "I stopped before finishing: this rested on an earlier answer of mine that is no longer kept. Please ask again.", zh: "我在完成之前停下了：这件事依据的是我之前的一份答复，那份答复已经不再保存。请再问一次。" },
   notSent: { en: "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.", zh: "我写好的内容没有发给你：读取所依据的授权已经结束，或者已经过了太久。请再问一次。" },
   notAnswered: { en: "I could not finish what you asked for earlier. Please ask again.", zh: "你之前让我做的事我没能完成，请再问一次。" },
   limit: { en: "I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow.", zh: "我今天的用量已经用完，没能完成你之前让我做的事。请明天再问一次。" },

@@ -145,6 +145,9 @@ export class Runner {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
     if (entered.entries > MAX_RUN_ENTRIES) return this.#abandon(runId, "the run kept failing and was abandoned");
+    // A run an earlier version left part way after reopening an answer kept for follow-ups, which
+    // are retired: nothing more of it is done, not even a call it left behind.
+    if (this.#b.requests.guards(runId).some((each) => each.retired)) return this.#retire(runId);
 
     for (;;) {
       const run = this.#stillActive(runId);
@@ -302,6 +305,18 @@ export class Runner {
   #stillActive(runId: string): RunRow | undefined {
     const run = this.activeRun();
     return run && run.id === runId && run.status === "running" ? run : undefined;
+  }
+
+  /** Ends a run that rests on something retired: its open calls are closed unrun, nothing it wrote is sent, and the person is told. */
+  #retire(runId: string): void {
+    const run = this.#stillActive(runId);
+    if (!run) return;
+    this.#s.transaction(() => {
+      for (const call of danglingCalls(this.#transcript(run.session_id))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+      this.#s.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status IN ('pending', 'draft') AND started = 0", runId);
+      this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("retired", run.session_id));
+    });
+    this.#finish(runId, "done");
   }
 
   #retryLater(runId: string, err: unknown): void {
