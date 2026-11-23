@@ -1,14 +1,34 @@
 # 代码导读（二）：BrainAgent 事件循环、持久化与发件箱
 
-本文档聚焦系统最核心的大脑模块（`src/brain/schema.ts`、`src/brain/agent.ts`、`src/brain/tools.ts`、`src/brain/prompt.ts`），拆解它如何仅靠**「一个 SQLite 数据库 + 一个 Durable Object `alarm()`」**，不依赖外部消息队列或 Workflow 引擎，实现可随时断电重启的确定性事件循环、防外部文本污染隔离与严格有序发件箱。
+本文档聚焦系统最核心的大脑模块（`src/brain/` 目录：`schema.ts`、`agent.ts` 及其拆出的各部件、`tools.ts`、`prompt.ts`），拆解它如何仅靠**「一个 SQLite 数据库 + 一个 Durable Object `alarm()`」**，不依赖外部消息队列或 Workflow 引擎，实现可随时断电重启的确定性事件循环、防外部文本污染隔离与严格有序发件箱。
 
 > 系列导读：[（一）核心对象、作用域与入口连接器](code-walkthrough.zh-CN.md) · [架构概览](architecture.zh-CN.md) · [审批机制](approvals.zh-CN.md)
 
 ---
 
+## 0. 代码地图：一个 Durable Object，几个部件
+
+`BrainAgent`（`agent.ts`）只做组装与入口：`ingest`、`alarm`、`#rearm`、每日清理和对外 RPC。具体职责分给几个部件，每个都是 `new Part(store, host)`：共用同一个 `BrainStore`（`store.ts`），需要别的部件时只通过显式的 `host` 接口拿到所需的那几个方法。
+
+| 文件 | 部件 | 负责 |
+|---|---|---|
+| `store.ts` | `BrainStore` | 对 SQLite 与 `meta` 的薄封装；行类型；`Wakes` 接口 |
+| `timers.ts` | `Timers` | 到期定时器转为 inbox 事件 |
+| `runner.ts` | `Runner` | 认领事件、执行一次 run（模型 ↔ 工具循环）、重试、放弃、外部文本的污点与清理 |
+| `run-tools.ts` | `RunTools` | 给某次 run 准备工具宿主（发消息、记忆、定时器、任务），含权限检查 |
+| `outbox.ts` | `Outbox` | 发件箱入队、有序投递、已关闭审批卡片的对账、送达后擦除 |
+| `tasks.ts` | `Tasks` | 派发与跟踪沙箱任务、回答审批、核对未决问题 |
+| `approval.ts` | 纯函数 | 从消息中读出审批决定、判断谁能批准 |
+| `revisions.ts` | `Revisions` | 可编辑评论的修订记录与「这句话是否仍然有效」 |
+| `requests.ts` | `Requests` | 等待后继续的请求、守卫与跟进 |
+
+各部件实现 `Wakes.nextWakeAt(now)` 报告自己下次要做事的时间，`#rearm()` 是唯一选闹钟时间的地方。
+
+---
+
 ## 1. 一张数据库装下五大原语（`src/brain/schema.ts`）
 
-每个作用域（`tenant:kind:id`）对应一个独立的 `BrainAgent` Durable Object 与一份独享 SQLite 数据库。表结构采用只追加、事务化版本演进（目前 18 步 `MIGRATIONS`，对象首次唤醒时在 `constructor` 中由 `migrate()` 自动追平），共分为 4 组：
+每个作用域（`tenant:kind:id`）对应一个独立的 `BrainAgent` Durable Object 与一份独享 SQLite 数据库。表结构采用只追加、事务化版本演进（目前 21 步 `MIGRATIONS`，对象首次唤醒时在 `constructor` 中由 `migrate()` 自动追平），共分为 4 组：
 
 ### 1.1 事件与对话层（驱动核心循环）
 
@@ -40,6 +60,8 @@
 - **`revisions`**：记录可编辑外部评论的最新修订时间戳与文本指纹 `holder`。
 - **`used_codes`**：作用域内所有用过的 4 位确认码，永不重复分配。
 - **`unsettled`**：记录已离开等待态但尚未确认沙箱是否收到决定的审批问题，交由后台定时向沙箱核对终态。
+- **`continuations`**：暂时不能执行、等条件满足后再继续的请求（`Requests` 负责）。
+- **`answers`**：基于外部来源写出的回答及其来源指纹，到期即删，用于跟进时重新核对（`Requests` 负责）。
 
 ---
 
@@ -55,22 +77,23 @@ Cloudflare 每个 Durable Object 只有一个 `alarm`。`BrainAgent` 将所有�
 
 ```text
 alarm()
- ├── 1. #fireTimers(now)     到期定时器转为 inbox 事件（跳过休眠期错过的周期）
- ├── 2. #housekeeping(now)   每日清理 30 天前已完成记录（inbox 去重键保留 1 年）
- ├── 3. #flushOutbox()       严格按序投递待发消息 + 旁路对账已关闭的审批提问
- ├── 4. #settleQuestions()   向沙箱核对 unsettled 表中未决审批的真实结局
- ├── 5. 循环最多 3 次：
- │       ├── runId = #claim()   有 active_run 则续跑，否则认领最早 pending 会话
- │       ├── #execute(runId)    执行一轮完整的「悬空工具 → 模型 → 工具」循环
- │       ├── #flushOutbox()     立刻把刚产生的回复发出去
+ ├── 1. timers.fire(now)        到期定时器转为 inbox 事件（跳过休眠期错过的周期）
+ ├── 2. requests.deadlines(now) 到期或该复查的等待请求，提醒其所在会话
+ ├── 3. 删除过期的 answers；#housekeeping(now) 每日清理 30 天前已完成记录（inbox 去重键保留 1 年）
+ ├── 4. outbox.flush()          严格按序投递待发消息 + 旁路对账已关闭的审批提问
+ ├── 5. tasks.settle()          向沙箱核对 unsettled 表中未决审批的真实结局
+ ├── 6. 循环最多 3 次：
+ │       ├── runId = runner.next()   有 active_run 则续跑，否则认领最早 pending 会话
+ │       ├── runner.execute(runId)   执行一轮完整的「悬空工具 → 模型 → 工具」循环
+ │       ├── outbox.flush()          立刻把刚产生的回复发出去
  │       └── 若 active_run 仍在（如等待退避重试或超预算暂停），立即跳出
- └── finally: #rearm()       汇总 6 类待办的最早触发时间，设下一次 alarm（全空则休眠）
+ └── finally: #rearm()          汇总各部件报告的最早触发时间，设下一次 alarm（全空则休眠）
 ```
 
 **几个关键工程细节**：
-- **周期定时器不补发风暴**：`#fireTimers()` 计算下一次触发时间时取 `Math.max(due_at + every_s * 1000, now + every_s * 1000)`，休眠期间错过的多次周期全部跳过，绝不会醒来后瞬间连发几十条提醒。
+- **周期定时器不补发风暴**：`Timers.fire()` 计算下一次触发时间时取 `Math.max(due_at + every_s * 1000, now + every_s * 1000)`，休眠期间错过的多次周期全部跳过，绝不会醒来后瞬间连发几十条提醒。
 - **两段式数据清理（`#housekeeping`）**：30 天前的已完成 `inbox` 只清空 `text / data / reply_to` 释放空间，但保留 `(source, source_id)` 骨架满 365 天——因为外部签名 Webhook 本身不过期，保留去重键才能持续防重放；清理旧 `items` 时同样只从 `is_user = 1` 边界截断，保证留下的对话结构合法。
-- **`#rearm()` 统一计算最早唤醒点**：扫描 `active_run`、`pending inbox`、最早 `active timer`、队首 `pending outbox`、待对账 `reconciling outbox`、待核对 `unsettled` 以及下次 `housekeeping_at`，取最小值（不早于 `now + 50ms`）设为下一次闹钟。没有任何待办时直接返回，DO 彻底休眠、零算力开销。
+- **`#rearm()` 统一计算最早唤醒点**：自己看 `active_run`、`pending inbox` 和下次 `housekeeping_at`，其余交给各部件的 `nextWakeAt(now)`（`Timers` 报最早 `active timer`，`Outbox` 报队首 `pending` 与待对账 `reconciling`，`Tasks` 报待核对 `unsettled`，`Requests` 报等待中请求的期限与 `answers` 的过期时间），取最小值（不早于 `now + 50ms`）设为下一次闹钟。没有任何待办时直接返回，DO 彻底休眠、零算力开销。
 
 ---
 
@@ -78,9 +101,9 @@ alarm()
 
 ```mermaid
 flowchart TD
-  A["#claim() 同步事务"] -->|"存在 active_run 且已到重试时间"| B["复用旧 runId"]
+  A["Runner #claim() 同步事务"] -->|"存在 active_run 且已到重试时间"| B["复用旧 runId"]
   A -->|"无 active_run"| C["取最早 pending inbox 的 session_key<br/>合并同会话 <=40条 / <=120KB 事件<br/>渲染成一条 user item 写入 items<br/>写入 meta.active_run"]
-  B --> D["#execute(runId): entries + 1"]
+  B --> D["Runner.execute(runId): entries + 1"]
   C --> D
   D -->|"entries > 5"| AB["#abandon(): 补齐悬空 tool_output<br/>标失败并通知用户"]
   D --> L{"循环读取 #transcript()"}
@@ -95,10 +118,10 @@ flowchart TD
   S --> L
 ```
 
-### 3.1 批处理窗口与同步事务认领（`ingest` + `#claim`）
+### 3.1 批处理窗口与同步事务认领（`ingest` + `Runner.next` / `#claim`）
 
 - 外部事件写入 `inbox` 时，`ingest()` 设一个 `BATCH_WINDOW_MS = 2_000`（2 秒）后的闹钟，让连续发出的多条消息有机会聚合成同一批处理。
-- `#claim()` 在单个 `transactionSync` 中锁定最早一条 `pending` 事件所属的 `session_key`，把该会话下最多 `40` 条、总计不超过 `120 KB` 的待处理事件标记为 `claimed`，按 `[时间戳] 类型 from 身份: 文本` 拼成一条 `role: "user"` 记录写入 `items`，同时把最近一条带 `reply_to` 的地址更新为 `sessions.target`，最后写下 `meta.active_run = runId`。
+- `Runner` 的 `#claim()`（由 `next()` 调用）在单个 `transactionSync` 中锁定最早一条 `pending` 事件所属的 `session_key`，把该会话下最多 `40` 条、总计不超过 `120 KB` 的待处理事件标记为 `claimed`，按 `[时间戳] 类型 from 身份: 文本` 拼成一条 `role: "user"` 记录写入 `items`，同时把最近一条带 `reply_to` 的地址更新为 `sessions.target`，最后写下 `meta.active_run = runId`。
 
 ### 3.2 「对话记录即进度」的崩溃续跑（`danglingCalls`）
 
@@ -108,7 +131,7 @@ flowchart TD
 3. **重部署 / 崩溃恢复**：若进程在第 `k` 个工具执行前后意外中断，重启后 `alarm()` 认领同一个 `active_run`、`entries + 1`，从 `danglingCalls` 原地续跑未落盘的工具调用。由于所有带副作用的工具均以 `call_id` 为幂等键（发消息 `msg:${callId}`、定闹钟 `tmr_${callId}`、派任务 `tasks.op_id = callId`），即使崩溃发生在「副作用已发生但输出未落盘」之间，重跑也不会造成重复副作用。
 4. **每次 `await` 之后强校验 `#stillActive(runId)`**：防止异步等待期间状态被外部改变后继续写脏数据。
 
-### 3.3 对话窗口切分（`#transcript`）
+### 3.3 对话窗口切分（`Runner#transcript`）
 
 模型每次最多读取最近 `MAX_TRANSCRIPT_ITEMS = 80` 条 `items`，但绝不能从工具输出或推理项中间截断（否则 API 会因缺少配对的 `function_call` 报错）。`#transcript()` 通过 `is_user = 1` 定位窗口起点之后的第一个用户轮次作为起始 `seq`；如果最新一轮本身工具调用就超过 80 条，则回退到最后一个 `is_user = 1`，宁可临时放宽窗口也不破坏单轮完整性。
 
@@ -132,28 +155,29 @@ flowchart TD
   - 记忆：`memory_list`、`memory_read`、`memory_write`、`memory_delete`。其中 `instructions.md` 写入/删除受 `#instructionEditors()` 保护——必须是纯由受信任渠道真人明确发言触发的 `run` 才能修改。
   - 定时：`set_timer`（延迟 5 秒至 1 年，周期最小 60 秒）、`list_timers`、`cancel_timer`。
   - 任务：`dispatch_task`、`task_status`、`answer_task`、`cancel_task`。
+- 这些工具在 `tools.ts` 里定义，由 `RunTools.for(run)`（`run-tools.ts`）为每次 `run` 提供执行宿主、做权限检查。另有 `reopen_answer`（`follow-up.ts`，由 `Requests` 执行），只在 Worker 变量 `FOLLOW_UPS=on` 时提供给模型。
 
-### 4.2 连接器只读外部工具的双重隔离（`#actingFor` + `outside` + `private`）
+### 4.2 连接器只读外部工具的双重隔离（`actingFor` + `outside` + `private`）
 
 部分连接器允许在对话中向模型暴露只读外部工具（例如查询外部系统信息）。因为外部文档天然包含不可信文本（潜在 Prompt Injection）且可能含敏感内容，代码构建了一套严密的**开启准入 + 污点追踪 + 用后即焚**闭环：
 
-1. **严苛的开启条件（`#actingFor(runId)`）**：
-   只有同时满足以下所有条件时，`#toolsFor(runId)` 才会向模型暴露连接器工具：
+1. **严苛的开启条件（`Runner.actingFor(runId)`）**：
+   只有同时满足以下所有条件时，`Runner#toolsFor(runId)` 才会向模型暴露连接器工具：
    - 当前是私人单聊作用域（`scope.kind === "user"`）；
    - 本次 `run` 认领的**全部事件**均来自同一个受信任连接器、同一个私聊会话 `privateSessionKey(source, origin)`、同一验证来源 `origin`，且全部是该用户本人直接发出的普通消息（`data.direct === true`，不含按钮点击、卡片回复、跨话题路由、定时器或 Worker 回报）。
-2. **运行时污点拦截（`#sawOutside(runId)`）**：
-   一旦本次 `run` 触发了任何连接器工具调用，`#outside` 集合与 `items.outside = 1` 会立即被标记（即便工具报错也可能引用了外部文本，同样视为已读外部内容）：
+2. **运行时污点拦截（`Runner.sawOutside(runId)`）**：
+   一旦本次 `run` 触发了任何连接器工具调用，`outside` 集合（由 `BrainAgent` 持有、各部件共用）与 `items.outside = 1` 会立即被标记（即便工具报错也可能引用了外部文本，同样视为已读外部内容）：
    - 本次 `run` 剩余步骤中**彻底禁止 `memory_write` 和 `memory_delete`**（直接报错 `READ_OUTSIDE`），防止外部文本借提示词注入持久化篡改记忆或 `instructions.md`；
    - 本次 `run` 写入 `outbox` 的消息都会被标记 `private = 1`。
-3. **结束后零残留清理（`#forgetOutside` + `#scrubDelivered`）**：
-   - `run` 结束时，`#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
-   - 标记 `private = 1` 的 `outbox` 消息一旦成功送达（或进入 `dead` 终态），`#scrubDelivered()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
+3. **结束后零残留清理（`Runner#forgetOutside` + `Outbox.scrub`）**：
+   - `run` 结束时，`Runner#finish()` 调用 `#forgetOutside()`：**不仅移除外部工具返回原文，而是将整个 `run` 除用户原话外的所有模型产出与工具记录统一替换为固定占位说明（标 `outside = 2`）**，防止模型在回复或思考中转述外部机密进入长期对话记录；若 `run` 失败，报错信息也统一替换为固定脱敏文案 `ERROR_WITHHELD`。
+   - 标记 `private = 1` 的 `outbox` 消息一旦成功送达（或进入 `dead` 终态），`Outbox.scrub()` 会立刻清空其在数据库中的正文内容，且投递报错日志同样脱敏为 `DELIVERY_WITHHELD`。
 
 ---
 
 ## 5. Outbox：严格有序投递、限流退避与审批卡片旁路对账
 
-`#flushOutbox()` 负责把 `outbox` 里的消息可靠投递到外部系统，核心解决四个难题：
+`Outbox.flush()`（`outbox.ts`）负责把 `outbox` 里的消息可靠投递到外部系统，核心解决四个难题：
 
 1. **严格队头有序（Head-of-Line Ordering）**
    循环每次只取 `status = 'pending'` 中 `id` 最小的一条；若它在退避等待（`next_at > now`）或本次投递失败，立刻 `return`，确保后发的消息绝不会越过前面未发出的消息造成对话乱序。
@@ -162,6 +186,6 @@ flowchart TD
 3. **已结束审批卡片的旁路对账（`withdrawn` vs `reconciling`）**
    如果队头是一条正在退避重发的审批卡片（`row.ask` 非空），而该审批在发送完成前就已被决策或超时撤回（`row.closed` 非空）：
    - 若 `started === 0`（从未真正发起过网络请求）：直接标 `withdrawn` 移出主队列，既不发送废卡片，也不阻塞后面的消息；
-   - 若 `started === 1`（可能已经发到了飞书/GitHub 只是没收到响应）：立刻把状态改为 `reconciling` 移出主队列（不阻塞后续正常消息），然后在 `finally` 的 `#reconcileClosed()` 里用同一个幂等键 `idem` 独立重试拿回 `receipt`，再调用 `#showClosed()` / `amend()` 把远端卡片更新为「已批准 / 已拒绝 / 已失效」。
+   - 若 `started === 1`（可能已经发到了飞书/GitHub 只是没收到响应）：立刻把状态改为 `reconciling` 移出主队列（不阻塞后续正常消息），然后在 `finally` 的 `#reconcileClosed()` 里用同一个幂等键 `idem` 独立重试拿回 `receipt`，再通过 `Tasks.showClosed()` / `amend()` 把远端卡片更新为「已批准 / 已拒绝 / 已失效」。
 4. **尊重平台限流且防无限阻塞（`DeliveryDeferred`）**
    普通失败按 `2s → 10s → 60s → 5m → 15m` 共 5 次退避重试后标记 `dead`。若连接器抛出 `DeliveryDeferred(notBefore)`（例如平台返回 429 与 `Retry-After`），下次重试严格不早于 `notBefore`；但如果对方要求等待超过 `MAX_DEFERRAL_MS`（24 小时），为避免有序队列被永久堵死，直接判为 `dead` 并输出结构化告警日志 `message_undeliverable`。
