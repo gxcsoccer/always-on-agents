@@ -26,7 +26,8 @@ import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS, buildInstructions } from "./prompt";
 import { migrate } from "./schema";
-import { BrainStore, type InboxRow, type Row, type RunRow } from "./store";
+import { BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
+import { Timers } from "./timers";
 import type { Passage } from "./follow-up";
 import { type Continuation, HANDLING_LIMIT_MS, Requests, type Source, WAITING_NOTE, fingerprint } from "./requests";
 import { MAX_MESSAGE_TEXT, TOOLS, type ToolCall, type ToolHost, describeTool, executeTool, withoutQuotes } from "./tools";
@@ -68,7 +69,6 @@ const DELIVERY_WITHHELD = "delivery failed; the details are not kept";
 const ERROR_WITHHELD = "failed after reading outside text; the details are not kept";
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
-const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
 /** How long a message that must not go out yet is left before it is looked at again. */
 const HELD_MS = 3_000;
 /** The same, when what it waits on will not change within this wake-up. */
@@ -110,10 +110,14 @@ export class BrainAgent extends DurableObject<Env> {
   readonly #outside = new Set<string>();
   /** Requests that wait, guards and follow-ups: the same database and transactions, in a file of their own. */
   readonly #requests: Requests;
+  readonly #timers: Timers;
+  /** The parts that can ask to be woken. */
+  readonly #parts: Wakes[];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#store = new BrainStore(ctx);
+    this.#timers = new Timers(this.#store);
     const brain = this;
     this.#requests = new Requests(this.#store, {
       // Read each time, as everywhere else in this class: not the value at construction.
@@ -128,6 +132,7 @@ export class BrainAgent extends DurableObject<Env> {
       enqueueMessage: (...args) => this.#enqueueMessage(...args),
       notice: (which, sessionId) => this.#notice(which, sessionId),
     });
+    this.#parts = [this.#timers, this.#requests];
     migrate(ctx.storage);
     // If an invocation died between committing work and scheduling the wake-up for it, nothing else
     // would ever schedule it. Any activation of this object repairs that.
@@ -200,7 +205,7 @@ export class BrainAgent extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     try {
-      this.#fireTimers(Date.now());
+      this.#timers.fire(Date.now());
       this.#requests.deadlines(Date.now());
       this.#store.sql.exec("DELETE FROM answers WHERE expires_at <= ?", Date.now());
       this.#housekeeping(Date.now());
@@ -232,19 +237,17 @@ export class BrainAgent extends DurableObject<Env> {
     const active = this.#activeRun();
     if (active) candidates.push(active.retry_at ?? now + 1_000);
     else if (this.#store.rows("SELECT 1 FROM inbox WHERE status = 'pending' LIMIT 1").length > 0) candidates.push(now + 200);
-    const timer = this.#store.rows<{ due_at: number }>("SELECT MIN(due_at) AS due_at FROM timers WHERE status = 'active'")[0]?.due_at;
-    if (timer != null) candidates.push(timer);
     const outbox = this.#store.rows<{ next_at: number }>("SELECT next_at FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0]?.next_at;
     if (outbox != null) candidates.push(outbox);
     const reconciling = this.#store.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM outbox WHERE status = 'reconciling'")[0]?.next_at;
     if (reconciling != null) candidates.push(reconciling);
     const unsettled = this.#store.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM unsettled")[0]?.next_at;
     if (unsettled != null) candidates.push(unsettled);
-    const forget = this.#store.rows<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM answers")[0]?.at;
-    if (forget != null) candidates.push(forget);
-    // A wait that has run out is looked at once a minute until its owner has been asked.
-    const waitUntil = this.#store.rows<{ until: number | null }>("SELECT MIN(MIN(until, COALESCE(check_at, until))) AS until FROM continuations WHERE status = 'waiting'")[0]?.until;
-    if (waitUntil != null) candidates.push(waitUntil > now ? waitUntil : now + 60_000);
+    // Each part says for itself when it next has something to do.
+    for (const part of this.#parts) {
+      const at = part.nextWakeAt(now);
+      if (at != null) candidates.push(at);
+    }
     // Housekeeping is work too: a scope that has gone quiet still has old records to remove.
     const housekeeping = Number(this.#store.meta("housekeeping_at") ?? 0);
     if (housekeeping > 0 && this.#store.rows("SELECT 1 FROM inbox LIMIT 1").length > 0) candidates.push(housekeeping);
@@ -288,35 +291,6 @@ export class BrainAgent extends DurableObject<Env> {
     });
   }
 
-  // ------------------------------------------------------------------ timers
-
-  #fireTimers(now: number): void {
-    this.#store.transaction(() => {
-      for (const timer of this.#store.rows<Row>("SELECT * FROM timers WHERE status = 'active' AND due_at <= ?", now)) {
-        const data = timer.data ? JSON.parse(timer.data) : {};
-        // A watchdog for a task that already ended has nothing to say.
-        const stale = data.task_id && TERMINAL_TASK.has(this.#store.rows<Row>("SELECT status FROM tasks WHERE id = ?", data.task_id)[0]?.status);
-        if (!stale) {
-          this.#store.insertEvent({
-            source: "timer",
-            source_id: `${timer.id}:${timer.due_at}`,
-            kind: data.task_id ? "task.overdue" : "timer",
-            session_key: timer.session_key,
-            principal: { kind: "timer", id: timer.id, explicit: false },
-            text: timer.note,
-            data,
-          });
-        }
-        if (timer.every_s && !stale) {
-          // Skip occurrences that were missed while asleep rather than firing them all at once.
-          const next = Math.max(timer.due_at + timer.every_s * 1_000, now + timer.every_s * 1_000);
-          this.#store.sql.exec("UPDATE timers SET due_at = ? WHERE id = ?", next, timer.id);
-        } else {
-          this.#store.sql.exec("UPDATE timers SET status = 'done' WHERE id = ?", timer.id);
-        }
-      }
-    });
-  }
 
   // ------------------------------------------------------------------ runs
 
