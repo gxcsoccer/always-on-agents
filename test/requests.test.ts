@@ -473,3 +473,53 @@ describe("what a run read under, by itself", () => {
     });
   });
 });
+
+describe("when requests and kept answers next need the Brain awake", () => {
+  const NOW = 1_800_000_000_000;
+  const answer = (store: BrainStore, id: string, expires: number) =>
+    void store.sql.exec("INSERT INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) VALUES (?, ?, ?, ?, ?, 'feishu', '[]', '[]', 't', ?, ?)", id, SESSION, Number(id.replace(/\D/g, "")), `feishu:message:${id}`, TARGET, expires, NOW);
+
+  it("asks for nothing when nothing waits and nothing is kept", async () => {
+    await within(({ requests }) => expect(requests.nextWakeAt(NOW)).toBeNull());
+  });
+
+  it("asks to be woken when the first kept answer runs out", async () => {
+    await within(({ requests, store }) => {
+      answer(store, "ans_2", NOW + 9_000);
+      answer(store, "ans_1", NOW + 4_000);
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
+    });
+  });
+
+  it("asks to be woken at a waiting request's deadline, or at its next check if that comes first", async () => {
+    await within(({ requests, request }) => {
+      request("a", { until: NOW + 60_000 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 60_000);
+      request("b", { until: NOW + 90_000, check_at: NOW + 20_000 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 20_000);
+    });
+  });
+
+  it("looks again in a minute at a wait whose time is up, until it has been dealt with", async () => {
+    await within(({ requests, request }) => {
+      request("late", { until: NOW - 5_000 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 60_000);
+    });
+  });
+
+  it("ignores requests that are no longer waiting", async () => {
+    await within(({ requests, request }) => {
+      request("resuming", { until: NOW + 1_000, status: "resuming" });
+      request("done", { until: NOW + 1_000, status: "done" });
+      expect(requests.nextWakeAt(NOW)).toBeNull();
+    });
+  });
+
+  it("takes the earlier of the two", async () => {
+    await within(({ requests, request, store }) => {
+      request("a", { until: NOW + 60_000 });
+      answer(store, "ans_1", NOW + 4_000);
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
+    });
+  });
+});

@@ -29,6 +29,15 @@ export interface RunRow {
   retry_at: number | null;
 }
 
+/** The states a task ends in. */
+export const TERMINAL_TASK = new Set(["succeeded", "failed", "lost", "cancelled"]);
+
+/** A part of the Brain that can have something to do at a later time. */
+export interface Wakes {
+  /** When this part next needs the Brain awake (a time in ms, possibly already past), or null if it is waiting for nothing. */
+  nextWakeAt(now: number): number | null;
+}
+
 export class BrainStore {
   readonly sql: SqlStorage;
   readonly #ctx: DurableObjectState;

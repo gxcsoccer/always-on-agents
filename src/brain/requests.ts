@@ -9,7 +9,7 @@ import type { Env } from "../env";
 import type { Item } from "../model/openai";
 import type { NoticeKey, Said } from "./agent";
 import { type Passage, followUpDecision, locate, passageNow } from "./follow-up";
-import type { BrainStore, InboxRow, Row, RunRow } from "./store";
+import type { BrainStore, InboxRow, Row, RunRow, Wakes } from "./store";
 
 /**
  * How long a request that was carried on has, from the moment it was taken up, to read and to
@@ -122,7 +122,7 @@ export interface RequestsHost {
 /** The one person a run acts for, and their own messages it rests on. */
 export type Acting = { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] };
 
-export class Requests {
+export class Requests implements Wakes {
   readonly #s: BrainStore;
   readonly #b: RequestsHost;
 
@@ -138,6 +138,17 @@ export class Requests {
   // run of its own carries out that one call again and answers. Who says the condition holds is
   // the connector the tool belongs to, asked afresh each time; a report that it may hold is only
   // ever a reason to ask. See docs/design/agent-core-step0.md.
+
+  /** The earliest of: a kept answer running out, and a wait's deadline or next check. */
+  nextWakeAt(now: number): number | null {
+    const candidates: number[] = [];
+    const forget = this.#s.rows<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM answers")[0]?.at;
+    if (forget != null) candidates.push(forget);
+    // A wait that has run out is looked at once a minute until its owner has been asked.
+    const waitUntil = this.#s.rows<{ until: number | null }>("SELECT MIN(MIN(until, COALESCE(check_at, until))) AS until FROM continuations WHERE status = 'waiting'")[0]?.until;
+    if (waitUntil != null) candidates.push(waitUntil > now ? waitUntil : now + 60_000);
+    return candidates.length > 0 ? Math.min(...candidates) : null;
+  }
 
   /** The request this run carries on, whatever has become of it since. */
   continuationOf(runId: string): Continuation | undefined {
