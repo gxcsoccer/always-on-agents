@@ -138,6 +138,20 @@ function bench(state: DurableObjectState) {
 
 describe("the run loop, by itself", () => {
   describe("claiming", () => {
+    it("takes into one run only messages that reply to the same thing, leaving the next one pending", async () => {
+      await within(async ({ runner, event, inbox }) => {
+        const reply = (to: string | undefined) => ({ data: { direct: true, origin: ORIGIN, ...(to ? { replies_to: to } : {}) } });
+        const a1 = event("A 那份收到了", reply("feishu:message:om_bot_a"));
+        const a2 = event("谢谢", reply("feishu:message:om_bot_a"));
+        const b = event("请读我这条里 B 的标题", reply("feishu:message:om_mine_b"));
+        const plain = event("还有一件事", reply(undefined));
+        const first = (await runner.next())!;
+        expect(inbox().filter((each) => each.run_id === first).map((each) => each.id)).toEqual([a1, a2]);
+        expect(inbox().find((each) => each.id === b)?.status).toBe("pending");
+        expect(inbox().find((each) => each.id === plain)?.status).toBe("pending");
+      });
+    });
+
     it("takes the oldest conversation's pending events as one run, with a user turn that says who said what", async () => {
       await within(async ({ runner, store, event, inbox, items, run }) => {
         const first = event("hello");
@@ -610,6 +624,22 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("does not work out whom a run acts for once per earlier turn when putting the transcript together", async () => {
+      const lookups = async (turns: number) =>
+        within(async (b) => {
+          b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', ?, 1, 1)", PRIVATE);
+          for (let i = 0; i < turns; i++) {
+            b.runner.append("s0", "old", { role: "user", content: `turn ${i}` });
+            b.runner.append("s0", "old", { role: "assistant", content: `answer ${i}` });
+          }
+          const actingFor = vi.spyOn(b.runner, "actingFor");
+          b.event("and now?");
+          await b.go();
+          return actingFor.mock.calls.length;
+        });
+      expect(await lookups(40)).toBe(await lookups(1));
+    });
+
     it("counts the window by the items there are, not by the places scrubbed items left", async () => {
       await within(async (b) => {
         b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', ?, 1, 1)", PRIVATE);
@@ -939,15 +969,23 @@ describe("the run loop, by itself", () => {
       }, "chat:oc_1");
     });
 
-    it("counts as what came shortly before only the person's own messages here, within ten minutes, with the same verified origin", async () => {
+    it("counts as what came before only the person's own messages here, over the last day and at most fifty, with the same verified origin", async () => {
       await within(async ({ runner, event, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
-        event("too old", { status: "done", received_at: Date.now() - 11 * 60_000 });
+        event("too old", { status: "done", received_at: Date.now() - 25 * 3_600_000 });
+        const earlier = event("this morning", { status: "done", received_at: Date.now() - 5 * 3_600_000 });
         event("no origin", { status: "done", received_at: Date.now() - 60_000, data: { direct: true } });
         const kept = event("just now", { status: "done", received_at: Date.now() - 30_000 });
         event("summarise it");
         const id = (await runner.next())!;
-        expect(runner.actingFor(id)?.recentIds).toEqual([kept]);
+        expect(runner.actingFor(id)?.recentIds).toEqual([earlier, kept]);
+      });
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        const all = Array.from({ length: 52 }, (_, i) => event(`message ${i}`, { status: "done", received_at: Date.now() - 60_000 }));
+        event("summarise it");
+        const id = (await runner.next())!;
+        expect(runner.actingFor(id)?.recentIds).toEqual(all.slice(-50));
       });
     });
 

@@ -16,7 +16,7 @@ import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
-import { READ_OUTSIDE, type RunTools } from "./run-tools";
+import { READ_OUTSIDE, type RunTools, eligibleSource } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
@@ -40,8 +40,9 @@ const ERROR_WITHHELD = "failed after reading outside text; the details are not k
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 export type Said = { text: string; data: Record<string, unknown> };
 /** How far back a person's earlier messages still count as part of what they are asking now. */
-const RECENT_REQUEST_MS = 10 * 60_000;
-const MAX_RECENT_REQUESTS = 5;
+/** How far back a person's own earlier messages count as part of what they ask now: a day, and at most fifty. */
+const RECENT_REQUEST_MS = 24 * 3_600_000;
+const MAX_RECENT_REQUESTS = 50;
 
 /** What the run loop needs from the Brain it is part of. */
 export interface RunnerHost {
@@ -101,6 +102,9 @@ export class Runner {
       for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind != 'request.ready' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
         bytes += (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
         if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
+        // A message that replies to something other than what the ones before it reply to is about
+        // something else: it starts a run of its own, in order, so each is read under its own binding.
+        if (events.length > 0 && repliesTo(event) !== repliesTo(events.at(-1)!)) break;
         events.push(event);
         this.#s.sql.exec("UPDATE inbox SET status = 'claimed', run_id = ? WHERE id = ?", runId, event.id);
       }
@@ -165,7 +169,7 @@ export class Runner {
     for (;;) {
       const run = this.#stillActive(runId);
       if (!run) return;
-      const items = this.#transcript(run.session_id);
+      const items = this.#transcript(run.session_id, runId);
 
       // Tool calls without a recorded output: either the model just asked for them, or an earlier
       // attempt died mid-call. Either way, execute and record. Tools are idempotent per call id.
@@ -325,7 +329,7 @@ export class Runner {
     const run = this.#stillActive(runId);
     if (!run) return;
     this.#s.transaction(() => {
-      for (const call of danglingCalls(this.#transcript(run.session_id))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+      for (const call of danglingCalls(this.#transcript(run.session_id, runId))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
       this.#s.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status IN ('pending', 'draft') AND started = 0", runId);
       this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("retired", run.session_id));
     });
@@ -348,7 +352,7 @@ export class Runner {
     const outside = this.sawOutside(runId);
     this.#s.transaction(() => {
       // Close any open tool call so the transcript stays well-formed for the next run.
-      for (const call of danglingCalls(this.#transcript(run.session_id))) {
+      for (const call of danglingCalls(this.#transcript(run.session_id, runId))) {
         this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "the run was abandoned before this finished" }) });
       }
       // A task that never got past "dispatching" in this run will not be picked up by anything else.
@@ -484,13 +488,7 @@ export class Runner {
     if (this.#s.rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
     // Fixed words, and what the tool said it read. Nothing the model wrote is carried over, not even what it asked a tool for.
-    const links = [...new Set(read.flatMap((each) => {
-      try {
-        return Object.values(JSON.parse(each.args) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
-      } catch {
-        return [];
-      }
-    }))];
+    const links = linksOf(read);
     // Also as a record (never shown to the model as such): what this turn read, whether or not anything it said reached the person.
     this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(links), ...(read.length > 0 ? { _reads: read } : {}) } as Item);
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
@@ -516,7 +514,7 @@ export class Runner {
    * - Before a person's turn that replied to one of those messages, the words replied to, as the
    *   agent's own.
    */
-  #transcript(sessionId: string): Item[] {
+  #transcript(sessionId: string, runId?: string): Item[] {
     const lastUser = this.#s.rows<{ seq: number | null }>("SELECT MAX(seq) AS seq FROM items WHERE session_id = ? AND is_user = 1", sessionId)[0]?.seq;
     const floor = this.#s.rows<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM (SELECT seq FROM items WHERE session_id = ? ORDER BY seq DESC LIMIT ?)", sessionId, MAX_TRANSCRIPT_ITEMS * 4)[0]?.seq;
     if (floor == null) return [];
@@ -535,18 +533,27 @@ export class Runner {
     // The words people replied to, for every reply in the window, in one query.
     const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
     const quotedOf = new Map(
-      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number }>("SELECT outbox_id, text, sent_at FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
     // What is kept beside an item for the system's own use (names starting with "_") is never shown.
     const shown = (item: Record<string, unknown>) => Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith("_"))) as Item;
     const entries: { item: Item; starts: boolean }[] = [];
+    // Who the run acts for, worked out once and only if some answer is quoted: what they can still
+    // point at decides what an answer is shown as written from.
+    const acting = quotedOf.size > 0 && runId ? this.actingFor(runId) : undefined;
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
         const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
-        quoted.forEach((each, at) => entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}:]\n${each.text}` }, starts: at === 0 }));
+        quoted.forEach((each, at) => {
+          // What it was written from, by the tool's canonical call, where that is the one thing the
+          // person can still point at: what they are asking about, even once that turn is out of sight.
+          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf);
+          const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
+          entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
+        });
         entries.push({ item: shown(item), starts: quoted.length === 0 });
       } else entries.push({ item: shown(item), starts: false });
       if (row.run_id && lastOf.get(row.run_id) === index) for (const words of wordsOf.get(row.run_id) ?? []) entries.push({ item: words, starts: false });
@@ -627,6 +634,27 @@ export class Runner {
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/** What a message replies to, if anything. */
+function repliesTo(event: InboxRow): string | null {
+  const to = event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
+  return typeof to === "string" ? to : null;
+}
+
+/** The strings in what some reads were made with (their canonical calls): what a person or a model can recognise them by. */
+function linksOf(read: { args: string }[]): string[] {
+  return [
+    ...new Set(
+      read.flatMap((each) => {
+        try {
+          return Object.values(JSON.parse(each.args) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
+        } catch {
+          return [];
+        }
+      }),
+    ),
+  ];
 }
 
 /** Function calls in the transcript that have no output yet. */

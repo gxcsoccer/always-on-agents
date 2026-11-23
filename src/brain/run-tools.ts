@@ -47,6 +47,21 @@ export class RunTools {
   }
 
   /** The tools of this run. */
+  /**
+   * Whether the person's messages reply to one of the agent's own answers in this conversation,
+   * as it reached them, and if so the one thing every such answer was written from that the
+   * person can still point at (see eligibleSource); none when there is no such single thing.
+   */
+  #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown> } } {
+    const subjects = this.#b.requests.basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    if (subjects.length === 0) return {};
+    const answers = this.#s.rows<{ reads: string }>("SELECT reads FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
+    if (answers.length === 0) return {};
+    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf));
+    const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
+    return { answering: one ? { source: one.request } : {} };
+  }
+
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
@@ -94,7 +109,7 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           if (!isWaiting(result)) {
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.
@@ -199,4 +214,33 @@ export class RunTools {
       cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
     };
   }
+}
+
+type Read = { connector: string; tool: string; args: string; identity: string };
+
+/**
+ * The one thing an answer was written from, if it was written from exactly one, and the person
+ * can still point at it: linked by them in the messages the run acts on or in their own earlier
+ * messages here (as the tool that read it judges). None for an answer written from nothing read,
+ * from several (even if only one of them is still in reach), or from one they linked too long ago.
+ */
+export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[]): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
+  if (!acting) return undefined;
+  const own = [...acting.said, ...acting.recent];
+  const tools = toolsOf(acting.connector);
+  // An answer written from several things rests on all of them: none of them alone is its source,
+  // whichever of them the person can still point at.
+  const distinct = [...new Map(reads.map((each) => [`${each.connector}\u0000${each.identity}`, each])).values()];
+  if (distinct.length !== 1 || distinct[0].connector !== acting.connector) return undefined;
+  const eligible = distinct.flatMap((each) => {
+    const tool = tools.find((candidate) => candidate.name === each.tool);
+    let request: Record<string, unknown>;
+    try {
+      request = JSON.parse(each.args) as Record<string, unknown>;
+    } catch {
+      return [];
+    }
+    return tool?.links && own.some((message) => tool.links!(message, request)) ? [{ tool: each.tool, request, identity: each.identity }] : [];
+  });
+  return eligible.length === 1 ? eligible[0] : undefined;
 }
