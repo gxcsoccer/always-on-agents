@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectorTool, ToolContext } from "../src/connectors";
 import type { Env } from "../src/env";
@@ -23,6 +23,8 @@ let scopes = 0;
 function within<T>(use: (bench: ReturnType<typeof bench>) => T | Promise<T>): Promise<T> {
   return runInDurableObject(env.BRAIN.getByName(`acme:user:tools-${++scopes}`), (_instance: unknown, state: DurableObjectState) => use(bench(state)));
 }
+
+afterEach(() => vi.restoreAllMocks());
 
 function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
@@ -159,6 +161,16 @@ describe("a run's tools", () => {
         expect(t.cancelTimer("tmr_callabc1")).toEqual({ ok: true, cancelled: true });
         expect(t.cancelTimer("tmr_callabc1")).toEqual({ ok: true, cancelled: false });
         expect(t.listTimers()).toEqual({ timers: [] });
+      });
+    });
+
+    it("fires exactly the delay asked for after now", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        vi.spyOn(Date, "now").mockReturnValue(now);
+        const set = tools().setTimer("c1", 60, "n", null) as { fires_at: string };
+        expect(set.fires_at).toBe(new Date(now + 60_000).toISOString());
+        expect(store.rows<{ due_at: number }>("SELECT due_at FROM timers")[0].due_at).toBe(now + 60_000);
       });
     });
 

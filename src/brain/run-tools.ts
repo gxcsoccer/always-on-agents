@@ -48,153 +48,153 @@ export class RunTools {
 
   /** The tools of this run. */
   for(run: RunRow): ToolHost {
-  const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
-  const sql = this.#s.sql;
-  return {
-    connectorTool: async (callId, name, args) => {
-      // Decided afresh at the moment of use, from what is stored: also after an interruption.
-      const acting = this.#b.actingFor(run.id);
-      const found = acting && this.#b.toolsOf(acting.connector).find((each) => each.name === name);
-      if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
-      const carried = this.#b.requests.continuationOf(run.id);
-      // A run that carries a request on makes one call: the one made for it, with what the
-      // request was made with. Nothing the model asks for in such a run is carried out.
-      if (carried && (carried.status !== "resuming" || carried.call_id !== callId || carried.tool !== name)) throw new Error("this run can only answer the request it carries on");
-      // A call that was told to wait has that for its answer, also when the run is replayed
-      // after an interruption: the connector is not asked a second time, whatever has happened
-      // since. Carrying the request on is another run's to do.
-      if (!carried && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) return { waiting: true, request: callId, note: WAITING_NOTE };
-      const key = carried ? carried.id : callId;
-      const { replaces, ...asked } = args;
-      const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
-      // In place of a request that still waits: that one ends in the same step this one is kept
-      // or done. Ending a request changes something, so it needs what calling one off needs,
-      // decided here and before anything is read: a run that has read outside text may not.
-      const replacing = !carried && typeof replaces === "string" && replaces !== "";
-      if (replacing && !this.#b.mayUse(run.id, "cancel_request")) throw new Error(READ_OUTSIDE);
-      const replaced = replacing ? this.#b.requests.mayCancel(run, replaces as string, callId) : undefined;
-      // Which earlier messages of the person the tool acted on, as it says itself.
-      const relied = new Set<number>();
-      const named = new Set<number>();
-      let identified: { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
-      const evidence = () => {
-        const said = this.#b.requests.basis(run.id).map((each) => each.id);
-        const recent = [...relied].map((index) => acting.recentIds[index]).filter((each) => each !== undefined);
-        // `bound`: the messages the tool said its action rests on. A reply to one of these is about this request.
-        return { said, recent, bound: [...[...named].map((index) => said[index]).filter((each) => each !== undefined), ...recent] };
-      };
-      const notAfter = (carried?.claimed_at ?? 0) + HANDLING_LIMIT_MS;
-      if (carried && Date.now() > notAfter) {
-        this.#b.requests.endRequest(carried.id, "void", "it was not finished in time");
-        throw new Error("this request was not finished in time; nothing was read. The person can ask again");
-      }
-      // Whatever comes back is from outside, including an error that quotes something.
-      this.#b.outside.add(callId);
-      // Which tool and for whom. Not its arguments: they can name what the person is reading.
-      this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
-      let waits = false;
-      try {
-        const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
-        if (!isWaiting(result)) {
-          if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
-          // What was read, for a later follow-up; a refusal or an error is not something read.
-          // Only what the tool itself identified: its canonical call and the thing as resolved.
-          const read = identified as { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
-          if (read && typeof result === "object" && result !== null && !("error" in result)) {
-            this.#b.requests.noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), call: key, events: evidence(), fingerprint: await fingerprint(result), identity: read.identity, ...read.under });
-          }
-          return result;
+    const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
+    const sql = this.#s.sql;
+    return {
+      connectorTool: async (callId, name, args) => {
+        // Decided afresh at the moment of use, from what is stored: also after an interruption.
+        const acting = this.#b.actingFor(run.id);
+        const found = acting && this.#b.toolsOf(acting.connector).find((each) => each.name === name);
+        if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
+        const carried = this.#b.requests.continuationOf(run.id);
+        // A run that carries a request on makes one call: the one made for it, with what the
+        // request was made with. Nothing the model asks for in such a run is carried out.
+        if (carried && (carried.status !== "resuming" || carried.call_id !== callId || carried.tool !== name)) throw new Error("this run can only answer the request it carries on");
+        // A call that was told to wait has that for its answer, also when the run is replayed
+        // after an interruption: the connector is not asked a second time, whatever has happened
+        // since. Carrying the request on is another run's to do.
+        if (!carried && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) return { waiting: true, request: callId, note: WAITING_NOTE };
+        const key = carried ? carried.id : callId;
+        const { replaces, ...asked } = args;
+        const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
+        // In place of a request that still waits: that one ends in the same step this one is kept
+        // or done. Ending a request changes something, so it needs what calling one off needs,
+        // decided here and before anything is read: a run that has read outside text may not.
+        const replacing = !carried && typeof replaces === "string" && replaces !== "";
+        if (replacing && !this.#b.mayUse(run.id, "cancel_request")) throw new Error(READ_OUTSIDE);
+        const replaced = replacing ? this.#b.requests.mayCancel(run, replaces as string, callId) : undefined;
+        // Which earlier messages of the person the tool acted on, as it says itself.
+        const relied = new Set<number>();
+        const named = new Set<number>();
+        let identified: { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
+        const evidence = () => {
+          const said = this.#b.requests.basis(run.id).map((each) => each.id);
+          const recent = [...relied].map((index) => acting.recentIds[index]).filter((each) => each !== undefined);
+          // `bound`: the messages the tool said its action rests on. A reply to one of these is about this request.
+          return { said, recent, bound: [...[...named].map((index) => said[index]).filter((each) => each !== undefined), ...recent] };
+        };
+        const notAfter = (carried?.claimed_at ?? 0) + HANDLING_LIMIT_MS;
+        if (carried && Date.now() > notAfter) {
+          this.#b.requests.endRequest(carried.id, "void", "it was not finished in time");
+          throw new Error("this request was not finished in time; nothing was read. The person can ask again");
         }
-        // Nothing was read. The answer the model gets is written here, not by the tool.
-        waits = true;
-        this.#b.outside.delete(callId);
-        return this.#b.requests.wait(run, { connector: acting.connector, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
-      } finally {
-        // What this run has already written to send, and whatever it writes from here on.
-        if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
-      }
-    },
-    sendMessage: (callId, text, quotes) => {
-      this.#b.requests.noteQuotes(run.id, quotes);
-      const carried = this.#b.requests.continuationOf(run.id);
-      if (!carried) {
-        return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text);
-      }
-      // Everything such a run says belongs to the request it carries on. That request has one
-      // answer, kept as a draft until the run ends; one that is waiting again has none.
-      if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
-      return this.#b.requests.draft(carried, run, text);
-    },
-    reopenAnswer: (callId, answerId) => this.#b.requests.reopenAnswer(run, callId, answerId),
-    cancelRequest: (callId, requestId, ask) => {
-      const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
-      this.#b.requests.cancel(chosen.record, callId, chosen.choosing);
-      return { ok: true, cancelled: chosen.record.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
-    },
-    sendReview: (callId, summary, commit, comments) => {
-      // The same review in words, for wherever comments cannot be attached to lines.
-      const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
-      if (said.length > MAX_MESSAGE_TEXT) throw new Error(`the review is too long: summary and comments together must stay within ${MAX_MESSAGE_TEXT} characters`);
-      return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
-    },
+        // Whatever comes back is from outside, including an error that quotes something.
+        this.#b.outside.add(callId);
+        // Which tool and for whom. Not its arguments: they can name what the person is reading.
+        this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
+        let waits = false;
+        try {
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          if (!isWaiting(result)) {
+            if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
+            // What was read, for a later follow-up; a refusal or an error is not something read.
+            // Only what the tool itself identified: its canonical call and the thing as resolved.
+            const read = identified as { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
+            if (read && typeof result === "object" && result !== null && !("error" in result)) {
+              this.#b.requests.noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), call: key, events: evidence(), fingerprint: await fingerprint(result), identity: read.identity, ...read.under });
+            }
+            return result;
+          }
+          // Nothing was read. The answer the model gets is written here, not by the tool.
+          waits = true;
+          this.#b.outside.delete(callId);
+          return this.#b.requests.wait(run, { connector: acting.connector, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+        } finally {
+          // What this run has already written to send, and whatever it writes from here on.
+          if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+        }
+      },
+      sendMessage: (callId, text, quotes) => {
+        this.#b.requests.noteQuotes(run.id, quotes);
+        const carried = this.#b.requests.continuationOf(run.id);
+        if (!carried) {
+          return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text);
+        }
+        // Everything such a run says belongs to the request it carries on. That request has one
+        // answer, kept as a draft until the run ends; one that is waiting again has none.
+        if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
+        return this.#b.requests.draft(carried, run, text);
+      },
+      reopenAnswer: (callId, answerId) => this.#b.requests.reopenAnswer(run, callId, answerId),
+      cancelRequest: (callId, requestId, ask) => {
+        const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
+        this.#b.requests.cancel(chosen.record, callId, chosen.choosing);
+        return { ok: true, cancelled: chosen.record.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
+      },
+      sendReview: (callId, summary, commit, comments) => {
+        // The same review in words, for wherever comments cannot be attached to lines.
+        const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
+        if (said.length > MAX_MESSAGE_TEXT) throw new Error(`the review is too long: summary and comments together must stay within ${MAX_MESSAGE_TEXT} characters`);
+        return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
+      },
 
-    memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
-    memoryRead: (path) => {
-      const row = this.#s.rows<Row>("SELECT content FROM memory WHERE path = ?", path)[0];
-      if (!row) throw new Error(`no memory file at ${path}`);
-      return { path, content: row.content };
-    },
-    memoryWrite: (path, content) => {
-      if (!MEMORY_PATH.test(path) || path.includes("..")) throw new Error("path must look like notes/topic.md: lowercase letters, digits, - _ /");
-      // instructions.md is read as instructions in every later run, so only a person who is a
-      // member here may cause it to change. Text from a PR, a CI log or a worker cannot.
-      if (path === "instructions.md") this.#s.audit(this.#b.instructionEditors(run.id).join(","), "instructions.changed", { length: content.length });
-      const exists = this.#s.rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
-      if (!exists && this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM memory")[0].n >= MAX_MEMORY_FILES) throw new Error("memory is full; delete something first");
-      sql.exec("INSERT INTO memory (path, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at", path, content, Date.now());
-      // Said at the moment it happens, so the file is shortened by the run that made it long.
-      const limit = path === "index.md" ? MAX_LOADED_INDEX : path === "instructions.md" ? MAX_LOADED_INSTRUCTIONS : undefined;
-      if (limit !== undefined && content.trim().length > limit) return { ok: true, path, note: `saved, but only the first ${limit} characters of ${path} are loaded into a run; shorten it, and move detail into other files` };
-      return { ok: true, path };
-    },
-    memoryDelete: (path) => {
-      if (path === "instructions.md") this.#s.audit(this.#b.instructionEditors(run.id).join(","), "instructions.deleted", {});
-      const existed = this.#s.rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
-      sql.exec("DELETE FROM memory WHERE path = ?", path);
-      return { ok: true, deleted: existed };
-    },
+      memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
+      memoryRead: (path) => {
+        const row = this.#s.rows<Row>("SELECT content FROM memory WHERE path = ?", path)[0];
+        if (!row) throw new Error(`no memory file at ${path}`);
+        return { path, content: row.content };
+      },
+      memoryWrite: (path, content) => {
+        if (!MEMORY_PATH.test(path) || path.includes("..")) throw new Error("path must look like notes/topic.md: lowercase letters, digits, - _ /");
+        // instructions.md is read as instructions in every later run, so only a person who is a
+        // member here may cause it to change. Text from a PR, a CI log or a worker cannot.
+        if (path === "instructions.md") this.#s.audit(this.#b.instructionEditors(run.id).join(","), "instructions.changed", { length: content.length });
+        const exists = this.#s.rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
+        if (!exists && this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM memory")[0].n >= MAX_MEMORY_FILES) throw new Error("memory is full; delete something first");
+        sql.exec("INSERT INTO memory (path, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at", path, content, Date.now());
+        // Said at the moment it happens, so the file is shortened by the run that made it long.
+        const limit = path === "index.md" ? MAX_LOADED_INDEX : path === "instructions.md" ? MAX_LOADED_INSTRUCTIONS : undefined;
+        if (limit !== undefined && content.trim().length > limit) return { ok: true, path, note: `saved, but only the first ${limit} characters of ${path} are loaded into a run; shorten it, and move detail into other files` };
+        return { ok: true, path };
+      },
+      memoryDelete: (path) => {
+        if (path === "instructions.md") this.#s.audit(this.#b.instructionEditors(run.id).join(","), "instructions.deleted", {});
+        const existed = this.#s.rows("SELECT 1 FROM memory WHERE path = ?", path).length > 0;
+        sql.exec("DELETE FROM memory WHERE path = ?", path);
+        return { ok: true, deleted: existed };
+      },
 
-    setTimer: (callId, delaySeconds, note, repeat) => {
-      if (delaySeconds < 5 || delaySeconds > 366 * 86_400) throw new Error("delay_seconds must be between 5 and one year");
-      if (repeat !== null && repeat < 60) throw new Error("repeat_every_seconds must be at least 60");
-      const id = `tmr_${callId.replace(/[^A-Za-z0-9]/g, "").slice(-24)}`;
-      if (this.#s.rows("SELECT 1 FROM timers WHERE id = ?", id).length === 0 && this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM timers WHERE status = 'active'")[0].n >= MAX_ACTIVE_TIMERS) {
-        throw new Error("too many active timers; cancel one first");
-      }
-      const due = Date.now() + delaySeconds * 1_000;
-      sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, Date.now());
-      return { ok: true, id, fires_at: new Date(due).toISOString() };
-    },
-    listTimers: () => ({
-      timers: this.#s.rows<Row>("SELECT id, due_at, every_s, note FROM timers WHERE status = 'active' AND data IS NULL ORDER BY due_at").map((t) => ({
-        id: t.id,
-        fires_at: new Date(t.due_at).toISOString(),
-        repeat_every_seconds: t.every_s,
-        note: t.note,
-      })),
-    }),
-    cancelTimer: (id) => {
-      const active = this.#s.rows("SELECT 1 FROM timers WHERE id = ? AND status = 'active' AND data IS NULL", id).length > 0;
-      if (active) sql.exec("UPDATE timers SET status = 'cancelled' WHERE id = ?", id);
-      return { ok: true, cancelled: active };
-    },
+      setTimer: (callId, delaySeconds, note, repeat) => {
+        if (delaySeconds < 5 || delaySeconds > 366 * 86_400) throw new Error("delay_seconds must be between 5 and one year");
+        if (repeat !== null && repeat < 60) throw new Error("repeat_every_seconds must be at least 60");
+        const id = `tmr_${callId.replace(/[^A-Za-z0-9]/g, "").slice(-24)}`;
+        if (this.#s.rows("SELECT 1 FROM timers WHERE id = ?", id).length === 0 && this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM timers WHERE status = 'active'")[0].n >= MAX_ACTIVE_TIMERS) {
+          throw new Error("too many active timers; cancel one first");
+        }
+        const due = Date.now() + delaySeconds * 1_000;
+        sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, Date.now());
+        return { ok: true, id, fires_at: new Date(due).toISOString() };
+      },
+      listTimers: () => ({
+        timers: this.#s.rows<Row>("SELECT id, due_at, every_s, note FROM timers WHERE status = 'active' AND data IS NULL ORDER BY due_at").map((t) => ({
+          id: t.id,
+          fires_at: new Date(t.due_at).toISOString(),
+          repeat_every_seconds: t.every_s,
+          note: t.note,
+        })),
+      }),
+      cancelTimer: (id) => {
+        const active = this.#s.rows("SELECT 1 FROM timers WHERE id = ? AND status = 'active' AND data IS NULL", id).length > 0;
+        if (active) sql.exec("UPDATE timers SET status = 'cancelled' WHERE id = ?", id);
+        return { ok: true, cancelled: active };
+      },
 
-    dispatchTask: async (callId, title, brief, repository) => {
-      return this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, repository);
-    },
-    taskStatus: (taskId) => this.#b.tasks.status(taskId),
-    answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),
-    cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
-  };
+      dispatchTask: async (callId, title, brief, repository) => {
+        return this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, repository);
+      },
+      taskStatus: (taskId) => this.#b.tasks.status(taskId),
+      answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),
+      cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
+    };
   }
 }
