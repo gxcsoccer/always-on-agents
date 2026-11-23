@@ -7,6 +7,7 @@ import type { Env } from "../src/env";
 import type { Acting, Continuation } from "../src/brain/requests";
 import { READ_OUTSIDE, RunTools, type RunToolsHost } from "../src/brain/run-tools";
 import { BrainStore, type RunRow } from "../src/brain/store";
+import { Timers } from "../src/brain/timers";
 import type { ToolHost } from "../src/brain/tools";
 
 /**
@@ -171,6 +172,49 @@ describe("a run's tools", () => {
         const set = tools().setTimer("c1", 60, "n", null) as { fires_at: string };
         expect(set.fires_at).toBe(new Date(now + 60_000).toISOString());
         expect(store.rows<{ due_at: number }>("SELECT due_at FROM timers")[0].due_at).toBe(now + 60_000);
+      });
+    });
+
+    it("tells a replayed call when the timer it set fires, not a time counted from the replay", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        const first = tools().setTimer("c1", 60, "n", null) as { id: string; fires_at: string };
+        // The run is picked up again after a crash, 40 seconds later, and the same call made again.
+        clock.mockReturnValue(now + 40_000);
+        const again = tools().setTimer("c1", 60, "n", null) as { id: string; fires_at: string };
+        expect(again).toEqual({ ok: true, id: first.id, fires_at: new Date(now + 60_000).toISOString() });
+        expect(store.rows<{ due_at: number }>("SELECT due_at FROM timers")).toEqual([{ due_at: now + 60_000 }]);
+      });
+    });
+
+    it("tells a replayed call of a repeating timer that has fired since when it fires next", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        tools().setTimer("c1", 60, "n", 3600);
+        clock.mockReturnValue(now + 61_000);
+        new Timers(store).fire(now + 61_000);
+        expect(tools().setTimer("c1", 60, "n", 3600)).toEqual({ ok: true, id: "tmr_c1", fires_at: new Date(now + 61_000 + 3_600_000).toISOString() });
+      });
+    });
+
+    it("tells a replayed call of a timer that has fired or been cancelled since that it will not fire, and sets none", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        tools().setTimer("c1", 60, "n", null);
+        tools().setTimer("c2", 120, "n", null);
+        // The alarm fires due timers before it picks the interrupted run up again.
+        clock.mockReturnValue(now + 61_000);
+        new Timers(store).fire(now + 61_000);
+        expect(tools().cancelTimer("tmr_c2")).toEqual({ ok: true, cancelled: true });
+        expect(tools().setTimer("c1", 60, "n", null)).toEqual({ ok: true, id: "tmr_c1", status: "done" });
+        expect(tools().setTimer("c2", 120, "n", null)).toEqual({ ok: true, id: "tmr_c2", status: "cancelled" });
+        expect(store.rows<{ id: string; status: string }>("SELECT id, status FROM timers ORDER BY id")).toEqual([
+          { id: "tmr_c1", status: "done" },
+          { id: "tmr_c2", status: "cancelled" },
+        ]);
       });
     });
 
