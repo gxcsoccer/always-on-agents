@@ -416,6 +416,52 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(said.map((each: any) => JSON.parse(each.reads).map((read: any) => read.args))).toEqual([[JSON.stringify({ document: "https://example.feishu.cn/docx/DocHost00000000000001" })]]);
   });
 
+  it("records the link of the very message that named the document, when the person linked it twice under different hosts", async () => {
+    const doc = "DocTwice0000000000001";
+    const second = `https://second.larkoffice.com/docx/${doc}`;
+    const readsOf = async (person: ReturnType<typeof someone>, text: string) => (await rowsOf(person.stub, "SELECT reads FROM said WHERE text = ?", text)).map((each: any) => JSON.parse(each.reads).map((read: any) => read.args));
+    const recorded = [[JSON.stringify({ document: second })]];
+    feishu.docs.set(doc, { readers: [], text: "Three items." });
+
+    // Asked just after the message that linked it the second time.
+    const bob = someone();
+    feishu.docs.get(doc)!.readers.push(bob.openId);
+    await authorised(bob, doc);
+    model.replies([say("")]);
+    await bob.says(`先存一下 ${link(doc)}`);
+    model.replies([say("")]);
+    await bob.says(`还有这个 ${second}`);
+    model.replies([call("feishu_read_document", { document: second })], [call("send_message", { text: "三项（一）" })], [say("")]);
+    await bob.says("这个有几项");
+    expect(await readsOf(bob, "三项（一）")).toEqual(recorded);
+
+    // As a reply to that message, after the first host was linked again.
+    const cora = someone();
+    feishu.docs.get(doc)!.readers.push(cora.openId);
+    await authorised(cora, doc);
+    model.replies([say("")]);
+    await cora.says(`还有这个 ${second}`);
+    const named = await messageId(cora, `还有这个 ${second}`);
+    model.replies([say("")]);
+    await cora.says(`先存一下 ${link(doc)}`);
+    model.replies([call("feishu_read_document", { document: second })], [call("send_message", { text: "三项（二）" })], [say("")]);
+    await cora.says("这个有几项", undefined, named);
+    expect(await readsOf(cora, "三项（二）")).toEqual(recorded);
+
+    // Waiting for her to authorise first: carried on with the same link.
+    const dana = someone();
+    feishu.docs.get(doc)!.readers.push(dana.openId);
+    model.replies([say("")]);
+    await dana.says(`先存一下 ${link(doc)}`);
+    model.replies([say("")]);
+    await dana.says(`还有这个 ${second}`);
+    model.replies([call("feishu_read_document", { document: second })], [say("")]);
+    await dana.says("这个有几项");
+    carriesOn("三项（三）");
+    await authorises(dana);
+    expect(await readsOf(dana, "三项（三）")).toEqual(recorded);
+  });
+
   it("does not open for a person what only the bot or someone else could open, and keeps their authorisation", async () => {
     const bob = someone();
     feishu.docs.set("DocShared000000000001", { readers: ["ou_bot", "ou_somebody_else"], text: "Not for Bob." });

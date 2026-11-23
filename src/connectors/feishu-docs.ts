@@ -158,6 +158,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const documents = (message: { data: Record<string, unknown> }) => (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]).filter(Boolean) : []);
   const now = context.said.flatMap(documents);
   let chosen = now;
+  // The messages that named the document read: the link recorded for it is the one written there.
+  let naming: { text: string }[] = context.said;
   let carriedFrom: string | undefined;
   // A reply names what it is about: if this request links nothing but is a reply to messages of
   // the person's own that do, those are the documents meant, not whatever they linked last. The
@@ -173,6 +175,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (parents.some((message) => !message || documents(message).length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
     if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
     chosen = distinct;
+    naming = parents.flatMap((each) => (each ? [each] : []));
     for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
     if (context.said.length === 1) context.relied?.("said", 0);
   } else if (now.length === 0) {
@@ -181,6 +184,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (!last || !id) return { error: "the person has not linked a document in this request or just before it; ask them to send the link" };
     if (documents(last).length > 1) return { error: "the person linked several documents and this request does not say which; ask them to send the one they mean together with what they want" };
     chosen = documents(last);
+    naming = [last];
     carriedFrom = id;
     // This earlier message, and no other, is part of what the request rests on.
     context.relied?.("recent", context.recent.indexOf(last));
@@ -207,8 +211,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const name = await grantName(who);
   // The link as far as it identifies the document: this, not what the model wrote, is what a
   // request that has to wait is carried on with.
-  // As the person wrote it (their host), where one of their messages here links it; the model's host only failing that.
-  const theirs = [...context.said, ...context.recent].flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
+  // As the person wrote it (their host) in the message that named it; the model's host only failing that.
+  // The latest of those messages that links it, if several do.
+  const theirs = [...naming].reverse().flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
   const canonical = theirs?.link ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
   const grant = env.FEISHU_GRANTS.getByName(name);
   const { generation, credential, unreadable, answered } = await grant.held();
