@@ -406,6 +406,16 @@ describe("reading a Feishu document as the person who asked", () => {
     expect((stored as any).grant.sealed.length).toBeGreaterThan(20);
   });
 
+  it("records what was read by the link the person gave, whatever host the model wrote", async () => {
+    const bob = someone();
+    feishu.docs.set("DocHost00000000000001", { readers: [bob.openId], text: "Three items." });
+    await authorised(bob, "DocHost00000000000001");
+    model.replies([call("feishu_read_document", { document: "https://other.larkoffice.com/docx/DocHost00000000000001?from=model" })], [call("send_message", { text: "三项。" })], [say("")]);
+    await bob.says(`看看 ${link("DocHost00000000000001")}?from=chat#top 有几项`);
+    const said = await rowsOf(bob.stub, "SELECT reads FROM said WHERE text = '三项。'");
+    expect(said.map((each: any) => JSON.parse(each.reads).map((read: any) => read.args))).toEqual([[JSON.stringify({ document: "https://example.feishu.cn/docx/DocHost00000000000001" })]]);
+  });
+
   it("does not open for a person what only the bot or someone else could open, and keeps their authorisation", async () => {
     const bob = someone();
     feishu.docs.set("DocShared000000000001", { readers: ["ou_bot", "ou_somebody_else"], text: "Not for Bob." });
@@ -710,7 +720,7 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(names()).toEqual(["DocPiaA00000000000001", "DocPiaA00000000000001"]);
     const told = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
     // One of the agent's own messages, as it reached her: shown to the model as its own words, just before her turn.
-    expect(told).toContain("(written as a reply to a message of yours, shown just before this)");
+    expect(told).toMatch(/\(written as a reply to the message you sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z\)/);
     expect(told).not.toContain("their own earlier message");
     const input = modelCalls.at(-1).input;
     const turn = input.map((each: any) => each.role).lastIndexOf("user");

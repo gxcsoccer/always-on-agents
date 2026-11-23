@@ -241,6 +241,7 @@ export const MIGRATIONS: string[] = [
   // of its own messages as they were delivered, kept with the conversation's history rather than
   // with the outbox row, and what the run had read by the time the message was written.
   // `outbox.reads` carries the latter from when the message is written to when it is delivered.
+  // `outbox.authored` says the words are the agent's own (written by the model), not the system's.
   `CREATE TABLE said (
      outbox_id INTEGER PRIMARY KEY,
      run_id TEXT,
@@ -252,7 +253,8 @@ export const MIGRATIONS: string[] = [
    );
    CREATE INDEX said_receipt ON said (receipt_subject);
    CREATE INDEX said_run ON said (run_id);
-   ALTER TABLE outbox ADD COLUMN reads TEXT;`,
+   ALTER TABLE outbox ADD COLUMN reads TEXT;
+   ALTER TABLE outbox ADD COLUMN authored INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -75,13 +75,13 @@ export class Outbox implements Wakes {
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
-  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string }): { ok: true } {
+  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean }): { ok: true } {
     // The answer to a request that waited goes where the request came from, as it was then.
     const target = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#s.meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
     this.#s.sql.exec(
-      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction, reads) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction, reads, authored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       idem,
       runId,
       target,
@@ -94,6 +94,7 @@ export class Outbox implements Wakes {
       bound?.interaction ?? null,
       // What the run had read by now: what these words can have been written from.
       runId ? JSON.stringify(this.#b.requests.readsOf(runId)) : null,
+      bound?.authored ? 1 : 0,
     );
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
@@ -173,7 +174,7 @@ export class Outbox implements Wakes {
     } finally {
       // However a message ended (sent, void, given up, unverified), what tied it to something
       // read is of no further use and does not stay on its row.
-      this.#s.sql.exec("UPDATE outbox SET source = NULL, guard = NULL WHERE status NOT IN ('pending', 'draft') AND (source IS NOT NULL OR guard IS NOT NULL)");
+      this.#s.sql.exec("UPDATE outbox SET source = NULL, guard = NULL, reads = NULL WHERE status NOT IN ('pending', 'draft') AND (source IS NOT NULL OR guard IS NOT NULL OR reads IS NOT NULL)");
       await this.#reconcileClosed();
     }
   }
@@ -271,7 +272,8 @@ export class Outbox implements Wakes {
    */
   /** One of the agent's own messages (written with send_message, or a request's answer), to a person in their private conversation. */
   #isOwnPrivateMessage(row: Row): boolean {
-    const own = typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
+    // Written by the model, under one of the keys its own messages go by; never the system's fixed words.
+    const own = row.authored === 1 && typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
     return own && !row.ask && !row.review && typeof row.run_id === "string" && isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id));
   }
 

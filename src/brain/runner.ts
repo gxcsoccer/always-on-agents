@@ -56,7 +56,7 @@ export interface RunnerHost {
   registry(): Pick<ReturnType<typeof registry>, "recordUsage" | "adjustUsage">;
   /** One call to the model. */
   respond(request: ModelRequest): Promise<ModelResponse>;
-  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume">;
+  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
 }
@@ -137,14 +137,14 @@ export class Runner {
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
     if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))})`;
-    // Words of the agent's that reached the person in this very conversation: shown to the model
-    // as the agent's own, from where they are kept, when the transcript is put together.
-    const words = this.#s.rows<{ outbox_id: number }>("SELECT outbox_id FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
+    // Words of the agent's that reached the person in this very conversation: pointed at, and
+    // shown to the model as the agent's own when the transcript is put together, while they are kept.
+    const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
     if (words) {
       replied.push(words.outbox_id);
-      return "\n  (written as a reply to a message of yours, shown just before this)";
+      return `\n  (written as a reply to the message you sent at ${new Date(words.sent_at).toISOString()})`;
     }
-    // One of the agent's own, sent in this conversation.
+    // One of the agent's own, sent in this conversation, whose words are not kept.
     const yours = this.#s.rows<{ sent_at: number | null }>(
       "SELECT o.sent_at FROM outbox o WHERE json_extract(o.receipt, '$.subject') = ? AND (o.run_id IN (SELECT r.id FROM runs r JOIN sessions s ON s.id = r.session_id WHERE s.session_key = ?) OR o.continuation IN (SELECT c.id FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE s.session_key = ?)) LIMIT 1",
       subject,
@@ -379,14 +379,8 @@ export class Runner {
       // answered. Until here the answer was a draft that nothing would send. A request that is
       // no longer being carried on (told to wait again, ended) leaves no answer behind.
       // What the run read under is on every message it wrote by now (outbox.guard); the run's own note of it goes.
-      // What the run read, by the tool's own canonical call (never anything the model wrote, nor what came back): named in the note below.
-      const read = [...new Set((JSON.parse(this.#s.meta(`sources:${runId}`) ?? "[]") as { args?: unknown }[]).flatMap((each) => {
-        try {
-          return Object.values(JSON.parse(String(each.args)) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
-        } catch {
-          return [];
-        }
-      }))];
+      // What the run read, by the tool's own canonical call (never anything the model wrote, nor what came back): kept on the note below.
+      const read = this.#b.requests.readsOf(runId);
       this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") {
@@ -486,11 +480,19 @@ export class Runner {
    * not handed the content, in the original or retold, nor anything else the model wrote.
    * Messages the run wrote are emptied once they have been delivered or given up.
    */
-  #forgetOutside(run: RunRow, read: string[] = []): void {
+  #forgetOutside(run: RunRow, read: { args: string }[] = []): void {
     if (this.#s.rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
     // Fixed words, and what the tool said it read. Nothing the model wrote is carried over, not even what it asked a tool for.
-    this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(read) });
+    const links = [...new Set(read.flatMap((each) => {
+      try {
+        return Object.values(JSON.parse(each.args) as Record<string, unknown>).filter((value): value is string => typeof value === "string");
+      } catch {
+        return [];
+      }
+    }))];
+    // Also as a record (never shown to the model as such): what this turn read, whether or not anything it said reached the person.
+    this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(links), ...(read.length > 0 ? { _reads: read } : {}) } as Item);
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
     this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
     this.#b.outbox.scrub("run_id = ?", run.id);
@@ -520,24 +522,33 @@ export class Runner {
     if (floor == null) return [];
     const from = lastUser != null ? Math.min(lastUser, floor) : floor;
     const rows = this.#s.rows<{ run_id: string | null; is_user: number; item: string; outside: number }>("SELECT run_id, is_user, item, outside FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, from);
-    // Each scrubbed turn's delivered words go after the last of its kept items.
-    const scrubbed = [...new Set(rows.filter((each) => each.is_user === 0 && each.outside === 2 && each.run_id).map((each) => each.run_id as string))];
+    // Each scrubbed turn's delivered words go after the last of its kept items. One query for all of them.
     const wordsOf = new Map<string, Item[]>();
-    for (const runId of scrubbed) {
-      const words = this.#s.rows<{ text: string }>("SELECT text FROM said WHERE run_id = ? AND session_id = ? ORDER BY outbox_id", runId, sessionId);
-      if (words.length > 0) wordsOf.set(runId, words.map((each) => ({ role: "assistant", content: each.text })));
+    for (const each of this.#s.rows<{ run_id: string; text: string }>(
+      "SELECT run_id, text FROM said WHERE session_id = ? AND run_id IN (SELECT DISTINCT run_id FROM items WHERE session_id = ? AND seq >= ? AND is_user = 0 AND outside = 2) ORDER BY outbox_id",
+      sessionId,
+      sessionId,
+      from,
+    )) {
+      wordsOf.set(each.run_id, [...(wordsOf.get(each.run_id) ?? []), { role: "assistant", content: each.text }]);
     }
+    // The words people replied to, for every reply in the window, in one query.
+    const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
+    const quotedOf = new Map(
+      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number }>("SELECT outbox_id, text, sent_at FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+    );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
+    // What is kept beside an item for the system's own use (names starting with "_") is never shown.
+    const shown = (item: Record<string, unknown>) => Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith("_"))) as Item;
     const entries: { item: Item; starts: boolean }[] = [];
     rows.forEach((row, index) => {
-      const item = JSON.parse(row.item) as Item & { _replied?: number[] };
+      const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
-        const { _replied, ...plain } = item;
-        const quoted = (_replied ?? []).flatMap((id) => this.#s.rows<{ text: string; sent_at: number }>("SELECT text, sent_at FROM said WHERE outbox_id = ? AND session_id = ?", id, sessionId));
+        const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
         quoted.forEach((each, at) => entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}:]\n${each.text}` }, starts: at === 0 }));
-        entries.push({ item: plain as Item, starts: quoted.length === 0 });
-      } else entries.push({ item, starts: false });
+        entries.push({ item: shown(item), starts: quoted.length === 0 });
+      } else entries.push({ item: shown(item), starts: false });
       if (row.run_id && lastOf.get(row.run_id) === index) for (const words of wordsOf.get(row.run_id) ?? []) entries.push({ item: words, starts: false });
     });
     let start = Math.max(0, entries.length - MAX_TRANSCRIPT_ITEMS);

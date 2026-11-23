@@ -547,10 +547,10 @@ describe("the outbox, by itself", () => {
   it("leaves nothing that ties a message to what was read on a row that has ended, however it ended", async () => {
     await within(async ({ outbox, row, store }) => {
       for (const status of ["pending", "draft", "sent", "void", "dead", "unverified", "withdrawn"]) {
-        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, source, guard) VALUES (?, ?, 't', ?, ?, 0, '{}', '[]')", status, TARGET, status, Date.now() + 600_000);
+        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, source, guard, reads) VALUES (?, ?, 't', ?, ?, 0, '{}', '[]', '[]')", status, TARGET, status, Date.now() + 600_000);
       }
       await outbox.flush();
-      const tied = store.rows<{ idem: string }>("SELECT idem FROM outbox WHERE source IS NOT NULL OR guard IS NOT NULL ORDER BY id").map((each) => each.idem);
+      const tied = store.rows<{ idem: string }>("SELECT idem FROM outbox WHERE source IS NOT NULL OR guard IS NOT NULL OR reads IS NOT NULL ORDER BY id").map((each) => each.idem);
       expect(tied).toEqual(["pending", "draft"]);
       expect(row("pending").status).toBe("pending");
     });
@@ -618,10 +618,10 @@ describe("the outbox, by itself", () => {
         run("r1");
         outside.add("r1");
         settings.reads.r1 = [READ_A];
-        outbox.enqueue("msg:c1", SESSION, "r1", "A has three items");
+        outbox.enqueue("msg:c1", SESSION, "r1", "A has three items", undefined, undefined, { authored: true });
         // Read later in the same run: not what the first message was written from.
         settings.reads.r1 = [READ_A, { ...READ_A, identity: "docx:BBBBBBBBBB" }];
-        outbox.enqueue("msg:c2", SESSION, "r1", "B has two");
+        outbox.enqueue("msg:c2", SESSION, "r1", "B has two", undefined, undefined, { authored: true });
         await outbox.flush();
         await outbox.flush();
         expect(kept()).toEqual([
@@ -636,7 +636,7 @@ describe("the outbox, by itself", () => {
     it("keeps the words as they finally went out, not as first written", async () => {
       await within(async ({ outbox, run, set, kept }) => {
         run("r1");
-        outbox.enqueue("answer:q1", SESSION, "r1", "first draft");
+        outbox.enqueue("answer:q1", SESSION, "r1", "first draft", undefined, undefined, { authored: true });
         set("answer:q1", { text: "final words" });
         await outbox.flush();
         expect(kept().map((each) => each.text)).toEqual(["final words"]);
@@ -646,19 +646,21 @@ describe("the outbox, by itself", () => {
     it("keeps nothing that did not reach the person, nothing that was not the agent's own message, and nothing outside a private conversation", async () => {
       await within(async ({ outbox, run, set, channel, gates, settings, kept }) => {
         run("r1");
-        outbox.enqueue("msg:void", SESSION, "r1", "withheld");
+        // The system's own words in place of an answer, under the answer's key: not the agent's.
+        outbox.enqueue("answer:q2", SESSION, "r1", "你之前让我做的事我没能完成，请再问一次。");
+        outbox.enqueue("msg:void", SESSION, "r1", "withheld", undefined, undefined, { authored: true });
         gates["msg:void"] = "void";
-        outbox.enqueue("msg:dead", SESSION, "r1", "refused");
+        outbox.enqueue("msg:dead", SESSION, "r1", "refused", undefined, undefined, { authored: true });
         channel["msg:dead"] = fails(new DeliveryRejected("no"));
         set("msg:dead", { attempts: 5 });
-        outbox.enqueue("msg:gone", SESSION, "r1", "nothing to send");
+        outbox.enqueue("msg:gone", SESSION, "r1", "nothing to send", undefined, undefined, { authored: true });
         channel["msg:gone"] = fails(new DeliveryVoid());
         outbox.enqueue("ask:q1", SESSION, "r1", "may I?", { code: "A1" } as never);
         outbox.notify("budget:r1", SESSION, "r1", "paused until tomorrow");
         await outbox.flush();
         expect(kept()).toEqual([]);
         settings.sessionKey = "chat:oc_9";
-        outbox.enqueue("msg:group", SESSION, "r1", "in a group");
+        outbox.enqueue("msg:group", SESSION, "r1", "in a group", undefined, undefined, { authored: true });
         await outbox.flush();
         expect(kept()).toEqual([]);
       });

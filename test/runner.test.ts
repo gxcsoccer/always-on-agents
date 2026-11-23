@@ -95,6 +95,8 @@ function bench(state: DurableObjectState) {
       cancellable: () => [],
       askedFor: () => "",
       resume: async (event: InboxRow) => (log.push(["resume", event.source_id]), undefined),
+      // As the requests part has it: what the run noted it read, each thing once.
+      readsOf: (runId: string) => [...new Map((JSON.parse(store.meta(`sources:${runId}`) ?? "[]") as { connector: string; tool: string; args: string; identity: string }[]).map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()],
     } as unknown as RunnerHost["requests"],
     outbox: {
       notify: (idem: string, sessionId: string, runId: string | null, text: string) => void log.push(["notify", idem, sessionId, runId, text]),
@@ -597,6 +599,14 @@ describe("the run loop, by itself", () => {
         expect(note.content).toContain("https://x.feishu.cn/wiki/BBBBBBBBBB");
         expect(note.content).not.toContain("the document text");
         expect(note.content).toContain("What you said to the person in this turn, as it reached them, follows this note");
+        // Kept as a record too, for what comes later; never shown to the model as such.
+        expect((note as unknown as { _reads: unknown })._reads).toEqual([
+          { connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: "https://x.feishu.cn/docx/AAAAAAAAAA" }), identity: "docx:AAAAAAAAAA" },
+          { connector: "feishu", tool: "feishu_read_document", args: JSON.stringify({ document: "https://x.feishu.cn/wiki/BBBBBBBBBB" }), identity: "docx:CCCCCCCCCC" },
+        ]);
+        b.event("and the second?");
+        await b.go();
+        expect(JSON.stringify(b.asked.at(-1)!.input)).not.toContain("_reads");
       });
     });
 
@@ -626,6 +636,7 @@ describe("the run loop, by itself", () => {
         const input = b.asked[0].input;
         expect(input.at(-2)).toEqual({ role: "assistant", content: "[The message of yours they are replying to, sent at 2026-11-23T08:00:00.000Z:]\nA has three items" });
         expect(input.at(-1)?.role).toBe("user");
+        expect(String(input.at(-1)?.content)).toContain("(written as a reply to the message you sent at 2026-11-23T08:00:00.000Z)");
         // What is kept for the person's turn points at those words; it does not hold them.
         const stored = b.store.rows<{ item: string }>("SELECT item FROM items WHERE is_user = 1 ORDER BY seq DESC LIMIT 1")[0].item;
         expect(stored).not.toContain("A has three items");
@@ -636,6 +647,20 @@ describe("the run loop, by itself", () => {
         b.event("what is the second?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
         await b.go();
         expect(JSON.stringify(b.asked[0].input)).not.toContain("not yours");
+      });
+      // The words replied to are no longer kept by the time the model is asked: the person's turn still says when that message was sent, and claims nothing more.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "A has three items", { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.event("what is the second?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
+        const id = (await b.runner.next())!;
+        b.store.sql.exec("DELETE FROM said");
+        b.model.push(answer([says("ok")]));
+        await b.runner.execute(id);
+        const input = b.asked[0].input;
+        expect(JSON.stringify(input)).not.toContain("A has three items");
+        expect(String(input.at(-1)?.content)).toContain("(written as a reply to the message you sent at 2026-11-23T08:00:00.000Z)");
+        expect(JSON.stringify(input)).not.toContain("shown just before");
       });
     });
   });

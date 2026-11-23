@@ -79,7 +79,7 @@ export interface RequestsHost {
   append(sessionId: string, runId: string, item: Item, outside?: boolean): void;
   actingFor(runId: string): Acting | undefined;
   actingOn(events: InboxRow[], kept?: number[]): Acting | undefined;
-  enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string }): { ok: true };
+  enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean }): { ok: true };
   notice(which: NoticeKey, sessionId: string): string;
 }
 
@@ -208,9 +208,10 @@ export class Requests implements Wakes {
    * written again, but not a message anything will send until the run that wrote it ends (see
    * #finish). So a run interrupted after writing it cannot have it sent, or thrown away, early.
    */
-  draft(carried: Continuation, run: RunRow, text: string): { ok: true } {
-    this.#b.enqueueMessage(`answer:${carried.id}`, run.session_id, run.id, text, undefined, undefined, { continuation: carried });
-    this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ?, reads = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, JSON.stringify(this.readsOf(run.id)), `answer:${carried.id}`);
+  /** `authored`: written by the model, as against the system's fixed words in place of an answer. */
+  draft(carried: Continuation, run: RunRow, text: string, authored = false): { ok: true } {
+    this.#b.enqueueMessage(`answer:${carried.id}`, run.session_id, run.id, text, undefined, undefined, { continuation: carried, authored });
+    this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ?, reads = ?, authored = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, JSON.stringify(this.readsOf(run.id)), authored ? 1 : 0, `answer:${carried.id}`);
     return { ok: true };
   }
 

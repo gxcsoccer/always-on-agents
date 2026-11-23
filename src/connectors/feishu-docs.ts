@@ -115,7 +115,16 @@ export function documentOf(link: string): DocumentRef | undefined {
  * A link this cannot settle is not counted, and the person can paste it on a line of its own.
  */
 export function documentsIn(text: string): DocumentRef[] {
-  const found: DocumentRef[] = [];
+  return linksIn(text).map(({ kind, token }) => ({ kind, token }));
+}
+
+/**
+ * The documents a person's text links, each with the link as they wrote it, down to its path: the
+ * same scheme and host, without the query or fragment. What was read is recorded by this link,
+ * not by whatever host a model wrote for the same document.
+ */
+export function linksIn(text: string): (DocumentRef & { link: string })[] {
+  const found: (DocumentRef & { link: string })[] = [];
   for (const word of text.split(/\s+/)) {
     const start = /[A-Za-z][A-Za-z0-9+.-]*:\/\//.exec(word);
     if (!start) continue;
@@ -127,8 +136,12 @@ export function documentsIn(text: string): DocumentRef[] {
     const cut = whole.search(/[^\x00-\x7f]/);
     const rest = cut > 0 ? whole.slice(cut) : "";
     const sentenceGoesOn = /^[，。；：！？、）】》」』”’]/u.test(rest) && !/[/?#@%&=:\\]/.test(rest);
-    const each = documentOf(trimmed(whole)) ?? (sentenceGoesOn ? documentOf(trimmed(whole.slice(0, cut))) : undefined);
-    if (each && !found.some((seen) => seen.kind === each.kind && seen.token === each.token)) found.push(each);
+    const written = documentOf(trimmed(whole)) ? trimmed(whole) : sentenceGoesOn && documentOf(trimmed(whole.slice(0, cut))) ? trimmed(whole.slice(0, cut)) : undefined;
+    const each = written === undefined ? undefined : documentOf(written);
+    if (each && written && !found.some((seen) => seen.kind === each.kind && seen.token === each.token)) {
+      const url = new URL(written);
+      found.push({ ...each, link: `${url.origin}/${each.kind}/${each.token}` });
+    }
   }
   return found;
 }
@@ -194,7 +207,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const name = await grantName(who);
   // The link as far as it identifies the document: this, not what the model wrote, is what a
   // request that has to wait is carried on with.
-  const canonical = `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
+  // As the person wrote it (their host), where one of their messages here links it; the model's host only failing that.
+  const theirs = [...context.said, ...context.recent].flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
+  const canonical = theirs?.link ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
   const grant = env.FEISHU_GRANTS.getByName(name);
   const { generation, credential, unreadable, answered } = await grant.held();
   // The authorisation was taken away, or replaced, while this read was under way: what the old
