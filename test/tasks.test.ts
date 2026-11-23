@@ -1112,6 +1112,61 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("does not send an approval on record again once its author has said more where they typed it, when it was moved here", async () => {
+      await within(async ({ task, asks, reply, answer, worker }) => {
+        task("t1");
+        const open = await asks("t1", 1);
+        reply(`approve ${open.code}`, { routed_from: "thread:1" });
+        worker.answer = async () => ({ ok: false, error: "busy" });
+        await expect(answer("t1", "allow", "call_1")).rejects.toThrow("busy");
+        worker.answer = async (decision) => ({ ok: true, decision });
+        // Said only in the conversation the approval was typed in.
+        reply("wait", { session: "thread:1" });
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow();
+        expect(worker.answered).toHaveLength(1);
+      });
+    });
+
+    it("takes the approval said last, by the source's time, however the two arrived", async () => {
+      await within(async ({ task, asks, reply, answer, kept, settings }) => {
+        settings.revisable.add("feishu");
+        settings.now["q:posted"] = { revision: 1, holder: "as written", deleted: false, edited: false };
+        settings.now.c1 = { revision: 30_000, holder: "h1", deleted: false, edited: false };
+        settings.now.c2 = { revision: 20_000, holder: "h1", deleted: false, edited: false };
+        task("t1");
+        const open = await asks("t1", 1, undefined, { subject: "q:posted", holder: "as written" });
+        // The newer one arrives first.
+        const newer = reply(`approve ${open.code}`, { subject: "c1", revision: 30_000 });
+        reply(`approve ${open.code}`, { subject: "c2", revision: 20_000 });
+        await expect(answer("t1", "allow")).resolves.toMatchObject({ decision: "allow" });
+        expect(JSON.parse(kept("t1").answering).deciding_event).toBe(newer);
+      });
+    });
+
+    it("orders two approvals that arrived at the same moment, with no time from their source, as they were stored", async () => {
+      await within(async ({ task, asks, reply, answer, kept }) => {
+        task("t1");
+        const open = await asks("t1", 1);
+        reply(`approve ${open.code}`, { received_at: 12_000 });
+        const second = reply(`approve ${open.code}`, { received_at: 12_000 });
+        await expect(answer("t1", "allow")).resolves.toMatchObject({ decision: "allow" });
+        expect(JSON.parse(kept("t1").answering).deciding_event).toBe(second);
+      });
+    });
+
+    it("names nobody for a decision in force that is neither the one passed on nor one on record before it", async () => {
+      await within(async ({ task, asks, reply, answer, worker, audited }) => {
+        task("t1");
+        const open = await asks("t1", 1);
+        reply(`deny ${open.code}`, { person: "bob" });
+        worker.answer = async () => ({ ok: true, decision: "allow" });
+        const result = (await answer("t1", "deny")) as Record<string, unknown>;
+        expect(result).toMatchObject({ ok: true, task_id: "t1", decision: "allow" });
+        expect(result).not.toHaveProperty("decided_by");
+        expect(audited("task.answer_too_late")).toEqual([{ actor: "bob", task_id: "t1", question: open.id, wanted: "deny", in_force: "allow", in_force_by: null }]);
+      });
+    });
+
     it("clears only the question it answered: a newer one that arrived meanwhile stays open", async () => {
       await within(async ({ tasks, task, asks, reply, answer, worker, kept, pendingOf, closed }) => {
         task("t1");
