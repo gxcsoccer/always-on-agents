@@ -520,6 +520,8 @@ describe("when requests and kept answers next need the Brain awake", () => {
       request("a", { until: NOW + 60_000 });
       answer(store, "ans_1", NOW + 4_000);
       expect(requests.nextWakeAt(NOW)).toBe(NOW + 4_000);
+    });
+  });
 });
 
 describe("keeping a request that has to wait", () => {
