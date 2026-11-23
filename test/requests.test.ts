@@ -509,6 +509,22 @@ describe("when requests and kept answers next need the Brain awake", () => {
     });
   });
 
+  it("does not let a wait whose time is up hold back another wait's earlier check", async () => {
+    await within(({ requests, request }) => {
+      request("late", { until: NOW - 5_000 });
+      request("b", { until: NOW + 90_000, check_at: NOW + 20_000 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 20_000);
+    });
+  });
+
+  it("looks again at a wait whose time is up when its own next check is due", async () => {
+    await within(({ requests, request }) => {
+      // Its owner could not be asked; it is to be asked again in half a minute.
+      request("late", { until: NOW - 5_000, check_at: NOW + 30_000 });
+      expect(requests.nextWakeAt(NOW)).toBe(NOW + 30_000);
+    });
+  });
+
   it("ignores requests that are no longer waiting", async () => {
     await within(({ requests, request }) => {
       request("resuming", { until: NOW + 1_000, status: "resuming" });

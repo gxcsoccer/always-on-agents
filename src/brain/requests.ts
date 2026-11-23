@@ -145,9 +145,14 @@ export class Requests implements Wakes {
     const candidates: number[] = [];
     const forget = this.#s.rows<{ at: number | null }>("SELECT MIN(expires_at) AS at FROM answers")[0]?.at;
     if (forget != null) candidates.push(forget);
-    // A wait that has run out is looked at once a minute until its owner has been asked.
-    const waitUntil = this.#s.rows<{ until: number | null }>("SELECT MIN(MIN(until, COALESCE(check_at, until))) AS until FROM continuations WHERE status = 'waiting'")[0]?.until;
-    if (waitUntil != null) candidates.push(waitUntil > now ? waitUntil : now + 60_000);
+    // Each wait by itself: at its deadline or its next check, whichever comes first. One whose
+    // time for that has already passed is looked at again in a minute (until its owner has been
+    // asked), without holding back the others.
+    for (const wait of this.#s.rows<{ until: number; check_at: number | null }>("SELECT until, check_at FROM continuations WHERE status = 'waiting'")) {
+      const due = Math.min(wait.until, wait.check_at ?? wait.until);
+      const next = due > now ? due : wait.check_at != null && wait.check_at > now ? wait.check_at : now + 60_000;
+      candidates.push(next);
+    }
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
