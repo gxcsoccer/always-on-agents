@@ -27,7 +27,8 @@ import { migrate } from "./schema";
 import { BrainStore, type InboxRow, type Row, type RunRow, type Wakes } from "./store";
 import { Outbox } from "./outbox";
 import { Revisions } from "./revisions";
-import { Tasks, quotes } from "./tasks";
+import { quotes } from "./approval";
+import { Tasks } from "./tasks";
 import { Timers } from "./timers";
 import type { Passage } from "./follow-up";
 import { type Continuation, HANDLING_LIMIT_MS, Requests, type Source, WAITING_NOTE, fingerprint } from "./requests";
@@ -1107,4 +1108,4 @@ function renderEvent(event: InboxRow): string {
 }
 
 export { messageText };
-export { readDecision, readTiedDecision, wantsStanding } from "./tasks";
+export { readDecision, readTiedDecision, wantsStanding } from "./approval";
