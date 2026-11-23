@@ -354,21 +354,29 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // not sent at all: there is nothing left to act on.
   const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
   if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
-  // An approval question or an invitation goes out as a card; everything else as text.
+  // An approval question or an invitation goes out as a card. The agent's own words go as
+  // Markdown (a post with one md element), or as text where a post would be too large; the
+  // system's fixed words as text. A message whose sending began under the earlier encoding (0)
+  // is sent exactly as it was then: as text, verbatim. Decided from the message alone, so every
+  // attempt sends the very same thing.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
-  const msgType = card ? "interactive" : "text";
-  const content = JSON.stringify(card ?? { text: message.text });
+  const current = message.encoding !== 0;
+  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: chatId, msg_type: msgType, content, uuid });
+  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
+  // Feishu takes a post of up to 30 KB, measured as the request is sent.
+  const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
+  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text) : message.text }));
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ msg_type: msgType, content, uuid, reply_in_thread: thread === "1" }),
+        body: JSON.stringify(body),
       })
     : await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
+        body: JSON.stringify(body),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
   const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
@@ -380,6 +388,21 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // something to count as delivered.
   if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
   return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** Feishu's limit for a post, in bytes of the request, with a margin. */
+const MAX_POST_BYTES = 29_000;
+
+/**
+ * The agent's words as Feishu shows them, minus their one way of acting: Feishu's mention markup
+ * (`<at user_id="…">`, `<at id=…>`, `</at>`) notifies whoever it names, everyone even. Every such
+ * piece of markup the model wrote or quoted is shown as the text it is (a zero-width space after
+ * the `<`), in code too: working out for certain where Markdown code begins and ends is not worth
+ * any chance of a mention in prose notifying someone. Nothing else is touched: other tags keep
+ * their names and case.
+ */
+function quiet(text: string): string {
+  return text.replace(/<(\/?)(at)(?=[\s>])/gi, "<\u200b$1$2");
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */

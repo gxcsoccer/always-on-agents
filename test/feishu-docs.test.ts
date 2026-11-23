@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { documentOf, documentsIn, readDocument } from "../src/connectors/feishu-docs";
 import { challengeOf, grantName, grantOf } from "../src/connectors/feishu-grant";
-import { normalize } from "../src/connectors/feishu";
+import { deliverFeishu, normalize } from "../src/connectors/feishu";
 import { scopeName } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 import { call, installFakeModel, model, modelCalls, say, wake } from "./helpers";
@@ -69,8 +69,10 @@ const feishu = {
   duringAppToken: undefined as undefined | (() => Promise<void>),
   /** How many of the bot's next messages in words Feishu takes and then fails to confirm. */
   loseTexts: 0,
-  /** What the bot sent to people. */
-  sent: [] as { to: string; type: string; content: any; uuid: string }[],
+  /** What the bot sent to people. A message in words is recorded as text, whichever form it went in (`format`). */
+  sent: [] as { to: string; type: string; content: any; uuid: string; format?: string }[],
+  /** Every request to send a message, as it was made: where to, and its body. */
+  bodies: [] as { path: string; body: any }[],
   /** Every document request, with the token it was made with. */
   reads: [] as { path: string; bearer: string }[],
   issued: 0,
@@ -82,6 +84,7 @@ function installFakeFeishu() {
   feishu.tokens.clear();
   feishu.codes.clear();
   feishu.sent.length = 0;
+  feishu.bodies.length = 0;
   feishu.reads.length = 0;
   feishu.looks.length = 0;
   feishu.blocksFail = false;
@@ -119,15 +122,22 @@ function installFakeFeishu() {
       await feishu.duringAppToken?.();
       return Response.json({ code: 0, tenant_access_token: "t-app", expire: 7200 });
     }
-    if (url.host === "open.feishu.cn" && url.pathname.endsWith("/im/v1/messages")) {
+    const replyingTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reply$/.exec(url.pathname)?.[1] : undefined;
+    if (url.host === "open.feishu.cn" && (url.pathname.endsWith("/im/v1/messages") || replyingTo)) {
       if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
+      feishu.bodies.push({ path: url.pathname, body });
+      // Words, in either form Feishu takes them.
+      const words = body.msg_type === "text" || body.msg_type === "post";
       if (body.msg_type === "interactive") feishu.sendAttempts++;
       if (body.msg_type === "interactive" && feishu.failSends > 0) return (feishu.failSends--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
-      if (body.msg_type === "text" && feishu.failTexts > 0) return (feishu.failTexts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
-      if (body.msg_type === "text" && feishu.rejectTexts > 0) return (feishu.rejectTexts--, Response.json({ code: 230002, msg: "refused" }, { status: 400 }));
-      const lost = body.msg_type === "text" && feishu.loseTexts > 0 && feishu.loseTexts-- > 0;
+      if (words && feishu.failTexts > 0) return (feishu.failTexts--, Response.json({ code: 230001, msg: "busy" }, { status: 500 }));
+      if (words && feishu.rejectTexts > 0) return (feishu.rejectTexts--, Response.json({ code: 230002, msg: "refused" }, { status: 400 }));
+      const lost = words && feishu.loseTexts > 0 && feishu.loseTexts-- > 0;
+      const content = JSON.parse(body.content);
+      // A post is recorded by its words, as a text would be.
+      const said = body.msg_type === "post" ? { text: content.zh_cn.content.flat().map((each: any) => each.text).join("") } : content;
       // Feishu drops a repeat of the same uuid.
-      if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id, type: body.msg_type, content: JSON.parse(body.content), uuid: body.uuid });
+      if (!feishu.sent.some((each) => each.uuid === body.uuid)) feishu.sent.push({ to: body.receive_id ?? `reply:${replyingTo}`, type: words ? "text" : body.msg_type, content: said, uuid: body.uuid, format: body.msg_type });
       if (lost) return Response.json({ code: 230001, msg: "busy" }, { status: 500 });
       return Response.json({ code: 0, data: { message_id: `om_sent_${body.uuid}` } });
     }
@@ -3031,3 +3041,84 @@ describe("the document tool by itself", () => {
     expect(result.truncated).toBe(true);
   });
 });
+
+describe("how the bot's words are sent", () => {
+  const scope = { tenant: TENANT, kind: "user" as const, id: "ou_words" };
+  const dm = { connector: "feishu", address: { app_id: APP_ID, chat_id: "oc_words" } };
+  const thread = { connector: "feishu", address: { app_id: APP_ID, chat_id: "oc_group", message_id: "om_parent", thread: "1" } };
+  let n = 0;
+  const send = (text: string, authored: boolean, target: any = dm) => deliverFeishu(env as any, scope, target, { id: ++n, idem: `msg:words_${n}`, text, authored, encoding: 1 });
+  const sentAs = () => feishu.bodies.at(-1)!.body;
+
+  it("sends the agent's own words as Markdown, in a private chat and as a reply in a thread", async () => {
+    const text = "共有 **3 个章节**：\n\n- 一\n- 二\n\n```\ncode\n```";
+    await send(text, true);
+    expect(sentAs()).toMatchObject({ receive_id: "oc_words", msg_type: "post" });
+    expect(JSON.parse(sentAs().content)).toEqual({ zh_cn: { content: [[{ tag: "md", text }]] } });
+    await send(text, true, thread);
+    expect(feishu.bodies.at(-1)!.path).toBe("/open-apis/im/v1/messages/om_parent/reply");
+    expect(sentAs()).toMatchObject({ msg_type: "post", reply_in_thread: true });
+  });
+
+  it("sends a message whose sending began under the earlier version exactly as that version did", async () => {
+    // Its first attempt went out as text, with this uuid; whether it arrived is not known.
+    await deliverFeishu(env as any, scope, dm, { id: 900, idem: "msg:legacy", text: "**旧的**", authored: true, encoding: 0 });
+    expect(sentAs()).toMatchObject({ msg_type: "text" });
+    expect(JSON.parse(sentAs().content)).toEqual({ text: "**旧的**" });
+  });
+
+  it("sends what the model writes in a conversation as Markdown, end to end", async () => {
+    const vera = someone();
+    model.replies([call("send_message", { text: "**好的**" })], [say("")]);
+    await vera.says("你好");
+    expect(feishu.sent.filter((each) => each.to === `oc_${vera.openId}`).map((each) => [each.format, each.content.text])).toEqual([["post", "**好的**"]]);
+  });
+
+  it("sends the system's own fixed words as plain text", async () => {
+    await send("我在完成之前停下了。请再问一次。", false);
+    expect(sentAs()).toMatchObject({ msg_type: "text" });
+    expect(JSON.parse(sentAs().content)).toEqual({ text: "我在完成之前停下了。请再问一次。" });
+  });
+
+  it("notifies nobody through mention markup the model wrote", async () => {
+    await send('见 <at user_id="all"></at> 和 <AT user_id="ou_x">x</at>', true);
+    const md = JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
+    expect(md).not.toMatch(/<at/i);
+    expect(md).toContain('user_id="all"');
+  });
+
+  it("defuses every piece of Feishu's own mention markup, in code too, and changes nothing else", async () => {
+    // Code included: telling for certain where Markdown code begins and ends is not worth a chance
+    // that a mention in prose notifies someone. In code, such markup gains one invisible character.
+    const yaml = "```yaml\nquote: \"```\"\n```";
+    const text = `Ping <at user_id="all"></at>, keep <AT-KEY>speed</AT-KEY>, inline \`<at user_id="x">\`, \`\`a <at id="z"></at> b\`\` and\n${yaml}\n<at id="y"></at><AT-KEY/>\n\`\`\`\n<sample/>\n\`\`\``;
+    await send(text, true);
+    const md = JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
+    expect(md).not.toMatch(/<\/?at[\s>]/i);
+    expect(md).toContain("<AT-KEY>speed</AT-KEY>");
+    expect(md).toContain("<AT-KEY/>");
+    expect(md).toContain("<sample/>");
+    expect(md).toContain(yaml);
+    // Nothing else differs.
+    expect(md.replace(/\u200b/g, "")).toBe(text);
+    for (const open of ["三个反引号 ``` 用于代码块，请通知 ", "说明：\n```\n"]) {
+      await send(`${open}<at user_id="all">所有人</at>`, true);
+      expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).not.toContain('<at user_id="all">');
+    }
+  });
+
+  it("sends as plain text what would be too large as a post, and the same way every time it is tried", async () => {
+    // Within the 8,000 characters a message may have, but escaped twice over (inside the post, then inside the request) beyond Feishu's 30 KB for a post.
+    // Ends in what reads as code in Markdown, but as text there is no such thing: a mention there would notify.
+    const long = '"\\'.repeat(3_930) + '`<at user_id="all"></at>`';
+    expect(long.length).toBeLessThanOrEqual(8_000);
+    await send(long, true);
+    expect(sentAs().msg_type).toBe("text");
+    // Plain text recognises mentions too: still nobody is notified.
+    expect(JSON.parse(sentAs().content).text).not.toContain('<at user_id="all">');
+    const idem = `msg:words_${n}`;
+    await deliverFeishu(env as any, scope, dm, { id: n, idem, text: long, authored: true, encoding: 1 });
+    expect(feishu.bodies.at(-1)!.body).toEqual(feishu.bodies.at(-2)!.body);
+  });
+});
+

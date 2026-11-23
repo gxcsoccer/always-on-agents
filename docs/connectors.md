@@ -198,6 +198,10 @@ People are then asked for that leave as well (those who authorised before are as
 
 The invitation card says, before the person agrees, that this authorisation renews itself and how to end it. Turning the setting off again (`{"offline_access":false}`) stops it for that app: new invitations no longer ask for it, an invitation for it that is still out is not honoured, and nothing is renewed any more; an authorisation already given keeps working until its current token runs out (about two hours), at which point the token for renewing is discarded and the person is invited afresh. To end one person's authorisation at once, use `DELETE /v1/admin/feishu-grants/…` above. Neither tells Feishu to revoke what it issued; the person can do that in Feishu's own authorisation settings.
 
+### How messages look
+
+What the agent writes itself goes out as a Feishu post with one Markdown element, so bold, lists, links, code and tables render. Mention markup in it (`<at …>`), in code too, is shown as text and notifies nobody (it gains one invisible character). The system's own fixed words go out as plain text, and questions and invitations as cards. A post that would exceed Feishu's 30 KB is sent as plain text instead. The form is decided from the message alone, so a retry sends exactly the same thing.
+
 ### Language
 
 The card's fixed text is currently Chinese only.
