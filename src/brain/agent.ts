@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, type Outcome, type Receipt, DeliveryRejected, DeliveryVoid, amend, canRevisit, dedupeWindow, deliver, received, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
+import { type ApprovalQuestion, type Outcome, type Receipt, amend, canRevisit, deliver, received, isWaiting, standingOf, toolsOf, trusts } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, isPrivateSession, privateSessionKey, type Target, type WorkerEventKind } from "../events";
 import { type Item, ModelError, type ToolDefinition, messageText, respond } from "../model/openai";
@@ -27,6 +27,7 @@ import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS, buildInstructions } from "./prompt";
 import { migrate } from "./schema";
 import { BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
+import { Outbox } from "./outbox";
 import { Timers } from "./timers";
 import type { Passage } from "./follow-up";
 import { type Continuation, HANDLING_LIMIT_MS, Requests, type Source, WAITING_NOTE, fingerprint } from "./requests";
@@ -49,13 +50,6 @@ const MAX_MEMORY_FILES = 200;
 const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
 const MODEL_CALL_RESERVE = 20_000;
-const OUTBOX_RETRY_DELAYS_MS = [2_000, 10_000, 60_000, 300_000, 900_000];
-/**
- * The longest an outside system's request to wait is waited out. The queue delivers in order, so a
- * message that waits holds back those behind it; one asked to wait longer than this is given up
- * as undeliverable rather than sent early or held indefinitely.
- */
-const MAX_DEFERRAL_MS = 24 * 60 * 60_000;
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How long finished records are kept before housekeeping removes them. */
 const RETAIN_RECORDS_MS = 30 * 86_400_000;
@@ -65,35 +59,9 @@ const RETAIN_ITEMS_PER_SESSION = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
 const READ_OUTSIDE = "this run has read text from outside through a tool. From then on it can only reply to the person with send_message and read again; no other tool can be used in it. If the person wants something else done, they can ask for it in a new message";
 const OUTSIDE_REMOVED = "[In this turn you answered using a tool that read text from outside. What it returned, and what you said and did with it, are not kept here. If the content is needed again, read it again from what the person themselves pointed to.]";
-const DELIVERY_WITHHELD = "delivery failed; the details are not kept";
 const ERROR_WITHHELD = "failed after reading outside text; the details are not kept";
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
-/** How long a message that must not go out yet is left before it is looked at again. */
-const HELD_MS = 3_000;
-/** The same, when what it waits on will not change within this wake-up. */
-const HELD_LONG_MS = 60_000;
-/** How long a delivered answer can be reopened for a follow-up. */
-const ANSWER_KEPT_MS = 24 * 60 * 60_000;
-/**
- * What the system itself says to a person about a request of theirs, in fixed words. Said in the
- * language they last wrote in here, as far as that can be told without a model: Chinese if their
- * latest message has Chinese characters in it, English otherwise.
- */
-export type NoticeKey = keyof typeof NOTICES;
-const NOTICES = {
-  withheld: { en: "I stopped before finishing: the authorisation for what I was reading has ended. Please ask again.", zh: "我在完成之前停下了：读取所依据的授权已经结束。请再问一次。" },
-  notSent: { en: "I did not send what I had written for you: the authorisation for what I had read has ended, or too much time had passed. Please ask again.", zh: "我写好的内容没有发给你：读取所依据的授权已经结束，或者已经过了太久。请再问一次。" },
-  notAnswered: { en: "I could not finish what you asked for earlier. Please ask again.", zh: "你之前让我做的事我没能完成，请再问一次。" },
-  limit: { en: "I have reached today's usage limit here and could not finish what you asked for earlier. Please ask again tomorrow.", zh: "我今天的用量已经用完，没能完成你之前让我做的事。请明天再问一次。" },
-  which: { en: "More than one of your requests could be meant. Which one?", zh: "你指的可能不止一件事，是哪一件？" },
-  unchecked: { en: "I did not send what I had written for you: I could not confirm that the authorisation for what I had read still stands. Please ask again.", zh: "我写好的内容没有发给你：我没能确认读取所依据的授权是否仍然有效。请再问一次。" },
-  invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
-  tomorrow: { en: "I have reached today's usage limit here and will pick this up tomorrow.", zh: "我今天的用量已经用完，明天接着处理。" },
-  failed: { en: "Something went wrong on my side and I could not finish handling that. Please try again.", zh: "我这边出了问题，没能处理完。请再试一次。" },
-} as const;
-/** How often a message whose condition's owner cannot be asked is put off before it is given up. */
-const MAX_UNASKED = 8;
 const REPLACES = { type: ["string", "null"], description: "If the person wants this instead of a request of theirs that is still waiting (they changed their mind about what they want), that request's id; otherwise null." };
 
 
@@ -111,6 +79,8 @@ export class BrainAgent extends DurableObject<Env> {
   /** Requests that wait, guards and follow-ups: the same database and transactions, in a file of their own. */
   readonly #requests: Requests;
   readonly #timers: Timers;
+  /** Messages to deliver. */
+  readonly #outbox: Outbox;
   /** The parts that can ask to be woken. */
   readonly #parts: Wakes[];
 
@@ -119,6 +89,15 @@ export class BrainAgent extends DurableObject<Env> {
     this.#store = new BrainStore(ctx);
     this.#timers = new Timers(this.#store);
     const brain = this;
+    this.#outbox = new Outbox(this.#store, {
+      deliver: (target, message) => deliver(this.env, this.#store.scope(), target, message),
+      sawOutside: (runId) => this.#sawOutside(runId),
+      showClosed: (ask) => this.#showClosed(ask),
+      // Built after this part: read when it is used.
+      get requests() {
+        return brain.#requests;
+      },
+    });
     this.#requests = new Requests(this.#store, {
       // Read each time, as everywhere else in this class: not the value at construction.
       get env() {
@@ -129,10 +108,10 @@ export class BrainAgent extends DurableObject<Env> {
       append: (sessionId, runId, item, outside) => this.#append(sessionId, runId, item, outside),
       actingFor: (runId) => this.#actingFor(runId),
       actingOn: (events, kept) => this.#actingOn(events, kept),
-      enqueueMessage: (...args) => this.#enqueueMessage(...args),
-      notice: (which, sessionId) => this.#notice(which, sessionId),
+      enqueueMessage: (...args) => this.#outbox.enqueue(...args),
+      notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
     });
-    this.#parts = [this.#timers, this.#requests];
+    this.#parts = [this.#timers, this.#requests, this.#outbox];
     migrate(ctx.storage);
     // If an invocation died between committing work and scheduling the wake-up for it, nothing else
     // would ever schedule it. Any activation of this object repairs that.
@@ -209,14 +188,14 @@ export class BrainAgent extends DurableObject<Env> {
       this.#requests.deadlines(Date.now());
       this.#store.sql.exec("DELETE FROM answers WHERE expires_at <= ?", Date.now());
       this.#housekeeping(Date.now());
-      await this.#flushOutbox();
+      await this.#outbox.flush();
       await this.#settleQuestions();
       // A few runs per wake-up at most, so one busy scope cannot hold an invocation forever.
       for (let i = 0; i < 3; i++) {
         const runId = await this.#next();
         if (!runId) break;
         await this.#execute(runId);
-        await this.#flushOutbox();
+        await this.#outbox.flush();
         if (this.#store.meta("active_run")) break;
       }
     } finally {
@@ -237,10 +216,6 @@ export class BrainAgent extends DurableObject<Env> {
     const active = this.#activeRun();
     if (active) candidates.push(active.retry_at ?? now + 1_000);
     else if (this.#store.rows("SELECT 1 FROM inbox WHERE status = 'pending' LIMIT 1").length > 0) candidates.push(now + 200);
-    const outbox = this.#store.rows<{ next_at: number }>("SELECT next_at FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0]?.next_at;
-    if (outbox != null) candidates.push(outbox);
-    const reconciling = this.#store.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM outbox WHERE status = 'reconciling'")[0]?.next_at;
-    if (reconciling != null) candidates.push(reconciling);
     const unsettled = this.#store.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM unsettled")[0]?.next_at;
     if (unsettled != null) candidates.push(unsettled);
     // Each part says for itself when it next has something to do.
@@ -412,13 +387,13 @@ export class BrainAgent extends DurableObject<Env> {
         // It ends here, and the person is told, in place of its answer.
         const carrying = this.#requests.continuationOf(runId);
         if (carrying) {
-          if (carrying.status === "resuming") this.#requests.draft(carrying, run, this.#notice("limit", run.session_id));
+          if (carrying.status === "resuming") this.#requests.draft(carrying, run, this.#outbox.notice("limit", run.session_id));
           this.#store.log("budget_exhausted", { run: runId, tokens_today: this.#tokensToday() });
           break;
         }
         // The run stays claimed and resumes after midnight UTC; nothing is dropped. This pause is
         // not a failure, so it does not count towards the run's entry limit.
-        this.#notify(`budget:${runId}:${today()}`, run.session_id, runId, this.#notice("tomorrow", run.session_id));
+        this.#outbox.notify(`budget:${runId}:${today()}`, run.session_id, runId, this.#outbox.notice("tomorrow", run.session_id));
         this.#store.log("budget_exhausted", { run: runId, tokens_today: this.#tokensToday() });
         const midnight = new Date();
         midnight.setUTCHours(24, 0, 30, 0);
@@ -445,7 +420,7 @@ export class BrainAgent extends DurableObject<Env> {
           if (!this.#stillActive(runId)) return;
           this.#requests.endRequest(carried.id, "void", why ?? "it is no longer the person's to ask here");
           // They were waiting for this: told, in fixed words, that it stopped.
-          this.#notify(`withheld:${runId}`, run.session_id, null, this.#notice("withheld", run.session_id));
+          this.#outbox.notify(`withheld:${runId}`, run.session_id, null, this.#outbox.notice("withheld", run.session_id));
           break;
         }
       }
@@ -468,7 +443,7 @@ export class BrainAgent extends DurableObject<Env> {
           // Nothing more of it goes out; the person is told, in fixed words, that it stopped.
           this.#store.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL WHERE run_id = ? AND status = 'pending' AND started = 0", runId);
           if (carried) this.#requests.endRequest(carried.id, "void", over);
-          this.#notify(`withheld:${runId}`, run.session_id, null, this.#notice("withheld", run.session_id));
+          this.#outbox.notify(`withheld:${runId}`, run.session_id, null, this.#outbox.notice("withheld", run.session_id));
           break;
         }
       }
@@ -482,7 +457,7 @@ export class BrainAgent extends DurableObject<Env> {
           if (!this.#stillActive(runId)) return;
           if (still?.status === "resuming") {
             this.#requests.endRequest(still.id, "void", "it was not finished in time");
-            this.#notify(`withheld:${runId}`, run.session_id, null, this.#notice("notSent", run.session_id));
+            this.#outbox.notify(`withheld:${runId}`, run.session_id, null, this.#outbox.notice("notSent", run.session_id));
           }
           break;
         }
@@ -548,10 +523,10 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("UPDATE tasks SET status = 'failed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", Date.now(), run.session_id);
       // For a request that was being carried on, this takes the place of its answer: one or the other.
       const carried = this.#requests.continuationOf(runId);
-      if (carried?.status === "resuming") this.#requests.draft(carried, run, this.#notice("failed", run.session_id));
+      if (carried?.status === "resuming") this.#requests.draft(carried, run, this.#outbox.notice("failed", run.session_id));
       // One that went back to waiting, or ended, has nothing to say here: its answer, if it gets
       // one, is the request's.
-      else if (!carried) this.#notify(`abandoned:${runId}`, run.session_id, runId, this.#notice("failed", run.session_id));
+      else if (!carried) this.#outbox.notify(`abandoned:${runId}`, run.session_id, runId, this.#outbox.notice("failed", run.session_id));
       this.#finish(runId, "failed", reason);
     });
     this.#store.log("run_abandoned", { run: runId, reason: outside ? ERROR_WITHHELD : reason.slice(0, 300) });
@@ -593,7 +568,7 @@ export class BrainAgent extends DurableObject<Env> {
       const carried = this.#requests.continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
-        if (this.#store.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#requests.draft(carried, run, this.#notice("notAnswered", run.session_id));
+        if (this.#store.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#requests.draft(carried, run, this.#outbox.notice("notAnswered", run.session_id));
         this.#store.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#store.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) this.#store.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
@@ -695,22 +670,7 @@ export class BrainAgent extends DurableObject<Env> {
     this.#append(run.session_id, run.id, { role: "assistant", content: OUTSIDE_REMOVED });
     this.#store.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
     this.#store.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
-    this.#scrubDelivered("run_id = ?", run.id);
-  }
-
-  /**
-   * Empties messages written in a run that read outside text, once they will not be sent again:
-   * delivered, or given up. Their words, any structured form of them, and any error text are
-   * removed; what is needed to know they were sent, and where, stays. While a message is still to
-   * be delivered or reconciled it is kept, since it cannot be sent otherwise.
-   */
-  #scrubDelivered(which: "id = ?" | "run_id = ?", value: number | string): void {
-    this.#store.sql.exec(
-      `UPDATE outbox SET text = '', review = NULL, error = CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE ${which} AND private = 1 AND status IN ('sent', 'dead', 'unverified') AND (text != '' OR review IS NOT NULL OR (error IS NOT NULL AND error != ?))`,
-      DELIVERY_WITHHELD,
-      value,
-      DELIVERY_WITHHELD,
-    );
+    this.#outbox.scrub("run_id = ?", run.id);
   }
 
   /** Whether this run has been given text from outside by a connector's tool. */
@@ -786,195 +746,6 @@ export class BrainAgent extends DurableObject<Env> {
     return Number(this.#store.meta(`tokens:${today()}`) ?? 0);
   }
 
-  // ------------------------------------------------------------------ outbox
-
-  #enqueueMessage(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string }): { ok: true } {
-    // The answer to a request that waited goes where the request came from, as it was then.
-    const target = bound?.continuation?.target ?? bound?.target ?? this.#store.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#store.meta("default_target");
-    if (!target) throw new Error("there is nowhere to send a message in this conversation");
-    const now = Date.now();
-    this.#store.sql.exec(
-      "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      idem,
-      runId,
-      target,
-      text,
-      now,
-      now,
-      ask ? JSON.stringify(ask) : null,
-      review ? JSON.stringify(review) : null,
-      bound?.continuation?.id ?? null,
-      bound?.interaction ?? null,
-    );
-    if (runId && this.#sawOutside(runId)) this.#store.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
-    if (runId) this.#requests.stampGuards(runId);
-    return { ok: true };
-  }
-
-  /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */
-  #notice(which: keyof typeof NOTICES, sessionId: string): string {
-    const last = this.#store.rows<{ text: string | null }>("SELECT text FROM inbox WHERE kind = 'message' AND text IS NOT NULL AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY id DESC LIMIT 1", sessionId)[0]?.text ?? "";
-    return NOTICES[which][/[\u4e00-\u9fff]/.test(last) ? "zh" : "en"];
-  }
-
-  /** A message from the system rather than the model. Having nowhere to send it must never fail the caller. */
-  #notify(idem: string, sessionId: string, runId: string | null, text: string, continuation?: Continuation): void {
-    try {
-      this.#enqueueMessage(idem, sessionId, runId, text, undefined, undefined, continuation ? { continuation } : undefined);
-    } catch {
-      // Conversations started by automation (a CI run on a branch, say) can have no reply address.
-    }
-  }
-
-  /** Delivers strictly in order: the oldest undelivered message goes first, even while it is backing off. */
-  async #flushOutbox(): Promise<void> {
-    try {
-      for (;;) {
-        const row = this.#store.rows<Row>("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
-        if (!row) return;
-        // A closed question leaves the ordered queue at once, whatever back-off it is in, so it
-        // never holds up the messages behind it. If no attempt to send it was ever begun, nobody
-        // has seen it and it is simply not sent. If one was begun, it may have reached people
-        // although we never heard so: it is set aside to be found and shown as closed (below).
-        if (row.ask && row.closed) {
-          this.#store.sql.exec("UPDATE outbox SET status = ?, error = NULL WHERE id = ? AND status = 'pending'", row.started ? "reconciling" : "withdrawn", row.id);
-          continue;
-        }
-        if (row.next_at > Date.now()) return;
-        // A message tied to a request, or one that shows something to act on, goes out only
-        // while that still stands; this is looked at before every attempt, not only the first.
-        const gate = await this.#requests.gate(row);
-        // Its condition's owner could not be asked. Put off a bounded number of times, then
-        // given up as one that may not go out: later messages are not held behind it for good.
-        // Counted by themselves: they are not attempts to deliver, and a message whose owner
-        // could be asked again has all of its delivery attempts left.
-        const unasked = gate === "unasked" && row.unasked + 1 > MAX_UNASKED;
-        if (gate === "unasked" && !unasked) {
-          this.#store.sql.exec("UPDATE outbox SET unasked = unasked + 1, next_at = ? WHERE id = ? AND status = 'pending'", Date.now() + HELD_LONG_MS, row.id);
-          return;
-        }
-        if (gate !== "unasked" && row.unasked) this.#store.sql.exec("UPDATE outbox SET unasked = 0 WHERE id = ?", row.id);
-        if (gate === "hold" || gate === "wait") {
-          this.#store.sql.exec("UPDATE outbox SET next_at = ? WHERE id = ? AND status = 'pending'", Date.now() + (gate === "hold" ? HELD_MS : HELD_LONG_MS), row.id);
-          return;
-        }
-        // An earlier attempt whose outcome was never heard, in a system that would no longer
-        // drop a repeat: it may have arrived, and a second copy could not be told from the first.
-        const window = row.ask ? undefined : dedupeWindow((JSON.parse(row.target) as Target).connector);
-        const stale = Boolean(row.uncertain) && window !== undefined && row.first_attempt_at != null && Date.now() - row.first_attempt_at >= window;
-        if (gate === "void" || unasked || stale) {
-          // Not sent (again). What it said is removed. If an attempt may have reached the person,
-          // the record says so: it is not shown as never sent.
-          const how = row.uncertain ? "unverified" : "void";
-          this.#store.sql.exec("UPDATE outbox SET status = ?, text = '', review = NULL, error = NULL WHERE id = ? AND status = 'pending'", how, row.id);
-          // Something written for the person that will now certainly not reach them, and not
-          // because they called it off: they are told so, in fixed words, rather than left waiting.
-          const calledOff = row.continuation ? this.#store.rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", row.continuation)[0]?.status === "cancelled" : false;
-          const session = this.#store.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", row.run_id ?? "")[0]?.session_id;
-          if (how === "void" && !calledOff && !row.interaction && session && (row.guard || row.continuation)) this.#notify(`withheld:${row.run_id ?? row.idem}`, session, null, this.#notice(unasked ? "unchecked" : "notSent", session));
-          if (row.continuation) this.#requests.endRequest(row.continuation, how, how === "void" ? "it no longer stood when its answer was to be sent" : "its answer may have been delivered; that could not be verified");
-          if (how === "unverified") this.#store.log("message_unverified", { outbox_id: row.id });
-          continue;
-        }
-        if (await this.#attempt(row, "pending")) continue;
-        // Not delivered. One that is still to be tried holds the queue; one that has left it
-        // (nothing to send, or given up) does not keep the messages behind it waiting.
-        if (this.#store.rows<{ status: string }>("SELECT status FROM outbox WHERE id = ?", row.id)[0]?.status === "pending") return;
-      }
-    } finally {
-      // However a message ended (sent, void, given up, unverified), what tied it to something
-      // read is of no further use and does not stay on its row.
-      this.#store.sql.exec("UPDATE outbox SET source = NULL, guard = NULL WHERE status NOT IN ('pending', 'draft') AND (source IS NOT NULL OR guard IS NOT NULL)");
-      await this.#reconcileClosed();
-    }
-  }
-
-  /**
-   * Closed questions whose delivery was begun but never confirmed. Each is sent again under its own
-   * id, which the connector does not duplicate, to learn where it is, and is then shown as closed.
-   * Outside the ordered queue: these hold nothing up, and one failing does not stop the others.
-   */
-  async #reconcileClosed(): Promise<void> {
-    for (const row of this.#store.rows<Row>("SELECT * FROM outbox WHERE status = 'reconciling' AND next_at <= ? ORDER BY id LIMIT 20", Date.now())) await this.#attempt(row, "reconciling");
-  }
-
-  /** One attempt to deliver a row. Returns whether it was delivered. */
-  async #attempt(row: Row, status: "pending" | "reconciling"): Promise<boolean> {
-    // Recorded before anything is sent: if this instance dies between the send and the receipt,
-    // the row still says that an attempt was begun.
-    // Likewise that its outcome is not known: it stays so unless the channel says, of this very
-    // attempt, that nothing was posted. An instance that dies after the channel took the message
-    // leaves a row that says "may have arrived", not one that looks untouched.
-    this.#store.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?", Date.now(), row.id);
-    try {
-      // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-      const receipt = await deliver(this.env, this.#store.scope(), JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
-      // If an earlier attempt had in fact been posted, that is when people could first answer it.
-      this.#store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, error = NULL, receipt = ? WHERE id = ? AND status = ?", receipt?.posted_at ?? Date.now(), receipt ? JSON.stringify(receipt) : null, row.id, status);
-      // Delivered, with a receipt to know it by, and from one source: kept for a while, so the
-      // person can ask about it. Its words are taken before they are removed from the outbox.
-      if (row.source && receipt && this.#requests.followUps() && isPrivateSession(this.#requests.sessionKeyOf(row.target, row.run_id))) {
-        const kept = JSON.parse(row.source) as { sources: Source[]; quotes: Passage[] };
-        this.#store.sql.exec(
-          "INSERT OR IGNORE INTO answers (id, session_id, outbox_id, subject, target, connector, sources, quotes, text, expires_at, created_at) VALUES (?, (SELECT session_id FROM runs WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          `ans_${row.id}`,
-          row.run_id,
-          row.id,
-          receipt.subject,
-          row.target,
-          kept.sources[0].connector,
-          JSON.stringify(kept.sources),
-          JSON.stringify(kept.quotes),
-          row.text,
-          Date.now() + ANSWER_KEPT_MS,
-          Date.now(),
-        );
-      }
-      this.#store.sql.exec("UPDATE outbox SET source = NULL WHERE id = ?", row.id);
-      this.#scrubDelivered("id = ?", row.id);
-      if (row.continuation) {
-        // From the request being taken up (its condition holding) to its answer being handed over.
-        const taken = this.#store.rows<{ claimed_at: number | null }>("SELECT claimed_at FROM continuations WHERE id = ?", row.continuation)[0]?.claimed_at;
-        if (taken) this.#store.log("request_answered", { claim_to_receipt_ms: Date.now() - taken });
-        this.#requests.endRequest(row.continuation, "done", "answered");
-      }
-      // It may have been closed while it was on its way.
-      if (row.ask) this.#showClosed(row.idem);
-      return true;
-    } catch (err) {
-      // The connector found nothing left to send: nothing was posted, and it is not tried again.
-      // That settles this attempt, not an earlier one whose outcome was never heard.
-      if (err instanceof DeliveryVoid) {
-        const how = row.uncertain ? "unverified" : "void";
-        this.#store.sql.exec("UPDATE outbox SET status = ?, text = '', error = NULL, uncertain = ? WHERE id = ? AND status = ?", how, row.uncertain ? 1 : 0, row.id, status);
-        if (row.continuation) this.#requests.endRequest(row.continuation, how, how === "void" ? "there was nothing left to send" : "its answer may have been delivered; that could not be verified");
-        return false;
-      }
-      // Whether this attempt can have reached anyone. Only the outside system saying no, or
-      // saying not yet, settles that it did not.
-      const uncertain = Boolean(row.uncertain) || !(err instanceof DeliveryRejected || err instanceof DeliveryDeferred);
-      const attempts = row.attempts + 1;
-      // The outside system may have said not to try again before a certain time. That time is
-      // kept exactly: the message is not sent sooner. One too far off to wait for, in a queue
-      // that delivers in order, ends here as undeliverable instead, and is not sent again.
-      const notBefore = err instanceof DeliveryDeferred && Number.isFinite(err.notBefore) ? err.notBefore : 0;
-      const tooFar = notBefore > Date.now() + MAX_DEFERRAL_MS;
-      const dead = tooFar || attempts > OUTBOX_RETRY_DELAYS_MS.length;
-      const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), notBefore);
-      // An error can quote what was being sent. For a message from a run that read outside text, only the fact is kept.
-      const isPrivate = this.#store.rows<{ private: number }>("SELECT private FROM outbox WHERE id = ?", row.id)[0]?.private === 1;
-      const why = isPrivate ? DELIVERY_WITHHELD : `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
-      // Given up on: where the system has a horizon for repeats and an attempt may have arrived,
-      // that is what is recorded, not that it failed. Approval questions keep their own reckoning.
-      const gaveUp = uncertain && !row.ask && dedupeWindow((JSON.parse(row.target) as Target).connector) !== undefined ? "unverified" : "dead";
-      this.#store.sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ?, uncertain = ? WHERE id = ?", dead ? gaveUp : status, attempts, nextAt, why, uncertain ? 1 : 0, row.id);
-      if (dead) this.#store.log("message_undeliverable", { outbox_id: row.id, error: isPrivate ? DELIVERY_WITHHELD : String(err).slice(0, 300) });
-      if (dead && row.continuation) this.#requests.endRequest(row.continuation, gaveUp === "dead" ? "failed" : "unverified", "its answer could not be delivered");
-      this.#scrubDelivered("id = ?", row.id);
-      return false;
-    }
-  }
-
   // ------------------------------------------------------------------ tools
 
   #toolHost(run: RunRow): ToolHost {
@@ -1048,7 +819,7 @@ export class BrainAgent extends DurableObject<Env> {
         this.#requests.noteQuotes(run.id, quotes);
         const carried = this.#requests.continuationOf(run.id);
         if (!carried) {
-          return this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, text);
+          return this.#outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text);
         }
         // Everything such a run says belongs to the request it carries on. That request has one
         // answer, kept as a draft until the run ends; one that is waiting again has none.
@@ -1065,7 +836,7 @@ export class BrainAgent extends DurableObject<Env> {
         // The same review in words, for wherever comments cannot be attached to lines.
         const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
         if (said.length > MAX_MESSAGE_TEXT) throw new Error(`the review is too long: summary and comments together must stay within ${MAX_MESSAGE_TEXT} characters`);
-        return this.#enqueueMessage(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
+        return this.#outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments });
       },
 
       memoryList: () => ({ files: this.#store.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
@@ -1559,7 +1330,7 @@ export class BrainAgent extends DurableObject<Env> {
               ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated && standingEligible(Array.isArray(body.refs) ? (body.refs as RefUpdate[]) : []) }
               : {}),
           };
-          this.#enqueueMessage(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);
+          this.#outbox.enqueue(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);
         } catch {
           // No reply address: the question reaches nobody, so it cannot be approved.
           ask = undefined;
