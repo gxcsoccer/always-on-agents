@@ -101,7 +101,7 @@ A connector owns three things for one outside system: verifying an inbound reque
 |---|---|
 | Events, scopes, principals | `src/events.ts` |
 | The inbox, runs, tasks, the outbox | `src/brain/agent.ts` |
-| Requests that wait, and answers that can be followed up | the sections of those names in `src/brain/agent.ts`; `Waiting` and `holds` in `src/connectors/types.ts` |
+| Requests that wait, and answers that can be followed up | `src/brain/requests.ts` (a part of the Brain in a file of its own: same database, same transactions), the rules that need no judgement in `src/brain/follow-up.ts`; `Waiting` and `holds` in `src/connectors/types.ts` |
 | What the model can do | `src/brain/tools.ts`, `src/brain/prompt.ts` |
 | The approval rules | `#answerTask` and `readDecision` in `src/brain/agent.ts` |
 | The sandbox's boundary | `src/workers/sandbox/outbound.ts` |
