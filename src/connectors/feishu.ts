@@ -20,16 +20,16 @@ import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken } from "./feishu-api";
-import { type DocumentRef, documentsIn, handleOauthCallback, readDocument } from "./feishu-docs";
+import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import type { ApprovalQuestion, Connector, OutboundMessage, Outcome, Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
   async http(request, env, path, ingress) {
     if (path[0] === "events" && path[1] && request.method === "POST") return handleFeishuWebhook(request, env, path[1], (work) => ingress.defer(work));
     // Where Feishu sends a person back to after they authorise reading their documents.
-    if (path[0] === "oauth" && path[1] === "callback" && path.length === 2 && request.method === "GET") return handleOauthCallback(request, env, (work) => ingress.defer(work));
+    if (path[0] === "oauth" && path[1] === "callback" && path.length === 2 && request.method === "GET") return handleOauthCallback(request, env);
     return json({ error: "not found" }, 404);
   },
   async admin({ method, path, url, body }, env) {
@@ -76,8 +76,10 @@ export const feishuConnector: Connector = {
     }
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
-  channel: { deliver: deliverFeishu, amend: amendFeishu },
+  // Feishu drops a repeat of the same message within an hour.
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
+  holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
 
 /** Feishu signs with a timestamp; anything much older is a replay. */
@@ -348,9 +350,14 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const token = await tenantAccessToken(env, appId);
   // Feishu drops a repeat of the same uuid within an hour, which makes a retry safe.
   const uuid = (await hex(message.idem)).slice(0, 40);
-  // An approval question goes out as a card with buttons; everything else as text.
-  const msgType = message.ask ? "interactive" : "text";
-  const content = JSON.stringify(message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : { text: message.text });
+  // What the person is to act on, made now and kept nowhere. One that can no longer be used is
+  // not sent at all: there is nothing left to act on.
+  const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
+  if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
+  // An approval question or an invitation goes out as a card; everything else as text.
+  const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
+  const msgType = card ? "interactive" : "text";
+  const content = JSON.stringify(card ?? { text: message.text });
 
   const response = messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
@@ -364,10 +371,33 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
         body: JSON.stringify({ receive_id: chatId, msg_type: msgType, content, uuid }),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
-  if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
-  // Which message the question is, so a reply to it can be told from a reply to anything else,
-  // and so the card can be closed later.
-  if (message.ask && result.data?.message_id) return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+  const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
+  // Feishu answered and said no: nothing was posted. A failure on its side leaves that open.
+  if (response.status < 500 && typeof result.code === "number" && result.code !== 0) throw new DeliveryRejected(said);
+  if (!response.ok || result.code !== 0) throw new Error(said);
+  // Which message this is, so a reply to it can be told from a reply to anything else, and so a
+  // question's card can be closed later. Accepted without saying which message it became is not
+  // something to count as delivered.
+  if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
+  return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */
+export async function receivedFeishu(env: Env, _scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean> {
+  const messageId = typeof event.data?.message_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(event.data.message_id) ? event.data.message_id : undefined;
+  const appId = event.reply_to?.address.app_id;
+  // Only a message a person wrote: a button press has no message of theirs to mark.
+  if (!messageId || !appId || event.data?.card !== undefined) return false;
+  const token = await tenantAccessToken(env, appId);
+  // Too late to mean "it has arrived": nothing is posted.
+  if (!event.wanted()) return false;
+  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ reaction_type: { emoji_type: "Get" } }),
+  });
+  const result = (await response.json().catch(() => ({}))) as { code?: number };
+  return response.ok && result.code === 0;
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

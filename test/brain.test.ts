@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readDecision, readTiedDecision, wantsStanding } from "../src/brain/agent";
-import { MIGRATIONS } from "../src/brain/schema";
+import { MIGRATIONS, migrate } from "../src/brain/schema";
 import { MAX_RESULT_TEXT, clipResult } from "../src/workers/sandbox/result";
 import { brain, call, installFakeModel, message, model, modelCalls, say, task, wake } from "./helpers";
 import { notes } from "./notes";
@@ -269,6 +269,72 @@ describe("timers and memory", () => {
     await wake(stub);
     expect(toolOutputs()[0].error).toMatch(/started solely by a person/);
     expect(await stub.readMemory("instructions.md")).toBeNull();
+  });
+
+  it("loads only the first part of an index that has grown long, and says so when it is written", async () => {
+    const { stub } = brain();
+    const long = `${"- notes/a.md: something worth knowing\n".repeat(200)}THE-END`;
+    model.replies([call("memory_write", { path: "index.md", content: long })], [say("")], [say("")]);
+    await stub.ingest(message("remember all this"));
+    await wake(stub);
+    expect(toolOutputs().at(-1).note).toMatch(/only the first 4000 characters/);
+    // The whole file is kept; a later run is given the start of it and told the rest was left out.
+    expect(await stub.readMemory("index.md")).toBe(long);
+    await stub.ingest(message("hello again"));
+    await wake(stub);
+    const given = modelCalls.at(-1).instructions as string;
+    expect(given).toContain("- notes/a.md: something worth knowing");
+    expect(given).not.toContain("THE-END");
+    expect(given).toContain("index.md is longer than what is loaded into a run");
+  });
+
+  it("brings a scope with data in it, as the version before requests could wait left it, up to date", async () => {
+    const { stub } = brain();
+    model.replies([call("send_message", { text: "hi" })], [say("")]);
+    await stub.ingest(message("hello"));
+    await wake(stub);
+    const after = await runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      // Put the store back to version 18: what a deployment of main has, with its rows in place.
+      sql.exec("DROP TABLE answers");
+      sql.exec("DROP INDEX continuations_open");
+      sql.exec("DROP TABLE continuations");
+      for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
+      sql.exec("UPDATE meta SET value = '18' WHERE key = 'schema_version'");
+      const target = JSON.stringify({ connector: "console", address: {} });
+      // A message whose delivery was begun and never confirmed, one not yet tried, and an approval question.
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, started, attempts) VALUES ('msg:begun', ?, 'begun', 9e15, 1000, 1, 1)", target);
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at) VALUES ('msg:fresh', ?, 'fresh', 9e15, 2000)", target);
+      sql.exec("INSERT INTO outbox (idem, target, text, next_at, created_at, started, ask) VALUES ('ask:t:1', ?, 'q', 9e15, 3000, 1, '{}')", target);
+      const before = { inbox: [...sql.exec("SELECT COUNT(*) AS n FROM inbox")][0].n, items: [...sql.exec("SELECT COUNT(*) AS n FROM items")][0].n, outbox: [...sql.exec("SELECT COUNT(*) AS n FROM outbox")][0].n };
+      migrate(state.storage);
+      // Running it again changes nothing.
+      migrate(state.storage);
+      return {
+        before,
+        version: [...sql.exec("SELECT value FROM meta WHERE key = 'schema_version'")][0].value,
+        counts: { inbox: [...sql.exec("SELECT COUNT(*) AS n FROM inbox")][0].n, items: [...sql.exec("SELECT COUNT(*) AS n FROM items")][0].n, outbox: [...sql.exec("SELECT COUNT(*) AS n FROM outbox")][0].n },
+        rows: [...sql.exec("SELECT idem, status, text, started, uncertain, first_attempt_at, continuation, interaction, source, guard FROM outbox WHERE idem IN ('msg:begun', 'msg:fresh', 'ask:t:1') ORDER BY idem")],
+        tables: [...sql.exec("SELECT COUNT(*) AS n FROM continuations")][0].n + [...sql.exec("SELECT COUNT(*) AS n FROM answers")][0].n,
+      };
+    });
+    expect(after.version).toBe(String(MIGRATIONS.length));
+    // Nothing that was there is lost or altered.
+    expect(after.counts).toEqual(after.before);
+    expect(after.tables).toBe(0);
+    expect(after.rows).toEqual([
+      // An approval question keeps its own reckoning.
+      { idem: "ask:t:1", status: "pending", text: "q", started: 1, uncertain: 0, first_attempt_at: null, continuation: null, interaction: null, source: null, guard: null },
+      // Begun before the upgrade: taken as possibly delivered, counted from when it was written, so it gets no fresh window for a repeat.
+      { idem: "msg:begun", status: "pending", text: "begun", started: 1, uncertain: 1, first_attempt_at: 1000, continuation: null, interaction: null, source: null, guard: null },
+      { idem: "msg:fresh", status: "pending", text: "fresh", started: 0, uncertain: 0, first_attempt_at: null, continuation: null, interaction: null, source: null, guard: null },
+    ]);
+    // And the scope goes on working.
+    await runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("DELETE FROM outbox WHERE idem IN ('msg:begun', 'msg:fresh', 'ask:t:1')"));
+    model.replies([call("send_message", { text: "still here" })], [say("")]);
+    await stub.ingest(message("are you there"));
+    await wake(stub);
+    expect((await stub.inspect()).outbox[0]).toMatchObject({ text: "still here", status: "sent" });
   });
 
   it("rejects memory paths that are not plain markdown files", async () => {
@@ -860,7 +926,6 @@ describe("tasks and approvals", () => {
   });
 
   it("takes questions that were pending before the send marker existed as possibly sent", async () => {
-    const { migrate } = await import("../src/brain/schema");
     const scope = brain("chat");
     await scope.stub.ingest(message("hello", { user: "bob", session_key: "chat" }));
     model.replies([say("hi")]);
@@ -875,6 +940,9 @@ describe("tasks and approvals", () => {
       sql.exec("DROP INDEX inbox_run");
       sql.exec("ALTER TABLE items DROP COLUMN outside");
       sql.exec("ALTER TABLE outbox DROP COLUMN private");
+      sql.exec("DROP TABLE continuations");
+      sql.exec("DROP TABLE answers");
+      for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
       sql.exec("UPDATE meta SET value = '9' WHERE key = 'schema_version'");
       const target = JSON.stringify({ connector: "console", address: {} });
       const question = JSON.stringify({ id: "ask:x:1", code: "K7PW", title: "t", kind: "command", detail: "d", can_approve: true });

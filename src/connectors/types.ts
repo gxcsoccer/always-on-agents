@@ -38,6 +38,42 @@ export interface Connector {
   channel?: Channel;
   /** Named `<connector name>_…`. See ConnectorTool for when they are offered. */
   tools?: ConnectorTool[];
+  /**
+   * Required of a connector whose tools can answer "not yet" (see Waiting). Says whether a
+   * condition one of its tools named holds now, checked afresh against whatever the connector
+   * itself keeps: never against what a caller says. `since` is when it began to hold, by the
+   * connector's own record. "gone" means it can no longer come to hold as it was asked for.
+   * Throws if that cannot be found out right now.
+   */
+  holds?(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds>;
+}
+
+export type Holds = { state: "holds"; since: number } | { state: "not_yet" | "gone" };
+
+/**
+ * A tool's answer when it cannot act until something happens that is not the agent's to do (the
+ * person authorising, say). The Brain keeps the request and carries it on once the condition
+ * holds; the tool is then called again with the same `callId`. All of these are the connector's
+ * own strings, which the Brain stores and hands back without reading:
+ *   subject     - whose condition it is; a report that "something changed for this subject"
+ *                 (see BrainAgent.conditionReported) makes the Brain ask `holds` again
+ *   condition   - what exactly has to hold for this request
+ *   generation  - `holds` answers "gone" once the connector has moved past it
+ *   until       - the condition has to have come to hold before this, in ms
+ *   request     - the call to make again when the condition holds, in the tool's own canonical
+ *                 form: only what identifies the thing asked for. The Brain stores this, never
+ *                 the arguments the model wrote
+ *   interaction - what to put in front of the person so that they can bring it about. The Brain
+ *                 sends it through the conversation's channel, which turns it into something to
+ *                 look at only at the moment of sending (see OutboundMessage.interaction)
+ */
+export interface Waiting {
+  waiting: { on: string; subject: string; condition: string; generation: number; until: number; interaction: string; request: Record<string, unknown> };
+}
+
+export function isWaiting(result: unknown): result is Waiting {
+  const w = (result as Waiting | null)?.waiting;
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null;
 }
 
 /**
@@ -56,9 +92,9 @@ export interface Connector {
  *
  * A tool call may be repeated after an interruption, so a tool must be safe to run twice.
  *
- * A tool that cannot act yet because the person has not authorised it may have its connector send
- * that person, and only them, the connector's own fixed invitation to do so. Nothing else is sent
- * on a tool's account: what the agent says goes through the Brain.
+ * A tool that cannot act yet because the person has not authorised it answers with a Waiting.
+ * It sends nothing itself: what the person is shown goes out through the Brain, like everything
+ * else said to them.
  */
 export interface ConnectorTool {
   name: string;
@@ -94,8 +130,35 @@ export interface ToolContext {
    * messages as they arrived; nothing a run wrote or read is among them.
    */
   recent: { text: string; data: Record<string, unknown> }[];
-  /** Names this call; the same on a repeat. */
+  /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
+  /**
+   * Set when this call carries on a request that waited (see Waiting). The call is good only
+   * for the generation the request waited on and only until `notAfter`: if the connector has
+   * moved past that generation, or the time is up, the tool must do nothing and say so. It must
+   * not start the request over under a newer generation.
+   */
+  resuming?: { generation: number; notAfter: number };
+  /**
+   * To be called by a tool for each of the person's messages its action actually rests on: the
+   * one in `said` that names the thing, or the one in `recent` (by its index there) when the
+   * tool acts on that rather than on what was just said ("summarise it" after a link). The
+   * Brain keeps the earlier message as part of what the request rests on, and takes a reply to
+   * any of these messages, and to no other, as being about this request.
+   */
+  relied?(from: "said" | "recent", index: number): void;
+  /**
+   * To be called by a tool that has read something, before it returns: the call that would read
+   * the same thing again, in the tool's own canonical form, and a name for the very thing that
+   * was read as the outside system resolved it (a link can come to point elsewhere). Kept by the
+   * Brain so that an answer can later be tied to what it was read from.
+   */
+  /**
+   * `under` names the condition the read was made under, in the same terms as a Waiting's
+   * (`condition`, `generation`): what `holds` can be asked about later. With it, what was read
+   * goes no further (to the model, to the channel) once that no longer holds.
+   */
+  identified?(request: Record<string, unknown>, identity: string, under: { condition: string; generation: number }): void;
 }
 
 export interface Ingress {
@@ -135,6 +198,25 @@ export interface Channel {
    * the Brain refuses them.
    */
   standing?(env: Env, scope: Scope, subject: string): Promise<Standing | undefined>;
+  /**
+   * Shows the person, on the very message they wrote, that it has arrived: a reaction, say. It
+   * is a sign, not a message: it may fail, repeat or come late without anything depending on it,
+   * and it must never add a message to the conversation. Called once per message a person
+   * addressed to the agent, as soon as the message is stored; nothing waits for it.
+   */
+  /**
+   * `wanted` is asked last of all, just before anything is posted: it says no once the sign
+   * would come too late to mean anything (the message has been dealt with, or time has passed).
+   * Resolves to whether the outside system confirmed the sign; false when there was nothing to
+   * mark or it was skipped.
+   */
+  received?(env: Env, scope: Scope, event: { source_id: string; data?: Record<string, unknown>; reply_to?: Target; wanted(): boolean }): Promise<boolean>;
+  /**
+   * For how long the outside system drops a repeat of the same `idem`. A message whose first
+   * attempt is older than this and was never confirmed is not sent again: it may have arrived,
+   * and a second copy could no longer be told from the first.
+   */
+  dedupeMs?: number;
 }
 
 /**
@@ -149,6 +231,28 @@ export class DeliveryDeferred extends Error {
   ) {
     super(message);
     this.name = "DeliveryDeferred";
+  }
+}
+
+/**
+ * Thrown by `deliver` when the outside system answered and refused the message: it is certain
+ * that nothing was posted. Any other failure leaves that open.
+ */
+export class DeliveryRejected extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryRejected";
+  }
+}
+
+/**
+ * Thrown by `deliver` when there is no longer anything to send (what the message was to show
+ * can no longer be used). Nothing was posted, and it is not tried again.
+ */
+export class DeliveryVoid extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryVoid";
   }
 }
 
@@ -173,6 +277,13 @@ export interface OutboundMessage {
    * from this.
    */
   review?: CodeReview;
+  /**
+   * A Waiting's `interaction`, for the connector that made it to turn into what the person is
+   * shown. Whatever it stands for (a link that authorises, say) exists only inside the connector
+   * and in the message as sent; the Brain never holds it. A channel that does not know the
+   * reference sends `text`.
+   */
+  interaction?: string;
 }
 
 export interface CodeReview {

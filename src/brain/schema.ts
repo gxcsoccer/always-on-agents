@@ -163,6 +163,62 @@ export const MIGRATIONS: string[] = [
   // 17, 18: the lookups made for every run and every tool call.
   `CREATE INDEX items_outside ON items (run_id) WHERE outside = 1;`,
   `CREATE INDEX inbox_run ON inbox (run_id, id);`,
+  // 19: requests that could not be carried out yet and are carried on when a condition holds.
+  // `id` is the tool call that was told to wait, and stays the name of the request.
+  `CREATE TABLE continuations (
+     id TEXT PRIMARY KEY,
+     session_id TEXT NOT NULL,
+     events TEXT NOT NULL,                      -- {said, recent}: inbox ids of the person's messages it rests on
+     connector TEXT NOT NULL,
+     tool TEXT NOT NULL,
+     args TEXT NOT NULL,
+     target TEXT NOT NULL,                      -- where its answer goes: as it was when asked
+     subject TEXT NOT NULL,
+     condition TEXT NOT NULL,
+     generation INTEGER NOT NULL,
+     interaction TEXT NOT NULL,
+     until INTEGER NOT NULL,
+     status TEXT NOT NULL,                      -- waiting | resuming | answering | done | failed | cancelled | expired | void
+     run_id TEXT,
+     call_id TEXT,                              -- the call the continuing run makes in its place
+     claimed_at INTEGER,
+     check_at INTEGER,                          -- when its condition is next asked about, if its owner could not be asked
+     created_at INTEGER NOT NULL,
+     ended_at INTEGER,
+     why TEXT
+   );
+   CREATE INDEX continuations_open ON continuations (status, until);`,
+  // 20: a message that may only go out while a request still stands, or that shows something to
+  // act on; when a message was first tried, to know when a repeat would no longer be dropped; and
+  // whether any attempt ended without the outside system saying that nothing was posted. Messages
+  // already begun when this is introduced are taken as begun when written and as uncertain: they
+  // get no fresh window in which to be repeated.
+  `ALTER TABLE outbox ADD COLUMN continuation TEXT;
+   ALTER TABLE outbox ADD COLUMN interaction TEXT;
+   ALTER TABLE outbox ADD COLUMN first_attempt_at INTEGER;
+   ALTER TABLE outbox ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE outbox ADD COLUMN unasked INTEGER NOT NULL DEFAULT 0;
+   UPDATE outbox SET first_attempt_at = created_at, uncertain = 1 WHERE started = 1 AND status = 'pending' AND ask IS NULL;`,
+  // 21: answers that were delivered to a person about one thing read for them, kept for a short
+  // while so that a follow-up can be answered: what was said, what it was read from and on whose
+  // request, and a fingerprint of what the source said then. `outbox.source` carries the same
+  // from the run that read to the moment of delivery. `outbox.guard` is what a message written
+  // after reading may only go out under: the conditions its sources were read under, and a time.
+  `CREATE TABLE answers (
+     id TEXT PRIMARY KEY,
+     session_id TEXT NOT NULL,
+     outbox_id INTEGER NOT NULL,
+     subject TEXT NOT NULL,
+     target TEXT NOT NULL,
+     connector TEXT NOT NULL,
+     sources TEXT NOT NULL,                     -- every thing it was read from: the call to read it again, what it resolved to, its fingerprint then
+     quotes TEXT NOT NULL,                      -- the sentences the answer said it rested on, each found word for word in what was read
+     text TEXT NOT NULL,
+     expires_at INTEGER NOT NULL,
+     created_at INTEGER NOT NULL
+   );
+   ALTER TABLE outbox ADD COLUMN source TEXT;
+   ALTER TABLE outbox ADD COLUMN guard TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -37,6 +37,12 @@ export interface Env {
   PUBLIC_ORIGIN?: string;
   /** Seals the tokens people's authorisations produce. At least 32 characters; keep it out of storage. */
   GRANTS_KEY?: string;
+  /**
+   * "on" keeps delivered answers for a day and offers a way to reopen one for a follow-up.
+   * Anything else, or unset, is the strict behaviour: nothing of an answer is kept, nothing is
+   * noted about what was read, and the tool does not exist.
+   */
+  FOLLOW_UPS?: string;
   /** A single deployment-wide token, used only when no App is configured. For local development. */
   GITHUB_TOKEN?: string;
 }

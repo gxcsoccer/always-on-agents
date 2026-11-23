@@ -16,7 +16,7 @@ export interface ToolCall {
 export interface ToolHost {
   /** A tool that is not one of the Brain's own: a connector's, if this run may use it. */
   connectorTool(callId: string, name: string, args: Record<string, unknown>): Promise<unknown>;
-  sendMessage(callId: string, text: string): unknown;
+  sendMessage(callId: string, text: string, quotes: { point: string; quote: string }[]): unknown;
   sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
   memoryRead(path: string): unknown;
@@ -29,6 +29,8 @@ export interface ToolHost {
   taskStatus(taskId: string): Promise<unknown>;
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
   cancelTask(taskId: string): Promise<unknown>;
+  cancelRequest(callId: string, requestId: string, ask: string): unknown;
+  reopenAnswer(callId: string, answerId: string): Promise<unknown>;
 }
 
 /** The longest message the Brain can send. */
@@ -56,7 +58,14 @@ export const TOOLS: ToolDefinition[] = [
   tool(
     "send_message",
     "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
-    { text: string },
+    {
+      text: string,
+      quotes: {
+        type: "array",
+        description: "When this message says what something you read with a tool says: for each point you make, the point in a few of your own words and the one sentence of the source it rests on, copied exactly as it stands there. They are kept so that a later question about a point can be checked against the source. Empty in every other case.",
+        items: { type: "object", properties: { point: string, quote: string }, required: ["point", "quote"], additionalProperties: false },
+      },
+    },
   ),
   tool(
     "send_review",
@@ -115,6 +124,16 @@ export const TOOLS: ToolDefinition[] = [
     { task_id: string, decision: { type: "string", enum: ["allow", "deny"] }, reason: string },
   ),
   tool("cancel_task", "Stop a task and discard its sandbox.", { task_id: string }),
+  tool(
+    "reopen_answer",
+    "Bring back an earlier answer of yours that rested on something you read for the person (they are listed for you under \"Answers you can reopen\"), together with what that source says now, so that you can answer a follow-up about it: \"expand on the second point\", \"where does it say that\". Use it only when the person is asking about that answer; not for a new subject, and not when they say they do not want it read. If the source has changed since, say so before you answer from the new text.",
+    { answer_id: string },
+  ),
+  tool(
+    "cancel_request",
+    "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If more than one request could be meant, the system asks the person which, itself; say nothing more about it then.",
+    { request_id: string, ask: { type: "string", description: "One short sentence, in the person's language, asking which of their requests they mean. It is sent, followed by the list of those requests, only if more than one could be meant." } },
+  ),
 ];
 
 /** Runs one tool call and returns the JSON string the model will see. Never throws. */
@@ -135,7 +154,7 @@ export async function executeTool(host: ToolHost, call: ToolCall): Promise<strin
 function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
   switch (call.name) {
     case "send_message":
-      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT));
+      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT), Array.isArray(a.quotes) ? a.quotes.filter((each: any) => typeof each?.quote === "string").map((each: any) => ({ point: typeof each.point === "string" ? each.point.slice(0, 300) : "", quote: each.quote as string })).slice(0, 20) : []);
     case "send_review": {
       if (!Array.isArray(a.comments) || a.comments.length > MAX_REVIEW_COMMENTS) throw new Error(`comments must be a list of at most ${MAX_REVIEW_COMMENTS}`);
       const comments = a.comments.map((c: Record<string, unknown>, i: number) => ({
@@ -171,6 +190,10 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
       return host.answerTask(call.call_id, text(a.task_id, "task_id", 64), a.decision, text(a.reason, "reason", 1_000, true));
     case "cancel_task":
       return host.cancelTask(text(a.task_id, "task_id", 64));
+    case "reopen_answer":
+      return host.reopenAnswer(call.call_id, text(a.answer_id, "answer_id", 200));
+    case "cancel_request":
+      return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200), typeof a.ask === "string" ? a.ask.slice(0, 300) : "");
     default:
       return host.connectorTool(call.call_id, call.name, a);
   }
@@ -186,4 +209,10 @@ function text(value: unknown, name: string, max: number, allowEmpty = false): st
 function integer(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${name} must be an integer`);
   return value;
+}
+
+/** send_message as it is offered where nothing is kept for follow-ups: without the quotes. */
+export function withoutQuotes(definition: ToolDefinition): ToolDefinition {
+  const { quotes: _quotes, ...properties } = (definition.parameters as { properties: Record<string, unknown> }).properties;
+  return { ...definition, parameters: { ...(definition.parameters as object), properties, required: Object.keys(properties) } } as ToolDefinition;
 }
