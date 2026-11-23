@@ -173,8 +173,10 @@ export class RunTools {
         }
         const due = Date.now() + delaySeconds * 1_000;
         sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, Date.now());
-        // A replayed call set nothing new: it is told when the timer it set fires.
-        const stored = this.#s.rows<{ due_at: number }>("SELECT due_at FROM timers WHERE id = ?", id)[0];
+        // A replayed call set nothing new: it is told when the timer it set fires next, or, if
+        // that timer has fired for the last time or been cancelled since, that it will not.
+        const stored = this.#s.rows<{ due_at: number; status: string }>("SELECT due_at, status FROM timers WHERE id = ?", id)[0];
+        if (stored.status !== "active") return { ok: true, id, status: stored.status };
         return { ok: true, id, fires_at: new Date(stored.due_at).toISOString() };
       },
       listTimers: () => ({
