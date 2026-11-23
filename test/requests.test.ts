@@ -77,6 +77,8 @@ function bench(state: DurableObjectState) {
   };
   const kept = (id: string) => store.rows<Continuation & { check_at: number | null; ended_at: number | null; created_at: number }>("SELECT * FROM continuations WHERE id = ?", id)[0];
   let said = 0;
+  /** The id the source gave a stored message, which is not the row's own id. */
+  const sourceId = (id: number) => store.rows<{ source_id: string }>("SELECT source_id FROM inbox WHERE id = ?", id)[0].source_id;
   /** A message of the person's as it is stored, claimed by a run if one is named. Its id. */
   const message = (text: string | null, data: Record<string, unknown> = {}, runId: string | null = null): number => {
     const id = `om_${++said}`;
@@ -116,7 +118,7 @@ function bench(state: DurableObjectState) {
   const sent = (idem: string) => store.rows<Record<string, unknown>>("SELECT * FROM outbox WHERE idem = ?", idem)[0];
   const audited = (action: string) => store.rows<{ detail: string }>("SELECT detail FROM audit WHERE action = ? ORDER BY id", action).map((each) => JSON.parse(each.detail) as Record<string, unknown>);
   const hints = () => store.rows<{ source_id: string }>("SELECT source_id FROM inbox WHERE source = 'request' ORDER BY id").map((each) => each.source_id);
-  return { store, host, settings, requests, woken, appended, request, kept, message, run, outgoing, sent, audited, hints };
+  return { store, host, settings, requests, woken, appended, request, kept, message, sourceId, run, outgoing, sent, audited, hints };
 }
 
 describe("requests that wait, by themselves", () => {
@@ -329,7 +331,7 @@ describe("requests that wait, by themselves", () => {
   });
 
   it("takes a reply to be about a request only through that request's answer, its invitation, or a message it was tied to", async () => {
-    await within(({ requests, host, request, message, run, outgoing }) => {
+    await within(({ requests, host, request, message, sourceId, run, outgoing }) => {
       const asked = message("读一下这篇");
       const loose = message("顺便说一句");
       request("r_a", { events: JSON.stringify({ said: [asked, loose], recent: [], bound: [asked] }) });
@@ -354,9 +356,9 @@ describe("requests that wait, by themselves", () => {
       };
       expect(about("feishu:message:om_answer_a")).toEqual(["r_a"]);
       expect(about("feishu:message:om_invite_b")).toEqual(["r_b"]);
-      expect(about(`feishu:message:om_${asked}`)).toEqual(["r_a"]);
+      expect(about(`feishu:message:${sourceId(asked)}`)).toEqual(["r_a"]);
       // In the request's batch, and not what its tool tied it to.
-      expect(about(`feishu:message:om_${loose}`)).toEqual([]);
+      expect(about(`feishu:message:${sourceId(loose)}`)).toEqual([]);
       expect(about("feishu:message:om_unrelated")).toEqual([]);
       expect(about("feishu:message:om_nothing")).toEqual([]);
 
