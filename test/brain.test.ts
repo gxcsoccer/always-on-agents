@@ -718,7 +718,7 @@ describe("tasks and approvals", () => {
       const newer = message("[edited their earlier comment to] still fine", { user: "carol", session_key: "chat", data: { subject: `test:note:${order}`, revision: 200, holder: "h2" } });
       for (const event of order === "oldest-first" ? [older, newer] : [newer, older]) await stub.ingest(event);
       await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
-    // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
+      // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
       model.replies([say("")], [call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
       await wake(stub);
       expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });

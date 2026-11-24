@@ -119,7 +119,8 @@ export class Runner {
     const principal = JSON.parse(event.principal) as Principal;
     const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
     const ordinary = event.kind === "message" && this.#b.isDecider(principal, event.source) && plain(data);
-    return ordinary ? principal.id : `#${event.id}`;
+    // Told apart by kind and by connector, so that no id can read as another's or as an event's.
+    return ordinary ? `person:${event.source}:${principal.id}` : `event:${event.id}`;
   }
 
   /** Starts a run over exactly these messages, those of them still pending. Anything that arrived since waits for the next. */
