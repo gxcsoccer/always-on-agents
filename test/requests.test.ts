@@ -867,6 +867,19 @@ describe("keeping a request that has to wait", () => {
       requests.shown(invite() as never, "failed");
       expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "sent", text: "notice:invitedElsewhere" });
     });
+    // The same, where word of the failure was tried once and nobody knows whether it arrived: it is not tried again, and stays on record as such.
+    await asking(async ({ requests, store, run, message, sent }, invite) => {
+      store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+      requests.shown(invite() as never, "failed");
+      store.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, attempts = 1 WHERE idem = ?", told("grant_1.nonce", "call_1"));
+      requests.wait(run("r2"), { ...acting, events: { said: [message("再问一次", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "unverified", text: "notice:inviteNotSent" });
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = 1 WHERE idem = 'invite:grant_1.nonce'");
+      requests.shown(invite() as never, "reached");
+      // Not said again in other words either: it may be in front of them already.
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "unverified", text: "notice:inviteNotSent" });
+      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
+    });
     // A request's id may hold any character: which request a line is about is not read off punctuation.
     await within(async ({ requests, run, message, sent }) => {
       const active = run("r1");

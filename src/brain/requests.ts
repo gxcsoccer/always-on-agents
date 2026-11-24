@@ -215,9 +215,11 @@ export class Requests implements Wakes {
       // arrived. One that may have (kept as unverified) is not sent a second time. A time it
       // was told not to be sent before still holds.
       const again = this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
-      // It is being tried again: word of how the earlier try went, where it has certainly not
-      // reached anyone yet, is no longer true and is not said. What comes of this try is said instead.
-      if (again) this.#s.sql.exec("UPDATE outbox SET status = 'void' WHERE idem LIKE 'invited:%' AND status = 'pending' AND uncertain = 0 AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[0]') = ?", waiting.interaction);
+      // It is being tried again: word of how the earlier try went is no longer true, and is
+      // not sent (again). Where it has certainly not reached anyone, it is set aside and what
+      // comes of this try is said in its place; where an attempt may have arrived, it is kept
+      // as that, and nothing more is said to that request.
+      if (again) this.#s.sql.exec("UPDATE outbox SET status = CASE WHEN uncertain = 0 THEN 'void' ELSE 'unverified' END WHERE idem LIKE 'invited:%' AND status = 'pending' AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[0]') = ?", waiting.interaction);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
         const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
