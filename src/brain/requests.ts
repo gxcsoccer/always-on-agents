@@ -173,7 +173,11 @@ export class Requests implements Wakes {
    * of them. One step: the record, and the message that shows the way in, exist together or not
    * at all, so nothing can be acted on before there is a request to carry on.
    */
-  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, asked: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+    // Where there is nothing for the person to do (what is waited for happens by itself),
+    // nothing is put before them: the request is kept, and asked about as any other.
+    const shows = asked.interaction !== undefined;
+    const waiting = { ...asked, interaction: asked.interaction ?? "" };
     // The same messages asking for the same thing through the same way in, a second time (the
     // model called the tool twice): that is the request already kept, and it is answered once.
     const twice = this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", id).length > 0
@@ -193,8 +197,8 @@ export class Requests implements Wakes {
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // "here": in the conversation the request was made in, for their eyes only, where the
       // connector can; directly otherwise. Never where the others would see it.
-      const asked = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
-      const here = waiting.privately === "here" && asked ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(asked) as Target) : undefined;
+      const from = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
+      const here = waiting.privately === "here" && from ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(from) as Target) : undefined;
       // Where they are reached directly: used at once where it cannot be shown where they asked,
       // and kept beside the request for the one case that it could, and then certainly was not.
       const directly = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
@@ -235,6 +239,7 @@ export class Requests implements Wakes {
       }
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
+      if (!shows) return void this.hint(now, `asked:${id}`);
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: aside ? JSON.stringify(aside) : now.target });
       // One set aside because nobody waited on it any more is wanted again, and so is one that
@@ -438,6 +443,10 @@ export class Requests implements Wakes {
       }
       if (answer.state !== "holds" || !(answer.since < now.until)) {
         if (Date.now() >= now.until) this.endRequest(id, "expired", "it was not done in time");
+        // Nobody will come and say when this holds: asked again when its owner says it is worth it, within bounds.
+        else if (answer.state === "not_yet" && typeof answer.again_in_ms === "number" && Number.isFinite(answer.again_in_ms)) {
+          this.#s.sql.exec("UPDATE continuations SET check_at = ? WHERE id = ? AND status = 'waiting'", Math.min(now.until, Date.now() + Math.min(600_000, Math.max(2_000, answer.again_in_ms))), id);
+        }
         return drop();
       }
       const runId = crypto.randomUUID();

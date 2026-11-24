@@ -23,7 +23,7 @@ import { API, chatFactsFor, hex, tenantAccessToken, forgetTenantAccessToken } fr
 export { type ChatFacts, chatFacts } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, linksIn, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -510,7 +510,8 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const uuid = (await hex(message.idem)).slice(0, 40);
   // What the person is to act on, made now and kept nowhere. One that can no longer be used is
   // not sent at all: there is nothing left to act on.
-  const invitation = message.interaction ? await invitationFor(env, message.interaction) : undefined;
+  // (One a plugged-in connector made is shown as it gave it: words and one link.)
+  const invitation = message.invitation ? plainCard(message.invitation) : message.interaction ? await invitationFor(env, message.interaction) : undefined;
   if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
   // An approval question or an invitation goes out as a card. The agent's own words go as
   // Markdown (a post with one md element), or as text where a post would be too large; the
@@ -566,6 +567,20 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   if (!result.data?.message_id && !only) throw new Error("Feishu accepted the message without naming it");
   if (!result.data?.message_id) return undefined;
   return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+}
+
+/** A card with a title, words, one button that opens a link, and a note: for what another connector asks to have shown. */
+function plainCard(invitation: Invitation): unknown {
+  const plain = (content: string) => ({ tag: "plain_text", content: content.slice(0, 1_000) });
+  return {
+    config: { wide_screen_mode: true },
+    header: { template: "blue", title: plain(invitation.title) },
+    elements: [
+      { tag: "div", text: plain(invitation.text) },
+      { tag: "action", actions: [{ tag: "button", text: plain(invitation.action.label), type: "primary", url: invitation.action.url }] },
+      ...(invitation.note ? [{ tag: "note", elements: [plain(invitation.note)] }] : []),
+    ],
+  };
 }
 
 /** Feishu's limit for a post, in bytes of the request, with a margin. */
