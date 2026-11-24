@@ -92,7 +92,6 @@ const NEXT: Record<Op["stage"], Op["stage"][]> = { asked: ["submitting"], submit
 const MAX_OPS = 50;
 /** How long after its deadline a piece of work is still kept: longer than a request can be carried on after it. */
 const KEPT_AFTER_MS = 2 * 60 * 60_000;
-const CARRY_ON_WITHIN_MS = 24 * 60 * 60_000;
 
 const same = (a: Who, b: Who) => a.chat_app_id === b.chat_app_id && a.tenant_key === b.tenant_key && a.open_id === b.open_id;
 
@@ -245,14 +244,14 @@ export class DoubaoGrant extends DurableObject<Env> {
    * sending it twice the same as once, when it is given up, under which pairing and generation,
    * and which conversation it goes into. Asked for again by the same call, it is the one kept.
    *
-   * To carry on: the conversation of the piece of work the person points at (`from`: the call
-   * whose answer they replied to), or, pointing at none, of the only one they had here in the
-   * last day. Several, and it is not guessed.
+   * To go on with an earlier piece: the conversation of the piece named (`from`), which has to be
+   * one that can still be gone on with: answered, or handed over and still within its own time.
+   * Going on without naming one is refused: which is never guessed from what the account has had.
    *
    * A piece of work is never dropped to make room while the call that made it could still be
    * made again. With no room left, a new one is refused.
    */
-  async begin(who: Who, call: string, text: string, to: { carryOn: boolean; from?: string }, pairing: string, generation: number): Promise<Op | "nothing_to_carry_on" | "several" | "not_found" | "full"> {
+  async begin(who: Who, call: string, text: string, to: { carryOn: boolean; from?: string }, pairing: string, generation: number): Promise<Op | "unnamed" | "not_found" | "full"> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [], ops: {} };
     if (!same(stored.who, who)) throw new Error("this record belongs to someone else");
     if (stored.ops[call]) return stored.ops[call];
@@ -261,12 +260,12 @@ export class DoubaoGrant extends DurableObject<Env> {
     let session: string | undefined;
     if (to.carryOn && to.from !== undefined) {
       const pointed = stored.ops[to.from];
-      if (!pointed || !under(pointed)) return "not_found";
+      // One that was handed over and never answered within its time is not gone on with: nothing more is waited for from it.
+      if (!pointed || !under(pointed) || (pointed.stage === "submitted" && now >= pointed.deadline)) return "not_found";
       session = pointed.session;
     } else if (to.carryOn) {
-      const lately = [...new Set(Object.values(stored.ops).filter((each) => under(each) && now - each.created_at < CARRY_ON_WITHIN_MS).map((each) => each.session!))];
-      if (lately.length !== 1) return lately.length === 0 ? "nothing_to_carry_on" : "several";
-      session = lately[0];
+      // Which piece is never guessed from what this account has had lately: the same account is used from more than one conversation.
+      return "unnamed";
     }
     // Only once nothing can ask about it again: the request it belongs to ends at its deadline at
     // the latest, and may be carried on for a while after. Until then its key and its outcome are
@@ -361,16 +360,15 @@ async function asPerson(token: string, method: string, path: string, body?: unkn
 }
 
 /** Whether the person themselves named Doubao, in what they just wrote or wrote here shortly before. */
-const NAMED = /豆包|doubao/i;
 
 export const doubaoAsk: ConnectorTool = {
   name: "doubao_ask",
   description:
-    "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it in two cases, and never on your own initiative. One: the person themselves plainly asks, in this message, for Doubao to do something (research, write a document, and the like). Two: your last answer to them was what Doubao made for them, and what they write now goes on with that piece of work (more depth, a correction, the next part): then carry it on with Doubao (`carry_on` true) without their having to name Doubao again. Something they ask of you yourself (what you think, to answer here, a different subject, anything they would not want written into that Doubao conversation) you answer yourself. If they say not to use Doubao, do not. If it cannot be told whether they mean you or Doubao and it matters where their words go, ask them once which. `text` is what to ask Doubao: the person's own request, in their words where those are enough. Doubao knows nothing of this conversation, so add what it needs from here to understand the request (what a \"this\" or \"that\" refers to, say), and nothing else: no requirements, scope, format or guesses at what they mean that they did not state. `carry_on`: false for something new (they have to have named Doubao in this message); true for a follow-up to a piece of work Doubao already did for this person: the one whose answer they replied to, else the one your last answer to them came from, else the only recent one; where it cannot be told which, you are told to ask them. Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
+    "Doubao Work's way in: it is handed work through the worker of that name. `brief`: what to do. `continue_from`: the id of an earlier piece of work of that worker's to go on with, or null.",
   effect: "act",
   optional: true,
   hands_to: "doubao",
-  parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
+  parameters: { brief: { type: "string" }, continue_from: { type: ["string", "null"] } },
   // How the piece of work stands is said from its own record, however the call went.
   run: async (context, args) => {
     // The record of the piece of work as this call last had it from where it is kept: never read a second time for this.
@@ -408,37 +406,21 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   const { env, origin } = context;
   // As a worker's tool it is called with `brief` and `continue_from`; a request kept before that, with what it was kept as.
   const text = String(args.brief ?? args.text ?? "").trim();
-  const from = [args.continue_from, args.from].find((each): each is string => typeof each === "string" && each !== "");
+  // The piece to go on with: for a new call, the one the Brain has checked (`continue_from`) and no other; for a request carried on, the one it was kept with.
+  const named = context.resuming ? args.from : args.continue_from;
+  const from = typeof named === "string" && named !== "" ? named : undefined;
   if (!text) return { error: "say what Doubao is to do" };
   if (text.length > MAX_TEXT) return { error: `that is too long to hand over: at most ${MAX_TEXT} characters` };
+  // Whether to hand this over, to whom, and which earlier piece it goes on with are not decided
+  // here: that is the agent's to judge by the deployment's guidance. The Brain has checked that
+  // the piece named is this person's own, handed to this worker in this conversation; what is
+  // checked below is that it can in fact be gone on with where it is kept.
   const carryOn = from !== undefined || args.carry_on === true;
   if (context.scope.kind !== "user") return { error: "this can only be done for one person, in their own conversation" };
   const redirect = redirectUri(env);
   if (!redirect || !grantsKey(env)) return { error: "handing work to Doubao is not set up on this deployment" };
   const app = await registry(env).doubaoApp(origin.app_id ?? "");
   if (!app || app.tenant !== context.scope.tenant || !origin.tenant_key) return { error: "handing work to Doubao is not set up for this conversation" };
-  // What they point at, if their message replies to an answer that was written from one piece of work handed over here.
-  const pointed = typeof context.answering?.source?.op === "string" ? context.answering.source.op : undefined;
-  // Their own word for it, in what they just wrote: not what the model was led to ask for, nor
-  // something they said another time. (Or their reply to what Doubao made for them.)
-  // Or, for a follow-up only: the last answer they had from the agent when they wrote was what Doubao made for them, not long ago.
-  // (How recent is judged as it is first asked: a request carried on later is the same piece of work.)
-  const last = typeof context.latest?.source.op === "string" && (context.resuming !== undefined || Date.now() - context.latest.sent_at < CARRY_ON_WITHIN_MS) ? context.latest.source.op : undefined;
-  // (Not where the model names a piece itself: if that is not the one, it is not swapped for another without a word.)
-  const followed = carryOn && from === undefined && pointed === undefined ? last : undefined;
-  const named = context.said.some((each) => NAMED.test(each.text));
-  // A piece of work the model names to go on with is taken on the person's word only: the one they
-  // replied to, the one their last answer came from, or any of theirs where they name Doubao themselves.
-  // What they replied to says which, before anything the model names.
-  if (from !== undefined && pointed !== undefined && from !== pointed) return { error: "the person's message replies to the answer of another piece of work than the one named; nothing was sent. Ask them which they mean" };
-  // (Where they name Doubao and the model's choice has nothing of theirs behind it, the choice is not taken: it is the one recent piece of theirs, or they are asked.)
-  const chosen = from !== undefined && (from === pointed || from === last) ? from : undefined;
-  if (from !== undefined && chosen === undefined && !named) return { error: "it cannot be told from the person's message that they mean that piece of work: they did not name Doubao, reply to its answer, or write straight after it; nothing was sent. Answer it yourself, or ask them" };
-  // Something new is handed over only on their word for it in this message: what they reply to, or what came before, can only say which piece of work to go on with.
-  if (!carryOn && !named) return { error: "the person has not asked for Doubao in this message; nothing was sent. Something new is handed to Doubao only when they say so in the message itself" };
-  // A reply they marked that does not lead to a piece of work is not guessed around.
-  if (carryOn && pointed === undefined && context.said.some((each) => each.data.replies_to !== undefined)) return { error: "the person's message replies to something that is not a piece of work Doubao did for them, so it cannot be told what to carry on; nothing was sent. Answer it yourself, or ask them which piece of work they mean" };
-  if (!named && pointed === undefined && followed === undefined && chosen === undefined) return { error: "the person has not asked for Doubao in this message, and it does not follow on an answer Doubao made for them; nothing was sent. If they want this handed to Doubao, they can say so" };
   // Who they are on the other side, as the chat connector verified it with each of their messages.
   const ids = new Set(context.said.map((each) => each.data.union_id));
   const union = ids.size === 1 && typeof [...ids][0] === "string" && [...ids][0] !== "" ? ([...ids][0] as string) : undefined;
@@ -446,15 +428,14 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   const who: Who = { chat_app_id: app.chat_app_id, tenant_key: origin.tenant_key, open_id: context.person, ...(union ? { union_id: union } : {}) };
   const name = await grantName(who);
   const grant = env.DOUBAO_GRANTS.getByName(name);
-  const request = { text, carry_on: carryOn, ...(chosen !== undefined ? { from: chosen } : {}) };
+  const request = { text, carry_on: carryOn, ...(from !== undefined ? { from } : {}) };
 
   const { generation, token, version } = await grant.held();
   if (context.resuming && generation !== context.resuming.generation) return CHANGED;
   // Kept as it is first asked for. The same call made again (carried on, or after an interruption) is the same piece of work.
-  const op = await grant.begin(who, context.callId, text, { carryOn, ...(carryOn && (chosen ?? pointed ?? followed) !== undefined ? { from: chosen ?? pointed ?? followed } : {}) }, app.version, generation);
-  if (op === "nothing_to_carry_on") return { error: "there is no recent piece of work with Doubao to carry on for this person; hand it over as something new instead" };
-  if (op === "several") return { error: "the person has had more than one piece of work with Doubao lately, and it cannot be told which this follows; nothing was sent. Ask them which one: replying to the answer in question says it. Or hand it over as something new" };
-  if (op === "not_found") return { error: "the piece of work this replies to can no longer be carried on (it is too old, or the authorisation changed since); nothing was sent. Hand it over as something new" };
+  const op = await grant.begin(who, context.callId, text, { carryOn, ...(from !== undefined ? { from } : {}) }, app.version, generation);
+  if (op === "unnamed") return { error: "it was not said which piece of work this goes on with; nothing was sent. Name it (continue_from), or hand this over as something new" };
+  if (op === "not_found") return { error: "that piece of work can no longer be gone on with (it is too old, it never reached Doubao, or the authorisation or set-up changed since); nothing was sent. Hand this over as something new if the person still wants it" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
   seen.op = op;
   // Each step of it is kept where the record is, and what comes back is the record as it then stands.
@@ -544,7 +525,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
 function answered(op: Op): unknown {
   const reply = op.reply!;
   if (reply.status !== "completed") return { error: `Doubao did not finish this: its reply ended as ${reply.status}` };
-  return { text: reply.text, ...(reply.truncated ? { truncated: true } : {}), ...(reply.artifacts.length > 0 ? { made: reply.artifacts } : {}), note: "This is Doubao's reply, not the person's words. A follow-up to it can be handed over with `carry_on` true." };
+  return { text: reply.text, ...(reply.truncated ? { truncated: true } : {}), ...(reply.artifacts.length > 0 ? { made: reply.artifacts } : {}), note: "This is Doubao's reply, not the person's words. What follows on it can be handed to the same worker, naming this piece of work to go on with." };
 }
 
 /** Whether a condition of this connector's holds: the person's authorisation, or the reply to something handed over. Nothing for a condition that is not its own. */
@@ -666,7 +647,7 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 export const doubaoWorker: Worker = {
   name: "doubao",
   description:
-    "Doubao Work (豆包工作): researches, writes documents and the like. It takes a while. Something new goes to it only when the person asks for Doubao by name in this message. What follows on something it made for them (more depth, a correction, the next part) can go on with it without the name: when they reply to that answer, or write straight after it. What they ask of you yourself (what you think, to answer here, another subject, anything they would not want written into that Doubao conversation) you answer yourself; if they say not to use Doubao, do not; if it cannot be told whether they mean you or Doubao and it matters where their words go, ask them once.",
+    "Doubao Work (豆包工作): researches, writes documents and the like, and takes a while. What you hand it is written into the person's own Doubao Work account as them, where it stays; they have to have authorised that, and are asked to when they have not. It can go on with a piece of work it did for them before.",
   acts_as: "person",
   tool: doubaoAsk.name,
 };

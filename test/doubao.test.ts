@@ -219,7 +219,10 @@ const toolOutputs = (asked: any = modelCalls.at(-1)): any[] => {
 };
 /** The workers a call to the model was offered, by name. */
 const workersOffered = (asked: any): string[] => asked.tools.find((t: any) => t.name === "hand_over")?.parameters.properties.worker.enum ?? [];
-const asks = (text: string, carry_on = false) => call("doubao_ask", { text, carry_on });
+/** Hands something to Doubao: something new, or going on with the piece of work of that id (`true`: going on, without saying with which). */
+const asks = (text: string, from: string | boolean = false) => (typeof from === "string" ? call("hand_over", { worker: "doubao", title: "t", brief: text, continue_from: from, repository: null, replaces: null }) : call("doubao_ask", { text, carry_on: from }));
+/** The id of the piece of work a person handed over last. */
+const lastWork = async (person: Person): Promise<string> => (await rowsOf(person.stub, "SELECT id FROM work ORDER BY created_at DESC, rowid DESC LIMIT 1"))[0].id;
 const UNDER_WAY = "已经交出去处理了，需要一些时间。完成后我会把结果发给你。";
 /** Asks for something, authorises when invited, and is left with the work handed over. */
 async function handsOver(person: Person, text = "调研一下向量数据库") {
@@ -309,7 +312,7 @@ describe("handing work to Doubao Work", () => {
     model.replies([call("send_message", { text: "第一版。" })], [say("")]);
     await cy.later();
 
-    model.replies([asks("再补充成本对比", true)], [say("")]);
+    model.replies([asks("再补充成本对比", await lastWork(cy))], [say("")]);
     await cy.says("让豆包再补充成本对比");
     expect(toolOutputs()).toEqual([{ waiting: true, request: expect.any(String), note: expect.stringContaining("handed over") }]);
     expect(world.writes.map((each) => each.path)).toEqual(["/open-apis/agent/v1/sessions", `/open-apis/agent/v1/sessions/${session}/events`]);
@@ -320,71 +323,73 @@ describe("handing work to Doubao Work", () => {
     expect(cy.heard().at(-1)).toBe("成本对比如下。");
   });
 
-  it("carries an unmarked follow-up on with Doubao when the last answer was Doubao's, and not past an answer of the agent's own", async () => {
+  it("goes on with the piece of work that is named, whatever the person's last answer was, and with none that is not theirs here", async () => {
     await pair();
     const cy = someone();
-    const first = await handsOver(cy, "调研 A");
-    doubaoReplies(first, "A 的结论。");
+    const a = await handsOver(cy, "调研 A");
+    const idA = await lastWork(cy);
+    doubaoReplies(a, "A 的结论。");
     model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
     await cy.later();
-    // A second piece of work, so that "the only recent one" could not tell which.
+    // Something new, without Doubao being named: whether to hand it over is the agent's to judge, and it is handed over.
     model.replies([asks("调研 B")], [say("")]);
-    await cy.says("让豆包调研 B");
-    const second = [...world.sessions.keys()].at(-1)!;
-    doubaoReplies(second, "B 的结论。");
+    await cy.says("调研 B");
+    const b = [...world.sessions.keys()].at(-1)!;
+    expect(b).not.toBe(a);
+    doubaoReplies(b, "B 的结论。");
     model.replies([call("send_message", { text: "B 的结论。" })], [say("")]);
     await cy.later();
-    expect(cy.heard().at(-1)).toBe("B 的结论。");
 
-    // No name, no reply marked: it follows the answer they last had, which was Doubao's on B.
+    // B's answer is the last they had. The agent names A: it is theirs, so it goes to A's conversation.
     const before = world.writes.length;
-    model.replies([asks("再深入一点", true)], [say("")]);
-    await cy.says("再深入一点");
-    expect(toolOutputs()).toEqual([{ waiting: true, request: expect.any(String), note: expect.stringContaining("handed over") }]);
-    expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${second}/events`]);
-    doubaoReplies(second, "更深入的 B。");
-    model.replies([call("send_message", { text: "更深入的 B。" })], [say("")]);
+    model.replies([asks("A 再深入一点", idA)], [say("")]);
+    await cy.says("A 那个再深入一点");
+    expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${a}/events`]);
+    doubaoReplies(a, "更深入的 A。");
+    model.replies([call("send_message", { text: "更深入的 A。" })], [say("")]);
     await cy.later();
 
-    // Something new still has to name Doubao, whatever the last answer was.
-    model.replies([asks("调研 C")], [say("没发出去")]);
-    await cy.says("调研 C");
-    expect(JSON.stringify(toolOutputs())).toContain("has not asked for Doubao");
-
-    // The agent answers something itself. What comes after that no longer follows Doubao's answer.
-    model.replies([call("send_message", { text: "我自己答的。" })], [say("")]);
-    await cy.says("你怎么看");
+    // Going on without saying with which is not guessed; nor is a piece that does not exist turned into something new, or into another.
     const then = world.writes.length;
-    model.replies([asks("再补充", true)], [say("没发出去")]);
+    const sessions = world.sessions.size;
+    model.replies([asks("再补充", true)], [say("")]);
     await cy.says("再补充");
-    expect(JSON.stringify(toolOutputs())).toContain("has not asked for Doubao");
-    expect(world.writes).toHaveLength(then);
-  });
-
-  it("does not guess around a reply the person marked, and starts nothing new on the strength of a reply", async () => {
-    await pair();
-    const cy = someone();
-    model.replies([call("send_message", { text: "我自己的看法。" })], [say("")]);
-    await cy.says("你怎么看向量数据库");
-    const session = await handsOver(cy, "调研 A");
-    doubaoReplies(session, "A 的结论。");
-    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
-    await cy.later();
-    const before = world.writes.length;
-
-    // The last answer was Doubao's, but they reply to the agent's own earlier one.
-    model.replies([asks("再解释一下", true)], [say("")]);
-    await cy.says("再解释一下", undefined, cy.sentAs("我自己的看法。"));
-    expect(JSON.stringify(toolOutputs())).toContain("replies to something that is not a piece of work");
-    // Replying to Doubao's answer says which to go on with, and no more: it does not start something new.
+    expect(JSON.stringify(toolOutputs())).toContain("was not said which piece of work");
+    model.replies([asks("再补充", "call_nope")], [say("")]);
+    await cy.says("再补充一下");
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+    // Under the tool's own name, with the field a kept request is kept with: that is not a new call's to give, so no piece is named.
+    model.replies([call("doubao_ask", { text: "再补充", carry_on: true, from: idA })], [say("")]);
+    await cy.says("再补充一点");
+    expect(JSON.stringify(toolOutputs())).toContain("is named in continue_from; nothing was sent");
+    // The same without saying that it goes on with something: not handed over as something new in its place.
+    const none = world.sessions.size;
+    model.replies([call("doubao_ask", { text: "再补充", from: idA })], [say("")]);
+    await cy.says("再补充一点点");
+    expect(JSON.stringify(toolOutputs())).toContain("is named in continue_from; nothing was sent");
+    expect(world.sessions.size).toBe(none);
+    // A piece that was handed over and never answered within its time is not gone on with.
     model.replies([asks("调研 C")], [say("")]);
-    await cy.says("调研 C", undefined, cy.sentAs("A 的结论。"));
-    expect(JSON.stringify(toolOutputs())).toContain("Something new is handed to Doubao only when they say so");
-    expect(world.writes).toHaveLength(before);
-    // And going on with what they replied to still works.
-    model.replies([asks("补充成本", true)], [say("")]);
-    await cy.says("补充成本", undefined, cy.sentAs("A 的结论。"));
-    expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${session}/events`]);
+    await cy.says("让豆包调研 C");
+    const idC = await lastWork(cy);
+    const sent = world.writes.length;
+    await runInDurableObject(await cy.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.ops[idC].deadline = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    model.replies([asks("C 接着做", idC)], [say("")]);
+    await cy.says("C 接着做");
+    expect(JSON.stringify(toolOutputs())).toContain("can no longer be gone on with");
+    expect(world.writes).toHaveLength(sent);
+    const then2 = world.writes.length;
+    // Somebody else names it: it is not theirs.
+    const eve = someone();
+    model.replies([asks("接着做", idA)], [say("")]);
+    await eve.says("接着做");
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+    expect(world.writes).toHaveLength(then2);
+    expect(world.sessions.size).toBe(sessions + 1);
   });
 
   it("keeps one row in the index of work for each piece handed over, through authorising, waiting again and the answer; a follow-up is a row of its own", async () => {
@@ -406,7 +411,7 @@ describe("handing work to Doubao Work", () => {
     await cy.later();
     expect(await work()).toMatchObject([{ id: request, state: "done" }]);
 
-    model.replies([asks("再深入", true)], [say("")]);
+    model.replies([asks("再深入", request)], [say("")]);
     await cy.says("再深入");
     expect((await work()).map((each) => each.state)).toEqual(["done", "open"]);
   });
@@ -459,19 +464,19 @@ describe("handing work to Doubao Work", () => {
     expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ ok: true, cancelled: second, how: "no_longer_waited_for" });
     expect((await rowsOf(cy.stub, "SELECT state FROM work ORDER BY created_at, rowid")).map((each) => each.state)).toEqual(["done", "cancelled"]);
 
-    // Named by the model with nothing of the person's to rest on: the agent has answered since, and they do not name Doubao.
+    // The agent has answered since, and they do not name Doubao: going on with the first piece is still the agent's to choose.
     model.replies([hand("补充成本", first)], [say("")]);
     await cy.says("补充成本");
-    expect(JSON.stringify(toolOutputs())).toContain("cannot be told from the person's message");
+    expect(world.writes.at(-1)!.path).toBe(`/open-apis/agent/v1/sessions/${session}/events`);
     // An option of another worker's, and a piece of work that is nobody's here.
     model.replies([hand("调研 B", null, { repository: "https://github.com/acme/app" })], [call("work_status", { work_id: "nope" })], [say("")]);
     await cy.says("让豆包调研 B");
     expect(JSON.stringify(toolOutputs(modelCalls.at(-2)))).toContain('has no option repository');
     expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work nope here");
-    expect(world.writes).toHaveLength(before + 1);
+    expect(world.writes).toHaveLength(before + 2);
   });
 
-  it("lists and tells of work by what is kept of it on either side, stops what was not yet handed over as that, and takes the person's reply over the model's choice", async () => {
+  it("lists and tells of work by what is kept of it on either side, and stops what was not yet handed over as that", async () => {
     await pair();
     const cy = someone();
     const hand = (brief: string, continue_from: string | null = null, more: Record<string, unknown> = {}) => call("hand_over", { worker: "doubao", title: "调研", brief, continue_from, repository: null, replaces: null, ...more });
@@ -500,26 +505,6 @@ describe("handing work to Doubao Work", () => {
     await cy.later();
     const ids = (await rowsOf(cy.stub, "SELECT id FROM work WHERE state = 'done' ORDER BY created_at, rowid")).map((each) => each.id);
     expect(ids).toHaveLength(2);
-    // They reply to A's answer; the model names B. What they replied to says which: asked, and nothing sent.
-    const before = world.writes.length;
-    model.replies([hand("补充成本", ids[1])], [say("")]);
-    await cy.says("补充成本", undefined, cy.sentAs("A 的结论。"));
-    expect(JSON.stringify(toolOutputs())).toContain("replies to the answer of another piece of work");
-    expect(world.writes).toHaveLength(before);
-    // B's answer is the last they had. They name Doubao and mean A, and the model names A: it has nothing of theirs
-    // behind it, so it is not taken, and it is not sent to B in its place either. Two lately: they are asked.
-    model.replies([hand("把 A 展开讲一下", ids[0])], [say("")]);
-    await cy.says("让豆包把 A 展开讲一下");
-    expect(JSON.stringify(toolOutputs())).toContain("cannot be told which");
-    expect(world.writes).toHaveLength(before);
-    // They name Doubao and the model names A, with the agent having spoken since and B the last: the model's choice is not taken; two lately, so they are asked.
-    model.replies([call("send_message", { text: "好。" })], [say("")]);
-    await cy.says("谢谢");
-    model.replies([hand("补充成本", ids[0])], [say("")]);
-    await cy.says("让豆包把之前那个补充一下成本");
-    expect(JSON.stringify(toolOutputs())).toContain("cannot be told which");
-    expect(world.writes).toHaveLength(before);
-
     // A piece that never had to wait and whose taking is not known: listed, and told of, by its row alone.
     world.unreachable = 2;
     model.replies([hand("调研 C")], [call("send_message", { text: "没能确认。" })], [say("")]);
@@ -759,21 +744,8 @@ describe("handing work to Doubao Work", () => {
     expect(world.writes).toEqual([]);
   });
 
-  it("sends nothing unless the person named Doubao themselves, or where who they are cannot be told", async () => {
+  it("sends nothing where who the person is cannot be told", async () => {
     await pair();
-    const eli = someone();
-    model.replies([asks("调研一下竞品")], [say("我来查")]);
-    await eli.says("调研一下竞品");
-    expect(JSON.stringify(toolOutputs())).toContain("has not asked for Doubao");
-    expect(eli.cards()).toEqual([]);
-    // Having named it another time is not asking for it now.
-    model.replies([say("豆包工作是一个办公智能体。")]);
-    await eli.says("豆包是什么？");
-    model.replies([asks("调研一下竞品")], [say("我来查")]);
-    await eli.says("那调研一下竞品吧");
-    expect(JSON.stringify(toolOutputs())).toContain("has not asked for Doubao");
-    expect(eli.cards()).toEqual([]);
-
     // Their message came without the id they are matched by.
     const fay = someone();
     model.replies([asks("调研一下竞品")], [say("不行")]);
@@ -820,8 +792,8 @@ describe("handing work to Doubao Work", () => {
     await kay.says("让豆包写周报");
     expect(await rowsOf(kay.stub, "SELECT 1 FROM continuations")).toHaveLength(1);
     expect(await rowsOf(kay.stub, "SELECT state FROM work")).toEqual([{ state: "open" }]);
-    // Not named, so nothing is handed over: nothing is recorded.
-    model.replies([asks("写月报")], [say("")]);
+    // A call that hands nothing over (it says nothing to do) is not recorded.
+    model.replies([asks(" ")], [say("")]);
     await kay.says("写月报");
     expect(await rowsOf(kay.stub, "SELECT state FROM work")).toEqual([{ state: "open" }]);
   });
@@ -912,35 +884,6 @@ describe("handing work to Doubao Work", () => {
     await mo.settle();
     expect(toolOutputs(modelCalls.at(-2))[0].error).toContain("could not be confirmed");
     expect(await (await mo.grant()).status()).toMatchObject({ work: { lost: 1 } });
-  });
-
-  it("carries on the piece of work whose answer the person replied to, and does not guess between several", async () => {
-    await pair();
-    const ned = someone();
-    const a = await handsOver(ned, "调研A");
-    doubaoReplies(a, "A 的结论。");
-    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
-    await ned.later();
-    model.replies([asks("调研B")], [say("")]);
-    await ned.says("让豆包调研B");
-    const b = [...world.sessions.keys()].at(-1)!;
-    expect(b).not.toBe(a);
-    doubaoReplies(b, "B 的结论。");
-    model.replies([call("send_message", { text: "B 的结论。" })], [say("")]);
-    await ned.later();
-
-    // The agent says something of its own, so the last answer they had is neither piece of work.
-    model.replies([call("send_message", { text: "好的。" })], [say("")]);
-    await ned.says("谢谢");
-    // Two lately, and nothing says which: nothing is sent, and the model is told to ask.
-    model.replies([asks("补充成本", true)], [say("你指哪一份？")]);
-    await ned.says("让豆包补充成本");
-    expect(toolOutputs()[0].error).toContain("cannot be told which");
-    expect(world.writes).toHaveLength(2);
-    // Replying to A's answer says it is A, without naming Doubao again.
-    model.replies([asks("补充成本", true)], [say("")]);
-    await ned.says("这份再补充成本", undefined, ned.sentAs("A 的结论。"));
-    expect(world.writes.map((each) => each.path).at(-1)).toBe(`/open-apis/agent/v1/sessions/${a}/events`);
   });
 
   it("no longer hands on what Doubao brought back once the pairing it was asked under has changed", async () => {
@@ -1036,7 +979,7 @@ describe("handing work to Doubao Work", () => {
     model.replies([call("send_message", { text: "第一份。" })], [say("")]);
     await pat.later();
     // A follow-up, and after it more talk in the same conversation (from Doubao Work itself, say).
-    model.replies([asks("再补充", true)], [say("")]);
+    model.replies([asks("再补充", await lastWork(pat))], [say("")]);
     await pat.says("让豆包再补充");
     doubaoReplies(session, "补充好了。");
     const messages = world.sessions.get(session)!.messages;
