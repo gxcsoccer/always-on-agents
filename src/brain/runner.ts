@@ -1030,6 +1030,33 @@ export class Runner {
     return entries.slice(start).map((each) => each.item);
   }
 
+  /**
+   * For the operator: the shape of what the model is shown for a run, as it would be put
+   * together now. For each of the last entries: whose it is, how long, and the label the system
+   * itself wrote at its head (the bracketed words: a time, or what kind of thing it is). For the
+   * turn the run was started by, also the notes the system wrote under it, each cut short. Never
+   * what a person or a document said. With it: which tools it would be offered, and whether it
+   * counts as someone waiting.
+   */
+  shapeOf(runId: string): { tools: string[]; waiting: boolean; acting: boolean; shown: { role: string; chars: number; label?: string; notes?: string[] }[] } | undefined {
+    const run = this.#s.rows<RunRow>("SELECT * FROM runs WHERE id = ?", runId)[0];
+    if (!run) return undefined;
+    const label = (text: string) => (text.startsWith("[") && text.includes("]") ? text.slice(0, text.indexOf("]") + 1).slice(0, 120) : undefined);
+    const shown = this.#transcript(run.session_id, runId)
+      .slice(-14)
+      .map((item) => {
+        const body = item as Record<string, unknown>;
+        const content = typeof body.content === "string" ? body.content : Array.isArray(body.content) ? (body.content as { text?: unknown }[]).map((each) => String(each?.text ?? "")).join("") : String(body.output ?? body.arguments ?? "");
+        const notes = body.role === "user" ? content.split("\n").filter((line) => line.startsWith("  (")).map((line) => line.trim().slice(0, 70)) : [];
+        return { role: String(body.role ?? body.type ?? "?") + (typeof body.name === "string" ? `:${body.name}` : ""), chars: content.length, ...(label(content) ? { label: label(content) } : {}), ...(notes.length > 0 ? { notes } : {}) };
+      });
+    const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
+      const principal = JSON.parse(event.principal) as Principal;
+      return principal.kind === "human" && principal.explicit === true;
+    });
+    return { tools: this.#toolsFor(runId).map((each) => each.name), waiting, acting: this.actingFor(runId) !== undefined, shown };
+  }
+
   #toolsFor(runId: string): ToolDefinition[] {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
