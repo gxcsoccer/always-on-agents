@@ -149,6 +149,7 @@ export class Tasks implements Wakes {
     }
     let started: Started;
     try {
+      if (!worker.start) throw new Error("this worker is not started by the Brain");
       started = await worker.start(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() });
     } catch (err) {
       // Whether the worker heard us is unknown. Stop it if it did, and free the slot either way, so

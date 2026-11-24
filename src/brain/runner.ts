@@ -10,16 +10,17 @@
  */
 import type { ConnectorTool, Quoted } from "../connectors";
 import type { Env } from "../env";
+import type { Worker } from "../workers";
 import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
-import { READ_OUTSIDE, type RunTools, eligibleSource, toolsIn } from "./run-tools";
+import { READ_OUTSIDE, type RunTools, eligibleSource, standingOf, toolsIn, workersIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { workIs } from "./work";
-import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
+import { TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
 
 const MAX_STEPS_PER_RUN = 16;
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
@@ -58,6 +59,10 @@ export interface RunnerHost {
   isDecider(principal: Principal, source: string): boolean;
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
+  /** Every worker this deployment lists. */
+  workers(): Worker[];
+  /** Whether a piece of work done in a person's name still stands under what it was done under: see BrainAgent. */
+  workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   /** Where the tenant's usage is kept. */
   registry(): Pick<ReturnType<typeof registry>, "recordUsage" | "adjustUsage">;
   /** One call to the model. */
@@ -66,7 +71,7 @@ export interface RunnerHost {
   quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
   /** The message something sent to this address is written under, where the connector says. */
   under(target: Target): string | undefined;
-  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf">;
+  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
 }
@@ -539,6 +544,18 @@ export class Runner {
         return;
       }
 
+      // What the model is told besides the transcript is put together first: it asks others things
+      // (whether work done in the person's name still stands), and nothing may be waited for
+      // between the checks below and the call.
+      let instructions: string;
+      try {
+        instructions = await this.#instructions(runId);
+      } catch (err) {
+        await release();
+        return this.#retryLater(runId, err);
+      }
+      if (!this.#stillActive(runId)) return void (await release());
+
       // A request being carried on has read what it waited for. Each time that text is about to
       // be put before the model (also after an interruption, or a pause of any length) the
       // condition's owner is asked whether it still holds, and nothing else is waited for between
@@ -607,7 +624,7 @@ export class Runner {
           baseUrl: this.#b.env.OPENAI_BASE_URL,
           apiKey: this.#b.env.OPENAI_API_KEY,
           model: this.#b.env.BRAIN_MODEL,
-          instructions: this.#instructions(runId),
+          instructions,
           input: items,
           tools: this.#toolsFor(runId),
         });
@@ -961,8 +978,14 @@ export class Runner {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
     const acting = this.actingFor(runId);
-    const own = TOOLS;
-    const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
+    // Work is handed over through one set of tools, whichever worker it goes to. A connector's
+    // tool that carries a worker is not offered under its own name: it is that worker's way in.
+    const workers = workersIn(acting, this.#b.toolsOf, this.#b.workers());
+    const carrying = new Set(workers.flatMap((each) => (each.tool ? [each.tool] : [])));
+    // (Nor where its worker is not among them: such a tool is a worker's way in and nothing else.)
+    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined })), carrying.size > 0 ? REPLACES : undefined);
+    const own = [...TOOLS, ...handing];
+    const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
   }
 
@@ -985,22 +1008,43 @@ export class Runner {
     return acting !== undefined && toolsIn(acting, this.#b.toolsOf).some((each) => each.name === name && each.effect === "read");
   }
 
-  #instructions(runId: string): string {
+  async #instructions(runId: string): Promise<string> {
     // A person who deliberately wrote to the agent is waiting for it; anything else merely happened.
     const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
       const principal = JSON.parse(event.principal) as Principal;
       return principal.kind === "human" && principal.explicit === true;
     });
     const asker = this.actingFor(runId)?.person;
+    const session = this.#s.rows<{ id: string; session_key: string }>("SELECT s.id, s.session_key FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?", runId)[0];
+    // A request kept for a tool that hands work to a worker is a piece of work, listed as that and nowhere else.
+    const handsTo = (each: { connector: string; tool: string }) => this.#b.toolsOf(each.connector).find((tool) => tool.name === each.tool)?.hands_to;
+    const requests = asker && session ? this.#b.requests.cancellable(session.id, asker) : [];
+    // Work done in the person's name: theirs alone, in this conversation; what is under way, and what ended in the last day (it can be gone on with).
+    // (A request kept before there was an index is given its row first. What is under way comes before what has ended.)
+    for (const each of requests) if (handsTo(each)) this.#b.requests.indexed(each.id);
+    // Of what has ended, only what can be gone on with (done) or what the person may need to hear of (not known whether it was taken).
+    const found = asker && session ? this.#s.rows<{ id: string; worker: string; state: string; condition: string | null; generation: number | null; handed: number }>("SELECT id, worker, state, condition, generation, handed FROM work WHERE session_key = ? AND person = ? AND (state = 'open' OR (state IN ('done', 'unknown') AND updated_at > ?)) AND id NOT IN (SELECT id FROM tasks) ORDER BY state = 'open' DESC, created_at DESC LIMIT 8", session.session_key, asker, Date.now() - 24 * 60 * 60_000) : [];
+    // And nothing done under an authorisation that has since been taken away, or a set-up since changed: whoever keeps
+    // that is asked, each time the model is about to be asked, so that it is seen within a run too.
+    const theirs = (await Promise.all(found.map(async (each) => ((await this.#b.workStands(each)) ? [each] : [])))).flat();
     return buildInstructions({
       scope: this.#s.scope(),
       situation: waiting ? "conversation" : "background",
       now: Date.now(),
       instructions: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
-      tasks: this.#s.rows<Row>("SELECT id, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at") as any,
+      work: [
+        ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status })),
+        ...theirs.map((each) => {
+          const record = this.#b.requests.record(each.id);
+          const waits = each.state === "open" && record?.status === "waiting" ? (record.interaction !== "" ? ("authorisation" as const) : ("result" as const)) : undefined;
+          const handed = waits === "authorisation" && (each.handed === 1 || this.#b.requests.promised(each.id));
+          // One that never had to wait is kept only as that it was handed over: not what was asked.
+          return { id: each.id, worker: each.worker, title: record ? this.#b.requests.askedFor(record) : "(what was asked is not kept)", state: standingOf(each.state, waits, handed) };
+        }),
+      ],
       // The requests of the person this run stands for, which only they can call off; none where it stands for nobody.
-      requests: (asker ? this.#b.requests.cancellable(this.#s.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "", asker) : []).map((each) => ({ id: each.id, asked: this.#b.requests.askedFor(each) })),
+      requests: requests.filter((each) => !handsTo(each)).map((each) => ({ id: each.id, asked: this.#b.requests.askedFor(each) })),
     });
   }
 

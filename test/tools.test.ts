@@ -235,3 +235,25 @@ describe("the console's feed", () => {
     void env;
   });
 });
+
+describe("the tools for handing work over", () => {
+  it("are made from the workers at hand; with none, how work stands can still be asked and work stopped", async () => {
+    const { workTools } = await import("../src/brain/tools");
+    expect(workTools([], undefined).map((each) => each.name)).toEqual(["work_status", "cancel_work"]);
+    const two = workTools(
+      [
+        { name: "a", description: "does a", acts_as: "agent", options: { where: { type: ["string", "null"], description: "Where." } }, continues: false },
+        { name: "b", description: "does b", acts_as: "person", continues: true },
+      ],
+      { type: ["string", "null"] },
+    );
+    expect(two.map((each) => each.name)).toEqual(["hand_over", "work_status", "cancel_work"]);
+    const parameters = two[0].parameters as { properties: Record<string, any>; required: string[] };
+    expect(parameters.properties.worker.enum).toEqual(["a", "b"]);
+    expect(parameters.properties.where.description).toContain('Only for the worker "a"');
+    expect(parameters.required).toEqual(["worker", "title", "brief", "continue_from", "where", "replaces"]);
+    expect(parameters.properties.continue_from.description).toContain("Only b can go on with an earlier piece");
+    // Two workers cannot have an option of the same name.
+    expect(() => workTools([{ name: "a", description: "", acts_as: "agent", options: { x: {} }, continues: false }, { name: "c", description: "", acts_as: "agent", options: { x: {} }, continues: false }], undefined)).toThrow("already taken");
+  });
+});

@@ -185,6 +185,36 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("hands work to the sandbox through the one tool for all workers, lists it by its id, and tells how it stands and stops it by that id", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: null })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    // The console has no worker that acts as a person: one worker, its own option, no way to replace a request.
+    const tool = modelCalls[0].tools.find((t: any) => t.name === "hand_over");
+    expect(tool.parameters.properties.worker.enum).toEqual(["sandbox"]);
+    expect(Object.keys(tool.parameters.properties)).toEqual(["worker", "title", "brief", "continue_from", "repository"]);
+    const { work_id: id, status } = toolOutputs().at(-1);
+    expect(status).toBe("running");
+
+    model.replies([call("work_status", { work_id: id })], [call("hand_over", { worker: "sandbox", title: "More", brief: "and this", continue_from: id, repository: null })], [call("cancel_work", { work_id: id })], [say("")]);
+    await stub.ingest(message("how is it going? stop it"));
+    await wake(stub);
+    expect(modelCalls.at(-4).instructions).toContain(`- ${id} [sandbox] "Fix the build": running`);
+    const outputs = toolOutputs().slice(-3);
+    expect(outputs[0]).toMatchObject({ status: "running" });
+    // The sandbox cannot go on with an earlier piece of work yet: said, and nothing started.
+    expect(outputs[1].error).toContain("cannot go on with an earlier piece of work");
+    expect(outputs[2]).toMatchObject({ ok: true, status: "cancelled" });
+    // It does not take the place of a request that waits: said before anything is started.
+    model.replies([call("hand_over", { worker: "sandbox", title: "t", brief: "b", continue_from: null, repository: null, replaces: "req_1" })], [say("")]);
+    await stub.ingest(message("do this instead"));
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toContain("cannot take the place of a request that waits");
+    const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT worker, state FROM work").toArray());
+    expect(kept).toEqual([{ worker: "sandbox", state: "cancelled" }]);
+  });
+
   it("lets a person set standing instructions, and shows them to later runs", async () => {
     const { stub } = brain();
     model.replies([call("memory_write", { path: "instructions.md", content: "Answer in Chinese." })], [say("")]);
@@ -297,6 +327,7 @@ describe("timers and memory", () => {
       const sql = state.storage.sql;
       // Back to version 21, with follow-up work in every state it could be in.
       sql.exec("DROP TABLE said");
+      sql.exec("DROP TABLE IF EXISTS work");
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");
@@ -396,6 +427,7 @@ describe("timers and memory", () => {
       sql.exec("DROP TABLE continuations");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
       sql.exec("DROP TABLE said");
+      sql.exec("DROP TABLE IF EXISTS work");
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");
@@ -1066,6 +1098,7 @@ describe("tasks and approvals", () => {
       sql.exec("DROP TABLE continuations");
       for (const column of ["continuation", "interaction", "first_attempt_at", "uncertain", "unasked", "source", "guard"]) sql.exec(`ALTER TABLE outbox DROP COLUMN ${column}`);
       sql.exec("DROP TABLE said");
+      sql.exec("DROP TABLE IF EXISTS work");
       sql.exec("ALTER TABLE outbox DROP COLUMN reads");
       sql.exec("ALTER TABLE outbox DROP COLUMN authored");
       sql.exec("ALTER TABLE outbox DROP COLUMN wire");

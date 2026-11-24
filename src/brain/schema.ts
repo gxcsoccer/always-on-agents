@@ -312,6 +312,9 @@ export const MIGRATIONS: string[] = [
    CREATE INDEX IF NOT EXISTS work_session ON work (session_key, created_at);
    INSERT OR IGNORE INTO work (id, worker, session_key, person, state, created_at, updated_at)
      SELECT id, worker, session_key, requested_by, 'open', created_at, updated_at FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input');`,
+  // 31: whether a piece of work was handed over to its worker, or may have been, as whoever
+  // carries it out says: stopping one that was is only to stop waiting for it here.
+  `ALTER TABLE work ADD COLUMN handed INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -17,12 +17,12 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, aside, closeInvitation, canRevisit, deliver, direct, offeredFor, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
 import { registry } from "../registry";
-import { workerNamed } from "../workers";
+import { workerNamed, workers } from "../workers";
 import { sandboxWorker } from "../workers/sandbox/worker";
 import { migrate } from "./schema";
 import { BrainStore, type Row, type Wakes } from "./store";
@@ -112,6 +112,8 @@ export class BrainAgent extends DurableObject<Env> {
       outside: this.#outside,
       isDecider: (principal, source) => this.#isDecider(principal, source),
       toolsOf,
+      workers,
+      workStands: (work) => this.#workStands(work),
       registry: () => registry(this.env),
       respond,
       quoted: (connector, event) => quoted(this.env, connector, this.#store.scope(), event),
@@ -137,6 +139,8 @@ export class BrainAgent extends DurableObject<Env> {
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
+      workers,
+      workStands: (work) => this.#workStands(work),
       // Built after this part: read when they are used.
       get requests() {
         return brain.#requests;
@@ -312,6 +316,23 @@ export class BrainAgent extends DurableObject<Env> {
     if (housekeeping > 0 && this.#store.rows("SELECT 1 FROM inbox LIMIT 1").length > 0) candidates.push(housekeeping);
     if (candidates.length === 0) return;
     await this.ctx.storage.setAlarm(Math.max(Math.min(...candidates), now + 50));
+  }
+
+  /**
+   * Whether a piece of work done in a person's name that has ended still stands under what it
+   * was done under: whoever keeps the authorisation is asked, with the condition and generation
+   * the work was kept with. Gone (taken away, or the set-up changed), or not to be told: it does
+   * not. One still under way is its request's to settle, and one kept with no condition has
+   * nothing to ask about.
+   */
+  async #workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean> {
+    const connector = this.#requests.record(work.id)?.connector;
+    if (work.state === "open" || work.condition === null || work.generation === null || !connector) return true;
+    try {
+      return (await holds(this.env, connector, this.#store.scope(), work.condition, work.generation)).state !== "gone";
+    } catch {
+      return false;
+    }
   }
 
   // ------------------------------------------------------------------ records
