@@ -43,6 +43,18 @@ A run has a worker the Brain starts wherever it is listed, and a worker carried 
 
 Each worker says what it is in its own `description`. How to choose between the workers of a deployment is said once, in words, in `src/workers.md`: it is put before the model as it is written, under "Where to hand work", wherever a run has a worker to hand work to. It is advice for the model's judgement and is not parsed or matched. It is the deployment's to write (change it and deploy); nobody in a conversation can change it.
 
+## Where several people talk
+
+A worker that acts as a person can be used in a conversation several people share, if its tool says so (`shared: true`) and is offered for the message (the connector's `offers`). It then acts as the one person who asked, by the same test that decides whose tools a run carries anywhere.
+
+- The way in (an authorisation card) goes to that person directly, never into the conversation. There is one for each piece of work, told apart by the call that asked for it, however alike the words. It says which piece it is for in the person's own words, that what comes of it will be said before everyone there, and that authorising also carries on whatever else of theirs waits for it. If it cannot be sent to them directly it is not sent at all. Once they are authorised through one, the others can no longer be gone through.
+- The request waits in that conversation's own Brain. Whoever keeps the person's authorisation tells every conversation that has something of theirs under way when the authorisation changes or is taken away, each until it has heard.
+- What the worker brings back is said in that conversation, before everyone.
+- The piece of work is that person's there: only their own runs see it listed (and only on evidence that the conversation was told of it: the word that they were sent a way in, that it is under way, or its answer, was sent there and arrived), can ask how it stands, stop it or go on with it; and not from another conversation, their private one included.
+- A run in which something was done in a person's name leaves nothing of itself in the conversation's record when it ends: it is cleared as a run that read outside text is, the system's word to a run that carried a request on included. What actually reached the conversation is put back from the record of what was sent, so the next person's run is given that and nothing else of it. That put-back is for every later run in that conversation, whoever it acts for or nobody (a timer, a worker's report): what was said there reached everyone there. A run that was given such work to read (its instructions listed it) writes nothing to the conversation's shared memory; a person whose work there is not listed is held to nothing by it.
+
+This is separate from a connector's own tools being used there: for Feishu, reading a person's documents in a chat is still behind its own switch.
+
 ## A worker carried by a connector's tool
 
 A worker that does things in a person's name needs what a connector's tool already has: the person's authorisation, a request that waits and is carried on, a result that is checked against that authorisation before it goes anywhere. So such a worker names the tool that carries it (`tool`), and the tool names the worker (`hands_to`). The tool is no longer offered to the model under its own name; `hand_over` to the worker calls it with `{ brief, continue_from }`, and everything in [connectors.md](connectors.md) about tools holds for it.

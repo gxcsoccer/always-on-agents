@@ -824,7 +824,7 @@ describe("keeping a request that has to wait", () => {
         expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
         // It reaches them there: the conversation is told so. Had it failed too, that is said, and it is not moved again.
         requests.shown(direct() as never, "reached");
-        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere" });
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
       });
       await asking(({ requests, store, sent }, invite) => {
         store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
@@ -863,7 +863,7 @@ describe("keeping a request that has to wait", () => {
         // Shown, as far as anyone looking can tell, once that one has arrived; and where they asked is told that, in one line.
         store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
         requests.shown(sent("invite:grant_1.nonce:direct") as never, "reached");
-        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: "notice:invitedElsewhere" });
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
         expect(requests.waits().find((each) => each.id === "call_1")).toMatchObject({ shown: true });
       });
       // Not for one whose outcome is unknown, nor for a request that has ended.
@@ -887,7 +887,7 @@ describe("keeping a request that has to wait", () => {
         store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
         requests.wait(run("r2"), { ...acting, events: { said: [message("再读一篇", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, request: { document: "another" }, privately: "here" });
         expect(invite()).toMatchObject({ status: "dead" });
-        expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: "notice:invitedElsewhere" });
+        expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
       });
     });
 
@@ -975,7 +975,7 @@ describe("keeping a request that has to wait", () => {
       requests.shown(invite() as never, "reached");
       expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
       const line = sent(told("grant_1.nonce", "call_1"));
-      expect(line).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere", interaction: null, continuation: null });
+      expect(line).toMatchObject({ target: TARGET, text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/), interaction: null, continuation: null });
       // Sent only while that request still waits.
       expect(await requests.gate(line as never)).toBe("send");
       requests.endRequest("call_1", "cancelled", "x");
@@ -1002,7 +1002,7 @@ describe("keeping a request that has to wait", () => {
       const next = run("r2");
       const said = message("再读一篇", {}, "r2");
       requests.wait(next, { ...acting, events: { said: [said], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
-      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: "notice:invitedElsewhere" });
+      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
       expect(sent(told("grant_1.nonce", "call_1"))).toBeUndefined();
       void invite;
     });
@@ -1054,12 +1054,12 @@ describe("keeping a request that has to wait", () => {
       expect(sent(told("grant_1.nonce", "call_1")).status).toBe("void");
       store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = 1 WHERE idem = 'invite:grant_1.nonce'");
       requests.shown(invite() as never, "reached");
-      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
-      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "pending", text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
+      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
       // A line that has gone out, or may have, is not said again in other words.
       store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = ?", told("grant_1.nonce", "call_1"));
       requests.shown(invite() as never, "failed");
-      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "sent", text: "notice:invitedElsewhere" });
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "sent", text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
     });
     // The same, where word of the failure was tried once and nobody knows whether it arrived: it is not tried again, and stays on record as such.
     await asking(async ({ requests, store, run, message, sent }, invite) => {
@@ -1072,7 +1072,7 @@ describe("keeping a request that has to wait", () => {
       requests.shown(invite() as never, "reached");
       // Not said again in other words either: it may be in front of them already.
       expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "unverified", text: "notice:inviteNotSent" });
-      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
+      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
     });
     // A request's id may hold any character: which request a line is about is not read off punctuation.
     await within(async ({ requests, run, message, sent }) => {
@@ -1080,7 +1080,7 @@ describe("keeping a request that has to wait", () => {
       requests.wait(active, { ...acting, events: { said: [message("总结一下", {}, "r1")], recent: [] } }, "call:step1", "feishu_read_document", { ...waiting, interaction: "grant:1.nonce", privately: true });
       requests.shown(sent("invite:grant:1.nonce") as never, "reached");
       const line = sent(told("grant:1.nonce", "call:step1"));
-      expect(line).toMatchObject({ text: "notice:invitedElsewhere" });
+      expect(line).toMatchObject({ text: expect.stringMatching(/^notice:invitedElsewhere \([2-9A-Z]{4}\)$/) });
       expect(await requests.gate(line as never)).toBe("send");
     });
     // Two questions in one batch, each replied to where it was asked: the line and the answer go to the one the tool tied the request to.

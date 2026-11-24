@@ -23,7 +23,7 @@ import { API, chatFactsFor, hex, tenantAccessToken, forgetTenantAccessToken } fr
 export { type ChatFacts, chatFacts } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, linksIn, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
+import { markOf, type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -308,6 +308,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // Or one written where several people talk, through an app whose operator lets a
         // person's own tools be used for them there.
         ...(group ? (app.group_documents ? { shared: true } : {}) : { direct: true }),
+        // Written where several people talk: a fact about the message, whatever the operator has allowed there.
+        ...(group ? { group: true } : {}),
         // Which documents this message links to, for a tool that reads what the person pointed at.
         ...(documents.length ? { documents } : {}),
         message_id: message.message_id,
@@ -511,6 +513,8 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 export function asideFeishu(origin: Record<string, string>, person: string, from: Target): Target | undefined {
   const { app_id: appId, chat_id: chatId } = from.address;
   if (from.connector !== "feishu" || !chatId || !appId || appId !== origin.app_id || !person) return undefined;
+  // Feishu shows a card to one member of a chat only in the chat itself, not inside a topic: there it goes to them directly.
+  if (from.address.thread === "1") return undefined;
   return { connector: "feishu", address: { app_id: appId, chat_id: chatId, visible_to: person } };
 }
 
@@ -539,6 +543,9 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // (One a plugged-in connector made is shown as it gave it: words and one link.)
   const invitation = message.invitation ? plainCard(message.invitation) : message.interaction ? await invitationFor(env, message.interaction) : undefined;
   if (message.interaction && !invitation) throw new DeliveryVoid("the invitation can no longer be used");
+  // Every invitation carries its mark in its title: where it was sent somewhere else than it was asked for, the conversation was given the same mark.
+  const titled = (invitation as { header?: { title?: { content?: unknown } } } | undefined)?.header?.title;
+  if (message.interaction && titled && typeof titled.content === "string") titled.content = `${titled.content} · ${markOf(message.interaction)}`;
   // An approval question or an invitation goes out as a card. The agent's own words go as
   // Markdown (a post with one md element), or as text where a post would be too large; the
   // system's fixed words as text. A message whose sending began under the earlier encoding (0)

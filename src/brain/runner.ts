@@ -73,7 +73,7 @@ export interface RunnerHost {
   quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
   /** The message something sent to this address is written under, where the connector says. */
   under(target: Target): string | undefined;
-  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised">;
+  readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised" | "told">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
 }
@@ -734,6 +734,7 @@ export class Runner {
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
+      this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
     });
@@ -779,7 +780,8 @@ export class Runner {
     // the one it came in, and only tools that say they may be used there count.
     const shared = scope.kind === "chat";
     if (scope.kind !== "user" && !shared) return undefined;
-    if (!origin || toolsIn({ connector: source, ...(shared ? { shared: true as const } : {}) }, this.#b.toolsOf).length === 0) return undefined;
+    // (Whether the connector has any tool for such a place at all: which of them this run has is worked out from its messages, below and in toolsIn.)
+    if (!origin || !this.#b.toolsOf(source).some((each) => !shared || each.shared === true)) return undefined;
     const person = shared ? (JSON.parse(events[0].principal) as Principal).id : scope.id;
     const conversation = shared ? events[0].session_key : privateSessionKey(source, origin);
     // A request, in the person's own words, made here: through that connector, in that private
@@ -791,7 +793,9 @@ export class Runner {
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
       // What the connector itself says of the message, as it verified it: written to the agent
       // alone, or written where its tools may be used for the writer in front of the others.
-      if ((shared ? data.shared : data.direct) !== true || !plain(data)) return false;
+      // (There: by the connector's own word for all its tools, or by a tool being offered for this very message.)
+      const there = data.shared === true || (data.group === true && Array.isArray(data.offered) && data.offered.length > 0);
+      if (!(shared ? there : data.direct === true) || !plain(data)) return false;
       const same = originOf(event);
       return same !== undefined && JSON.stringify(same) === JSON.stringify(origin);
     };
@@ -836,11 +840,58 @@ export class Runner {
    * not handed the content, in the original or retold, nor anything else the model wrote.
    * Messages the run wrote are emptied once they have been delivered or given up.
    */
+  /**
+   * Where several people talk, the conversation's record is read by whoever asks next. A run in
+   * which something was done in one person's name (work handed to a worker that acts as them,
+   * asked about, stopped) leaves nothing of itself there: not its calls and their answers, not
+   * what the model wrote on the way, not a draft that was never sent, not the system's word to a
+   * run that carried a request on. Only what actually reached the conversation is put back, from
+   * the record of what was sent (see #window). That is what clearing a run that read outside text
+   * already does, so such a run is cleared the same way when it ends. Who may see a thing is kept
+   * apart from whether it came from outside: nothing is limited while the run lasts.
+   */
+  #forgetPersonal(run: RunRow): void {
+    if (this.#s.scope().kind !== "chat") return;
+    const rows = this.#s.rows<{ seq: number; is_user: number; item: string }>("SELECT seq, is_user, item FROM items WHERE run_id = ?", run.id).map((each) => ({ seq: each.seq, user: each.is_user === 1, item: JSON.parse(each.item) as Item }));
+    // The tools that carry a worker, by what the connectors say of their own tools: not only those of workers listed now.
+    // (For a run that carries a request on, the connector the request was made through.)
+    const carried = this.#b.requests.continuationOf(run.id)?.connector;
+    const sources = [...this.#s.rows<{ source: string }>("SELECT DISTINCT source FROM inbox WHERE run_id = ?", run.id).map((each) => each.source), ...(carried ? [carried] : [])];
+    const carrying = new Map(sources.flatMap((source) => this.#b.toolsOf(source).flatMap((tool) => (tool.hands_to ? [[tool.name, tool.hands_to] as const] : []))));
+    const acting = new Set([...carrying.values(), ...this.#b.workers().flatMap((each) => (each.tool ? [each.name] : []))]);
+    const args = (item: Item): Record<string, unknown> => {
+      try {
+        return JSON.parse(String(item.arguments ?? "{}")) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    };
+    const task = (id: unknown) => this.#s.rows("SELECT 1 FROM tasks WHERE id = ?", String(id ?? "")).length > 0;
+    const theirs = (item: Item): boolean => {
+      if (item.type !== "function_call") return false;
+      if (carrying.has(String(item.name))) return true;
+      if (item.name === "hand_over") return acting.has(String(args(item).worker));
+      // By its id: theirs unless it is a task, which is the conversation's.
+      if (item.name === "work_status" || item.name === "cancel_work") return !task(args(item).work_id);
+      if (item.name === "cancel_request") return carrying.has(String(this.#b.requests.record(String(args(item).request_id ?? ""))?.tool));
+      return false;
+    };
+    const calls = new Set(rows.filter((each) => !each.user && theirs(each.item)).map((each) => String(each.item.call_id)));
+    // Or it was given such work to read (its id, what was asked, how it stands), whatever it then did with that.
+    const given = this.#s.meta(`personal:${run.id}`) !== undefined;
+    this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `personal:${run.id}`);
+    if (calls.size === 0 && !given) return;
+    for (const each of rows) if (each.user && (each.item as { _carried?: boolean })._carried === true) this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND seq = ?", run.id, each.seq);
+    // Cleared as a run that read outside text is: marked, and left to that.
+    this.#s.sql.exec("UPDATE items SET outside = 1 WHERE run_id = ? AND is_user = 0 AND outside = 0", run.id);
+  }
+
   #forgetOutside(run: RunRow, read: { args: string }[] = []): void {
     if (this.#s.rows("SELECT 1 FROM items WHERE run_id = ? AND outside = 1 LIMIT 1", run.id).length === 0) return;
     this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND is_user = 0", run.id);
     // Fixed words, and what the tool said it read. Nothing the model wrote is carried over, not even what it asked a tool for.
-    const links = linksOf(read);
+    // What a worker's tool was called with names a piece of work, not something the person pointed to: it is not named in the note.
+    const links = linksOf((read as { args: string; connector?: string; tool?: string }[]).filter((each) => !this.#b.toolsOf(String(each.connector ?? "")).some((tool) => tool.name === each.tool && tool.hands_to)));
     // Also as a record (never shown to the model as such): what this turn read, whether or not anything it said reached the person.
     this.append(run.session_id, run.id, { role: "assistant", content: outsideRemoved(links), ...(read.length > 0 ? { _reads: read } : {}) } as Item);
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
@@ -874,10 +925,13 @@ export class Runner {
     const rows = this.#s.rows<{ run_id: string | null; is_user: number; item: string; outside: number }>("SELECT run_id, is_user, item, outside FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, from);
     // Each scrubbed turn's delivered words go after the last of its kept items. One query for all of them.
     const wordsOf = new Map<string, Item[]>();
-    // Where several people talk, those words are shown only to a run that itself acts for one of
-    // them there: they were written from what one person could read.
+    // What a cleared turn said in this conversation, as it reached it, is the conversation's: everyone
+    // there saw it, so any later run here is given it, whoever it acts for or nobody (a timer, a
+    // worker's report). It is what was sent to this very conversation and arrived: nothing sent to
+    // one person alone, nothing unsent, nothing from another conversation or topic.
+    // (What an answer was written from, and for whom, stays with runs that act for someone there: below.)
     const mayShow = this.#s.scope().kind !== "chat" || (runId !== undefined && this.actingFor(runId) !== undefined);
-    for (const each of mayShow === false ? [] : this.#s.rows<{ run_id: string; text: string }>(
+    for (const each of this.#s.rows<{ run_id: string; text: string }>(
       "SELECT run_id, text FROM said WHERE session_id = ? AND run_id IN (SELECT DISTINCT run_id FROM items WHERE session_id = ? AND seq >= ? AND is_user = 0 AND outside = 2) ORDER BY outbox_id",
       sessionId,
       sessionId,
@@ -1025,10 +1079,21 @@ export class Runner {
     // (A request kept before there was an index is given its row first. What is under way comes before what has ended.)
     for (const each of requests) if (handsTo(each)) this.#b.requests.indexed(each.id);
     // Of what has ended, only what can be gone on with (done) or what the person may need to hear of (not known whether it was taken).
-    const found = asker && session ? this.#s.rows<{ id: string; worker: string; state: string; condition: string | null; generation: number | null; handed: number }>("SELECT id, worker, state, condition, generation, handed FROM work WHERE session_key = ? AND person = ? AND (state = 'open' OR (state IN ('done', 'unknown') AND updated_at > ?)) AND id NOT IN (SELECT id FROM tasks) ORDER BY state = 'open' DESC, created_at DESC LIMIT 8", session.session_key, asker, Date.now() - 24 * 60 * 60_000) : [];
-    // And nothing done under an authorisation that has since been taken away, or a set-up since changed: whoever keeps
-    // that is asked, each time the model is about to be asked, so that it is seen within a run too.
-    const theirs = (await Promise.all(found.map(async (each) => ((await this.#b.workStands(each)) ? [each] : [])))).flat();
+    // Where several people talk, only what the conversation was in fact told of: the word that the person was sent a way in, that it is under way, or its answer, reached it.
+    const chat = this.#s.scope().kind === "chat";
+    const candidates = asker && session ? this.#s.rows<{ id: string; worker: string; state: string; condition: string | null; generation: number | null; handed: number }>(`SELECT id, worker, state, condition, generation, handed FROM work WHERE session_key = ? AND person = ? AND (state = 'open' OR (state IN ('done', 'unknown') AND updated_at > ?)) AND id NOT IN (SELECT id FROM tasks) ORDER BY state = 'open' DESC, created_at DESC, id`, session.session_key, asker, Date.now() - 24 * 60 * 60_000) : [];
+    // (All of them are candidates, however many: what is under way, and what ended in the last day, for one person in one conversation.)
+    // Eight of them, in that order, each of which the conversation was told of and which still
+    // stands under the authorisation it was done under (whoever keeps that is asked, each time the
+    // model is about to be asked, so that its being taken away is seen within a run too). One
+    // that does not count takes no place from one that does.
+    const theirs: typeof candidates = [];
+    for (const each of candidates) {
+      if (theirs.length >= 8) break;
+      if ((!chat || this.#b.requests.told(each.id)) && (await this.#b.workStands(each))) theirs.push(each);
+    }
+    // Where several people talk, a run that was given any of this is cleared when it ends as one that did something in the person's name is: kept to be found then.
+    if (chat && theirs.length > 0) this.#s.setMeta(`personal:${runId}`, "1");
     return buildInstructions({
       scope: this.#s.scope(),
       situation: waiting ? "conversation" : "background",

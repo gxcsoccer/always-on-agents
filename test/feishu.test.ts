@@ -386,3 +386,14 @@ describe("asking Feishu what kind of chat this is", () => {
     expect(await chatFacts("t-app", "oc_1")).toEqual({ info: { status: 0, missing: ["external", "tenant_key", "chat_mode", "chat_status"] }, member: { status: 0 } });
   });
 });
+
+describe("showing something to one member of a chat", () => {
+  it("is done in the chat itself, and not inside a topic: there it has to go to them directly", async () => {
+    const { asideFeishu } = await import("../src/connectors/feishu");
+    const origin = { app_id: "cli_test", tenant_key: "t" };
+    expect(asideFeishu(origin, "ou_alice", { connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_1", message_id: "om_1" } })).toEqual({ connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_1", visible_to: "ou_alice" } });
+    expect(asideFeishu(origin, "ou_alice", { connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_1", message_id: "om_1", thread: "1" } })).toBeUndefined();
+    // Not for another app's chat, nor without knowing whom.
+    expect(asideFeishu({ app_id: "cli_other", tenant_key: "t" }, "ou_alice", { connector: "feishu", address: { app_id: "cli_test", chat_id: "oc_1" } })).toBeUndefined();
+  });
+});

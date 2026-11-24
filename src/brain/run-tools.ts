@@ -120,6 +120,16 @@ export class RunTools {
     return { task: false, worker: row.worker, state: row.state, standing: standingOf(row.state, waits, handed), handed, ...(waits ? { waits } : {}) };
   }
 
+  /**
+   * Whether, in a conversation several people share, this run was given work done in one person's
+   * own name to read: exactly the runs whose instructions listed such work (the Runner notes it
+   * as it puts the list together). A person whose work there is not listed (called off, failed,
+   * no longer standing, or not yet said in the conversation) is held to nothing by it.
+   */
+  #personalHere(run: RunRow): boolean {
+    return this.#s.scope().kind === "chat" && this.#s.meta(`personal:${run.id}`) !== undefined;
+  }
+
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
@@ -286,6 +296,9 @@ export class RunTools {
       },
       memoryWrite: (path, content) => {
         if (!MEMORY_PATH.test(path) || path.includes("..")) throw new Error("path must look like notes/topic.md: lowercase letters, digits, - _ /");
+        // Where several people talk, memory is everyone's. A run that has before it something done
+        // in one person's name there (it is listed for them, or was called for) writes none of it down.
+        if (this.#personalHere(run)) throw new Error("this run has to do with work done in one person's own name; nothing is written to this conversation's shared memory in it");
         // instructions.md is read as instructions in every later run, so only a person who is a
         // member here may cause it to change. Text from a PR, a CI log or a worker cannot.
         if (path === "instructions.md") this.#s.audit(this.#b.instructionEditors(run.id).join(","), "instructions.changed", { length: content.length });
@@ -403,7 +416,11 @@ export function standingOf(state: string, waits?: "authorisation" | "result", ha
 export function toolsIn(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {
   // An optional tool: only where every message the run acts on was marked, as it arrived, as one it is offered for.
   const offered = (name: string) => acting.said !== undefined && acting.said.length > 0 && acting.said.every((each) => Array.isArray(each.data.offered) && each.data.offered.includes(name));
-  return toolsOf(acting.connector).filter((each) => (!acting.shared || each.shared === true) && (!each.optional || offered(each.name)));
+  // Where several people talk: a tool that says it may be used there. One that is there for
+  // everyone the connector lets it be (not optional) needs the connector's word on each message;
+  // an optional one is there by being offered for each message.
+  const allowed = acting.said === undefined || acting.said.every((each) => each.data.shared === true);
+  return toolsOf(acting.connector).filter((each) => (!acting.shared || (each.shared === true && (each.optional === true || allowed))) && (!each.optional || offered(each.name)));
 }
 
 /**

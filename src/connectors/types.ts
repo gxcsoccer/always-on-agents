@@ -79,6 +79,21 @@ export interface Connector {
  */
 export type Holds = { state: "holds"; since: number } | { state: "not_yet"; again_in_ms?: number } | { state: "gone"; refused?: true };
 
+/**
+ * A few characters that stand for one way in: said where a person is told that it was sent to
+ * them somewhere else, and shown on the way in itself, so that they can tell which goes with
+ * which. Made from the reference alone, the same every time; it gives nothing away and opens nothing.
+ */
+export function markOf(interaction: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < interaction.length; index++) hash = Math.imul(hash ^ interaction.charCodeAt(index), 16777619) >>> 0;
+  // No 0/O, 1/I/L: read back without doubt.
+  const letters = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+  let mark = "";
+  for (let index = 0; index < 4; index++, hash = Math.floor(hash / letters.length)) mark += letters[hash % letters.length];
+  return mark;
+}
+
 /** Something to put before a person so that they can bring a condition about: what it is, and the one place to go. */
 export interface Invitation {
   title: string;
