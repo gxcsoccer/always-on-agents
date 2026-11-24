@@ -288,6 +288,17 @@ export class Runner {
       // asked now: also when the run was interrupted after the request was claimed, however
       // long ago. No longer so, and nothing is read; not to be asked just now, and it is put off.
       const making = dangling.length > 0 ? this.#b.requests.continuationOf(runId) : undefined;
+      /** Closes the calls left open, unrun. */
+      const leave = () =>
+        this.#s.transaction(() => {
+          for (const call of dangling) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+        });
+      // One that is no longer being carried on (called off, told to wait again, ended): nothing
+      // of it is done, nobody is asked anything, and nothing more is said.
+      if (making && making.status !== "resuming") {
+        leave();
+        break;
+      }
       if (making?.status === "resuming") {
         let why: string | undefined;
         try {
@@ -296,12 +307,14 @@ export class Runner {
           return this.#retryLater(runId, err);
         }
         if (!this.#stillActive(runId)) return;
-        if (why) {
-          this.#s.transaction(() => {
-            for (const call of dangling) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
-            this.#b.requests.endRequest(making.id, "void", why);
-          });
-          this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("withheld", run.session_id));
+        // It may have been called off while the owner was asked: then that is how it ended, and it is not told otherwise.
+        const still = this.#b.requests.continuationOf(runId)?.status === "resuming";
+        if (why || !still) {
+          leave();
+          if (still) {
+            this.#b.requests.endRequest(making.id, "void", why!);
+            this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("withheld", run.session_id));
+          }
           break;
         }
       }

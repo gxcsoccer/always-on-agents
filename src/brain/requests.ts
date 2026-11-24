@@ -241,7 +241,10 @@ export class Requests implements Wakes {
       // was given up, now that the person asks afresh: as long as it is certain that it never
       // arrived. One that may have (kept as unverified) is not sent a second time. A time it
       // was told not to be sent before still holds.
-      const again = this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
+      // (Not one that has since gone to the person directly: that one stands for it from then on.)
+      const moved = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}:direct`)[0];
+      if (moved && aside) this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ?", id);
+      const again = !moved && this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
       // It is being tried again: word of how the earlier try went is no longer true, and is
       // not sent (again). Where it has certainly not reached anyone, it is set aside and what
       // comes of this try is said in its place; where an attempt may have arrived, it is kept
@@ -249,7 +252,8 @@ export class Requests implements Wakes {
       if (again) this.#s.sql.exec("UPDATE outbox SET status = CASE WHEN uncertain = 0 THEN 'void' ELSE 'unverified' END WHERE idem LIKE 'invited:%' AND status = 'pending' AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[0]') = ?", waiting.interaction);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
-        const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
+        const sent = moved?.status ?? this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
+        if (moved) now.direct = 1;
         if (sent === "sent") this.#tell(now, "reached");
         else if (sent === "dead") this.#tell(now, "failed");
         else if (sent === "unverified") this.#tell(now, "unknown");

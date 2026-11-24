@@ -870,6 +870,17 @@ describe("keeping a request that has to wait", () => {
       });
     });
 
+    it("is not shown there a second time once it has gone to them directly: another request for the same way in is told how that one fared", async () => {
+      await asking(({ requests, store, run, message, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.wait(run("r2"), { ...acting, events: { said: [message("再读一篇", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, request: { document: "another" }, privately: "here" });
+        expect(invite()).toMatchObject({ status: "dead" });
+        expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: "notice:invitedElsewhere" });
+      });
+    });
+
     it("says so where the request was made when they cannot be reached directly either, or when it cannot be told whether it was shown", async () => {
       await asking(
         async ({ requests, store, sent }, invite) => {

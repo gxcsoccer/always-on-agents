@@ -1090,6 +1090,27 @@ describe("the run loop, by itself", () => {
         expect(b.of("endRequest")).toEqual([["req_1", "void", "what it waited for no longer holds"]]);
         expect(b.run(id).status).toBe("done");
       });
+      // Called off before its call was made: the call is closed unrun, nothing is asked of anyone, and nothing more is said.
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.carried = { ...b.settings.carried, status: "cancelled" };
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.of("toolsFor")).toEqual([]);
+        expect(b.of("recordUsage")).toEqual([]);
+        expect(b.of("notify")).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+      });
+      // Called off while its condition's owner was being asked: it is not then told that it stopped.
+      await within(async (b) => {
+        const id = await claimed(b);
+        const carried = b.settings.carried!;
+        b.host.requests.mayNotDisclose = async () => ((b.settings.carried = { ...carried, status: "cancelled" }), "what it waited for no longer holds");
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.of("notify")).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+      });
       await within(async (b) => {
         const id = await claimed(b);
         b.settings.mayNotDisclose = new Error("the owner cannot be asked");
