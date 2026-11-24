@@ -41,7 +41,7 @@ describe("a connector's tools", () => {
     const other = { app: "a2", org: "o1" };
     const cases: [string, () => ReturnType<typeof brain>, (stub: any) => Promise<void>][] = [
       ["a group", () => brain("chat"), (stub) => stub.ingest(own("read my plan"))],
-      ["someone else's words in the batch", () => brain(), async (stub) => { await stub.ingest(own("read my plan")); await stub.ingest(own("and mine", { user: "mallory" })); }],
+      // (Someone else's words no longer share a run with the person's own: see "takes each person's ordinary messages on their own" in runner.test.ts.)
       ["the same person through the tenant's backend", () => brain(), (stub) => stub.ingest(message("read my plan", { user: "x", session_key: PRIVATE, data: { origin: ORIGIN, direct: true } }))],
       ["a conversation that is not the private one", () => brain(), (stub) => stub.ingest(own("read my plan", { session_key: "dm" }))],
       ["a connector the deployment does not trust", () => brain(), (stub) => stub.ingest(own("read my plan", { source: "newsfeed", session_key: privateSessionKey("newsfeed", ORIGIN) }))],
@@ -50,6 +50,7 @@ describe("a connector's tools", () => {
       ["an origin with a gap in it", () => brain(), (stub) => stub.ingest(own("read my plan", { session_key: privateSessionKey("notes", { app: "a1", org: "" }), data: { origin: { app: "a1", org: "" }, direct: true } }))],
       ["a button press", () => brain(), (stub) => stub.ingest(own("approve K7PW", { data: { origin: ORIGIN, card: true, question: "ask:x:1" } }))],
       ["a reply to a question", () => brain(), (stub) => stub.ingest(own("yes", { data: { origin: ORIGIN, direct: true, question: "ask:x:1" } }))],
+      ["words that name an open question", () => brain(), (stub) => stub.ingest(own("deny K7PW", { data: { origin: ORIGIN, direct: true, about_question: true } }))],
       ["something routed here from elsewhere", () => brain(), (stub) => stub.ingest(own("approve K7PW", { data: { origin: ORIGIN, direct: true, routed_from: "thread:1" } }))],
       ["a message not marked as written here in private", () => brain(), (stub) => stub.ingest(own("read my plan", { data: { origin: ORIGIN } }))],
       ["something that merely happened", () => brain(), (stub) => stub.ingest(own("a timer went off", { kind: "timer", principal: { kind: "timer", id: "t", explicit: false } }))],

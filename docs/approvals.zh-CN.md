@@ -46,7 +46,7 @@ agent 做的有些事，在有人点头之前不应该发生。这篇文档说�
 |---|---|
 | 消息必须来自本作用域的成员，是明确对 agent 说的，并且经由部署方信任其身份判断的 connector 到达（`src/agent.config.ts` 里的 `trusted`）。其他 connector 上报的内容不能决定任何事 | `#isDecider` |
 | 在群聊或仓库里，只有发起这个任务的人能批准 | `Tasks.answer` |
-| 同一批消息里有好几个人提出请求时，任务不记发起人，于是没有人能批准 | `Tasks.dispatch` |
+| 同一批消息里有好几个人提出请求时，任务不记发起人，于是没有人能批准。（经由飞书这类带个人工具的 connector 来的消息，一批只收同一个人的，这种情况不会出现） | `Tasks.dispatch` |
 | 在群聊或仓库里，不是由人发起的任务（比如 CI 失败后自动派出的）不能被批准，只能被拒绝。单聊只有一个成员，agent 自己发起的任务（比如定时器触发的）可以由这个成员批准 | `Tasks.answer` |
 | 问题没能送达任何人时，不能被批准 | `Tasks.event`、`Tasks.answer` |
 | 在仓库里，没有关联到租户用户的 GitHub 账号不算成员；只有 owner、member、collaborator 的评论才会被当作对 agent 的请求 | `#isDecider`、`connectors/github.ts` |

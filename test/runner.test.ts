@@ -178,6 +178,43 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("takes each person's ordinary messages on their own where a connector's tools would act for a person, in order", async () => {
+      const read = { name: "feishu_read_document", effect: "read" } as ConnectorTool;
+      const taken = (tools: ConnectorTool[]) =>
+        within(async ({ runner, store, event, settings }) => {
+          settings.connectorTools = tools;
+          const bob = { kind: "human", id: "ou_2", explicit: true };
+          const group = { session_key: "chat", data: { origin: ORIGIN } };
+          event("a1", group);
+          event("a2", group);
+          event("b1", { ...group, principal: bob });
+          event("a3", group);
+          // A button pressed, and something no person wrote: neither is anyone's ordinary request.
+          event("approve AB12", { ...group, data: { origin: ORIGIN, card: true } });
+          event("", { ...group, source: "timer", kind: "timer", principal: { kind: "system", id: "timer" } });
+          event("a4", group);
+          // Two people pressing buttons, one after the other: each press is taken up alone.
+          event("approve CD34", { ...group, data: { origin: ORIGIN, card: true } });
+          event("deny CD34", { ...group, principal: bob, data: { origin: ORIGIN, card: true } });
+          // Words that name an open question, then an ordinary request, from one person.
+          event("deny EF56", { ...group, data: { origin: ORIGIN, about_question: true } });
+          event("a5", group);
+          // Words not addressed to the agent, then words that are, from one person.
+          event("aside", { ...group, principal: { kind: "human", id: PERSON, explicit: false } });
+          event("a6", group);
+          const runs: string[][] = [];
+          for (let id = await runner.next(); id; id = await runner.next()) {
+            runs.push(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text));
+            store.sql.exec("UPDATE inbox SET status = 'done' WHERE run_id = ?", id);
+            store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+          }
+          return runs;
+        }, "chat:oc_1");
+      expect(await taken([read])).toEqual([["a1", "a2"], ["b1"], ["a3"], ["approve AB12"], [""], ["a4"], ["approve CD34"], ["deny CD34"], ["deny EF56"], ["a5"], ["aside"], ["a6"]]);
+      // Where no tool acts for a person, a conversation's messages are taken together as before.
+      expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4", "approve CD34", "deny CD34", "deny EF56", "a5", "aside", "a6"]]);
+    });
+
     it("takes a burst as several runs, by count and by size", async () => {
       await within(async ({ runner, store, event, inbox }) => {
         for (let i = 0; i < 45; i++) event(`m${i}`);
@@ -1075,6 +1112,8 @@ describe("the run loop, by itself", () => {
       await within(async ({ runner, event, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
         const earlier = event("the link", { status: "done", received_at: Date.now() - 60_000 });
+        // Words that named an open question are not among what they said shortly before.
+        event("deny AB12 https://x/docx/Other", { status: "done", received_at: Date.now() - 30_000, data: { direct: true, origin: ORIGIN, about_question: true } });
         event("summarise it");
         const id = (await runner.next())!;
         expect(runner.actingFor(id)).toEqual({ connector: "feishu", person: PERSON, origin: ORIGIN, said: [{ text: "summarise it", data: { direct: true, origin: ORIGIN } }], recent: [{ text: "the link", data: { direct: true, origin: ORIGIN } }], recentIds: [earlier] });
