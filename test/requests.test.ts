@@ -49,6 +49,8 @@ function bench(state: DurableObjectState) {
       return { ok: true };
     },
     notice: (which) => `notice:${which}`,
+    // The person's own chat with the bot, as the connector would address it from a verified origin.
+    direct: (connector, origin, person) => (settings.noDirect ? undefined : { connector, address: { app_id: origin.app_id, open_id: person } }),
   };
   const requests = new Requests(store, host);
   store.sql.exec("INSERT INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, ?, 1, 1)", SESSION, SESSION_KEY, TARGET);
@@ -389,6 +391,7 @@ describe("requests that wait, by themselves", () => {
       request("r_gone", { events: JSON.stringify({ said: [99_999], recent: [] }) });
       // As a deployment before this step has it.
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(kept("r_old").person).toBe("ou_7");
@@ -413,6 +416,7 @@ describe("requests that wait, by themselves", () => {
       store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('which:old', ?, 'which?', 'sent', 0, 0, ?, ?)", TARGET, Date.now(), JSON.stringify({ subject: "feishu:message:om_which", holder: "" }));
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.meta(`asked_which:${SESSION}`)).toBeUndefined();
@@ -469,6 +473,7 @@ describe("requests that wait, by themselves", () => {
       const choice = private_("第一个", "run_pick");
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old", chose: choice }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
@@ -482,6 +487,7 @@ describe("requests that wait, by themselves", () => {
       request("r2", { events: JSON.stringify({ said: [message("two", {}, null, "ou_2")], recent: [] }) });
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.rows("SELECT key FROM meta WHERE key LIKE 'asked_which:%'")).toEqual([]);
@@ -755,40 +761,87 @@ describe("keeping a request that has to wait", () => {
   });
 
   it("puts the way in before the person themselves where the tool says so, and tells the conversation only how that went", async () => {
-    const to = { connector: "feishu", address: { app_id: "cli_1", open_id: "ou_1" } };
-    const asking = (use: (bench_: ReturnType<typeof bench>, invite: () => Record<string, unknown>) => void, where?: typeof to) =>
-      within((all) => {
+    const to = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", open_id: "ou_1" } });
+    const acting = { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" } };
+    const asking = (use: (bench_: ReturnType<typeof bench>, invite: () => Record<string, unknown>) => void | Promise<void>, privately = true) =>
+      within(async (all) => {
         const active = all.run("r1");
         const said = all.message("总结一下", {}, "r1");
-        all.requests.wait(active, { connector: "feishu", person: "ou_1", events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, ...(where ? { to: where } : {}) });
-        use(all, () => all.sent("invite:grant_1.nonce"));
+        all.requests.wait(active, { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, ...(privately ? { privately: true } : {}) });
+        await use(all, () => all.sent("invite:grant_1.nonce"));
       });
-    // To the person, not to where the request was made.
-    await asking(({ requests, sent, store }, invite) => {
-      expect(invite().target).toBe(JSON.stringify(to));
+    // To the person, as the connector addresses them from where the request verifiably came: not to where it was made.
+    await asking(async ({ requests, sent, store }, invite) => {
+      expect(invite().target).toBe(to);
       expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
       // It reached them: the conversation is told so, once, without the way in itself.
-      requests.shown(invite() as never, true);
-      requests.shown(invite() as never, true);
+      requests.shown(invite() as never, "reached");
+      requests.shown(invite() as never, "reached");
       expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
-      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere", interaction: null });
-    }, to);
-    // It did not reach them: that is what is said.
+      const told = sent("invited:grant_1.nonce:call_1");
+      expect(told).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere", interaction: null, continuation: null });
+      // Sent only while that request still waits.
+      expect(await requests.gate(told as never)).toBe("send");
+      requests.endRequest("call_1", "cancelled", "x");
+      expect(await requests.gate(told as never)).toBe("void");
+    });
+    // It did not reach them, or there is no telling: each is said as what it is.
     await asking(({ requests, sent }, invite) => {
-      requests.shown(invite() as never, false);
-      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ target: TARGET, text: "notice:inviteNotSent" });
-    }, to);
+      requests.shown(invite() as never, "failed");
+      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ text: "notice:inviteNotSent" });
+    });
+    await asking(({ requests, sent }, invite) => {
+      requests.shown(invite() as never, "unknown");
+      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ text: "notice:inviteUnknown" });
+    });
     // A request no longer waiting is told nothing.
     await asking(({ requests, store }, invite) => {
       requests.endRequest("call_1", "cancelled", "x");
-      requests.shown(invite() as never, true);
+      requests.shown(invite() as never, "reached");
       expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
-    }, to);
+    });
+    // A second request that comes to wait on a way in already delivered is told at once.
+    await asking(({ requests, store, run, message, sent }, invite) => {
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = 1 WHERE idem = 'invite:grant_1.nonce'");
+      const next = run("r2");
+      const said = message("再读一篇", {}, "r2");
+      requests.wait(next, { ...acting, events: { said: [said], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
+      expect(sent("invited:grant_1.nonce:call_2")).toMatchObject({ text: "notice:invitedElsewhere" });
+      expect(sent("invited:grant_1.nonce:call_1")).toBeUndefined();
+      void invite;
+    });
+    // A reply to that line is about that request.
+    await asking(({ requests, store, run, message, kept }, invite) => {
+      requests.shown(invite() as never, "reached");
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = 1, receipt = ? WHERE idem = 'invited:grant_1.nonce:call_1'", JSON.stringify({ subject: "feishu:message:om_told", holder: "" }));
+      const calling = run("r_off");
+      message("算了", { replies_to: "feishu:message:om_told" }, "r_off");
+      expect(requests.mayCancel(calling, "call_1", "call_off").record.id).toBe("call_1");
+      void kept;
+    });
+    // A way in that was set aside unsent, because nobody waited on it any more, goes out again for a new request.
+    await asking(({ requests, store, run, message }, invite) => {
+      requests.endRequest("call_1", "cancelled", "x");
+      store.sql.exec("UPDATE outbox SET status = 'void' WHERE idem = 'invite:grant_1.nonce'");
+      const next = run("r2");
+      const said = message("再读一篇", {}, "r2");
+      requests.wait(next, { ...acting, events: { said: [said], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
+      expect(invite()).toMatchObject({ status: "pending", target: to });
+    });
     // Where the way in goes to the conversation itself, as it always has, there is nothing more to say.
     await asking(({ requests, store }, invite) => {
       expect(invite().target).toBe(TARGET);
-      requests.shown(invite() as never, true);
+      requests.shown(invite() as never, "reached");
       expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+    }, false);
+    // A connector that cannot address the person directly: nothing is kept, and the tool's answer is not used.
+    await within(({ requests, store, run, message, settings }) => {
+      settings.noDirect = "1";
+      const active = run("r1");
+      const said = message("总结一下", {}, "r1");
+      expect(() => requests.wait(active, { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, privately: true })).toThrow(/cannot be reached directly/);
+      expect(store.rows("SELECT id FROM continuations")).toEqual([]);
+      expect(store.rows("SELECT idem FROM outbox")).toEqual([]);
     });
   });
 

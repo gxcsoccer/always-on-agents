@@ -77,18 +77,19 @@ export interface Waiting {
     interaction: string;
     request: Record<string, unknown>;
     /**
-     * Where the way in is put, when that is not where the request was made: the person
-     * themselves, directly. A way in is for one person, and a conversation several people share
-     * is not the place for it. The conversation is then told only that it was sent, once it has
-     * reached them. Absent: it goes where the request came from.
+     * The way in is for the person alone: it is put before them directly, not where the request
+     * was made (a conversation several people share is not the place for it). The tool only says
+     * so. Where "directly" is, the connector's channel works out from where the request
+     * verifiably came and who made it (`channel.direct`); the tool names no address. The
+     * conversation the request was made in is told only how that went, once it is known.
      */
-    to?: Target;
+    privately?: boolean;
   };
 }
 
 export function isWaiting(result: unknown): result is Waiting {
   const w = (result as Waiting | null)?.waiting;
-  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.to === undefined || (typeof w.to === "object" && w.to !== null && typeof w.to.connector === "string" && typeof w.to.address === "object" && w.to.address !== null));
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean");
 }
 
 /**
@@ -257,6 +258,12 @@ export interface Channel {
    * system could not say (busy, unreachable); "permanent" when it will not be taken off.
    */
   unreceived?(env: Env, scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }, mark: string): Promise<"removed" | "retry" | "permanent">;
+  /**
+   * Where a person is reached directly through this connector (their own chat with the bot, say),
+   * worked out from a verified origin and their id, and from nothing else. Undefined where they
+   * cannot be.
+   */
+  direct?(origin: Record<string, string>, person: string): Target | undefined;
   /**
    * The message this one was written in reply to, where the Brain was never sent it (a group
    * sends the agent only what mentions it). Asked once, before the run that takes the message

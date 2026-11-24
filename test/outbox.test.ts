@@ -28,7 +28,7 @@ function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const delivered: { target: Target; message: OutboundMessage }[] = [];
   /** What the requests part was told about a way in: which message, and whether it reached the person. */
-  const shown: [string, boolean][] = [];
+  const shown: [string, string][] = [];
   const stamped: string[] = [];
   const ended: { id: string; status: string; why: string }[] = [];
   const closed: string[] = [];
@@ -51,7 +51,7 @@ function bench(state: DurableObjectState) {
       endRequest: (id, status, why) => void ended.push({ id, status, why }),
       sessionKeyOf: () => settings.sessionKey,
       readsOf: (runId) => settings.reads[runId] ?? [],
-      shown: (row, reached) => void shown.push([row.idem as string, reached]),
+      shown: (row, how) => void shown.push([row.idem as string, how]),
     },
   };
   const outbox = new Outbox(store, host);
@@ -181,14 +181,26 @@ describe("the outbox, by itself", () => {
     });
 
     it("tells the requests part how a way in fared: that it reached the person, or that it was given up", async () => {
-      await within(async ({ outbox, channel, set, shown }) => {
+      await within(async ({ outbox, channel, set, shown, row }) => {
         outbox.enqueue("plain", SESSION, null, "hello");
         outbox.enqueue("i1", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
         outbox.enqueue("i2", SESSION, null, "authorise", undefined, undefined, { interaction: "int:2" });
+        outbox.enqueue("i3", SESSION, null, "authorise", undefined, undefined, { interaction: "int:3" });
+        outbox.enqueue("after", SESSION, null, "next in line");
+        // A way in is not kept at the head of the queue: refused once, it is given up (it did not
+        // get there); with no answer, it is tried briefly and then given up (there is no telling).
         channel.i2 = fails(new DeliveryRejected("no"));
-        set("i2", { attempts: 5 });
+        channel.i3 = fails(new Error("timeout"));
         await outbox.flush();
-        expect(shown).toEqual([["i1", true], ["i2", false]]);
+        expect(row("i2")).toMatchObject({ status: "dead", attempts: 1 });
+        for (let tries = 0; tries < 3; tries++) {
+          set("i3", { next_at: 0 });
+          await outbox.flush();
+        }
+        expect(row("i3")).toMatchObject({ status: "unverified", attempts: 3 });
+        expect(row("after").status).toBe("sent");
+        expect(shown).toEqual([["i1", "reached"], ["i2", "failed"], ["i3", "unknown"]]);
+        void set;
       });
     });
 

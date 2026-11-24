@@ -284,6 +284,9 @@ export const MIGRATIONS: string[] = [
      ) who ON who.key = m.key
      WHERE m.key NOT LIKE 'asked_which:%:%';
    DELETE FROM meta WHERE key LIKE 'asked_which:%' AND key NOT LIKE 'asked_which:%:%';`,
+  // 27: whether a request's way in was put before the person directly, somewhere else than the
+  // request was made. The conversation is then told how that went (see Requests.shown).
+  `ALTER TABLE continuations ADD COLUMN direct INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

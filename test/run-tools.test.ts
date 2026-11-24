@@ -372,7 +372,7 @@ describe("a run's tools", () => {
         tool.answer = async (context) => (context.relied("recent", 1), { waiting });
         expect(await tools().connectorTool("c1", "feishu_read_document", { url: "u" })).toEqual({ waiting: "kept" });
         expect(outside.has("c1")).toBe(false);
-        expect(of("wait")).toEqual([[expect.objectContaining({ id: "r1" }), { connector: "feishu", person: "ou_1", events: { said: [7, 8], recent: [42], bound: [42] } }, "c1", "feishu_read_document", waiting, undefined]]);
+        expect(of("wait")).toEqual([[expect.objectContaining({ id: "r1" }), { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1" }, events: { said: [7, 8], recent: [42], bound: [42] } }, "c1", "feishu_read_document", waiting, undefined]]);
         expect(store.rows<{ private: number }>("SELECT private FROM outbox")[0].private).toBe(0);
       });
     });
@@ -393,6 +393,18 @@ describe("a run's tools", () => {
             ["mayCancel", "req_0", "c1", undefined],
             ["cancel", { id: "req_0" }, "c1", 3],
           ]);
+        });
+      });
+
+      it("takes a waiting answer that is not whole as a failure: the model is not shown it, nothing waits, and the one it would replace stands", async () => {
+        await within(async ({ tools, tool, calls, of }) => {
+          // Says it waits, and leaves out what it waits for.
+          tool.answer = async () => ({ waiting: { on: "feishu", subject: "g", generation: 1, until: Date.now() + 60_000, interaction: "secret-way-in", request: {} } });
+          const output = await tools().connectorTool("c1", "feishu_read_document", { url: "u", replaces: "req_0" });
+          expect(output).toEqual({ error: expect.stringMatching(/could not be used/) });
+          expect(JSON.stringify(output)).not.toContain("secret-way-in");
+          expect(of("wait")).toEqual([]);
+          expect(calls.filter(([name]) => name === "cancel")).toEqual([]);
         });
       });
 
