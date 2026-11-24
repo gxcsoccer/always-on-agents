@@ -35,6 +35,8 @@ const world = {
   /** How many of the next writes Doubao takes without the answer coming back. */
   dropAnswers: 0,
   /** How many of the next writes get no answer and are not taken either. */
+  /** Cards replaced where they were shown. */
+  closed: [] as any[],
   unreachable: 0,
   /** Doubao's account service gives no answer at all. */
   accountsDown: false,
@@ -61,6 +63,7 @@ function installWorld() {
   world.taken.clear();
   world.writes.length = 0;
   world.dropAnswers = 0;
+  world.closed.length = 0;
   world.unreachable = 0;
   world.accountsDown = false;
   world.scope = SCOPE;
@@ -83,6 +86,7 @@ function installWorld() {
         world.sent.push({ to: body.receive_id ?? "reply", type: words ? "text" : body.msg_type, content: body.msg_type === "post" ? { text: content.zh_cn.content.flat().map((each: any) => each.text).join("") } : content });
         return Response.json({ code: 0, data: { message_id: `om_sent_${world.sent.length}` } });
       }
+      if (init?.method === "PATCH") world.closed.push(JSON.parse(body.content));
       // Reactions and the like: taken, and of no interest here.
       return Response.json({ code: 0, data: {} });
     }
@@ -403,6 +407,8 @@ describe("handing work to Doubao Work", () => {
     await dee.settle();
     expect(await dee.requests()).toMatchObject([{ status: "void" }]);
     expect(dee.heard().filter((each) => each === NOT_DONE)).toHaveLength(1);
+    // The card that led nowhere no longer offers its way in.
+    await vi.waitFor(() => expect(world.closed.map((each) => each.header.title.content)).toEqual(["这次请求已结束"]), { interval: 5 });
     // The same link once more changes nothing and says nothing more.
     expect((await consent(first, dee)).status).toBe(400);
     await dee.quiet();

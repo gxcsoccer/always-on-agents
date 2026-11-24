@@ -1697,7 +1697,7 @@ describe("a request that waits and is carried on", () => {
     expect(read()).toEqual(["DocHal000000000000001"]);
   });
 
-  it("shows an invitation as over where it was shown, without its button: used once authorised, ended once called off", async () => {
+  it("shows an invitation as used where it was shown, without its button, and leaves one that may be shown again as it is", async () => {
     const actions = (card: any) => JSON.stringify(card).includes('"tag":"action"');
     const amy = owner("DocAmyClosed000000001");
     await asksFor(amy, "DocAmyClosed000000001");
@@ -1713,9 +1713,16 @@ describe("a request that waits and is carried on", () => {
     const id = await asksFor(jon, "DocJonClosed000000001");
     model.replies([call("cancel_request", { request_id: id })], [call("send_message", { text: "已取消" })], [say("")]);
     await jon.says("算了");
+    // Called off: the card keeps its button. Asked again at once, the same way in is the one
+    // they are shown, so it has to work still; and it does, to the end.
+    await sleep(30);
+    expect(feishu.closed).toHaveLength(1);
+    await asksFor(jon, "DocJonClosed000000001");
+    carriesOn("总结");
+    await authorises(jon);
+    expect(jon.heard().at(-1)).toBe("总结");
     await vi.waitFor(() => expect(feishu.closed).toHaveLength(2), { interval: 5 });
-    expect(feishu.closed[1].card.header.title.content).toBe("这次请求已结束");
-    expect(actions(feishu.closed[1].card)).toBe(false);
+    expect(feishu.closed[1].card.header.title.content).toBe("已授权");
     expect(feishu.closed[1].message).not.toBe(feishu.closed[0].message);
   });
 

@@ -516,7 +516,10 @@ export class Requests implements Wakes {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ? AND status = 'waiting'", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
-    if (ended.length > 0 && shown) this.#wayInOver(shown, "over");
+    // Only where the way in itself is finished too: past its time, or come to nothing. One a
+    // request merely stopped wanting (called off, say) may be the very one the person is shown
+    // again when they ask afresh, and has to keep working.
+    if (ended.length > 0 && shown && (status === "expired" || status === "void")) this.#wayInOver(shown, "over");
   }
 
   /**
