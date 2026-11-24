@@ -532,8 +532,10 @@ export class Requests implements Wakes {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
-    // If whoever carried it out has not said how it ended, it ended as the request did.
-    if (ended.length > 0) this.#work(id, status === "unverified" ? "unknown" : status);
+    // If whoever carried the work out has not said how it ended, the request's end says it only
+    // where that is about the work itself: called off, out of time, no longer standing. That its
+    // answer was sent, or could not be, says nothing of what the worker made of it: not known.
+    if (ended.length > 0) this.#work(id, status === "cancelled" || status === "expired" || status === "void" ? status : "unknown");
     if (ended.length > 0 && shown) this.#wayInOver(shown);
   }
 
