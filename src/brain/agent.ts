@@ -172,6 +172,7 @@ export class BrainAgent extends DurableObject<Env> {
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
       direct,
       aside,
+      handsTo: (connector, tool) => toolsOf(connector).find((each) => each.name === tool)?.hands_to,
       closeInvitation: (target, receipt, interaction, how) => closeInvitation(this.env, target, receipt, interaction, how),
       waitUntil: (promise) => this.ctx.waitUntil(promise),
     });
@@ -328,11 +329,28 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead') AND received_at < ? AND text IS NOT NULL", old);
       this.#store.sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead') AND received_at < ?", now - RETAIN_AUDIT_MS);
       this.#store.sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn', 'reconciling', 'void', 'unverified') AND created_at < ?", old);
+      // Before what the index of work points at is cleared: a row still open for something that has
+      // ended (ended while a version without the index ran, say) is given its end, with the time
+      // it ended. A task's is its own last status. For a request, only an end that is about the work
+      // itself (called off, out of time, no longer standing): that its answer was sent, or could
+      // not be, does not say what the worker made of it, so that is not known.
+      // One whose task or request is gone altogether is not known either.
+      this.#store.sql.exec(
+        `UPDATE work SET state = CASE t.status WHEN 'succeeded' THEN 'done' WHEN 'failed' THEN 'failed' WHEN 'cancelled' THEN 'cancelled' ELSE 'unknown' END, updated_at = t.updated_at
+         FROM tasks t WHERE t.id = work.id AND work.state = 'open' AND t.status IN ('succeeded', 'failed', 'lost', 'cancelled')`,
+      );
+      this.#store.sql.exec(
+        `UPDATE work SET state = CASE WHEN c.status IN ('cancelled', 'expired', 'void') THEN c.status ELSE 'unknown' END, updated_at = c.ended_at
+         FROM continuations c WHERE c.id = work.id AND work.state = 'open' AND c.ended_at IS NOT NULL`,
+      );
+      this.#store.sql.exec("UPDATE work SET state = 'unknown' WHERE state = 'open' AND id NOT IN (SELECT id FROM tasks) AND id NOT IN (SELECT id FROM continuations) AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM continuations WHERE ended_at IS NOT NULL AND ended_at < ?", old);
       this.#store.sql.exec("DELETE FROM runs WHERE status != 'running' AND ended_at < ?", old);
       this.#store.sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ?", old);
       this.#store.sql.exec("DELETE FROM task_events WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM tasks WHERE status IN ('succeeded', 'failed', 'lost', 'cancelled') AND updated_at < ?", old);
+      // The index of work is kept as long as what it points at: work that has ended, for the same time.
+      this.#store.sql.exec("DELETE FROM work WHERE state != 'open' AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM audit WHERE at < ?", now - RETAIN_AUDIT_MS);
       this.#store.sql.exec("DELETE FROM meta WHERE key LIKE 'tokens:%' AND key < ?", `tokens:${new Date(old).toISOString().slice(0, 10)}`);
       // Old transcript, beyond what any future run would be shown. The cut lands on a user turn, as

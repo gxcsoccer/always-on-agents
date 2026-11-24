@@ -383,6 +383,30 @@ describe("handing work to Doubao Work", () => {
     expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${session}/events`]);
   });
 
+  it("keeps one row in the index of work for each piece handed over, through authorising, waiting again and the answer; a follow-up is a row of its own", async () => {
+    await pair();
+    const cy = someone();
+    const work = () => rowsOf(cy.stub, "SELECT id, worker, person, state, condition FROM work ORDER BY created_at, id");
+    model.replies([asks("调研 A")], [say("")]);
+    await cy.says("让豆包调研 A");
+    // Waiting for their authorisation: already a piece of work, under the request's own id.
+    const request = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    expect(await work()).toMatchObject([{ id: request, worker: "doubao", person: cy.openId, state: "open", condition: expect.stringContaining("|auth|") }]);
+    expect((await consent(linkOn(cy.cards()[0]), cy)).status).toBe(200);
+    await cy.settle();
+    // Handed over and waiting for the reply: the same row, waiting on something else.
+    expect(await work()).toMatchObject([{ id: request, state: "open", condition: expect.stringContaining("|reply|") }]);
+    expect(world.writes).toHaveLength(1);
+    doubaoReplies([...world.sessions.keys()][0], "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await cy.later();
+    expect(await work()).toMatchObject([{ id: request, state: "done" }]);
+
+    model.replies([asks("再深入", true)], [say("")]);
+    await cy.says("再深入");
+    expect((await work()).map((each) => each.state)).toEqual(["done", "open"]);
+  });
+
   it("asks for a token for this work only, whatever else the person has allowed the app before", async () => {
     await pair();
     const dee = someone();
@@ -609,6 +633,28 @@ describe("handing work to Doubao Work", () => {
     expect(toolOutputs(modelCalls.at(-2))[0].error).toContain("could not be confirmed");
     expect(hal.heard()).toEqual(["没能确认豆包是否收到。"]);
     expect(await (await hal.grant()).status()).toMatchObject({ work: { lost: 1 } });
+    // In the index of work: not known to have been taken, whatever the person was told and whether that reached them.
+    expect(await rowsOf(hal.stub, "SELECT state FROM work")).toEqual([{ state: "unknown" }]);
+  });
+
+  it("records what Doubao made of a piece of work, not that the person was told: a row also for one that never waited", async () => {
+    await pair();
+    const ivy = someone();
+    const session = await handsOver(ivy, "调研 A");
+    // Doubao says it failed. The person is told, and that reaches them: the work has still failed.
+    doubaoReplies(session, "", "failed");
+    model.replies([call("send_message", { text: "豆包没有做成。" })], [say("")]);
+    await ivy.later();
+    expect(ivy.heard().at(-1)).toBe("豆包没有做成。");
+    expect(await rowsOf(ivy.stub, "SELECT state FROM work")).toEqual([{ state: "failed" }]);
+    // Said from the record the call already had: where the record cannot be read again, the same.
+
+    // With the authorisation standing, a new piece is taken by Doubao and its receipt is lost both times: it never waits, and is still a piece of work.
+    world.unreachable = 2;
+    model.replies([asks("调研 B")], [call("send_message", { text: "没能确认。" })], [say("")]);
+    await ivy.says("让豆包调研 B");
+    expect((await rowsOf(ivy.stub, "SELECT state FROM work ORDER BY created_at, rowid")).map((each) => each.state)).toEqual(["failed", "unknown"]);
+    expect(await rowsOf(ivy.stub, "SELECT 1 FROM continuations")).toHaveLength(1);
   });
 
   it("does not use an authorisation given under a pairing the operator has since changed", async () => {

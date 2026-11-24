@@ -1602,6 +1602,15 @@ describe("records and limits", () => {
       sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('t', 'old-done', 'message', 'old', '{}', 'an old secret', 'done', ?)", longAgo);
       sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, status, received_at) VALUES ('t', 'old-pending', 'message', 'old', ?, 'pending', ?)", JSON.stringify({ kind: "human", id: "alice", explicit: true }), longAgo);
       sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at) VALUES ('old', '{}', 'old message', 'sent', 0, ?)", longAgo);
+      // The index of work, as a version without it could leave it: rows still open for a task that ended long ago, for a
+      // request that was answered long ago, and for something that is gone altogether; and one for a task still running.
+      const work = (id: string, at: number) => sql.exec("INSERT INTO work (id, worker, session_key, person, state, created_at, updated_at) VALUES (?, 'sandbox', 'old', 'alice', 'open', ?, ?)", id, at, at);
+      const task = (id: string, status: string, at: number) => sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', 'old', ?, ?, ?)", id, `op_${id}`, status, at, at);
+      for (const id of ["w_task_old", "w_gone"]) work(id, longAgo);
+      for (const id of ["w_task_new", "w_running"]) work(id, Date.now() - 1_000);
+      task("w_task_old", "succeeded", longAgo);
+      task("w_task_new", "failed", Date.now() - 1_000);
+      task("w_running", "running", Date.now() - 1_000);
       sql.exec("DELETE FROM meta WHERE key = 'housekeeping_at'");
     });
     // Rows written behind the Brain's back schedule nothing; a new event wakes it.
@@ -1612,6 +1621,9 @@ describe("records and limits", () => {
     const state = await stub.inspect();
     const texts = state.recent_events.map((e: any) => e.text);
     expect(state.outbox.find((m: any) => m.text === "old message")).toBeUndefined();
+    // Each open row was given the end of what it points at first; then what ended long ago went with it, and nothing open or recent.
+    const kept = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT id, state FROM work WHERE id LIKE 'w_%' ORDER BY id").toArray());
+    expect(kept).toEqual([{ id: "w_running", state: "open" }, { id: "w_task_new", state: "failed" }]);
     // The old pending event was handled rather than deleted. The old finished one lost its content
     // but kept its identity, so a replay of it is still recognised as a duplicate.
     expect(state.inbox).toMatchObject({ done: 4, pending: 0, dead: 0 });

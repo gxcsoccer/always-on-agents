@@ -184,6 +184,11 @@ export interface ConnectorTool {
   /** Offered only where its connector said so for the very messages a run acts on (see `Connector.offers`): not there at all otherwise. */
   optional?: true;
   /**
+   * Set on a tool that hands a piece of work to a worker: the worker's name. A request such a
+   * tool keeps waiting is then recorded as a piece of work, under the request's id.
+   */
+  hands_to?: string;
+  /**
    * Whether the tool may also be used where several people talk (a group, say), for the one of
    * them who asked. Without it the tool exists only in a person's private conversation. A tool
    * that says so answers for what that takes: what it reads there is said in front of the others.
@@ -282,6 +287,14 @@ export interface ToolContext {
    * goes no further (to the model, to the channel) once that no longer holds.
    */
   identified?(request: Record<string, unknown>, identity: string, under: { condition: string; generation: number }): void;
+  /**
+   * For a tool that hands work to a worker (`hands_to`): to be called with how the piece of work
+   * of this call stands, as far as the tool knows it, whenever it has taken the work or has
+   * learnt how it ended: "open", or how it ended ("unknown" where it cannot be told whether the
+   * worker took it). Not called where nothing was handed over at all. This is the work's own
+   * outcome, whatever the person is told of it.
+   */
+  work?(as: "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown"): void;
 }
 
 export interface Ingress {

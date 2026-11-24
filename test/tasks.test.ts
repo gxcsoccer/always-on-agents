@@ -267,6 +267,28 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("keeps one row for each task in the index of work, opened as it is written and ended once", async () => {
+      await within(async ({ tasks, store, task }) => {
+        const work = () => store.rows<Record<string, unknown>>("SELECT id, worker, session_key, person, state FROM work ORDER BY created_at, id");
+        const one = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        // The same call again is the same task, and the same row.
+        await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null);
+        expect(work()).toEqual([{ id: one.task_id, worker: "sandbox", session_key: SESSION_KEY, person: "alice", state: "open" }]);
+        await tasks.event(one.task_id, 1, "result", { status: "succeeded", summary: "done" });
+        expect(work()).toMatchObject([{ id: one.task_id, state: "done" }]);
+        // A late word on it changes nothing.
+        await tasks.cancel(SESSION_KEY, one.task_id);
+        expect(work()).toMatchObject([{ state: "done" }]);
+        const two = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", "t", "b", null)) as { task_id: string };
+        await tasks.cancel(SESSION_KEY, two.task_id);
+        expect(work().map((each) => each.state).sort()).toEqual(["cancelled", "done"]);
+        // A task taken before there was an index has no row; it gets one when it ends.
+        task("t_old", { status: "running" });
+        await tasks.cancel(SESSION_KEY, "t_old");
+        expect(store.rows("SELECT worker, session_key, state FROM work WHERE id = 't_old'")).toEqual([{ worker: "sandbox", session_key: SESSION_KEY, state: "cancelled" }]);
+      });
+    });
+
     it("takes nothing new where the deployment lists no such worker, writes nothing for it, and still stops a task taken before", async () => {
       await within(async ({ tasks, store, kept, settings, worker, slots }) => {
         // Started while the worker was listed.

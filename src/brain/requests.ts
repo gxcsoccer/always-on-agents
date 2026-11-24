@@ -9,6 +9,7 @@ import { type Target, isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
 import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
+import { type WorkEnd, workIs } from "./work";
 import type { BrainStore, InboxRow, Row, RunRow, Wakes } from "./store";
 
 /**
@@ -93,6 +94,8 @@ export interface RequestsHost {
   direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
   /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
   aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
+  /** The worker a connector's tool hands work to, if it is such a tool. */
+  handsTo(connector: string, tool: string): string | undefined;
   /** Shows a delivered invitation as over where it was shown. Never holds anything up. */
   closeInvitation(target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean>;
   waitUntil(promise: Promise<unknown>): void;
@@ -245,6 +248,8 @@ export class Requests implements Wakes {
         );
         this.#s.audit("(system)", "request.waiting", { request: id, on: waiting.on });
       }
+      // What a tool that hands work to a worker keeps waiting is a piece of work, under the request's own id.
+      this.#work(id, "open");
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       if (!shows) {
@@ -515,11 +520,22 @@ export class Requests implements Wakes {
     return Date.now() - (record.claimed_at ?? 0) > HANDLING_LIMIT_MS ? "it was not finished in time" : undefined;
   }
 
+  /** A request kept for a tool that hands work to a worker is a piece of work, under the request's own id. */
+  #work(id: string, as: "open" | WorkEnd): void {
+    const record = this.#s.rows<Continuation & { session_key: string | null }>("SELECT c.*, s.session_key FROM continuations c LEFT JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", id)[0];
+    const worker = record && this.#b.handsTo(record.connector, record.tool);
+    if (worker) workIs(this.#s, { id, worker, sessionKey: record.session_key ?? "", person: record.person ?? null, under: { condition: record.condition, generation: record.generation } }, as);
+  }
+
   /** Ends a request, once. What ended it is kept; nothing ended is ever reopened. */
   endRequest(id: string, status: "done" | "failed" | "cancelled" | "expired" | "void" | "unverified", why: string): void {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
+    // If whoever carried the work out has not said how it ended, the request's end says it only
+    // where that is about the work itself: called off, out of time, no longer standing. That its
+    // answer was sent, or could not be, says nothing of what the worker made of it: not known.
+    if (ended.length > 0) this.#work(id, status === "cancelled" || status === "expired" || status === "void" ? status : "unknown");
     if (ended.length > 0 && shown) this.#wayInOver(shown);
   }
 

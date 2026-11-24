@@ -15,6 +15,7 @@ import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import type { Started, Worker } from "../workers";
 import type { Outbox } from "./outbox";
+import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
 import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
@@ -53,6 +54,9 @@ export interface TasksHost {
   /** Counts tokens against this scope's daily budget, at once: the same count the Brain's own calls go to. */
   spend(tokens: number): void;
 }
+
+/** What a task's last status is, as a piece of work. */
+export const taskEnd = (status: string): WorkEnd => ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown";
 
 /** The worker tasks are written for. */
 const WORKER = "sandbox";
@@ -97,17 +101,21 @@ export class Tasks implements Wakes {
       const askers = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
       const requestedBy = askers.length === 1 ? askers[0] : null;
       const id = crypto.randomUUID();
-      this.#s.sql.exec(
-        "INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', ?, ?, ?, ?, 'dispatching', ?, ?)",
-        id,
-        callId,
-        title,
-        brief,
-        sessionKey,
-        requestedBy,
-        now,
-        now,
-      );
+      // The task and its row in the index of work exist together or not at all.
+      this.#s.transaction(() => {
+        this.#s.sql.exec(
+          "INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', ?, ?, ?, ?, 'dispatching', ?, ?)",
+          id,
+          callId,
+          title,
+          brief,
+          sessionKey,
+          requestedBy,
+          now,
+          now,
+        );
+        workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
+      });
       this.#s.sql.exec(
         "INSERT INTO timers (id, due_at, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         `watch_${id}`,
@@ -364,7 +372,7 @@ export class Tasks implements Wakes {
 
   /** A terminal status is final: a late or repeated report cannot bring a task back. */
   #set(taskId: string, status: string, fields: { pending?: string | null; result?: string; last_progress?: string }): boolean {
-    const current = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
+    const current = this.#s.rows<Row>("SELECT status, worker, session_key, requested_by FROM tasks WHERE id = ?", taskId)[0];
     if (!current || TERMINAL_TASK.has(current.status)) return false;
     this.#s.sql.exec(
       "UPDATE tasks SET status = ?, pending = ?, result = COALESCE(?, result), last_progress = COALESCE(?, last_progress), updated_at = ? WHERE id = ?",
@@ -375,6 +383,7 @@ export class Tasks implements Wakes {
       Date.now(),
       taskId,
     );
+    if (TERMINAL_TASK.has(status)) workIs(this.#s, { id: taskId, worker: String(current.worker), sessionKey: String(current.session_key), person: (current.requested_by as string | null) ?? null }, taskEnd(status));
     // The watchdog has nothing left to watch.
     if (TERMINAL_TASK.has(status)) this.#s.sql.exec("UPDATE timers SET status = 'done' WHERE id = ? AND status = 'active'", `watch_${taskId}`);
     return true;

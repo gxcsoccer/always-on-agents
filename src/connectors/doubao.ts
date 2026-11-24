@@ -368,15 +368,33 @@ export const doubaoAsk: ConnectorTool = {
     "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it in two cases, and never on your own initiative. One: the person themselves plainly asks, in this message, for Doubao to do something (research, write a document, and the like). Two: your last answer to them was what Doubao made for them, and what they write now goes on with that piece of work (more depth, a correction, the next part): then carry it on with Doubao (`carry_on` true) without their having to name Doubao again. Something they ask of you yourself (what you think, to answer here, a different subject, anything they would not want written into that Doubao conversation) you answer yourself. If they say not to use Doubao, do not. If it cannot be told whether they mean you or Doubao and it matters where their words go, ask them once which. `text` is what to ask Doubao: the person's own request, in their words where those are enough. Doubao knows nothing of this conversation, so add what it needs from here to understand the request (what a \"this\" or \"that\" refers to, say), and nothing else: no requirements, scope, format or guesses at what they mean that they did not state. `carry_on`: false for something new (they have to have named Doubao in this message); true for a follow-up to a piece of work Doubao already did for this person: the one whose answer they replied to, else the one your last answer to them came from, else the only recent one; where it cannot be told which, you are told to ask them. Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
   effect: "act",
   optional: true,
+  hands_to: "doubao",
   parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
-  run: ask,
+  // How the piece of work stands is said from its own record, however the call went.
+  run: async (context, args) => {
+    // The record of the piece of work as this call last had it from where it is kept: never read a second time for this.
+    const seen: { op?: Op } = {};
+    const result = await ask(context, args, seen);
+    if (seen.op) context.work?.(standing(seen.op, result));
+    return result;
+  },
   // A piece of work handed over for the person is theirs to point at for as long as its record is kept: the call itself checks that.
   links: (_message, request) => typeof request.op === "string",
 };
 
 const UNCERTAIN = "it could not be confirmed whether Doubao took this; nothing more was sent, so that it is not done twice. The person can look in Doubao Work, or ask again";
 
-async function ask(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
+/** A piece of work as its record has it: what Doubao made of it where that is known, and not whether the person was told. */
+function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown" {
+  if (op.stage === "answered") return op.reply?.status === "completed" ? "done" : op.reply?.status === "cancelled" ? "cancelled" : "failed";
+  if (op.stage === "lost") return "unknown";
+  if (op.stage === "failed") return "failed";
+  // Still under way by its record. A call that ends in an error has given it up: never sent, or no longer waited for.
+  if (typeof result === "object" && result !== null && "error" in result) return op.stage === "asked" ? "failed" : Date.now() >= op.deadline ? "expired" : "void";
+  return "open";
+}
+
+async function ask(context: ToolContext, args: Record<string, unknown>, seen: { op?: Op } = {}): Promise<unknown> {
   const { env, origin } = context;
   const text = String(args.text ?? "").trim();
   if (!text) return { error: "say what Doubao is to do" };
@@ -418,6 +436,12 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   if (op === "several") return { error: "the person has had more than one piece of work with Doubao lately, and it cannot be told which this follows; nothing was sent. Ask them which one: replying to the answer in question says it. Or start a new one with `carry_on` false" };
   if (op === "not_found") return { error: "the piece of work this replies to can no longer be carried on (it is too old, or the authorisation changed since); nothing was sent. Start a new one with `carry_on` false" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
+  seen.op = op;
+  // Each step of it is kept where the record is, and what comes back is the record as it then stands.
+  const advance = async (stage: Op["stage"], more?: Partial<Op>) => {
+    const now = await grant.advance(context.callId, stage, more);
+    if (now) seen.op = now as Op;
+  };
   // Carried on only under what it was asked under: also what it has already brought back.
   if (op.pairing !== app.version || op.generation !== generation) return CHANGED;
   const condition = `doubao|reply|${name}|${context.callId}`;
@@ -437,7 +461,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
 
   // Written down before anything is sent, and sent exactly as recorded: Doubao gives the same
   // answer for the same key and words, so a second try after silence does not do it twice.
-  await grant.advance(context.callId, "submitting");
+  await advance("submitting");
   const contents = [{ type: "text", text: op.text }];
   // It was already being sent once (this call is made again after an interruption): it may have been taken then.
   let maybeTaken = op.stage === "submitting";
@@ -461,26 +485,26 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   const again = maybeTaken;
   if (!sent) {
     // Never sent at all (what it rested on changed, or its time ran out, before the first try): said as that.
-    if (!maybeTaken) return await grant.advance(context.callId, "failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
+    if (!maybeTaken) return await advance("failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
     // Tried, and not known to have failed.
-    await grant.advance(context.callId, "lost");
+    await advance("lost");
     return { error: UNCERTAIN };
   }
   if (sent.status === 401) {
     await grant.refused(version);
     // Turned away for who is asking: nothing of it was taken. Still to be sent, once they have authorised again.
-    return again ? (await grant.advance(context.callId, "lost"), { error: UNCERTAIN }) : authorise();
+    return again ? (await advance("lost"), { error: UNCERTAIN }) : authorise();
   }
   const mine = (Array.isArray(sent.data.messages) ? sent.data.messages : []).find((each: any) => each?.role === "user" && typeof each.id === "string");
   const session = op.fresh ? sent.data.id : op.session;
   if (sent.status !== 200 || sent.code !== 0 || typeof session !== "string" || !mine) {
     // A conflict on a second try can mean the first was taken; on a first try, that nothing was.
     // And "taken" without saying what became of it is not a refusal.
-    if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await grant.advance(context.callId, "lost"), { error: UNCERTAIN };
-    await grant.advance(context.callId, "failed");
+    if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await advance("lost"), { error: UNCERTAIN };
+    await advance("failed");
     return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; wait for it to finish, or start a new one with `carry_on` false" : `Doubao did not take this (status ${sent.status}); nothing was started` };
   }
-  await grant.advance(context.callId, "submitted", { session, message: mine.id });
+  await advance("submitted", { session, message: mine.id });
   return reply();
 
   function reply(): Waiting {
