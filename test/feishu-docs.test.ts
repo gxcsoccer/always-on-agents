@@ -2982,6 +2982,21 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(card).not.toContain("made-up");
   });
 
+  it("still names it by the link the person wrote when they ask about it again in a later message of their own", async () => {
+    const max = someone();
+    feishu.docs.set("DocGroupMax0000000001", { readers: [max.openId], text: "Max's." });
+    const id = chat();
+    const here = inGroup(id, max);
+    quotable.set("om_earlier_max", { chat_id: id, open_id: max.openId, text: `看看 ${link("DocGroupMax0000000001")}` });
+    model.replies([call("send_message", { text: "好的" })], [say("")]);
+    await here.says("先记一下", "om_earlier_max");
+    model.replies([call("feishu_read_document", { document: "https://made-up.feishu.cn/docx/DocGroupMax0000000001" })], [say("")]);
+    await here.says("请总结刚才那篇");
+    const card = JSON.stringify(here.shown()[0].content);
+    expect(card).toContain(link("DocGroupMax0000000001"));
+    expect(card).not.toContain("made-up");
+  });
+
   it("asks again with a fresh token of the app's when Feishu says the one it holds has lapsed, instead of taking the chat for unknown", async () => {
     const lee = someone();
     feishu.docs.set("DocGroupLee0000000001", { readers: [lee.openId], text: "Lee's." });

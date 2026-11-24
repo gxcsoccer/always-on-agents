@@ -252,6 +252,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
       const latest = linkingEarlier.at(-1)!;
       chosen = [...now, target];
       naming = [latest];
+      // Where that message only pointed at it (a reply to one the agent was never sent), the link as written there.
+      quotedLink = quotedDocuments(latest).find((each) => matches(each) && each.link)?.link;
       context.relied?.("recent", context.recent.indexOf(latest));
       // And the one message that asked for it now ("总结"), where there is exactly one: a reply to
       // that is about this request too. With several, which of them asked is not known.
