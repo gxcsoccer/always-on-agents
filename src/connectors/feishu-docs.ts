@@ -371,9 +371,15 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经失效", "链接只能使用一次，并且 10 分钟内有效。请回到飞书，重新向我发起请求。", 400);
   const { who } = invitation;
   const code = url.searchParams.get("code") ?? "";
-  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
+  // An invitation made for one question was claimed by this answer. However it ends short of
+  // the person's own token being kept, that invitation is over (a no-op for any other kind).
+  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) {
+    await grant.fail(state[2]);
+    return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
+  }
 
-  const refused = (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
+  const refused = async (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
+    await grant.fail(state[2]);
     // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
     // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
     // sent is logged.
@@ -411,6 +417,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
   if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
+    await grant.fail(state[2]);
     console.log(JSON.stringify({ feishu_authorisation_refused: "another_account", app: who.app_id }));
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }
@@ -426,7 +433,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,
     scope: granted.join(" "),
     ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
-  });
+  }, state[2]);
   if (!kept) return refused("superseded");
   // The grant tells the person's Brain, and keeps telling it until it is heard.
   // Said so that it is true for every invitation: one whose request is waiting is carried on; one

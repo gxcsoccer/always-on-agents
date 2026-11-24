@@ -317,7 +317,7 @@ function someone() {
     });
   };
   /** What the grant still owes the Brain: word of a token it has not yet been told of. */
-  const owed = async () => (await runInDurableObject(await grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant")))?.owed as { event: string; attempts: number } | undefined;
+  const owed = async () => (await runInDurableObject(await grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant")))?.owed?.[0] as { event: string; attempts: number } | undefined;
   /** Lets everything that is due happen: the grant telling the Brain, the Brain carrying on and sending. */
   const settle = async () => {
     await runDurableObjectAlarm(await grant());
@@ -2731,6 +2731,48 @@ describe("a sign that a message arrived", () => {
     await vi.waitFor(() => expect(feishu.reactions.map((each) => each.message)).toEqual([`om_${oli.openId}_2`]));
     model.replies([say("")]);
     await oli.quiet();
+  });
+});
+
+describe("the answer to an invitation made for one question", () => {
+  const DOCS = ["docx:document:readonly"];
+  /** Such an invitation for this person, as the page Feishu would show for it. */
+  const asked = async (person: ReturnType<typeof someone>) => {
+    const grant = await person.grant();
+    const made = (await grant.invite(person.who, "https://agent.test/v1/feishu/oauth/callback", DOCS, { generation: (await grant.held()).generation }, { brain: `${TENANT}:chat:oc_asked`, key: "om_asked" })) as { nonce: string; generation: number };
+    const card = (await grant.card(made.nonce)) as any;
+    return { grant, ...made, authorize: new URL(card.elements[1].actions[0].url) };
+  };
+
+  it("is done when the person it was made for completes it, once; the same link again changes nothing", async () => {
+    const pat = someone();
+    const { grant, nonce, generation, authorize } = await asked(pat);
+    expect((await consent(authorize, pat)).status).toBe(200);
+    expect(await grant.answered(nonce, DOCS, generation)).toMatchObject({ state: "holds" });
+    expect((await consent(authorize, pat)).status).toBe(400);
+    expect(await grant.answered(nonce, DOCS, generation)).toMatchObject({ state: "holds" });
+    expect(feishu.exchanges.filter((each) => each.app === APP_ID).length).toBeGreaterThan(0);
+  });
+
+  it("is over when it is turned down, when another account completes it, or when the exchange fails", async () => {
+    const denied = someone();
+    const first = await asked(denied);
+    await consent(first.authorize, denied, "deny");
+    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toEqual({ state: "gone" });
+
+    const victim = someone();
+    const second = await asked(victim);
+    expect((await consent(second.authorize, someone())).status).toBe(403);
+    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toEqual({ state: "gone" });
+    expect((await second.grant.status()).authorised).toBe(false);
+
+    const unlucky = someone();
+    const third = await asked(unlucky);
+    const back = new URL(third.authorize.searchParams.get("redirect_uri")!);
+    back.searchParams.set("state", third.authorize.searchParams.get("state")!);
+    back.searchParams.set("code", "a-code-feishu-never-gave");
+    expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
+    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toEqual({ state: "gone" });
   });
 });
 
