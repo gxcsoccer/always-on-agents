@@ -1035,8 +1035,8 @@ export class Runner {
       now: Date.now(),
       instructions: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
-      // Only where there is someone to hand work to.
-      guidance: workersIn(this.actingFor(runId), this.#b.toolsOf, this.#b.workers()).length > 0 ? this.#b.guidance() : undefined,
+      // Only where this very call to the model is given the tool to hand work over with: by the same word that decides its tools.
+      guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
         ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status })),
         ...theirs.map((each) => {
