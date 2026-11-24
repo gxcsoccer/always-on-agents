@@ -372,10 +372,10 @@ export const doubaoAsk: ConnectorTool = {
   parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
   // How the piece of work stands is said from its own record, however the call went.
   run: async (context, args) => {
-    const seen: { grant?: { op(call: string): Promise<Op | undefined> } } = {};
+    // The record of the piece of work as this call last had it from where it is kept: never read a second time for this.
+    const seen: { op?: Op } = {};
     const result = await ask(context, args, seen);
-    const op = await seen.grant?.op(context.callId).catch(() => undefined);
-    if (op) context.work?.(standing(op, result));
+    if (seen.op) context.work?.(standing(seen.op, result));
     return result;
   },
   // A piece of work handed over for the person is theirs to point at for as long as its record is kept: the call itself checks that.
@@ -394,7 +394,7 @@ function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancel
   return "open";
 }
 
-async function ask(context: ToolContext, args: Record<string, unknown>, seen: { grant?: unknown } = {}): Promise<unknown> {
+async function ask(context: ToolContext, args: Record<string, unknown>, seen: { op?: Op } = {}): Promise<unknown> {
   const { env, origin } = context;
   const text = String(args.text ?? "").trim();
   if (!text) return { error: "say what Doubao is to do" };
@@ -425,7 +425,6 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   const who: Who = { chat_app_id: app.chat_app_id, tenant_key: origin.tenant_key, open_id: context.person, ...(union ? { union_id: union } : {}) };
   const name = await grantName(who);
   const grant = env.DOUBAO_GRANTS.getByName(name);
-  seen.grant = grant;
   const request = { text, carry_on: carryOn };
   const CHANGED = { error: "the person's authorisation, or how this is set up, changed while this was under way; nothing more was done. They can ask again" };
 
@@ -437,6 +436,12 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   if (op === "several") return { error: "the person has had more than one piece of work with Doubao lately, and it cannot be told which this follows; nothing was sent. Ask them which one: replying to the answer in question says it. Or start a new one with `carry_on` false" };
   if (op === "not_found") return { error: "the piece of work this replies to can no longer be carried on (it is too old, or the authorisation changed since); nothing was sent. Start a new one with `carry_on` false" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
+  seen.op = op;
+  // Each step of it is kept where the record is, and what comes back is the record as it then stands.
+  const advance = async (stage: Op["stage"], more?: Partial<Op>) => {
+    const now = await grant.advance(context.callId, stage, more);
+    if (now) seen.op = now as Op;
+  };
   // Carried on only under what it was asked under: also what it has already brought back.
   if (op.pairing !== app.version || op.generation !== generation) return CHANGED;
   const condition = `doubao|reply|${name}|${context.callId}`;
@@ -456,7 +461,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
 
   // Written down before anything is sent, and sent exactly as recorded: Doubao gives the same
   // answer for the same key and words, so a second try after silence does not do it twice.
-  await grant.advance(context.callId, "submitting");
+  await advance("submitting");
   const contents = [{ type: "text", text: op.text }];
   // It was already being sent once (this call is made again after an interruption): it may have been taken then.
   let maybeTaken = op.stage === "submitting";
@@ -480,26 +485,26 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   const again = maybeTaken;
   if (!sent) {
     // Never sent at all (what it rested on changed, or its time ran out, before the first try): said as that.
-    if (!maybeTaken) return await grant.advance(context.callId, "failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
+    if (!maybeTaken) return await advance("failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
     // Tried, and not known to have failed.
-    await grant.advance(context.callId, "lost");
+    await advance("lost");
     return { error: UNCERTAIN };
   }
   if (sent.status === 401) {
     await grant.refused(version);
     // Turned away for who is asking: nothing of it was taken. Still to be sent, once they have authorised again.
-    return again ? (await grant.advance(context.callId, "lost"), { error: UNCERTAIN }) : authorise();
+    return again ? (await advance("lost"), { error: UNCERTAIN }) : authorise();
   }
   const mine = (Array.isArray(sent.data.messages) ? sent.data.messages : []).find((each: any) => each?.role === "user" && typeof each.id === "string");
   const session = op.fresh ? sent.data.id : op.session;
   if (sent.status !== 200 || sent.code !== 0 || typeof session !== "string" || !mine) {
     // A conflict on a second try can mean the first was taken; on a first try, that nothing was.
     // And "taken" without saying what became of it is not a refusal.
-    if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await grant.advance(context.callId, "lost"), { error: UNCERTAIN };
-    await grant.advance(context.callId, "failed");
+    if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await advance("lost"), { error: UNCERTAIN };
+    await advance("failed");
     return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; wait for it to finish, or start a new one with `carry_on` false" : `Doubao did not take this (status ${sent.status}); nothing was started` };
   }
-  await grant.advance(context.callId, "submitted", { session, message: mine.id });
+  await advance("submitted", { session, message: mine.id });
   return reply();
 
   function reply(): Waiting {

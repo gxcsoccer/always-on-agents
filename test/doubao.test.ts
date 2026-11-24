@@ -647,6 +647,7 @@ describe("handing work to Doubao Work", () => {
     await ivy.later();
     expect(ivy.heard().at(-1)).toBe("豆包没有做成。");
     expect(await rowsOf(ivy.stub, "SELECT state FROM work")).toEqual([{ state: "failed" }]);
+    // Said from the record the call already had: where the record cannot be read again, the same.
 
     // With the authorisation standing, a new piece is taken by Doubao and its receipt is lost both times: it never waits, and is still a piece of work.
     world.unreachable = 2;
