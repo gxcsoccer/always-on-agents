@@ -13,7 +13,7 @@ import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage
 import { DeliveryVoid } from "./types";
 
 export type * from "./types";
-export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isSettled, isWaiting } from "./types";
+export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isSettled, isWaiting, markOf } from "./types";
 
 const RESERVED = new Set(["admin", "worker", "timer", "system"]);
 const byName = new Map<string, Connector>();

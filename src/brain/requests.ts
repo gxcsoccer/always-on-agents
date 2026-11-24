@@ -3,7 +3,7 @@
  * same transactions, through the shared store and what else the Brain hands it (RequestsHost). Nothing here is reachable
  * from outside the Brain.
  */
-import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds } from "../connectors";
+import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds, markOf } from "../connectors";
 import type { Env } from "../env";
 import { type Target, isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
@@ -376,7 +376,8 @@ export class Requests implements Wakes {
     if (here && how === "reached") return;
     try {
       const which = here ? (how === "failed" ? "inviteNotShown" : "inviteUnknownHere") : how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
-      const text = this.#b.notice(which, waiting.session_id);
+      // Sent to them somewhere else: with the mark that is on it there, so that they can tell which it is.
+      const text = `${this.#b.notice(which, waiting.session_id)}${which === "invitedElsewhere" ? ` (${markOf(waiting.interaction)})` : ""}`;
       this.#b.enqueueMessage(told(waiting), waiting.session_id, null, text, undefined, undefined, { target: waiting.target });
       // One line per request. While it has certainly not reached anyone, it says how things
       // stand now; once it has gone out, or may have, it is not said again in other words.
@@ -503,7 +504,9 @@ export class Requests implements Wakes {
       this.#b.append(now.session_id, runId, {
         role: "user",
         content: `[${new Date().toISOString()}] system: A request that was waiting can now be carried on. What the person asked, in their own words:\n${asked}\nThe tool ${now.tool} has been called again for it and its result follows. Answer that request, and only that, in one send_message, as you would have if it had worked the first time. If the result says it has to wait again, send nothing.`,
-      });
+        // The system's own word to the run that carries the request on, not something anyone wrote in the conversation.
+        _carried: true,
+      } as Item);
       this.#b.append(now.session_id, runId, { type: "function_call", call_id: callId, name: now.tool, arguments: now.args } as Item);
       this.#s.setMeta("active_run", runId);
       this.#s.audit("(system)", "request.resumed", { request: id, run: runId });
@@ -529,6 +532,19 @@ export class Requests implements Wakes {
   /** Whether the person was ever told that what this request asked for is under way: it was handed over, whatever it waits on now. */
   promised(id: string): boolean {
     return this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
+  }
+
+  /**
+   * Whether the conversation was in fact told of what this request asked for: the word that the
+   * person was sent a way in, that it is under way, or its answer, was sent there and arrived.
+   * Kept to be sent is not sent.
+   */
+  told(id: string): boolean {
+    // Also the word that the person was sent a way in for it: said there while it still waits for them.
+    return (
+      this.#s.rows("SELECT 1 FROM outbox WHERE status = 'sent' AND ((idem >= ? AND idem < ?) OR idem = ?) LIMIT 1", `underway:${id}:`, `underway:${id};`, `answer:${id}`).length > 0 ||
+      this.#s.rows("SELECT 1 FROM outbox WHERE status = 'sent' AND idem LIKE 'invited:%' AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[1]') = ? LIMIT 1", id).length > 0
+    );
   }
 
   /** Makes sure a request that is a piece of work and is still under way has its row in the index of work (one kept before there was an index has none). */

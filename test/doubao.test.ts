@@ -83,7 +83,7 @@ function installWorld() {
       if (url.pathname.endsWith("/im/v1/messages") || /\/im\/v1\/messages\/[^/]+\/reply$/.test(url.pathname)) {
         const content = JSON.parse(body.content);
         const words = body.msg_type === "text" || body.msg_type === "post";
-        world.sent.push({ to: body.receive_id ?? "reply", type: words ? "text" : body.msg_type, content: body.msg_type === "post" ? { text: content.zh_cn.content.flat().map((each: any) => each.text).join("") } : content });
+        world.sent.push({ to: body.receive_id ?? `reply:${/\/messages\/([^/]+)\/reply$/.exec(url.pathname)?.[1] ?? ""}`, type: words ? "text" : body.msg_type, content: body.msg_type === "post" ? { text: content.zh_cn.content.flat().map((each: any) => each.text).join("") } : content });
         return Response.json({ code: 0, data: { message_id: `om_sent_${world.sent.length}` } });
       }
       if (init?.method === "PATCH") world.closed.push(JSON.parse(body.content));
@@ -203,6 +203,54 @@ function someone() {
 }
 
 type Person = ReturnType<typeof someone>;
+
+/** A person writing to the agent in a chat several people share, and what that chat's own Brain does. */
+function inGroup(chatId: string, person: Person) {
+  const stub = (env as any).BRAIN.getByName(scopeName({ tenant: TENANT, kind: "chat", id: chatId })) as any;
+  let n = 0;
+  const event = (text: string) =>
+    normalize(APP, {
+      schema: "2.0",
+      header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP },
+      event: {
+        sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: person.openId, union_id: person.unionId } },
+        message: { message_id: `om_${chatId}_${person.openId}_${++n}`, chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }] },
+      },
+    })!.event;
+  const quiet = async () => {
+    const busy = () =>
+      runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => {
+        const some = (query: string) => state.storage.sql.exec(query).toArray().length > 0;
+        const run = state.storage.sql.exec("SELECT r.retry_at FROM runs r JOIN meta m ON m.value = r.id WHERE m.key = 'active_run'").toArray()[0] as { retry_at: number | null } | undefined;
+        const next = state.storage.sql.exec("SELECT next_at FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1").toArray()[0] as { next_at: number } | undefined;
+        return (run !== undefined && !(run.retry_at && run.retry_at > Date.now())) || some("SELECT 1 FROM inbox WHERE status = 'pending'") || (next !== undefined && next.next_at <= Date.now());
+      });
+    for (let i = 0; i < 300; i++) {
+      await wake(stub);
+      if (!(await busy())) return;
+      await sleep(10);
+    }
+    throw new Error("the chat's Brain did not come to rest");
+  };
+  const says = async (text: string) => {
+    await stub.ingest(event(text));
+    await quiet();
+  };
+  /** Lets what is due happen: the grant telling every Brain it owes word, this one carrying on. */
+  const settle = async () => {
+    await runDurableObjectAlarm(await person.grant());
+    await vi.waitFor(async () => expect((await runInDurableObject(await person.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant")))?.owed).toBeUndefined(), { interval: 5 });
+    await quiet();
+  };
+  const later = async () => {
+    await rowsOf(stub, "UPDATE continuations SET check_at = ? WHERE status = 'waiting' AND check_at IS NOT NULL", ++ticks);
+    await quiet();
+  };
+  /** What everyone in the chat was told in words; and the cards only this person was shown there. */
+  const heard = () => world.sent.filter((each) => (each.to === chatId || each.to.startsWith(`reply:om_${chatId}_`)) && each.type === "text").map((each) => String(each.content.text));
+  const everyone = () => world.sent.filter((each) => (each.to === chatId || each.to.startsWith(`reply:om_${chatId}_`)) && each.type === "interactive");
+  return { stub, says, quiet, settle, later, heard, everyone };
+}
 const linkOn = (card: any) => new URL(card.elements.find((e: any) => e.tag === "action").actions[0].url);
 /** The person goes through Doubao's consent page as some account, and comes back. */
 async function consent(authorize: URL, as: { unionId: string; openId?: string; org?: string }): Promise<Response> {
@@ -568,6 +616,172 @@ describe("handing work to Doubao Work", () => {
     expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
   });
 
+  it("is there where several people talk: for the one who asked and as them, with the way in shown to them alone and the answer said to all", async () => {
+    await pair();
+    const ann = someone();
+    const bob = someone();
+    const chat = "oc_team";
+    const here = inGroup(chat, ann);
+    const there = inGroup(chat, bob);
+    model.replies([asks("调研 A")], [say("")]);
+    await here.says("调研一下 A");
+    // Offered, though the operator has not turned document reading on for chats: the two are not tied.
+    expect(workersOffered(modelCalls[0])).toContain("doubao");
+    expect(modelCalls[0].tools.map((t: any) => t.name)).not.toContain("feishu_read_document");
+    // The way in goes to her directly, never into the chat: a card that says which piece of work it is for and who will see what comes of it.
+    const direct = () => world.sent.filter((each) => each.to === ann.openId && each.type === "interactive").map((each) => each.content);
+    expect(direct()).toHaveLength(1);
+    expect(here.everyone()).toEqual([]);
+    // In her own words, not the agent's rendering of them.
+    expect(JSON.stringify(direct()[0])).toContain("调研一下 A");
+    expect(JSON.stringify(direct()[0])).toContain("那里所有人都能看到");
+    expect(JSON.stringify(direct()[0])).toContain("其他正在等授权的交办也会一起继续");
+    // The chat is told only that she was sent it.
+    expect(here.heard()).toHaveLength(1);
+    const mark = /^需要你先授权，我才能继续。授权卡片已私聊发你。 \(([2-9A-Z]{4})\)$/.exec(here.heard()[0])?.[1];
+    // The same mark is on the card she was sent, so that she can tell which card goes with which request.
+    expect(mark).toBeDefined();
+    expect(direct()[0].header.title.content).toBe(`需要你的授权 · ${mark}`);
+    // While it waits for her it is hers to ask about and to stop there: listed for her runs (the chat was told of it), and for nobody else's.
+    model.replies([call("work_status", { work_id: "x" })], [say("")]);
+    await here.says("怎么样了");
+    const waitingId = (await rowsOf(here.stub, "SELECT id FROM work"))[0].id;
+    expect((modelCalls.at(-2).instructions as string)).toMatch(new RegExp(`- ${waitingId} \\[doubao\\] .*waiting_for_authorisation`));
+    model.replies([say("")]);
+    await there.says("在吗");
+    expect((modelCalls.at(-1).instructions as string)).not.toContain(waitingId);
+    // She authorises: the request in the chat's own Brain is carried on (it is told, as her own conversation is).
+    expect((await consent(linkOn(direct()[0]), ann)).status).toBe(200);
+    await here.settle();
+    expect(world.writes).toHaveLength(1);
+    expect(here.heard()).toContain(UNDER_WAY);
+    const session = [...world.sessions.keys()][0];
+    doubaoReplies(session, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await here.later();
+    // The answer is said in the chat.
+    expect(here.heard().at(-1)).toBe("A 的结论。");
+    const id = (await rowsOf(here.stub, "SELECT id FROM work"))[0].id;
+
+    // Another member: the piece of work is not theirs to go on with, to ask about, or to see listed.
+    const before = world.writes.length;
+    model.replies([asks("接着做", id)], [say("")]);
+    await there.says("接着 A 再做一点");
+    // And nothing of hers is in what the agent is given for him: not the call, not the id of her piece of work. What was said in the chat is.
+    const given = JSON.stringify(modelCalls.at(-2).input);
+    expect(given).not.toContain(id);
+    expect((modelCalls.at(-2).input as any[]).filter((each) => each.type === "function_call" || each.type === "function_call_output")).toEqual([]);
+    expect(given).not.toContain("can now be carried on");
+    expect(given).toContain("A 的结论。");
+    expect((modelCalls.at(-2).instructions as string)).not.toContain(`- ${id} [doubao]`);
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+    expect(world.writes).toHaveLength(before);
+    model.replies([call("work_status", { work_id: id })], [say("")]);
+    await there.says("A 那个怎么样了");
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+    // She herself goes on with it there.
+    model.replies([asks("再深入", id)], [say("")]);
+    await here.says("A 再深入一点");
+    expect((modelCalls.at(-2).instructions as string)).toContain(`- ${id} [doubao]`);
+    expect(world.writes.at(-1)!.path).toBe(`/open-apis/agent/v1/sessions/${session}/events`);
+    // What the chat remembers is everyone's: a run of hers there, with work of her own before it, writes none of that down.
+    model.replies([call("memory_write", { path: "notes/a.md", content: "Ann 让豆包调研了 A" })], [say("")]);
+    await here.says("记一下");
+    expect(JSON.stringify(toolOutputs())).toContain("nothing is written to this conversation's shared memory");
+    // In her private chat it is not there: it was handed over in the other conversation.
+    model.replies([asks("再深入", id)], [say("")]);
+    await ann.says("A 再深入一点");
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+  });
+
+  it("carries on each of a person's requests once, in its own place, when they authorise through one of several cards: their private chat and two chats at once", async () => {
+    await pair();
+    const ann = someone();
+    const one = inGroup("oc_one", ann);
+    const two = inGroup("oc_two", ann);
+    const direct = () => world.sent.filter((each) => each.to === ann.openId && each.type === "interactive").map((each) => each.content);
+    model.replies([asks("私聊里的事")], [say("")]);
+    await ann.says("调研一下私聊里的事");
+    // The same words in two chats are two pieces of work all the same.
+    model.replies([asks("群里的事")], [say("")]);
+    await one.says("调研一下群里的事");
+    model.replies([asks("群里的事")], [say("")]);
+    await two.says("调研一下群里的事");
+    // A card for each piece of work, each saying which it is for: one in her private chat, two sent to her directly.
+    const cards = [...ann.cards(), ...direct()];
+    expect(cards).toHaveLength(3);
+    expect(cards.map((each) => ["私聊里的事", "群里的事"].find((text) => JSON.stringify(each).includes(text)))).toEqual(["私聊里的事", "群里的事", "群里的事"]);
+    expect(new Set(cards.map((each) => linkOn(each).searchParams.get("state"))).size).toBe(3);
+    // And told apart by her: each has its own mark, the one said in the chat it was asked in.
+    expect(new Set(cards.map((each) => each.header.title.content)).size).toBe(3);
+    for (const place of [one, two]) expect(cards.map((each) => each.header.title.content)).toContain(`需要你的授权 · ${/\(([2-9A-Z]{4})\)$/.exec(place.heard()[0])?.[1]}`);
+    // She goes through one of them; the same link again changes nothing.
+    const link = linkOn(direct()[0]);
+    expect((await consent(link, ann)).status).toBe(200);
+    expect((await consent(link, ann)).status).toBe(400);
+    await ann.settle();
+    await one.quiet();
+    await two.quiet();
+    // Each piece is handed over once, from its own conversation.
+    expect(world.writes).toHaveLength(3);
+    expect(world.sessions.size).toBe(3);
+    for (const stub of [ann.stub, one.stub, two.stub]) expect((await rowsOf(stub, "SELECT status FROM continuations")).map((each) => each.status)).toEqual(["waiting"]);
+    // Each answer is said where its request was made, once, and nowhere else.
+    for (const id of world.sessions.keys()) doubaoReplies(id, "豆包的结论。");
+    for (const place of [ann, one, two]) {
+      model.replies([call("send_message", { text: "这是结果。" })], [say("")]);
+      await place.later();
+    }
+    expect(ann.heard().filter((each) => each === "这是结果。")).toHaveLength(1);
+    expect(one.heard().filter((each) => each === "这是结果。")).toHaveLength(1);
+    expect(two.heard().filter((each) => each === "这是结果。")).toHaveLength(1);
+    expect(world.writes).toHaveLength(3);
+    // The cards she did not use are over too: there is nothing left to do through them.
+    await vi.waitFor(() => expect(world.closed.length).toBeGreaterThanOrEqual(3), { interval: 5 });
+  });
+
+  it("still tells the person's own conversation when what waits was kept before it was written down where work comes from", async () => {
+    await pair();
+    const old = someone();
+    model.replies([asks("调研 A")], [say("")]);
+    await old.says("让豆包调研 A");
+    // As a version before this one left it: no home, and nothing saying which conversation the work or the invitation came from.
+    await runInDurableObject(await old.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      delete stored.home;
+      for (const each of Object.values<any>(stored.ops)) delete each.brain;
+      for (const each of stored.pending) delete each.brain;
+      await state.storage.put("grant", stored);
+    });
+    expect((await consent(linkOn(old.cards()[0]), old)).status).toBe(200);
+    await old.settle();
+    // Told, and carried on: handed over once.
+    expect(world.writes).toHaveLength(1);
+    expect(old.heard()).toContain(UNDER_WAY);
+  });
+
+  it("tells the chat a piece of work was handed over from when the person's authorisation is taken away, and says nothing there of what came back after", async () => {
+    await pair();
+    const ann = someone();
+    const here = inGroup("oc_team2", ann);
+    model.replies([asks("调研 A")], [say("")]);
+    await here.says("调研一下 A");
+    const direct = () => world.sent.filter((each) => each.to === ann.openId && each.type === "interactive").map((each) => each.content);
+    expect((await consent(linkOn(direct()[0]), ann)).status).toBe(200);
+    await here.settle();
+    const session = [...world.sessions.keys()][0];
+    // Doubao has its reply ready; before it is fetched and said, her authorisation is taken away.
+    doubaoReplies(session, "A 的结论。");
+    expect((await admin("DELETE", `doubao/grants/${CHAT_APP}/${ORG}/${ann.openId}`)).status).toBe(200);
+    // The chat's own Brain is among those told (it had something of hers under way), and ends the request there.
+    await here.settle();
+    await here.later();
+    expect((await rowsOf(here.stub, "SELECT status FROM continuations")).map((each) => each.status)).toEqual(["void"]);
+    expect(here.heard()).not.toContain("A 的结论。");
+    expect(here.heard().at(-1)).toContain("不再等了");
+    expect(await rowsOf(here.stub, "SELECT state FROM work")).toEqual([{ state: "void" }]);
+  });
+
   it("asks for a token for this work only, whatever else the person has allowed the app before", async () => {
     await pair();
     const dee = someone();
@@ -655,7 +869,7 @@ describe("handing work to Doubao Work", () => {
     expect(await on("never_made_never_made_never_made")).toEqual({ state: "gone" });
   });
 
-  it("counts each invitation as done when it was done, not when a later one was", async () => {
+  it("lets one of several invitations be gone through and ends the others, with every wait holding since that one authorisation", async () => {
     await pair();
     const dee = someone();
     const grant = await dee.grant();
@@ -677,9 +891,12 @@ describe("handing work to Doubao Work", () => {
     const scope = { tenant: TENANT, kind: "user" as const, id: dee.openId };
     const firstDone = ((await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${first.nonce}`, 1)) as any).since;
     await sleep(15);
-    expect((await consent(new URL(secondCard.action.url), dee)).status).toBe(200);
+    // The other link is over the moment they are authorised: it cannot be gone through, on the server's side too.
+    expect((await consent(new URL(secondCard.action.url), dee)).status).toBe(400);
+    expect(await grant.card(name, second.nonce)).toBeNull();
+    // Both waits hold, each since the one authorisation there is: the first is not moved by the second link being tried.
     expect(await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${first.nonce}`, 1)).toEqual({ state: "holds", since: firstDone });
-    expect(((await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${second.nonce}`, 1)) as any).since).toBeGreaterThan(firstDone);
+    expect(await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${second.nonce}`, 1)).toMatchObject({ state: "holds" });
   });
 
   it("says that waiting has stopped, and not to ask again, when a new authorisation fails for work already handed over", async () => {

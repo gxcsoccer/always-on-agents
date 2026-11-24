@@ -108,6 +108,7 @@ function bench(state: DurableObjectState) {
       record: () => undefined,
       indexed: () => undefined,
       promised: () => false,
+      told: () => true,
       resume: async (event: InboxRow) => (log.push(["resume", event.source_id]), undefined),
       // As the requests part has it: what the run noted it read, each thing once.
       readsOf: (runId: string) => [...new Map((JSON.parse(store.meta(`sources:${runId}`) ?? "[]") as { connector: string; tool: string; args: string; identity: string }[]).map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()],
@@ -1608,7 +1609,7 @@ describe("the run loop, by itself", () => {
         });
       });
 
-      it("shows what a turn that read said afterwards only to a run that itself acts for someone there", async () => {
+      it("shows what a turn that read said in the conversation to any later run there, whoever it acts for or nobody", async () => {
         await within(async (b) => {
           b.settings.connectorTools = [SHARED];
           b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', 'chat', 1, 1)");
@@ -1616,15 +1617,18 @@ describe("the run loop, by itself", () => {
           b.runner.append("s0", "old", { role: "user", content: "summarise the doc" });
           b.store.sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES ('s0', 99, 'old', 0, ?, 2)", JSON.stringify({ role: "assistant", content: "[note]" }));
           b.store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (1, 'old', 's0', 'the doc says three things', 1, '[]')");
-          // Not marked by the connector: the run acts for nobody, and is not shown those words.
+          // Not marked by the connector: the run acts for nobody. What was said there reached everyone there, so it is given it all the same.
           b.store.sql.exec("UPDATE said SET receipt_subject = 'feishu:message:om_bot'");
-          // Not even when that very message is what they reply to.
           asks(b, "what about it?", { data: { origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
           await b.go();
-          expect(JSON.stringify(b.asked[0].input)).not.toContain("three things");
+          expect(JSON.stringify(b.asked[0].input)).toContain("the doc says three things");
+          // What was said in another conversation is not.
+          b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s9', 'elsewhere', 1, 1)");
+          b.store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (2, 'old', 's9', 'said somewhere else', 1, '[]')");
           asks(b, "and now?");
           await b.go();
           expect(JSON.stringify(b.asked[1].input)).toContain("the doc says three things");
+          expect(JSON.stringify(b.asked[1].input)).not.toContain("said somewhere else");
         }, "chat:oc_1");
       });
     });

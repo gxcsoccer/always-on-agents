@@ -68,6 +68,8 @@ interface Op {
   generation: number;
   /** How far back the look for its reply has got, where the conversation is longer than one look covers. */
   cursor?: string;
+  /** The conversation it was handed over from, by the scope name of its Brain. */
+  brain?: string;
   reply?: { status: string; text: string; artifacts: { name: string; kind: string; link?: string }[]; truncated?: boolean };
 }
 const STAGES = ["asked", "submitting", "submitted", "answered", "lost", "failed"] as const;
@@ -80,9 +82,16 @@ interface Stored {
    * that is being worked out, then `done` or `refused`. Kept past its time for as long as a
    * request could still wait on it, so that each request is answered by its own invitation.
    */
-  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; app_id: string; pairing: string; state?: "taken" | "done" | "refused"; at?: number }[];
+  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; app_id: string; pairing: string; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat" } }[];
   grant?: { sealed: string; version: string; expires_at: number; since: number; pairing: string };
-  owed?: { event: string; attempts: number };
+  /**
+   * Word owed of a change to the person's authorisation: to each conversation (by the scope name
+   * of its Brain) that has something of theirs under way, until that one has heard. Which those
+   * are is worked out when the change happens, from what is under way then.
+   */
+  owed?: { event: string; attempts: number; to?: string[] };
+  /** The person's own conversation, by the scope name of its Brain: kept so that who is owed word can be said without asking anything outside. */
+  home?: string;
   ops: Record<string, Op>;
 }
 
@@ -97,7 +106,7 @@ const same = (a: Who, b: Who) => a.chat_app_id === b.chat_app_id && a.tenant_key
 
 export class DoubaoGrant extends DurableObject<Env> {
   /** Makes an invitation for this person to authorise under one pairing, unless they already have. */
-  async invite(who: Who, redirect: string, app: Pick<DoubaoApp, "app_id" | "version">, generation: number): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
+  async invite(who: Who, redirect: string, app: Pick<DoubaoApp, "app_id" | "version">, generation: number, what?: { brain: string; call: string; text: string; where: "private" | "chat" }): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [], ops: {} };
     if (!same(stored.who, who)) throw new Error("this authorisation belongs to someone else");
     if (stored.generation !== generation || (stored.grant && stored.grant.pairing === app.version && usable(stored.grant))) return "superseded";
@@ -105,11 +114,15 @@ export class DoubaoGrant extends DurableObject<Env> {
     // As the chat connector says they are now: the id they are matched by is kept with the invitation's owner.
     stored.who = who;
     stored.pending = stored.pending.filter((each) => each.expires_at + INVITATION_KEPT_MS > now);
-    let pending = stored.pending.find((each) => !each.state && each.redirect === redirect && each.app_id === app.app_id && each.pairing === app.version && each.expires_at - now > 3 * 60_000);
+    // One for each piece of work: the card says which piece it is for and where its result will be
+    // said, so one is not shared between pieces, however alike their words. Which piece is told by
+    // the call that asked for it: the same call made again, while its invitation still has time,
+    // has the same one.
+    let pending = stored.pending.find((each) => !each.state && each.redirect === redirect && each.app_id === app.app_id && each.pairing === app.version && each.expires_at - now > 3 * 60_000 && each.brain === what?.brain && each.call === what?.call);
     if (!pending) {
       // None is dropped to make room: a request may still be waiting on each.
       if (stored.pending.length >= MAX_INVITATIONS) return "full";
-      pending = { nonce: random(32), verifier: random(48), redirect, expires_at: now + INVITATION_TTL_MS, app_id: app.app_id, pairing: app.version };
+      pending = { nonce: random(32), verifier: random(48), redirect, expires_at: now + INVITATION_TTL_MS, app_id: app.app_id, pairing: app.version, ...(what ? { brain: what.brain, call: what.call, what: { text: what.text.slice(0, 80), where: what.where } } : {}) };
       stored.pending = [...stored.pending, pending];
     }
     void this.ctx.storage.put("grant", stored);
@@ -121,10 +134,14 @@ export class DoubaoGrant extends DurableObject<Env> {
     const stored = await this.#load();
     const pending = stored?.pending.find((each) => each.nonce === nonce);
     if (!stored || !pending || pending.state || pending.expires_at <= Date.now()) return null;
+    // Nor once they are authorised some other way (through another card): there is nothing left to do through this one.
+    if (stored.grant && stored.grant.pairing === pending.pairing && usable(stored.grant)) return null;
+    // Which piece of work it is for, in the person's own words, and where what comes of it will be said.
+    const about = pending.what ? `\n\n这次是为了你说的：「${pending.what.text}」。${pending.what.where === "chat" ? "这是你在群里提出的，豆包的结果会发在那个群（或话题）里，那里所有人都能看到。" : "结果会发在你和我的这个私聊里。"}\n\n授权是给你的账号的：授权之后，你其他正在等授权的交办也会一起继续，各自的结果发回各自提出的地方。` : "";
     const url = `${ACCOUNTS}/open-apis/authen/v1/authorize?${new URLSearchParams({ client_id: pending.app_id, response_type: "code", redirect_uri: pending.redirect, scope: SCOPES.join(" "), state: `${name}.${pending.nonce}`, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
     return {
       title: "需要你的授权",
-      text: "要把这件事交给豆包工作，需要你先授权。授权后我只能以你的身份在豆包工作里发起对话、读取它的回复。",
+      text: `要把这件事交给豆包工作，需要你先授权。授权后我只能以你的身份在豆包工作里发起对话、读取它的回复。${about}`,
       action: { label: "去授权", url },
       note: "链接 10 分钟内有效，只对你本人有效。这次授权约两小时后过期。授权完成后我会接着处理，你不用再发一遍。",
     };
@@ -136,6 +153,8 @@ export class DoubaoGrant extends DurableObject<Env> {
     const found = stored?.pending.find((each) => each.nonce === nonce);
     if (!stored || !found || found.state) return null;
     if (found.expires_at <= Date.now()) return null;
+    // Authorised through another card meanwhile: this link is over too. What waits on it is carried on under that authorisation.
+    if (stored.grant && stored.grant.pairing === found.pairing && usable(stored.grant)) return null;
     found.state = "taken";
     void this.ctx.storage.put("grant", stored);
     return { who: stored.who, verifier: found.verifier, redirect: found.redirect, generation: stored.generation, app_id: found.app_id, pairing: found.pairing };
@@ -151,8 +170,16 @@ export class DoubaoGrant extends DurableObject<Env> {
     through.state = "done";
     // When this one was done: a later one being done as well does not move it.
     through.at = Date.now();
+    // They came back through two at once and the other was kept first: that authorisation stands, and this one shares it.
+    if (stored.grant && stored.grant.pairing === pairing && usable(stored.grant)) {
+      // Whoever waits on this invitation is told that it is done: word of the first one may already have been heard and acted on.
+      stored.owed = this.#owed(stored, `done:${nonce}`);
+      void this.ctx.storage.put("grant", stored);
+      void this.ctx.storage.setAlarm(Date.now());
+      return true;
+    }
     stored.grant = { sealed, version, expires_at: token.expires_at, since: Date.now(), pairing };
-    stored.owed = { event: version, attempts: 0 };
+    stored.owed = this.#owed(stored, version);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
     return true;
@@ -167,7 +194,7 @@ export class DoubaoGrant extends DurableObject<Env> {
     const through = stored?.pending.find((each) => each.nonce === nonce);
     if (!stored || !through || through.state !== "taken") return through?.state === "done" || through?.state === "refused" ? through.state : undefined;
     through.state = "refused";
-    stored.owed = { event: `refused:${nonce}`, attempts: 0 };
+    stored.owed = this.#owed(stored, `refused:${nonce}`);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
     return "refused";
@@ -185,7 +212,8 @@ export class DoubaoGrant extends DurableObject<Env> {
     const shown = stored?.pending.find((each) => each.nonce === nonce);
     if (!shown) return { state: "gone" };
     if (shown.state === "refused") return { state: "gone", refused: true };
-    if (shown.state === "taken") return { state: "not_yet" };
+    // Being worked out just now: asked again shortly, whether or not word of how it ends arrives.
+    if (shown.state === "taken") return { state: "not_yet", again_in_ms: 3_000 };
     if (!stored?.grant || !usable(stored.grant)) return { state: "not_yet" };
     const app = await registry(this.env).doubaoApp(stored.who.chat_app_id);
     if (!app) return { state: "gone" };
@@ -222,9 +250,37 @@ export class DoubaoGrant extends DurableObject<Env> {
   async drop(): Promise<void> {
     const stored = await this.#load();
     if (!stored) return;
-    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, owed: undefined });
-    void this.ctx.storage.deleteAlarm();
+    // Whoever has something of theirs under way is told that it no longer stands, as of any other change.
+    const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
+    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, owed });
+    void this.ctx.storage.setAlarm(Date.now());
   }
+
+  /**
+   * Word owed of a change, and to whom. For a record kept before it was written down which
+   * conversations work came from (it has no home either), nobody is named: the person's own
+   * conversation is then told, as it always was (see alarm).
+   */
+  #owed(stored: Stored, event: string): NonNullable<Stored["owed"]> {
+    return { event, attempts: 0, ...(stored.home ? { to: this.#audience(stored) } : {}) };
+  }
+
+  /**
+   * Every conversation that may have something of this person's under way, by the scope name of
+   * its Brain: their own, and each one a piece of work that is still kept, or an invitation that
+   * still has time, came from. (Also one whose work is answered: its answer may not have been
+   * said yet.) Worked out from what is kept here alone, so that nothing is waited for between
+   * reading the record and writing it back.
+   */
+  #audience(stored: Stored): string[] {
+    const now = Date.now();
+    const from = [
+      ...Object.values(stored.ops).filter((each) => now < each.deadline + KEPT_AFTER_MS).map((each) => each.brain),
+      ...stored.pending.filter((each) => each.expires_at + INVITATION_KEPT_MS > now).map((each) => each.brain),
+    ].filter((each): each is string => typeof each === "string");
+    return [...new Set([...(stored.home ? [stored.home] : []), ...from])];
+  }
+
 
   /** For the operator: whether there is a grant and until when, and how many pieces of work stand where. Never the token, nor what was asked. */
   async status(): Promise<{ authorised: boolean; expires_at?: number; pending: number; work: Record<string, number> }> {
@@ -251,7 +307,7 @@ export class DoubaoGrant extends DurableObject<Env> {
    * A piece of work is never dropped to make room while the call that made it could still be
    * made again. With no room left, a new one is refused.
    */
-  async begin(who: Who, call: string, text: string, to: { carryOn: boolean; from?: string }, pairing: string, generation: number): Promise<Op | "unnamed" | "not_found" | "full"> {
+  async begin(who: Who, call: string, text: string, to: { carryOn: boolean; from?: string }, pairing: string, generation: number, brain?: string, home?: string): Promise<Op | "unnamed" | "not_found" | "full"> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [], ops: {} };
     if (!same(stored.who, who)) throw new Error("this record belongs to someone else");
     if (stored.ops[call]) return stored.ops[call];
@@ -277,7 +333,8 @@ export class DoubaoGrant extends DurableObject<Env> {
       if (oldest < 0) return "full";
       kept.splice(oldest, 1);
     }
-    const op: Op = { text, uuid: crypto.randomUUID(), stage: "asked", fresh: !to.carryOn, ...(session ? { session } : {}), created_at: now, deadline: now + WORK_LIMIT_MS, pairing, generation };
+    if (home) stored.home = home;
+    const op: Op = { ...(brain ? { brain } : {}), text, uuid: crypto.randomUUID(), stage: "asked", fresh: !to.carryOn, ...(session ? { session } : {}), created_at: now, deadline: now + WORK_LIMIT_MS, pairing, generation };
     stored.ops = { ...Object.fromEntries(kept), [call]: op };
     void this.ctx.storage.put("grant", stored);
     return op;
@@ -305,24 +362,30 @@ export class DoubaoGrant extends DurableObject<Env> {
     void this.ctx.storage.put("grant", stored);
   }
 
-  /** Tells the person's Brain that their authorisation has changed, until it has heard. */
+  /** Tells each conversation that is owed word of a change to the person's authorisation, until each has heard: one that cannot be reached does not keep the others waiting. */
   async alarm(): Promise<void> {
     const stored = await this.#load();
     if (!stored?.owed) return;
     const { event, attempts } = stored.owed;
-    let heard = false;
+    let left = stored.owed.to;
     try {
       const app = await registry(this.env).doubaoApp(stored.who.chat_app_id);
-      if (app) heard = (await this.env.BRAIN.getByName(scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id })).conditionReported(app.chat_connector, await grantName(stored.who), event)).ok;
+      // (One kept before it was said who is owed: the person's own conversation.)
+      left ??= app ? [scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id })] : [];
+      if (app) {
+        const name = await grantName(stored.who);
+        const heard = await Promise.all(left.map((each) => this.env.BRAIN.getByName(each).conditionReported(app.chat_connector, name, event).then((answer) => answer.ok, () => false)));
+        left = left.filter((_each, index) => !heard[index]);
+      }
     } catch {
-      heard = false;
+      // Not reached at all this time: everyone is still owed.
     }
     const after = await this.#load();
     if (after?.owed?.event !== event) return;
-    if (heard) delete after.owed;
-    else after.owed = { event, attempts: attempts + 1 };
+    if (left !== undefined && left.length === 0) delete after.owed;
+    else after.owed = { event, attempts: attempts + 1, ...(left ? { to: left } : {}) };
     void this.ctx.storage.put("grant", after);
-    if (!heard) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)));
+    if (after.owed) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)));
   }
 
   #load(): Promise<Stored | undefined> {
@@ -367,6 +430,8 @@ export const doubaoAsk: ConnectorTool = {
     "Doubao Work's way in: it is handed work through the worker of that name. `brief`: what to do. `continue_from`: the id of an earlier piece of work of that worker's to go on with, or null.",
   effect: "act",
   optional: true,
+  // Also where several people talk: for the one who asked, as them. What it brings back is said there, before the others.
+  shared: true,
   hands_to: "doubao",
   parameters: { brief: { type: "string" }, continue_from: { type: ["string", "null"] } },
   // How the piece of work stands is said from its own record, however the call went.
@@ -416,7 +481,8 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   // the piece named is this person's own, handed to this worker in this conversation; what is
   // checked below is that it can in fact be gone on with where it is kept.
   const carryOn = from !== undefined || args.carry_on === true;
-  if (context.scope.kind !== "user") return { error: "this can only be done for one person, in their own conversation" };
+  // For one person, as them: in their own conversation, or where several people talk and the run acts for the one who asked.
+  if (context.scope.kind !== "user" && context.scope.kind !== "chat") return { error: "this can only be done for one person, where they talk to the agent" };
   const redirect = redirectUri(env);
   if (!redirect || !grantsKey(env)) return { error: "handing work to Doubao is not set up on this deployment" };
   const app = await registry(env).doubaoApp(origin.app_id ?? "");
@@ -433,7 +499,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   const { generation, token, version } = await grant.held();
   if (context.resuming && generation !== context.resuming.generation) return CHANGED;
   // Kept as it is first asked for. The same call made again (carried on, or after an interruption) is the same piece of work.
-  const op = await grant.begin(who, context.callId, text, { carryOn, ...(from !== undefined ? { from } : {}) }, app.version, generation);
+  const op = await grant.begin(who, context.callId, text, { carryOn, ...(from !== undefined ? { from } : {}) }, app.version, generation, scopeName(context.scope), scopeName({ tenant: app.tenant, kind: "user", id: context.person }));
   if (op === "unnamed") return { error: "it was not said which piece of work this goes on with; nothing was sent. Name it (continue_from), or hand this over as something new" };
   if (op === "not_found") return { error: "that piece of work can no longer be gone on with (it is too old, it never reached Doubao, or the authorisation or set-up changed since); nothing was sent. Hand this over as something new if the person still wants it" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
@@ -514,10 +580,10 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   }
   /** `handed`: whether the work was handed over already, or may have been. Unless said, by how far its record has got. */
   async function authorise(handed = (seen.op ?? (op as Op)).stage !== "asked"): Promise<unknown> {
-    const invitation = await grant.invite(who, redirect!, app!, generation);
+    const invitation = await grant.invite(who, redirect!, app!, generation, { brain: scopeName(context.scope), call: context.callId, text: context.said.map((each) => each.text.trim()).filter(Boolean).join(" ") || text, where: context.scope.kind === "chat" ? "chat" : "private" });
     if (invitation === "superseded") return (seen.gave_up = "void"), { error: "the person's authorisation changed just now; nothing was sent. They can ask again" };
     if (invitation === "full") return { error: "too many authorisations were begun and not finished in the last hour; nothing was sent. They can ask again later" };
-    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, ...(handed ? { handed: true as const } : {}), request } } satisfies Waiting;
+    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, ...(handed ? { handed: true as const } : {}), ...(context.scope.kind === "chat" ? { privately: true as const } : {}), request } } satisfies Waiting;
   }
 }
 
@@ -532,7 +598,7 @@ function answered(op: Op): unknown {
 async function holds(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds | undefined> {
   const part = condition.split("|");
   if (part[0] !== "doubao") return undefined;
-  if (scope.kind !== "user" || !/^[0-9a-f]{64}$/.test(part[2] ?? "")) return { state: "gone" };
+  if ((scope.kind !== "user" && scope.kind !== "chat") || !/^[0-9a-f]{64}$/.test(part[2] ?? "")) return { state: "gone" };
   const grant = env.DOUBAO_GRANTS.getByName(part[2]);
   if (part[1] === "auth" && part.length === 4) return grant.covers(generation, part[3]);
   if (part[1] !== "reply" || part.length !== 4) return { state: "gone" };
@@ -586,7 +652,8 @@ async function holds(env: Env, scope: Scope, condition: string, generation: numb
 /** Whether the tool is for whoever wrote this message: one written to the agent alone, through a chat app the operator has paired. */
 async function offers(env: Env, event: InboundEvent): Promise<string[]> {
   const appId = (event.data?.origin as { app_id?: unknown } | undefined)?.app_id;
-  if (event.data?.direct !== true || typeof appId !== "string") return [];
+  // Written to the agent alone, or to it where several people talk: for whoever wrote it, either way.
+  if ((event.data?.direct !== true && event.data?.group !== true) || typeof appId !== "string") return [];
   return (await registry(env).doubaoPaired(appId)) ? [doubaoAsk.name] : [];
 }
 
