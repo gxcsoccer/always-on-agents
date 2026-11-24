@@ -36,11 +36,14 @@ interface Worker {
   offered?(env, event): Promise<boolean>;
   /** 开始一件事，或接着 `from` 那一件做。可以回答"需要本人先授权"。 */
   start(context, work: { id; brief; from?: WorkRef }): Promise<Started | NeedsAuthorisation | Refused>;
-  /** 没有人会来汇报的 worker：Brain 到时候来问。会主动汇报的不实现。 */
-  look?(env, work: WorkRef): Promise<{ state: "not_yet"; again_in_ms } | { state: "done"; result } | { state: "gone" }>;
-  cancel?(env, work: WorkRef): Promise<void>;
+  /** 没有人会来汇报的 worker：Brain 到时候来问。会主动汇报的不实现。问的途中也可能要本人重新授权。 */
+  look?(env, work: WorkRef): Promise<{ state: "not_yet"; again_in_ms } | { state: "done"; result } | { state: "gone" } | NeedsAuthorisation>;
+  /** 能停的才实现。说清是远端停了，还是只是这里不等了。 */
+  cancel?(env, work: WorkRef): Promise<"stopped" | "no_longer_waited_for">;
 }
 ```
+
+`start` 是幂等的：同一个工作编号再调一次，得到的是同一次提交。`WorkRef` 对 Brain 不透明，指向的是一次提交（同一个远端会话里可以有多次追问），不只是会话号。
 
 worker 由 connector 插件提供（`Connector.workers`），和现在 connector 提供工具的方式一样；沙箱由 Brain 自带。授权回调、管理接口等仍是那个 connector 的事。
 
@@ -59,12 +62,30 @@ worker 由 connector 插件提供（`Connector.workers`），和现在 connector
 
 ## 4. 分步
 
-1. **契约和记录**：加 `Worker` 契约、工作记录的新列；沙箱改为按契约接入。行为不变，测试不变。
-2. **豆包改为 worker**：`doubao_ask` 的逻辑搬到 `start` / `look`，它自己 Durable Object 里的工作记录并入 Brain 的记录（授权和令牌仍在它那里）。对外行为不变。
-3. **一组工具和统一接续**：换成 `hand_over` 等三个工具，提示里列出 worker 和最近的工作；旧工具名下线。
-4. **沙箱的接着做**：按 [task-continuation](task-continuation.zh-CN.md) 的快照方案实现，接在同一个 `continue_from` 上。
+每步一个 PR，测试先行，Codex 复核。按 Codex 的意见切得更小：先适配、再记索引、最后才换模型看到的工具；worker 自己那边的记录先不搬。
 
-每步一个 PR，测试先行，Codex 复核。第 1、2 步不改变用户看到的行为，第 3 步起才变。
+1. **薄适配**：加 `Worker` 契约，沙箱和豆包各包一层适配。旧工具、旧执行路径原样保留。行为不变，测试不变。
+2. **工作索引**：每件交出去的事在 Brain 的 `tasks` 表里有一行（复用已有的 `worker`、`requested_by`、`session_key`、`op_id`），关联到 worker 那边原有的记录。只写不读，可以整步回滚。验收：一件事一行、一份回执。豆包那边的提交去重、阶段、远端消息号、授权代次留在原处。
+3. **一组工具和统一接续**：向模型开放 `hand_over` 等三个工具，提示里列出 worker 和最近的工作。旧工具名留作内部别名，给在途请求的重放和已送达答复的引用用；不能只凭"当前没有在跑的"就下线。从这步起用户看到的行为才变。
+4. **之后再定**：要不要把 worker 那边的记录搬进 Brain；沙箱的接着做（[task-continuation](task-continuation.zh-CN.md) 的快照方案）独立做，接在同一个 `continue_from` 上。
+
+### 4.1 每步都要守住的
+
+- **一件事只交一次**：`start` 对同一个工作编号重试，找回的是同一次提交；发出去没收到回执，要能说"对方接没接不知道"，不能当成拒绝再开一单。
+- **结果只投递一次**：tasks 记的是给用户看的工作，等待请求（continuations）只管某一次等待的授权、期限和投递，两者用工作编号关联。指定唯一的结果投递者，不让任务事件和等待请求各发一遍。停止等待之后迟到的结果不再发。
+- **授权复核不绕过**：读结果、给模型、投递之前的授权复核照旧；`work_status` 不能变成绕过复核读结果的入口。
+- **可见性一致**：最近工作的列表、状态查询、取消都只给本人、本对话；模型给的 `continue_from` 由执行器核对：本人、本对话、同一个 worker、确实送达过、当前授权一致。没有明确请求人的自动任务不补猜归属。
+- **取消说清楚**：区分"远端已经停了"和"这里不等了，远端可能还在跑"。
+- **名额不串**：沙箱的并发上限只数沙箱的工作，别的 worker 不占它的名额。按仓库派沙箱的参数和同仓限制保留。
+
+### 4.2 验收重点
+
+- 同一对话里两件工作的结果各归各的。
+- 对方已接单但回执丢了，重放只开一单。
+- 取消和结果同时到，只通知一次。
+- 撤权之后，工作列表、状态、迟到的结果都不泄露。
+- 升级前发出的答复，升级后仍能正确追问。
+- 第 3 步：用真实模型测它选哪个 worker，另用固定调用验证话实际发到了哪里。
 
 ## 5. 不做
 
@@ -74,6 +95,6 @@ worker 由 connector 插件提供（`Connector.workers`），和现在 connector
 
 ## 6. 代价和要定的事
 
-- 第 2 步要迁移已有的豆包工作记录（最多保留三小时，可以等它们自然结束再切）。
 - 模型的工具从"每个 worker 各一个"变成"一个工具选 worker"。好处是加 worker 不加工具、接续规则只有一套；代价是 worker 的说明要写得让模型选得准，需要真实使用来调。
-- **要用户定的**：（1）是否同意合成一组工具（建议同意）；（2）PR #54 是否先合并作为过渡（建议合并：它的规则在第 3 步原样成为通用规则）；（3）第 4 步排在什么时候。
+- 第 1、2 步之后有一段时间新旧两套并存（旧工具在用，索引只写不读），这是为了每步都能退回。
+- **要用户定的**：（1）是否同意合成一组工具（建议同意）；（2）PR #54 是否先合并作为过渡（建议合并：它的规则在第 3 步原样成为通用规则）；（3）沙箱的接着做排在什么时候。
