@@ -267,6 +267,17 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
     text = named(text, mentions, [app.bot_open_id]);
+  } else if (message.message_type === "post") {
+    // Words with formatting, links or pictures among them: the words and links are read as they
+    // are for a message replied to; a picture is named as something that cannot be seen yet.
+    let content: unknown;
+    try {
+      content = JSON.parse(message.content);
+    } catch {
+      return undefined;
+    }
+    text = flat(content, mentions, [app.bot_open_id]);
+    documents = linkedIn(content);
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -437,13 +448,23 @@ function linkedIn(post: any): (DocumentRef & { link: string })[] {
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */
-function flat(post: any): string {
+function flat(post: any, mentions: any[] = [], own: (string | null)[] = []): string {
   // Sometimes wrapped by language; then whichever comes first.
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
   const piece = (each: any): string => {
     if (each?.tag === "text" || each?.tag === "md" || each?.tag === "code_block") return String(each.text ?? "");
     if (each?.tag === "a") return each.text && each.href && each.text !== each.href ? `${String(each.text)} (${String(each.href)})` : String(each.text || each.href || "");
-    if (each?.tag === "at") return `${token(each.user_name)} `;
+    if (each?.tag === "at") {
+      // Who is meant is what the event's own list of mentions says, by the placeholder or the id
+      // the piece carries. The bot's own is dropped, as in a plain message: it only says the
+      // message is for the agent. Someone the list does not know stays visible as a mention.
+      const idOf = (mention: any) => (typeof mention?.id === "string" ? mention.id : mention?.id?.open_id);
+      const meant = mentions.find((mention) => mention?.key === each.user_id || (typeof idOf(mention) === "string" && idOf(mention) === each.user_id));
+      const id = meant ? idOf(meant) : each.user_id;
+      if (typeof id === "string" && own.includes(id)) return " ";
+      return `${token(meant?.name ?? each.user_name)} `;
+    }
+    if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? "[a picture, which I cannot see yet]" : "[a video, which I cannot see yet]";
     return `[${String(each?.tag ?? "?")}]`;
   };
   const lines: string[] = ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map(piece).join("").trim() : ""));
