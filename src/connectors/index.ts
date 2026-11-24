@@ -88,9 +88,19 @@ export async function deliver(env: Env, scope: Scope, target: Target, message: O
   return channel.deliver(env, scope, target, message);
 }
 
-/** Shows a delivered invitation as over, where the connector can. */
-export async function closeInvitation(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void> {
-  await byName.get(target.connector)?.channel?.closeInvitation?.(env, target, receipt, how);
+/**
+ * Shows a delivered invitation as over, where the connector can, unless whoever made it says it
+ * can still be used: then it stays as it is, and resolves to false.
+ */
+export async function closeInvitation(env: Env, target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean> {
+  const channel = byName.get(target.connector)?.channel;
+  if (!channel?.closeInvitation) return false;
+  for (const each of serving(target.connector)) {
+    const invitation = await each.invitation?.(env, interaction);
+    if (invitation) return false;
+    if (invitation === null) return (await channel.closeInvitation(env, target, receipt, interaction, how), true);
+  }
+  return channel.closeInvitation(env, target, receipt, interaction, how);
 }
 
 /** Shows a delivered approval question as closed, where the connector can. */

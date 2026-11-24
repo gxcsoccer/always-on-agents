@@ -642,10 +642,12 @@ export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: 
 }
 
 /** Replaces an invitation's card with one that says it is over and has no button. Fixed words: nothing of the invitation is kept to repeat. */
-export async function closeInvitationFeishu(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void> {
+export async function closeInvitationFeishu(env: Env, target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean> {
   const messageId = /^feishu:message:([A-Za-z0-9_-]{1,100})$/.exec(receipt.subject)?.[1];
   const appId = target.address.app_id;
-  if (!messageId || !appId) return;
+  if (!messageId || !appId) return false;
+  // One of this connector's own that still works stays: asked the same way as when it is sent.
+  if (await invitationFor(env, interaction).catch(() => undefined)) return false;
   const plain = (content: string) => ({ tag: "plain_text", content });
   const [template, title, text] = how === "used" ? ["green", "已授权", "授权已完成，不需要再操作。"] : ["grey", "这次请求已结束", "这张卡片不用再点了。还需要的话，请在聊天里再跟我说一遍。"];
   const card = { config: { wide_screen_mode: true, update_multi: true }, header: { template, title: plain(title) }, elements: [{ tag: "div", text: plain(text) }] };
@@ -657,6 +659,7 @@ export async function closeInvitationFeishu(env: Env, target: Target, receipt: R
   });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string };
   if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
+  return true;
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

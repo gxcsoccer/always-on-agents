@@ -94,7 +94,8 @@ export interface RequestsHost {
   /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
   aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
   /** Shows a delivered invitation as over where it was shown. Never holds anything up. */
-  closeInvitation(target: Target, receipt: Receipt, how: "used" | "over"): void;
+  closeInvitation(target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean>;
+  waitUntil(promise: Promise<unknown>): void;
 }
 
 /** The one person a run acts for, and their own messages it rests on. */
@@ -512,24 +513,30 @@ export class Requests implements Wakes {
 
   /** Ends a request, once. What ended it is kept; nothing ended is ever reopened. */
   endRequest(id: string, status: "done" | "failed" | "cancelled" | "expired" | "void" | "unverified", why: string): void {
-    // Its way in, if it was still waiting on one: looked up before it ends.
-    const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ? AND status = 'waiting'", id)[0]?.interaction;
+    const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
-    // Only where the way in itself is finished too: past its time, or come to nothing. One a
-    // request merely stopped wanting (called off, say) may be the very one the person is shown
-    // again when they ask afresh, and has to keep working.
-    if (ended.length > 0 && shown && (status === "expired" || status === "void")) this.#wayInOver(shown, "over");
+    if (ended.length > 0 && shown) this.#wayInOver(shown, "over");
   }
 
   /**
-   * A way in that no request waits on any more is shown as over wherever it was delivered: it
-   * was used, or it can no longer be. One that others still wait on stays as it is.
+   * A way in that no request waits on any more is shown as over wherever it was delivered, if
+   * whoever made it says it can no longer be used: it was used, ran out, or came to nothing. One
+   * that still works stays as it is (the next request may be shown the same one), and so does one
+   * that others still wait on. Shown as over once: what it was first shown as stays.
    */
   #wayInOver(interaction: string, how: "used" | "over"): void {
     if (this.#s.rows("SELECT 1 FROM continuations WHERE status = 'waiting' AND interaction = ? LIMIT 1", interaction).length > 0) return;
-    for (const row of this.#s.rows<{ target: string; receipt: string }>("SELECT target, receipt FROM outbox WHERE idem IN (?, ?) AND receipt IS NOT NULL", `invite:${interaction}`, `invite:${interaction}:direct`)) {
-      this.#b.closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, how);
+    for (const row of this.#s.rows<{ id: number; target: string; receipt: string }>("SELECT id, target, receipt FROM outbox WHERE idem IN (?, ?) AND receipt IS NOT NULL AND closed IS NULL", `invite:${interaction}`, `invite:${interaction}:direct`)) {
+      // Taken at once, so that a later ending does not show it as something else meanwhile; given back if it stays as it is.
+      this.#s.sql.exec("UPDATE outbox SET closed = ? WHERE id = ?", how, row.id);
+      const back = () => void this.#s.sql.exec("UPDATE outbox SET closed = NULL WHERE id = ? AND closed = ?", row.id, how);
+      this.#b.waitUntil(
+        this.#b
+          .closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, interaction, how)
+          .then((closed) => void (closed || back()))
+          .catch((err) => (back(), this.#s.log("invitation_not_closed", { error: String(err).slice(0, 300) }))),
+      );
     }
   }
 

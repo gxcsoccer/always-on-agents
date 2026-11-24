@@ -160,7 +160,8 @@ export class BrainAgent extends DurableObject<Env> {
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
       direct,
       aside,
-      closeInvitation: (target, receipt, how) => this.ctx.waitUntil(closeInvitation(this.env, target, receipt, how).catch((err) => this.#store.log("invitation_not_closed", { error: String(err).slice(0, 300) }))),
+      closeInvitation: (target, receipt, interaction, how) => closeInvitation(this.env, target, receipt, interaction, how),
+      waitUntil: (promise) => this.ctx.waitUntil(promise),
     });
     this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks, this.#marks];
     migrate(ctx.storage);

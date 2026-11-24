@@ -313,9 +313,11 @@ export interface Channel {
   /**
    * Shows a delivered invitation as over where it is shown, once nothing waits on it any more:
    * it stops offering its way in and says whether it was used ("used") or can no longer be
-   * ("over"). Best effort; nothing depends on it.
+   * ("over"). An invitation of the channel's own that can still be used is left as it is (the
+   * next request may be shown the same one): resolves to whether it was shown as over. Best
+   * effort; nothing depends on it.
    */
-  closeInvitation?(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void>;
+  closeInvitation?(env: Env, target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean>;
   /**
    * Required of a system where what was said can be changed afterwards (edited or deleted). Says
    * what a message says now, so that an approval is never acted on unseen. Such a connector gives
