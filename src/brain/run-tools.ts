@@ -113,7 +113,10 @@ export class RunTools {
       // are not one: if an answer went out between the writing and the arriving, which one they
       // had before them cannot be told, and none is taken.
       const [then, arrived] = [at(written), at(each.received_at)];
-      return then?.outbox_id === arrived?.outbox_id ? then : undefined;
+      // The same for an answer whose sending had begun by the time this arrived and was not yet
+      // confirmed when it was written: it may have been before them already.
+      const under_way = this.#s.rows("SELECT 1 FROM outbox o JOIN runs r ON r.id = o.run_id WHERE r.session_id = ? AND o.authored = 1 AND o.first_attempt_at IS NOT NULL AND o.first_attempt_at <= ? AND (o.sent_at IS NULL OR o.sent_at > ?) AND o.status IN ('pending', 'sent', 'unverified', 'reconciling') LIMIT 1", run.session_id, each.received_at, written).length > 0;
+      return !under_way && then?.outbox_id === arrived?.outbox_id ? then : undefined;
     });
     const last = lasts[0];
     if (!last || lasts.some((each) => each?.outbox_id !== last.outbox_id)) return {};
