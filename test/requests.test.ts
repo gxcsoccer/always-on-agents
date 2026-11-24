@@ -826,6 +826,40 @@ describe("keeping a request that has to wait", () => {
       });
     });
 
+    it("is made up for at the next look when going to them directly could not be written down at once: one card, however often it is looked at", async () => {
+      await asking(({ requests, store, host, kept, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        const enqueue = host.enqueueMessage;
+        host.enqueueMessage = (idem, ...rest) => {
+          if (idem.endsWith(":direct")) throw new Error("the queue could not be written");
+          return enqueue(idem, ...rest);
+        };
+        expect(() => requests.shown(invite() as never, "failed")).not.toThrow();
+        expect(kept("call_1").direct).toBe(2);
+        expect(sent("invite:grant_1.nonce:direct")).toBeUndefined();
+        host.enqueueMessage = enqueue;
+        requests.deadlines(Date.now());
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL ORDER BY id")).toEqual([{ idem: "invite:grant_1.nonce" }, { idem: "invite:grant_1.nonce:direct" }]);
+        expect(kept("call_1").direct).toBe(1);
+        // Shown, as far as anyone looking can tell, once that one has arrived.
+        store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
+        expect(requests.waits().find((each) => each.id === "call_1")).toMatchObject({ shown: true });
+      });
+      // Not for one whose outcome is unknown, nor for a request that has ended.
+      await asking(({ requests, store }) => {
+        store.sql.exec("UPDATE outbox SET status = 'unverified', started = 1, uncertain = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+      });
+      await asking(({ requests, store }) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        requests.endRequest("call_1", "cancelled", "x");
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+      });
+    });
+
     it("says so where the request was made when they cannot be reached directly either, or when it cannot be told whether it was shown", async () => {
       await asking(
         async ({ requests, store, sent }, invite) => {

@@ -283,14 +283,7 @@ export class Requests implements Wakes {
     // directly instead. Once: from then on it is a way in sent somewhere else, and how that
     // goes is said as for any such. The one that failed is left as it is.
     if (how === "failed") {
-      for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) {
-        const directly = (JSON.parse(waiting.events) as { directly?: Target }).directly;
-        if (!directly) continue;
-        this.#s.transaction(() => {
-          this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ? AND direct = 2", waiting.id);
-          this.#b.enqueueMessage(`invite:${row.interaction}:direct`, waiting.session_id, null, this.#b.notice("invite", waiting.session_id), undefined, undefined, { interaction: row.interaction as string, target: JSON.stringify(directly) });
-        });
-      }
+      for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) this.#redirect(waiting);
       // Those just moved wait for word of the new one; the rest are told below.
       // (Word of the first one's failure says nothing more once the second exists, however that one fares.)
       if (String(row.idem) === `invite:${row.interaction}` && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `invite:${row.interaction}:direct`).length > 0) {
@@ -299,6 +292,28 @@ export class Requests implements Wakes {
       }
     }
     for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) this.#tell(waiting, how);
+  }
+
+  /**
+   * Sends a way in that was certainly not shown where the person asked to them directly, where
+   * that is known: the request becomes one whose way in was sent somewhere else, and the new
+   * message exists, in one step. If that step cannot be kept just now it is made up for at the
+   * next look (see `deadlines`); the same key each time, so there is one such message at most.
+   */
+  #redirect(waiting: Continuation): boolean {
+    const directly = (JSON.parse(waiting.events) as { directly?: Target }).directly;
+    if (!directly) return false;
+    try {
+      this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ? AND direct = 2", waiting.id);
+        this.#b.enqueueMessage(`invite:${waiting.interaction}:direct`, waiting.session_id, null, this.#b.notice("invite", waiting.session_id), undefined, undefined, { interaction: waiting.interaction, target: JSON.stringify(directly) });
+      });
+      return true;
+    } catch {
+      // Looked at again shortly, whatever else is or is not due by then.
+      void this.#b.wakeBy(Date.now() + 2_000).catch(() => undefined);
+      return false;
+    }
   }
 
   #tell(waiting: Continuation, how: "reached" | "failed" | "unknown"): void {
@@ -360,6 +375,13 @@ export class Requests implements Wakes {
    * deadline never stand in for each other, whichever comes first.
    */
   deadlines(now: number): void {
+    // A way in certainly not shown where the person asked, whose going to them directly instead
+    // was not written down when that was found out: done now, for requests still waiting in time.
+    for (const waiting of this.#s.rows<Continuation>(
+      "SELECT c.* FROM continuations c JOIN outbox o ON o.idem = 'invite:' || c.interaction WHERE c.status = 'waiting' AND c.direct = 2 AND c.until > ? AND o.status = 'dead' AND o.uncertain = 0 AND NOT EXISTS (SELECT 1 FROM outbox d WHERE d.idem = 'invite:' || c.interaction || ':direct')",
+      now,
+    ))
+      this.#redirect(waiting);
     for (const waiting of this.#s.rows<Continuation & { check_at: number | null }>("SELECT * FROM continuations WHERE status = 'waiting' AND (until <= ? OR check_at <= ?)", now, now)) {
       if (waiting.check_at != null && waiting.check_at <= now) {
         this.#s.sql.exec("UPDATE continuations SET check_at = NULL WHERE id = ?", waiting.id);
@@ -669,7 +691,7 @@ export class Requests implements Wakes {
       kind: "request" as const,
       id: each.id,
       state: ({ resuming: "continuing", answering: "answer to be sent", done: "done", failed: "failed", cancelled: "withdrawn", expired: "withdrawn", void: "withdrawn", unverified: "cannot be verified" } as Record<string, string>)[each.status] ?? "waiting",
-      shown: shown(`invite:${each.interaction}`),
+      shown: shown(`invite:${each.interaction}`) || shown(`invite:${each.interaction}:direct`),
       since: each.created_at,
     }));
     const approvals = this.#s.rows<{ idem: string; closed: string | null; created_at: number; status: string }>("SELECT idem, closed, created_at, status FROM outbox WHERE ask IS NOT NULL ORDER BY id DESC LIMIT 20").map((each) => {
