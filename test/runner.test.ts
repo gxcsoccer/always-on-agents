@@ -958,6 +958,34 @@ describe("the run loop, by itself", () => {
         expect(b.inbox().filter((each) => each.run_id === taken)).toHaveLength(2);
         expect(b.inbox().filter((each) => each.status === "pending")).toHaveLength(1);
       });
+      // Where several people talk, one person's earlier words are led back to for them alone:
+      // the next person to ask there is not shown them, though the turn that pointed at them is still in sight.
+      await within(async (b) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read", shared: true, description: "", parameters: {} } as unknown as ConnectorTool];
+        const here = { origin: ORIGIN, shared: true };
+        b.event("the plan is to ship on Thursday", { session_key: "chat", source_id: "om_first", status: "done", data: here, received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
+        b.event("", { session_key: "chat", data: { ...here, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(JSON.stringify(b.asked[0].input)).toContain("ship on Thursday");
+        b.settings.quoted = undefined;
+        b.event("and what about me?", { session_key: "chat", data: here, principal: { kind: "human", id: "ou_2", explicit: true } });
+        await b.go();
+        const shown = JSON.stringify(b.asked[1].input);
+        expect(shown).toContain("说了啥？");
+        expect(shown).not.toContain("ship on Thursday");
+        expect(shown).toContain("is no longer kept");
+      }, "chat:oc_1");
+      // Measured as it is shown, in the same units as the messages themselves: characters outside the basic plane count as they do there.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "🙂".repeat(4_000), { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        for (let i = 0; i < 3; i++) b.event("y".repeat(38_000), { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        const taken = (await b.runner.next())!;
+        expect(b.inbox().filter((each) => each.run_id === taken)).toHaveLength(2);
+        expect(b.inbox().filter((each) => each.status === "pending")).toHaveLength(1);
+      });
       // Two messages taken up together that lead to the same answer: its words are shown once.
       await within(async (b) => {
         earlier(b, "r0", "summarise A");

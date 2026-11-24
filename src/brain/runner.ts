@@ -182,8 +182,9 @@ export class Runner {
     const replied: number[] = [];
     const pointed: Pointed[] = [];
     this.#repliedTo(event, sessionId, replied, pointed);
-    const said = replied.map((id) => ({ key: `said:${id}`, size: this.#s.rows<{ n: number }>("SELECT LENGTH(text) AS n FROM said WHERE outbox_id = ?", id)[0]?.n ?? 0 }));
-    return [...said, ...pointed.map((each) => ({ key: `inbox:${each.id}`, size: MAX_POINTED_TEXT }))];
+    // In the units the messages themselves are measured in (sizeOf), with room for what is written around each when it is shown.
+    const said = replied.map((id) => ({ key: `said:${id}`, size: (this.#s.rows<{ text: string }>("SELECT text FROM said WHERE outbox_id = ?", id)[0]?.text.length ?? 0) + SHOWN_AROUND }));
+    return [...said, ...pointed.map((each) => ({ key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + SHOWN_AROUND }))];
   }
 
   /** The stored message another was written in reply to: the very one, earlier, in the same conversation and through the same connector. */
@@ -745,7 +746,12 @@ export class Runner {
     const entries: { item: Item; starts: boolean }[] = [];
     // Who the run acts for, worked out once and only if some answer is quoted: what they can still
     // point at decides what an answer is shown as written from.
-    const acting = quotedOf.size > 0 && runId ? this.actingFor(runId) : undefined;
+    const leads = rows.some((row) => row.is_user === 1 && row.item.includes('"_pointed"'));
+    const acting = (quotedOf.size > 0 || leads) && runId ? this.actingFor(runId) : undefined;
+    // Whose earlier words may be led back to in this run: the person it acts for, where several
+    // people talk; in a person's own scope, theirs.
+    const scope = this.#s.scope();
+    const me = scope.kind === "chat" ? acting?.person : scope.kind === "user" ? scope.id : undefined;
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[]; _pointed?: Pointed[] };
       if (row.is_user === 1) {
@@ -755,7 +761,9 @@ export class Runner {
         const before = entries.length;
         for (const each of mayShow ? (item._pointed ?? []) : []) {
           const kept = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ? AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", each.id, sessionId)[0];
-          const theirs = kept && kept.text !== null && (JSON.parse(kept.principal) as Principal).id === each.by;
+          // Theirs then, and theirs now: the same person this run is for, through the same connector and origin where that is known.
+          const same = kept !== undefined && (!acting || (kept.source === acting.connector && JSON.stringify(originOf(kept)) === JSON.stringify(acting.origin)));
+          const theirs = kept && kept.text !== null && same && each.by === me && (JSON.parse(kept.principal) as Principal).id === each.by;
           entries.push({ item: { role: "user", content: theirs ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text!.slice(0, MAX_POINTED_TEXT)}` : "[An earlier message of theirs that this leads back to is no longer kept.]" }, starts: entries.length === before });
         }
         const led = entries.length > before;
@@ -866,6 +874,8 @@ function today(): string {
 type Pointed = { id: number; by: string };
 /** How much of such a message is shown. */
 const MAX_POINTED_TEXT = 500;
+/** Room for what is written around something shown with a turn: its label, and where it was written from. */
+const SHOWN_AROUND = 600;
 
 function sizeOf(event: InboxRow): number {
   return (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
