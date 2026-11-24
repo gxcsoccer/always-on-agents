@@ -905,6 +905,40 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("shows, one step further up, what the person's own fetched message was itself written in reply to, from its own records", async () => {
+      await within(async (b) => {
+        // The agent's answer, as it reached them; then their own message replying to it, which the agent was never sent; then a reply to that.
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "A has three items", { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        const input = b.asked[0].input;
+        expect(String(input.at(-1)!.content)).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to the message you sent at 2026-11-23T08:00:00.000Z)');
+        expect(input.at(-2)).toEqual({ role: "assistant", content: "[The message of yours they are replying to, sent at 2026-11-23T08:00:00.000Z:]\nA has three items" });
+        expect(JSON.parse(b.store.rows<{ data: string }>("SELECT data FROM inbox ORDER BY id DESC LIMIT 1")[0].data).quoted).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_bot" });
+      });
+      // Or to an earlier message of their own that is on record.
+      await within(async (b) => {
+        b.event("the plan https://x/docx/D1", { source_id: "om_first", status: "done" });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(String(b.asked[0].input.at(-1)!.content)).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to their own still earlier message: "the plan https://x/docx/D1")');
+      });
+      // Anything else up there (someone else's, nothing on record, something that is not a message's name): not said.
+      for (const further of ["feishu:message:om_nowhere", 7, "other:message:x"]) {
+        await within(async (b) => {
+          b.settings.quoted = { text: "说了啥？", replies_to: further };
+          b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+          await b.go();
+          const said = String(b.asked[0].input.at(-1)!.content);
+          expect(said).toContain('(written as a reply to their own earlier message: "说了啥？")');
+          expect(said).not.toContain("which they wrote");
+        });
+      }
+    });
+
     it("shows the message of the agent's a person replied to as the agent's own words, without keeping them again", async () => {
       await within(async (b) => {
         earlier(b, "r0", "summarise A");

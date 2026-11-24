@@ -56,7 +56,18 @@ export class RunTools {
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
   #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
-    const subjects = this.#b.requests.basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    // What each message points at: the message it replies to; or, where that is the person's own
+    // message the connector had to fetch, and that one was written in reply to an answer of the
+    // agent's, that answer (one step further up, as the model is shown it).
+    const delivered = (subject: unknown): subject is string => typeof subject === "string" && this.#s.rows("SELECT 1 FROM said WHERE session_id = ? AND receipt_subject = ? LIMIT 1", run.session_id, subject).length > 0;
+    const subjects = this.#b.requests
+      .basis(run.id)
+      .map((each) => {
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; replies_to?: unknown } };
+        const further = typeof data.quoted?.text === "string" ? data.quoted.replies_to : undefined;
+        return !delivered(data.replies_to) && delivered(further) ? further : data.replies_to;
+      })
+      .filter((each): each is string => typeof each === "string");
     if (subjects.length === 0) return {};
     const answers = this.#s.rows<{ reads: string }>("SELECT reads FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
     if (answers.length === 0) return {};

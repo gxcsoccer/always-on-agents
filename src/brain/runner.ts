@@ -199,9 +199,30 @@ export class Runner {
     if (yours?.sent_at) return `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})`;
     // A message the agent was never sent, which the connector was asked for before this run
     // (see #quote): the person's own words, or only that there was one.
-    const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { text?: unknown } }).quoted;
+    const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { text?: unknown; replies_to?: unknown } }).quoted;
     if (!quoted) return "";
-    return typeof quoted.text === "string" ? `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)})` : "\n  (written as a reply to a message here that is not shown to you: someone else's, or one that could not be read)";
+    if (typeof quoted.text !== "string") return "\n  (written as a reply to a message here that is not shown to you: someone else's, or one that could not be read)";
+    return `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)}${this.#further(event, sessionId, quoted.replies_to, replied)})`;
+  }
+
+  /**
+   * One step further up: what the person's own message, the one this event replies to and the
+   * connector had to fetch, was itself written in reply to. Only from the Brain's own records, in
+   * this conversation: an answer of the agent's as it reached them (shown as the agent's own when
+   * the transcript is put together), or an earlier message of the same person's. Anything else up
+   * there is not said.
+   */
+  #further(event: InboxRow, sessionId: string, subject: unknown, replied: number[]): string {
+    if (typeof subject !== "string") return "";
+    const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
+    if (words) {
+      replied.push(words.outbox_id);
+      return `, which they wrote as a reply to the message you sent at ${new Date(words.sent_at).toISOString()}`;
+    }
+    const parent = this.#parentOf(event, subject);
+    const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
+    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `, which they wrote as a reply to their own still earlier message: ${JSON.stringify(parent.text.slice(0, 500))}`;
+    return "";
   }
 
   /**
@@ -239,7 +260,7 @@ export class Runner {
     await Promise.all(
       [...unknown.values()].map(async ({ asking, source, ids }) => {
         const found = await Promise.race([this.#b.quoted(source, { ...asking, signal: stop.signal }), late]).catch((): Quoted => ({}));
-        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}) } : {}), id);
+        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(typeof found.replies_to === "string" ? { replies_to: found.replies_to } : {}) } : {}), id);
       }),
     );
     clearTimeout(timer);
