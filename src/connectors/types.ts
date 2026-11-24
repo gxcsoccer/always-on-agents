@@ -73,8 +73,11 @@ export interface Connector {
  * `again_in_ms`: with "not yet", how long until it is worth asking again, for something nobody
  * will come and report (a reply being written elsewhere, say). Without it, it is asked again
  * only when something is reported or the wait runs out.
+ *
+ * `refused`: with "gone", the person went the way they were shown and it did not go through, so
+ * what they asked for was not done. They are told so, once for each way in.
  */
-export type Holds = { state: "holds"; since: number } | { state: "not_yet"; again_in_ms?: number } | { state: "gone" };
+export type Holds = { state: "holds"; since: number } | { state: "not_yet"; again_in_ms?: number } | { state: "gone"; refused?: true };
 
 /** Something to put before a person so that they can bring a condition about: what it is, and the one place to go. */
 export interface Invitation {
