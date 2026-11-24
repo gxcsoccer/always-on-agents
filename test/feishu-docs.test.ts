@@ -140,7 +140,7 @@ function installFakeFeishu() {
     const fetched = url.host === "open.feishu.cn" && (init?.method ?? "GET") === "GET" ? /\/im\/v1\/messages\/([^/]+)$/.exec(url.pathname)?.[1] : undefined;
     if (fetched) {
       const found = quotable.get(fetched);
-      return found ? Response.json({ code: 0, data: { items: [{ message_id: fetched, chat_id: found.chat_id, msg_type: "text", sender: { sender_type: "user", id: found.open_id, tenant_key: ORG }, body: { content: JSON.stringify({ text: found.text }) } }] } }) : Response.json({ code: 230110 }, { status: 404 });
+      return found ? Response.json({ code: 0, data: { items: [{ message_id: fetched, chat_id: found.chat_id, msg_type: "text", sender: { sender_type: "user", id: found.open_id, tenant_key: ORG }, body: { content: JSON.stringify({ text: found.text }) }, ...(found.parent ? { parent_id: found.parent } : {}) }] } }) : Response.json({ code: 230110 }, { status: 404 });
     }
     // What Feishu says of a chat, and a card shown to one member of it.
     const aboutChat = url.host === "open.feishu.cn" ? /\/im\/v1\/chats\/([^/]+)(\/members\/is_in_chat)?$/.exec(url.pathname) : undefined;
@@ -276,7 +276,7 @@ const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const rowsOf = (stub: any, query: string, ...args: unknown[]): Promise<any[]> => runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
 /** A person, their scope's Brain, and their direct chat with the bot. */
 /** Messages the bot was never sent, which Feishu hands over when asked for one by its id. */
-const quotable = new Map<string, { chat_id: string; open_id: string; text: string }>();
+const quotable = new Map<string, { chat_id: string; open_id: string; text: string; parent?: string }>();
 /** The chats Feishu knows of in these tests, and what it says of each. */
 const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean; lapsedOnce?: boolean }>();
 
@@ -2965,6 +2965,89 @@ describe("reading a document for the one who asked, where several people talk", 
     await here.says("总结一下", "om_earlier_fay");
     expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupFay0000000001/raw_content"]);
     expect(here.heard()).toEqual(["读了"]);
+  });
+
+  it("answers a bare mention written as a reply to their own question about an answer of the agent's, from that answer; and reads again when more is wanted", async () => {
+    const nia = someone();
+    feishu.docs.set("DocGroupNia0000000001", { readers: [nia.openId], text: "Nia's plan has three steps." });
+    await authorised(nia, "DocGroupNia0000000001");
+    const id = chat();
+    const here = inGroup(id, nia);
+    model.replies([readCall("DocGroupNia0000000001")], [call("send_message", { text: "三步：甲乙丙。" })], [say("")]);
+    await here.says(`总结一下 ${link("DocGroupNia0000000001")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "三步：甲乙丙。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    // She replies to that answer without mentioning the bot (so it never arrives), then replies to her own reply with nothing but the mention.
+    quotable.set("om_what_nia", { chat_id: id, open_id: nia.openId, text: "说了啥？", parent: answer });
+    model.replies([call("send_message", { text: "说的是三步：甲乙丙。" })], [say("")]);
+    await here.says("", "om_what_nia");
+    const shown = JSON.stringify(modelCalls.at(-1)!.input);
+    expect(shown).toContain("说了啥？");
+    expect(shown).toContain("三步：甲乙丙。");
+    expect(feishu.reads).toEqual([]);
+    expect(here.heard().at(-1)).toBe("说的是三步：甲乙丙。");
+    // More than the answer said: the document that answer was written from is read again, for her.
+    quotable.set("om_more_nia", { chat_id: id, open_id: nia.openId, text: "第二步具体怎么做？", parent: answer });
+    model.replies([readCall("DocGroupNia0000000001")], [call("send_message", { text: "第二步是乙。" })], [say("")]);
+    await here.says("", "om_more_nia");
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupNia0000000001/raw_content"]);
+    // And the same through her own first message, the one with the link, where her unseen reply was written to that.
+    feishu.reads.length = 0;
+    quotable.set("om_own_nia", { chat_id: id, open_id: nia.openId, text: "这篇再看看", parent: here.ids[0] });
+    model.replies([readCall("DocGroupNia0000000001")], [call("send_message", { text: "看了。" })], [say("")]);
+    await here.says("", "om_own_nia");
+    expect(feishu.reads).toHaveLength(1);
+    // Not through someone else's message up there: nothing of it is known, and nothing is read on its strength.
+    feishu.reads.length = 0;
+    quotable.set("om_else_nia", { chat_id: id, open_id: nia.openId, text: "这个呢", parent: "om_someone_elses" });
+    model.replies([readCall("DocGroupNia0000000002")], [call("send_message", { text: "需要链接" })], [say("")]);
+    await here.says("", "om_else_nia");
+    expect(feishu.reads).toEqual([]);
+  });
+
+  it("goes by the link in the message replied to before anything further up: a newer document named there is the one read", async () => {
+    const ola = someone();
+    feishu.docs.set("DocGroupOla0000000001", { readers: [ola.openId], text: "The old version." });
+    feishu.docs.set("DocGroupOla0000000002", { readers: [ola.openId], text: "The new version." });
+    await authorised(ola, "DocGroupOla0000000001");
+    const id = chat();
+    const here = inGroup(id, ola);
+    model.replies([readCall("DocGroupOla0000000001")], [call("send_message", { text: "旧版三步。" })], [say("")]);
+    await here.says(`总结一下 ${link("DocGroupOla0000000001")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "旧版三步。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    quotable.set("om_newer_ola", { chat_id: id, open_id: ola.openId, text: `改看新版 ${link("DocGroupOla0000000002")}`, parent: answer });
+    model.replies([readCall("DocGroupOla0000000002")], [call("send_message", { text: "新版四步。" })], [say("")]);
+    await here.says("", "om_newer_ola");
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupOla0000000002/raw_content"]);
+  });
+
+  it("shows an answer written for someone else there as what was said, and reads nothing again on its strength for another person", async () => {
+    const pia = someone();
+    const quin = someone();
+    feishu.docs.set("DocGroupPia0000000001", { readers: [pia.openId, quin.openId], text: "Shared by both." });
+    await authorised(pia, "DocGroupPia0000000001");
+    await authorised(quin, "DocGroupPia0000000001");
+    const id = chat();
+    const hers = inGroup(id, pia);
+    const his = inGroup(id, quin);
+    // Both linked it there; the answer was written for her.
+    model.replies([say("")]);
+    await his.says(`存一下 ${link("DocGroupPia0000000001")}`);
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "给 Pia 的总结。" })], [say("")]);
+    await hers.says(`总结一下 ${link("DocGroupPia0000000001")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "给 Pia 的总结。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "请贴链接" })], [say("")]);
+    await his.says("第二点展开", answer);
+    expect(JSON.stringify(modelCalls.at(-2)!.input)).toContain("给 Pia 的总结。");
+    expect(JSON.stringify(modelCalls.at(-2)!.input)).not.toContain("written from");
+    expect(toolOutputs()[0].error).toMatch(/does not rest on one document/);
+    expect(feishu.reads).toEqual([]);
+    // She can: it was written for her.
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "第二点是…" })], [say("")]);
+    await hers.says("第二点展开", answer);
+    expect(feishu.reads).toHaveLength(1);
   });
 
   it("asks which is meant when the earlier message they reply to links several documents, and reads none of them", async () => {

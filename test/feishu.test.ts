@@ -293,6 +293,23 @@ describe("fetching the message a group message was written in reply to", () => {
 
 describe("which documents a fetched message links", () => {
   afterEach(() => vi.unstubAllGlobals());
+  it("says what the fetched message was itself written in reply to, outside a topic", async () => {
+    const item = (over: Record<string, unknown>) => ({ message_id: "om_p", chat_id: "oc_chat", msg_type: "text", sender: { sender_type: "user", id: "ou_alice", tenant_key: "t" }, body: { content: JSON.stringify({ text: "说了啥？" }) }, ...over });
+    const fetched = async (over: Record<string, unknown>) => {
+      vi.stubGlobal("fetch", async () => Response.json({ code: 0, data: { items: [item(over)] } }));
+      return quotedBy("t-app", app, "oc_chat", "om_p", { open_id: "ou_alice", tenant_key: "t" });
+    };
+    expect(await fetched({ parent_id: "om_answer" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
+    expect(await fetched({})).toEqual({ text: "说了啥？" });
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1" })).toEqual({ text: "说了啥？" });
+    expect(await fetched({ parent_id: "not an id!" })).toEqual({ text: "说了啥？" });
+    // Only the message it replies to itself: where it started is not that.
+    expect(await fetched({ root_id: "om_root" })).toEqual({ text: "说了啥？" });
+    expect(await fetched({ parent_id: "om_answer", root_id: "om_root" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
+    // Not for someone else's message: nothing of it is passed on, where it points included.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+  });
+
   it("goes by where a link leads, never by the words shown for it", async () => {
     const post = {
       zh_cn: {

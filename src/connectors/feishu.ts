@@ -394,7 +394,12 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const linked = found.msg_type === "text" ? linksIn(String(content.text ?? "")) : found.msg_type === "post" ? linkedIn(content) : [];
     const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
-    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}) };
+    // What it was itself written in reply to, as for a message that arrives: not inside a topic,
+    // where every post points at the topic's first message.
+    // Only the message it replies to itself: where the exchange started (`root_id`) is not that.
+    const above = found.parent_id;
+    const further = !found.thread_id && typeof above === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(above) ? { replies_to: `feishu:message:${above}` } : {};
+    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...further };
   } catch {
     return {};
   }

@@ -45,7 +45,7 @@ function bench(state: DurableObjectState) {
     },
     sawOutside: (runId) => outside.has(runId),
     showClosed: (ask) => void closed.push(ask),
-    actedFor: (runId) => settings.acted.includes(runId),
+    actedFor: (runId) => (settings.acted.includes(runId) ? "ou_1" : undefined),
     requests: {
       stampGuards: (runId) => void stamped.push(runId),
       gate: async (row) => gates[row.idem as string] ?? "send",
@@ -727,8 +727,8 @@ describe("the outbox, by itself", () => {
         await outbox.flush();
         await outbox.flush();
         expect(kept()).toEqual([
-          { outbox_id: row("msg:c1").id, run_id: "r1", session_id: SESSION, text: "A has three items", receipt_subject: RECEIPT.subject, reads: [READ_A] },
-          { outbox_id: row("msg:c2").id, run_id: "r1", session_id: SESSION, text: "B has two", receipt_subject: RECEIPT.subject, reads: [READ_A, { ...READ_A, identity: "docx:BBBBBBBBBB" }] },
+          { outbox_id: row("msg:c1").id, run_id: "r1", session_id: SESSION, text: "A has three items", receipt_subject: RECEIPT.subject, reads: [READ_A], person: null },
+          { outbox_id: row("msg:c2").id, run_id: "r1", session_id: SESSION, text: "B has two", receipt_subject: RECEIPT.subject, reads: [READ_A, { ...READ_A, identity: "docx:BBBBBBBBBB" }], person: null },
         ]);
         // The outbox's own copy of a private message is still emptied once it has gone out.
         expect(row("msg:c1")).toMatchObject({ status: "sent", text: "" });
@@ -748,7 +748,7 @@ describe("the outbox, by itself", () => {
         await outbox.flush();
         await outbox.flush();
         await outbox.flush();
-        expect(kept().map((each) => each.text)).toEqual(["the document says three things"]);
+        expect(kept().map((each) => [each.text, each.person])).toEqual([["the document says three things", "ou_1"]]);
       });
     });
 
@@ -759,7 +759,7 @@ describe("the outbox, by itself", () => {
         store.sql.exec("INSERT INTO continuations (id, person, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, run_id, created_at) VALUES ('q1', 'ou_1', ?, '{}', 'feishu', 't', '{}', ?, 'g', 'c', 1, 'i', ?, 'answering', 'r1', 0)", SESSION, TARGET, Date.now() + 60_000);
         outbox.enqueue("answer:q1", SESSION, "r1", "after you authorised: three things", undefined, undefined, { continuation: { id: "q1", target: TARGET } as Continuation, authored: true });
         await outbox.flush();
-        expect(kept().map((each) => each.text)).toEqual(["after you authorised: three things"]);
+        expect(kept().map((each) => [each.text, each.person])).toEqual([["after you authorised: three things", "ou_1"]]);
       });
     });
 

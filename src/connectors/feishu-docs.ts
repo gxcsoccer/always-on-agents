@@ -222,8 +222,13 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     // On record here; or, where the agent was never sent it, as the connector fetched it for the message that replies to it.
     const pointed = [...new Set(repliedTo)].map((subject) => {
       const parent = context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`);
-      const fetched = parent ? [] : context.said.filter((message) => message.data.replies_to === subject).flatMap(quotedDocuments);
-      return { parent, links: parent ? ownDocuments(parent) : fetched, fetched };
+      const replying = parent ? [] : context.said.filter((message) => message.data.replies_to === subject);
+      const fetched = replying.flatMap(quotedDocuments);
+      // One step further up, where the fetched message links nothing itself: the person's own
+      // earlier message it was written in reply to, if that is on record here.
+      const above = fetched.length > 0 ? [] : [...new Set(replying.map((message) => (message.data.quoted as { replies_to?: unknown } | undefined)?.replies_to).filter((each): each is string => typeof each === "string"))];
+      const earlier = above.length === 1 ? context.recent.find((message) => typeof message.data.message_id === "string" && above[0] === `feishu:message:${message.data.message_id}`) : undefined;
+      return { parent: parent ?? earlier, links: parent ? ownDocuments(parent) : earlier ? ownDocuments(earlier) : fetched, fetched };
     });
     const parents = pointed.map((each) => each.parent);
     const named = pointed.flatMap((each) => each.links);

@@ -56,15 +56,28 @@ export class RunTools {
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
   #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
-    const subjects = this.#b.requests.basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+    // What each message points at: the message it replies to; or, where that is the person's own
+    // message the connector had to fetch, and that one was written in reply to an answer of the
+    // agent's, that answer (one step further up, as the model is shown it).
+    const delivered = (subject: unknown): subject is string => typeof subject === "string" && this.#s.rows("SELECT 1 FROM said WHERE session_id = ? AND receipt_subject = ? LIMIT 1", run.session_id, subject).length > 0;
+    const subjects = this.#b.requests
+      .basis(run.id)
+      .map((each) => {
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; replies_to?: unknown; documents?: unknown } };
+        // Not where the fetched message names something itself: what it links comes first.
+        const names = Array.isArray(data.quoted?.documents) && data.quoted.documents.length > 0;
+        const further = typeof data.quoted?.text === "string" && !names ? data.quoted.replies_to : undefined;
+        return !delivered(data.replies_to) && delivered(further) ? further : data.replies_to;
+      })
+      .filter((each): each is string => typeof each === "string");
     if (subjects.length === 0) return {};
-    const answers = this.#s.rows<{ reads: string }>("SELECT reads FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
+    const answers = this.#s.rows<{ reads: string; person: string | null }>("SELECT reads, person FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
     if (answers.length === 0) return {};
     // Written from nothing read, every one of them: they point at nothing.
     // (And every message replied to has to be such an answer: a reply to anything else as well
     // keeps what that one points at.)
     if (answers.length === new Set(subjects).size && answers.every((each) => (JSON.parse(each.reads) as Read[]).length === 0)) return { answering: { nothing: true } };
-    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf));
+    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person));
     const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
     return { answering: one ? { source: one.request } : {} };
   }
@@ -275,8 +288,13 @@ export function toolsIn(acting: Pick<Acting, "connector" | "shared">, toolsOf: (
  * messages here (as the tool that read it judges). None for an answer written from nothing read,
  * from several (even if only one of them is still in reach), or from one they linked too long ago.
  */
-export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[]): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
+export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[], writtenFor?: string | null): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
   if (!acting) return undefined;
+  // An answer written for someone else is something that was said here, and no more: what it
+  // was read from is not this person's to have read again on its strength. Where several people
+  // talk, whom it was written for has to be on record; in a person's own conversation an answer
+  // from before that was kept is theirs. (Not given: not asked, as by a caller with no answer in hand.)
+  if (writtenFor !== undefined && (acting.shared ? writtenFor !== acting.person : writtenFor !== null && writtenFor !== acting.person)) return undefined;
   const own = [...acting.said, ...acting.recent];
   const tools = toolsIn(acting, toolsOf);
   // An answer written from several things rests on all of them: none of them alone is its source,

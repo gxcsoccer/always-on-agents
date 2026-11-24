@@ -905,6 +905,110 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("shows, one step further up, what the person's own fetched message was itself written in reply to, from its own records", async () => {
+      await within(async (b) => {
+        // The agent's answer, as it reached them; then their own message replying to it, which the agent was never sent; then a reply to that.
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "A has three items", { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        const input = b.asked[0].input;
+        expect(String(input.at(-1)!.content)).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to the message you sent at 2026-11-23T08:00:00.000Z)');
+        expect(input.at(-2)).toEqual({ role: "assistant", content: "[The message of yours they are replying to, sent at 2026-11-23T08:00:00.000Z:]\nA has three items" });
+        expect(JSON.parse(b.store.rows<{ data: string }>("SELECT data FROM inbox ORDER BY id DESC LIMIT 1")[0].data).quoted).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_bot" });
+      });
+      // Or to an earlier message of their own that is on record.
+      await within(async (b) => {
+        // Pointed at, not copied: its words are shown from where they are kept, for as long as they are, however far back that is.
+        b.event("the plan https://x/docx/D1", { source_id: "om_first", status: "done", received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        const id = (await b.go())!;
+        const input = b.asked[0].input;
+        expect(String(input.at(-1)!.content)).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to an earlier message of their own, shown just before this)');
+        expect(input.at(-2)).toEqual({ role: "user", content: "[An earlier message of theirs that this leads back to, written at 2026-11-23T07:00:00.000Z:]\nthe plan https://x/docx/D1" });
+        expect(JSON.stringify(b.items(id))).not.toContain("the plan");
+      });
+      // Once those words are no longer kept, only that there was such a message.
+      await within(async (b) => {
+        b.event("the plan https://x/docx/D1", { source_id: "om_first", status: "done", received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        const id = (await b.runner.next())!;
+        b.store.sql.exec("UPDATE inbox SET text = NULL WHERE source_id = 'om_first'");
+        await b.runner.execute(id);
+        expect(b.asked[0].input.at(-2)).toEqual({ role: "user", content: "[An earlier message of theirs that this leads back to is no longer kept.]" });
+      });
+      // What is shown like this counts towards how much one run takes up: each thing once, and what no longer fits waits for the next.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "x".repeat(8_000), { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        for (let i = 0; i < 3; i++) b.event("y".repeat(36_000), { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(b.inbox().filter((each) => each.status === "pending")).toEqual([]);
+      });
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "x".repeat(8_000), { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        for (let i = 0; i < 3; i++) b.event("y".repeat(38_000), { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        const taken = (await b.runner.next())!;
+        expect(b.inbox().filter((each) => each.run_id === taken)).toHaveLength(2);
+        expect(b.inbox().filter((each) => each.status === "pending")).toHaveLength(1);
+      });
+      // Where several people talk, one person's earlier words are led back to for them alone:
+      // the next person to ask there is not shown them, though the turn that pointed at them is still in sight.
+      await within(async (b) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read", shared: true, description: "", parameters: {} } as unknown as ConnectorTool];
+        const here = { origin: ORIGIN, shared: true };
+        b.event("the plan is to ship on Thursday", { session_key: "chat", source_id: "om_first", status: "done", data: here, received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
+        b.event("", { session_key: "chat", data: { ...here, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(JSON.stringify(b.asked[0].input)).toContain("ship on Thursday");
+        b.settings.quoted = undefined;
+        b.event("and what about me?", { session_key: "chat", data: here, principal: { kind: "human", id: "ou_2", explicit: true } });
+        await b.go();
+        const shown = JSON.stringify(b.asked[1].input);
+        expect(shown).toContain("说了啥？");
+        expect(shown).not.toContain("ship on Thursday");
+        expect(shown).toContain("is no longer kept");
+      }, "chat:oc_1");
+      // Measured as it is shown, in the same units as the messages themselves: characters outside the basic plane count as they do there.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "🙂".repeat(4_000), { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        for (let i = 0; i < 3; i++) b.event("y".repeat(38_000), { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        const taken = (await b.runner.next())!;
+        expect(b.inbox().filter((each) => each.run_id === taken)).toHaveLength(2);
+        expect(b.inbox().filter((each) => each.status === "pending")).toHaveLength(1);
+      });
+      // Two messages taken up together that lead to the same answer: its words are shown once.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "A has three items", { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        b.event("?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(JSON.stringify(b.asked[0].input).split("[The message of yours they are replying to").length - 1).toBe(1);
+      });
+      // Anything else up there (someone else's, nothing on record, something that is not a message's name): not said.
+      for (const further of ["feishu:message:om_nowhere", 7, "other:message:x"]) {
+        await within(async (b) => {
+          b.settings.quoted = { text: "说了啥？", replies_to: further };
+          b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+          await b.go();
+          const said = String(b.asked[0].input.at(-1)!.content);
+          expect(said).toContain('(written as a reply to their own earlier message: "说了啥？")');
+          expect(said).not.toContain("which they wrote");
+        });
+      }
+    });
+
     it("shows the message of the agent's a person replied to as the agent's own words, without keeping them again", async () => {
       await within(async (b) => {
         earlier(b, "r0", "summarise A");
@@ -1332,6 +1436,24 @@ describe("the run loop, by itself", () => {
           await b.go();
           expect(JSON.stringify(b.asked[1].input)).toContain("the doc says three things");
         }, "chat:oc_1");
+      });
+    });
+
+    it("counts among what the person said the earlier message of their own that their fetched message was written in reply to, however long ago", async () => {
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        const old = event("the plan https://x/docx/D1", { source_id: "om_old", status: "done", received_at: Date.now() - 3 * 86_400_000 });
+        settings.quoted = { text: "这篇再看看", replies_to: "feishu:message:om_old" };
+        event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        expect(runner.actingFor((await runner.next())!)?.recentIds).toEqual([old]);
+      });
+      // Not where the fetched message names a document itself: that is what it points at.
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        event("the plan https://x/docx/D1", { source_id: "om_old", status: "done", received_at: Date.now() - 3 * 86_400_000 });
+        settings.quoted = { text: "改看 https://x/docx/D2", documents: [{ kind: "docx", token: "D2" }], replies_to: "feishu:message:om_old" };
+        event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        expect(runner.actingFor((await runner.next())!)?.recentIds).toEqual([]);
       });
     });
 

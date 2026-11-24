@@ -442,4 +442,6 @@ export interface Quoted {
   text?: string;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
+  /** What that message was itself written in reply to, named as a message's `data.replies_to` names it. Only for the person's own. */
+  replies_to?: string;
 }

@@ -61,8 +61,8 @@ export interface OutboxHost {
   sawOutside(runId: string): boolean;
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
-  /** Whether this run acted for one person, with their own tools, in the conversation it answered. */
-  actedFor(runId: string): boolean;
+  /** The one person this run acted for, with their own tools, in the conversation it answered, if it did. */
+  actedFor(runId: string): string | undefined;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
   readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf" | "shown">;
 }
@@ -237,13 +237,15 @@ export class Outbox implements Wakes {
         const nowSent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE id = ?", row.id)[0]?.status === "sent";
         if (nowSent && this.#isOwnPrivateMessage(row)) {
           this.#s.sql.exec(
-            "INSERT OR IGNORE INTO said (outbox_id, run_id, session_id, text, sent_at, receipt_subject, reads) SELECT ?, ?, session_id, ?, ?, ?, ? FROM runs WHERE id = ?",
+            "INSERT OR IGNORE INTO said (outbox_id, run_id, session_id, text, sent_at, receipt_subject, reads, person) SELECT ?, ?, session_id, ?, ?, ?, ?, ? FROM runs WHERE id = ?",
             row.id,
             row.run_id,
             row.text,
             sentAt,
             receipt?.subject ?? null,
             row.reads ?? "[]",
+            // Whom it was written for: the person whose request it answers, or the one the run acted for.
+            this.#answeredFor(row) ?? this.#b.actedFor(row.run_id) ?? null,
             row.run_id,
           );
         }
@@ -313,12 +315,13 @@ export class Outbox implements Wakes {
     const own = row.authored === 1 && typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
     // In a person's private conversation, always. Where several people talk, only what a run
     // that acted for one of them there said: that is what its record is then cleared down to.
-    return own && !row.ask && !row.review && typeof row.run_id === "string" && (isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id)) || this.#b.actedFor(row.run_id) || this.#answersFor(row));
+    return own && !row.ask && !row.review && typeof row.run_id === "string" && (isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id)) || this.#b.actedFor(row.run_id) !== undefined || this.#answeredFor(row) !== undefined);
   }
 
-  /** Whether this is the answer of a request kept for one person: by the time it goes out the run that wrote it is no longer carrying the request on. */
-  #answersFor(row: Row): boolean {
-    return typeof row.continuation === "string" && this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND run_id = ? AND person IS NOT NULL", row.continuation, row.run_id).length > 0;
+  /** The person whose kept request this is the answer of, if it is one: by the time it goes out the run that wrote it is no longer carrying the request on. */
+  #answeredFor(row: Row): string | undefined {
+    if (typeof row.continuation !== "string") return undefined;
+    return this.#s.rows<{ person: string }>("SELECT person FROM continuations WHERE id = ? AND run_id = ? AND person IS NOT NULL", row.continuation, row.run_id)[0]?.person;
   }
 
   scrub(which: "id = ?" | "run_id = ?", value: number | string): void {
