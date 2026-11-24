@@ -472,7 +472,8 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // lapsed before its time (forgotten, so the next attempt asks for a fresh one). Nothing was posted.
   if (response.status === 429 || result.code === 99991400) {
     const wait = Number(response.headers.get("retry-after") ?? response.headers.get("x-ogw-ratelimit-reset"));
-    throw new DeliveryDeferred(said, Date.now() + (Number.isFinite(wait) && wait > 0 ? Math.min(wait, 600) * 1_000 : 5_000));
+    // For as long as it says, never sooner; whether that is too long to wait for is the queue's to decide.
+    throw new DeliveryDeferred(said, Date.now() + (Number.isFinite(wait) && wait > 0 ? wait * 1_000 : 5_000));
   }
   if (result.code === 99991663) {
     await forgetTenantAccessToken(env, appId, token);

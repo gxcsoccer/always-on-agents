@@ -842,6 +842,14 @@ describe("keeping a request that has to wait", () => {
       expect(invite().status).toBe("unverified");
       expect(sent(told("grant_1.nonce", "call_3"))).toMatchObject({ text: "notice:inviteUnknown" });
     });
+    // Tried once and put off, then set aside because they called it off: asked again, it goes out, no sooner than it was told to.
+    await asking(({ requests, store, run, message }, invite) => {
+      const later = Date.now() + 300_000;
+      requests.endRequest("call_1", "cancelled", "x");
+      store.sql.exec("UPDATE outbox SET status = 'void', started = 1, uncertain = 0, attempts = 1, next_at = ? WHERE idem = 'invite:grant_1.nonce'", later);
+      requests.wait(run("r2"), { ...acting, events: { said: [message("再问一次", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
+      expect(invite()).toMatchObject({ status: "pending", next_at: later });
+    });
     // A request's id may hold any character: which request a line is about is not read off punctuation.
     await within(async ({ requests, run, message, sent }) => {
       const active = run("r1");

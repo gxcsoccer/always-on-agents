@@ -135,7 +135,14 @@ export class Outbox implements Wakes {
           this.#s.sql.exec("UPDATE outbox SET status = ?, error = NULL WHERE id = ? AND status = 'pending'", row.started ? "reconciling" : "withdrawn", row.id);
           continue;
         }
-        if (row.next_at > Date.now()) return;
+        if (row.next_at > Date.now()) {
+          // Still backing off. A way in that nobody waits on any more is not waited for, though:
+          // it is set aside now, so what follows is not held behind it. One that someone still
+          // waits on keeps its time.
+          if (!row.interaction || (await this.#b.requests.gate(row)) !== "void") return;
+          this.#s.sql.exec("UPDATE outbox SET status = ?, text = '', error = NULL WHERE id = ? AND status = 'pending'", row.uncertain ? "unverified" : "void", row.id);
+          continue;
+        }
         // A message tied to a request, or one that shows something to act on, goes out only
         // while that still stands; this is looked at before every attempt, not only the first.
         const gate = await this.#b.requests.gate(row);

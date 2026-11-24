@@ -259,7 +259,7 @@ describe("the Feishu webhook endpoint", () => {
       ["/im/v1/messages?receive_id_type=chat_id", "oc_group"],
     ]);
     // Not now (limited, or the app's token lapsed early) is not a refusal: nothing was posted, and it can go later.
-    const answers: [number, unknown, Record<string, string>?][] = [[429, { code: 99991400, msg: "too many" }, { "retry-after": "7" }], [400, { code: 99991663, msg: "token" }], [400, { code: 230002, msg: "not in chat" }]];
+    const answers: [number, unknown, Record<string, string>?][] = [[429, { code: 99991400, msg: "too many" }, { "retry-after": "900" }], [400, { code: 99991663, msg: "token" }], [400, { code: 230002, msg: "not in chat" }]];
     let tokens = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = String(input instanceof Request ? input.url : input);
@@ -271,7 +271,8 @@ describe("the Feishu webhook endpoint", () => {
     const before = Date.now();
     const limited = await deliverFeishu(env as any, scope, person, message).catch((error) => error);
     expect(limited).toBeInstanceOf(DeliveryDeferred);
-    expect(limited.notBefore - before).toBeGreaterThanOrEqual(7_000);
+    // For as long as Feishu says, however long: never sooner.
+    expect(limited.notBefore - before).toBeGreaterThanOrEqual(900_000);
     expect(await deliverFeishu(env as any, scope, person, message).catch((error) => error)).toBeInstanceOf(DeliveryDeferred);
     // The lapsed token was forgotten: the next attempt asks for a fresh one.
     expect(await deliverFeishu(env as any, scope, person, message).catch((error) => error)).toBeInstanceOf(DeliveryRejected);

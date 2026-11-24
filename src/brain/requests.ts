@@ -210,10 +210,11 @@ export class Requests implements Wakes {
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: aside ? JSON.stringify(aside) : now.target });
-      // One set aside before it was ever tried, because nobody waited on it any more, is wanted
-      // again; and so is one that definitely did not get there, now that the person asks afresh.
-      // One that may have arrived is not sent a second time.
-      this.#s.sql.exec("UPDATE outbox SET status = 'pending', attempts = 0, next_at = ?, error = NULL WHERE idem = ? AND ((status = 'void' AND started = 0) OR status = 'dead')", Date.now(), `invite:${waiting.interaction}`);
+      // One set aside because nobody waited on it any more is wanted again, and so is one that
+      // was given up, now that the person asks afresh: as long as it is certain that it never
+      // arrived. One that may have (kept as unverified) is not sent a second time. A time it
+      // was told not to be sent before still holds.
+      this.#s.sql.exec("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0", Date.now(), `invite:${waiting.interaction}`);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
         const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;

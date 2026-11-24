@@ -216,6 +216,23 @@ describe("the outbox, by itself", () => {
       });
     });
 
+    it("does not keep the queue waiting behind a way in that is backing off once nobody waits on it", async () => {
+      await within(async ({ outbox, row, set, gates }) => {
+        outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
+        outbox.enqueue("after", SESSION, null, "next in line");
+        // Told to come back in ten minutes; while someone still waits on it, that is kept, and what follows waits its turn.
+        set("i", { started: 1, attempts: 1, next_at: Date.now() + 600_000 });
+        await outbox.flush();
+        expect(row("i").status).toBe("pending");
+        expect(row("after").status).toBe("pending");
+        // The last one waiting on it has gone: it is set aside now, and the queue moves on.
+        gates.i = "void";
+        await outbox.flush();
+        expect(row("i").status).toBe("void");
+        expect(row("after").status).toBe("sent");
+      });
+    });
+
     it("takes the time a message was really posted from the receipt, when an earlier attempt had landed", async () => {
       await within(async ({ outbox, row, channel }) => {
         outbox.enqueue("m1", SESSION, null, "one");
