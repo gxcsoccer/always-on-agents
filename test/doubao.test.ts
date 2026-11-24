@@ -397,6 +397,33 @@ describe("handing work to Doubao Work", () => {
     expect(await on("never_made_never_made_never_made")).toEqual({ state: "gone" });
   });
 
+  it("counts each invitation as done when it was done, not when a later one was", async () => {
+    await pair();
+    const dee = someone();
+    const grant = await dee.grant();
+    const who = { chat_app_id: CHAT_APP, tenant_key: ORG, open_id: dee.openId, union_id: dee.unionId };
+    const app = await (env as any).REGISTRY.getByName("global").doubaoApp(CHAT_APP);
+    const name = await grantName(who);
+    const first = await grant.invite(who, "https://agent.test/v1/doubao/oauth/callback", app, 1);
+    // The first is made to be near its end, so that a second one is made beside it.
+    await runInDurableObject(grant, async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.pending[0].expires_at = Date.now() + 60_000;
+      await state.storage.put("grant", stored);
+    });
+    const second = await grant.invite(who, "https://agent.test/v1/doubao/oauth/callback", app, 1);
+    expect(second.nonce).not.toBe(first.nonce);
+    const firstCard = await grant.card(name, first.nonce);
+    const secondCard = await grant.card(name, second.nonce);
+    expect((await consent(new URL(firstCard.action.url), dee)).status).toBe(200);
+    const scope = { tenant: TENANT, kind: "user" as const, id: dee.openId };
+    const firstDone = ((await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${first.nonce}`, 1)) as any).since;
+    await sleep(15);
+    expect((await consent(new URL(secondCard.action.url), dee)).status).toBe(200);
+    expect(await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${first.nonce}`, 1)).toEqual({ state: "holds", since: firstDone });
+    expect(((await doubaoConnector.holds!(env as any, scope, `doubao|auth|${name}|${second.nonce}`, 1)) as any).since).toBeGreaterThan(firstDone);
+  });
+
   it("says that waiting has stopped, and not to ask again, when a new authorisation fails for work already handed over", async () => {
     await pair();
     const dee = someone();

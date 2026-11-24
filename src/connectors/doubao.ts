@@ -79,7 +79,7 @@ interface Stored {
    * that is being worked out, then `done` or `refused`. Kept past its time for as long as a
    * request could still wait on it, so that each request is answered by its own invitation.
    */
-  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; app_id: string; pairing: string; state?: "taken" | "done" | "refused" }[];
+  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; app_id: string; pairing: string; state?: "taken" | "done" | "refused"; at?: number }[];
   grant?: { sealed: string; version: string; expires_at: number; since: number; pairing: string };
   owed?: { event: string; attempts: number };
   ops: Record<string, Op>;
@@ -149,6 +149,8 @@ export class DoubaoGrant extends DurableObject<Env> {
     const through = stored?.pending.find((each) => each.nonce === nonce);
     if (!stored || stored.generation !== generation || through?.state !== "taken") return false;
     through.state = "done";
+    // When this one was done: a later one being done as well does not move it.
+    through.at = Date.now();
     stored.grant = { sealed, version, expires_at: token.expires_at, since: Date.now(), pairing };
     stored.owed = { event: version, attempts: 0 };
     void this.ctx.storage.put("grant", stored);
@@ -187,7 +189,7 @@ export class DoubaoGrant extends DurableObject<Env> {
     if (!stored?.grant || !usable(stored.grant)) return { state: "not_yet" };
     const app = await registry(this.env).doubaoApp(stored.who.chat_app_id);
     if (!app) return { state: "gone" };
-    return app.version === stored.grant.pairing ? { state: "holds", since: stored.grant.since } : { state: "not_yet" };
+    return app.version === stored.grant.pairing ? { state: "holds", since: shown.state === "done" && shown.at ? Math.min(shown.at, stored.grant.since) : stored.grant.since } : { state: "not_yet" };
   }
 
   /**
