@@ -200,6 +200,25 @@ People are then asked for that leave as well (those who authorised before are as
 
 The invitation card says, before the person agrees, that this authorisation renews itself and how to end it. Turning the setting off again (`{"offline_access":false}`) stops it for that app: new invitations no longer ask for it, an invitation for it that is still out is not honoured, and nothing is renewed any more; an authorisation already given keeps working until its current token runs out (about two hours), at which point the token for renewing is discarded and the person is invited afresh. To end one person's authorisation at once, use `DELETE /v1/admin/feishu-grants/…` above. Neither tells Feishu to revoke what it issued; the person can do that in Feishu's own authorisation settings.
 
+**Reading in a group.** Off by default: a group has no tool for reading documents, as before. Turned on per app:
+
+```sh
+curl -X POST https://<your-domain>/v1/admin/feishu-apps/<app_id>/oauth \
+  -H "authorization: Bearer $ADMIN_KEY" \
+  -H 'content-type: application/json' -d '{"group_documents":true}'
+```
+
+With it on, when someone in a group mentions the bot with a document link (or replies to their own earlier message that had the link, mentioning the bot), the bot reads it with **that person's own authorisation** and answers under their message. What to know:
+
+- Only in a group that is **the organisation's own**. Before every read Feishu is asked: the chat is not external, it belongs to the asker's organisation, and the bot is in it. All three have to be said outright. In an external chat the system answers with one fixed line asking them to message the bot directly; where it cannot be told, another fixed line. In both cases nothing is read, no card is sent, and the model does nothing further. The app needs permission to read chat information (`im:chat:readonly` or the like).
+- Where the asker has not authorised yet, the card goes into the group but **only they see it** (Feishu's card visible to one member). A topic chat has no such card, so there it goes to them directly and the group is told so. Once they authorise through that card, the answer appears under their message by itself. The card is for that one question: authorising some other way does not carry the group's request on, and asking again simply reads.
+- Feishu drops no repeat of such a card, so it is sent once: if the outcome is not known it is not sent again, and the group is told it may not have arrived and to ask again.
+- Each person can have only links they posted themselves read, with their own authorisation. Others can ask about what was already answered in the group; to have the document read again they post the link themselves.
+- Between reading and sending, if the setting is turned off (or off and on again), the chat becomes external, or the bot is removed, what was written is not sent.
+- Known limits: someone who asked, was then removed from the group and still authorised within the ten minutes has the answer posted to a group they are no longer in. An answer already posted can still be quoted by the bot after the chat later becomes external; that is left for later.
+
+To see what Feishu says about one chat (to check the permissions, say): `GET /v1/admin/feishu-apps/<app_id>/chats/<chat_id>` returns only whether it is external, whose it is, its mode, whether the bot is in it, and Feishu's status codes.
+
 ### How messages look
 
 What the agent writes itself goes out as a Feishu post with one Markdown element, so bold, lists, links, code and tables render. Mention markup in it (`<at …>`), in code too, is shown as text and notifies nobody (it gains one invisible character). The system's own fixed words go out as plain text, and questions and invitations as cards. A post that would exceed Feishu's 30 KB is sent as plain text instead. The form is decided from the message alone, so a retry sends exactly the same thing.
@@ -264,6 +283,12 @@ The core decides when a connector's tools exist at all, and for whom:
 - **Every call is audited** (`tool.used`, with the person and the tool, not the arguments).
 - A call may be repeated after an interruption, so a tool must be safe to run twice.
 
+### Where several people talk, and a tool that settles the matter itself
+
+A tool exists only in one person's private conversation with the agent unless it declares `shared: true`. Then it is also there in a conversation several people share (a group, say), acting for **the one who asked**. That takes the connector marking the message `data.shared: true` (as `data.direct` marks a private one), and every message that started the run being an ordinary message one person wrote to the agent. Such a tool answers for whether reading something there, and having it said in front of the others, is right.
+
+A tool can return `{ settled: { say?: "<name of a fixed line>" } }`: the matter ends here, nothing was read and nothing waits. The Brain closes the run (no tool can be used in it any more, and the model is not asked again) and, where `say` is given, the system says that one line. `say` can only name one of the system's own fixed lines; the tool writes no words of its own there. One that is not whole, or names a line there is not, is a failure of the tool.
+
 ### A tool that has to wait
 
 A tool that cannot act until something happens that is not the agent's to do (the person authorising, say) returns `{ waiting: { … } }` instead of a result. It reads nothing and sends nothing. The Brain keeps the request, shows the person the way in, ends the run, and later carries the request on in a run of its own: the same tool is called again and the person gets one answer without asking twice. The Feishu document tool is the example (`src/connectors/feishu-docs.ts`); the reasoning is in the [design](design/agent-core.md) and the [contract](design/agent-core-step0.md).
@@ -278,7 +303,7 @@ Every field of a `Waiting` is the connector's own. The Brain stores them and han
 | `generation` | The state of the connector's own record that the wait belongs to. | Handed back to `holds`, which answers "gone" once the connector has moved past it; and to the tool, as `context.resuming.generation`. |
 | `until` | A time in milliseconds. The condition has to have come to hold before it. | The Brain compares it with the `since` that `holds` returns, and ends the wait when it has passed. |
 | `interaction` | A reference to what the person is to be shown so that they can bring the condition about. | Handed to the connector's own `channel.deliver` as `message.interaction`. |
-| `privately` (optional) | The invitation is for this person alone: it is not put where the request was made (a conversation several people share is not the place for it) but before them directly. | The tool only says so and names no address. Where "directly" is, the connector's `channel.direct` works out from the request's verified origin and the person's identity; if it cannot, the wait is not kept. The conversation the request was made in gets one fixed line once the outcome is known: sent to them directly, could not be sent, or no telling whether it arrived. An invitation that is refused is given up at once, and one that gets no answer after three tries, so it never holds back what else is waiting to be said in that conversation. |
+| `privately` (optional, `true` or `"here"`) | `"here"`: for this person alone, and where they asked if possible (the connector's `channel.aside` gives an address in that conversation only they see; without one it is treated as `true`). Where such an address drops no repeat (`dedupeMs` returns 0 for it), an attempt of unknown outcome is the last. `true`: the invitation is for this person alone: it is not put where the request was made (a conversation several people share is not the place for it) but before them directly. | The tool only says so and names no address. Where "directly" is, the connector's `channel.direct` works out from the request's verified origin and the person's identity; if it cannot, the wait is not kept. The conversation the request was made in gets one fixed line once the outcome is known: sent to them directly, could not be sent, or no telling whether it arrived. An invitation that is refused is given up at once, and one that gets no answer after three tries, so it never holds back what else is waiting to be said in that conversation. |
 | `request` | The call to make again, in the tool's own canonical form: only what identifies the thing asked for. | Stored in place of the arguments the model wrote, and passed to the tool's `run` as its arguments when the request is carried on. |
 
 What a connector must do to offer such a tool:

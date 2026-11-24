@@ -65,3 +65,34 @@ export async function hex(text: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
   return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+/** What Feishu said about one chat: how each of the two questions was answered, and the few fields read from it. */
+export interface ChatFacts {
+  info: { status: number; code?: number; external?: boolean; tenant_key?: string; chat_mode?: string; chat_status?: string; missing: string[] };
+  member: { status: number; code?: number; is_in_chat?: boolean };
+}
+
+/**
+ * Asks Feishu, as the app, what kind of chat this is and whether the app's bot is in it. Only
+ * these fields are taken from the answers, each only if it is of the kind Feishu documents; the
+ * chat's name, owner and everything else are left behind. A call that could not be made is status 0.
+ */
+export async function chatFacts(bearer: string, chatId: string, signal?: AbortSignal): Promise<ChatFacts> {
+  const ask = async (path: string): Promise<{ status: number; code?: number; data: Record<string, unknown> }> => {
+    try {
+      const response = await fetch(`${API}/im/v1/chats/${encodeURIComponent(chatId)}${path}`, { headers: { authorization: `Bearer ${bearer}` }, ...(signal ? { signal } : {}) });
+      const body = ((await response.json().catch(() => null)) ?? {}) as { code?: unknown; data?: unknown };
+      const data = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : {};
+      return { status: response.status, ...(typeof body.code === "number" && Number.isInteger(body.code) ? { code: body.code } : {}), data };
+    } catch {
+      return { status: 0, data: {} };
+    }
+  };
+  const [info, member] = await Promise.all([ask(""), ask("/members/is_in_chat")]);
+  const text = (name: string) => (typeof info.data[name] === "string" && info.data[name] !== "" ? { [name]: String(info.data[name]).slice(0, 100) } : {});
+  const read = { ...(typeof info.data.external === "boolean" ? { external: info.data.external } : {}), ...text("tenant_key"), ...text("chat_mode"), ...text("chat_status") };
+  return {
+    info: { status: info.status, ...(info.code === undefined ? {} : { code: info.code }), ...read, missing: ["external", "tenant_key", "chat_mode", "chat_status"].filter((name) => !(name in read)) },
+    member: { status: member.status, ...(member.code === undefined ? {} : { code: member.code }), ...(typeof member.data.is_in_chat === "boolean" ? { is_in_chat: member.data.is_in_chat } : {}) },
+  };
+}

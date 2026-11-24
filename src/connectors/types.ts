@@ -438,4 +438,6 @@ export type Outcome =
 /** A message another was written in reply to: the person's own words where they could be read and are theirs; empty when there was one that is not shown. */
 export interface Quoted {
   text?: string;
+  /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
+  documents?: unknown[];
 }

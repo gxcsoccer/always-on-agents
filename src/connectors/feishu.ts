@@ -19,41 +19,11 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
-import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
+import { API, chatFacts, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
+export { type ChatFacts, chatFacts } from "./feishu-api";
+import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
 import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
-
-/** What Feishu said about one chat: how each of the two questions was answered, and the few fields read from it. */
-export interface ChatFacts {
-  info: { status: number; code?: number; external?: boolean; tenant_key?: string; chat_mode?: string; chat_status?: string; missing: string[] };
-  member: { status: number; code?: number; is_in_chat?: boolean };
-}
-
-/**
- * Asks Feishu, as the app, what kind of chat this is and whether the app's bot is in it. Only
- * these fields are taken from the answers, each only if it is of the kind Feishu documents; the
- * chat's name, owner and everything else are left behind. A call that could not be made is status 0.
- */
-export async function chatFacts(bearer: string, chatId: string, signal?: AbortSignal): Promise<ChatFacts> {
-  const ask = async (path: string): Promise<{ status: number; code?: number; data: Record<string, unknown> }> => {
-    try {
-      const response = await fetch(`${API}/im/v1/chats/${encodeURIComponent(chatId)}${path}`, { headers: { authorization: `Bearer ${bearer}` }, ...(signal ? { signal } : {}) });
-      const body = ((await response.json().catch(() => null)) ?? {}) as { code?: unknown; data?: unknown };
-      const data = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : {};
-      return { status: response.status, ...(typeof body.code === "number" && Number.isInteger(body.code) ? { code: body.code } : {}), data };
-    } catch {
-      return { status: 0, data: {} };
-    }
-  };
-  const [info, member] = await Promise.all([ask(""), ask("/members/is_in_chat")]);
-  const text = (name: string) => (typeof info.data[name] === "string" && info.data[name] !== "" ? { [name]: String(info.data[name]).slice(0, 100) } : {});
-  const read = { ...(typeof info.data.external === "boolean" ? { external: info.data.external } : {}), ...text("tenant_key"), ...text("chat_mode"), ...text("chat_status") };
-  return {
-    info: { status: info.status, ...(info.code === undefined ? {} : { code: info.code }), ...read, missing: ["external", "tenant_key", "chat_mode", "chat_status"].filter((name) => !(name in read)) },
-    member: { status: member.status, ...(member.code === undefined ? {} : { code: member.code }), ...(typeof member.data.is_in_chat === "boolean" ? { is_in_chat: member.data.is_in_chat } : {}) },
-  };
-}
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -67,11 +37,12 @@ export const feishuConnector: Connector = {
     if (path[0] === "feishu-links" && path[1] && method === "GET") return json(await env.FEISHU_LINKS.getByName(path[1]).status());
     // How this one app's authorisations are obtained: which token endpoint, and whether they can be renewed.
     if (path[0] === "feishu-apps" && path[1] && path[2] === "oauth" && path.length === 3 && method === "POST") {
-      const { token_endpoint: endpoint, offline_access: offline } = await body();
-      if (endpoint === undefined && offline === undefined) return json({ error: "give token_endpoint, offline_access, or both" }, 400);
+      const { token_endpoint: endpoint, offline_access: offline, group_documents: shared } = await body();
+      if (endpoint === undefined && offline === undefined && shared === undefined) return json({ error: "give token_endpoint, offline_access, group_documents, or several" }, 400);
+      if (shared !== undefined && typeof shared !== "boolean") return json({ error: "group_documents must be true or false" }, 400);
       if (endpoint !== undefined && endpoint !== "v2" && endpoint !== "v3") return json({ error: "token_endpoint must be v2 or v3" }, 400);
       if (offline !== undefined && typeof offline !== "boolean") return json({ error: "offline_access must be true or false" }, 400);
-      const now = await registry(env).setFeishuOauth(path[1], { token_endpoint: endpoint, offline_access: offline });
+      const now = await registry(env).setFeishuOauth(path[1], { token_endpoint: endpoint, offline_access: offline, group_documents: shared });
       return now ? json({ ok: true, ...now }) : json({ error: "unknown app" }, 404);
     }
     // What Feishu says about one chat, asked from here because the operator's own machine may not
@@ -117,7 +88,7 @@ export const feishuConnector: Connector = {
   // Feishu drops a repeat of the same message within an hour.
   channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
-  holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
+  holds: (env, scope, condition, generation) => authorisationHolds(env, scope, condition, generation),
 };
 
 /** Feishu signs with a timestamp; anything much older is a replay. */
@@ -320,7 +291,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // stated them in the verified event.
         origin: { app_id: app.app_id, tenant_key: String(sender.tenant_key) },
         // An ordinary message written to the agent in a direct chat.
-        ...(group ? {} : { direct: true }),
+        // Or one written where several people talk, through an app whose operator lets a
+        // person's own tools be used for them there.
+        ...(group ? (app.group_documents ? { shared: true } : {}) : { direct: true }),
         // Which documents this message links to, for a tool that reads what the person pointed at.
         ...(documents.length ? { documents } : {}),
         message_id: message.message_id,
@@ -415,11 +388,20 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const content = JSON.parse(found.body.content);
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
+    // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
+    const linked = [...documentsIn(text), ...(found.msg_type === "post" ? hrefsOf(content).flatMap((href) => documentOf(href) ?? []) : [])];
+    const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
-    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED) };
+    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}) };
   } catch {
     return {};
   }
+}
+
+/** Where the links of a rich-text message lead. */
+function hrefsOf(post: any): string[] {
+  const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
+  return ((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap((each: any) => (each?.tag === "a" && typeof each.href === "string" ? [each.href] : [])) : []));
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */

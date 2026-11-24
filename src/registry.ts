@@ -30,6 +30,13 @@ export interface FeishuApp {
    * and published in Feishu first, or the consent page fails.
    */
   oauth_offline: number;
+  /**
+   * 1 if a person's documents may be read for them where several people talk (a group that is
+   * the organisation's own), and answered there. Off unless an operator turns it on.
+   */
+  group_documents?: number;
+  /** Counts every change of `group_documents`: what was read while it was on one time is not let out under another. */
+  group_documents_gen?: number;
 }
 
 export interface Tenant {
@@ -70,6 +77,8 @@ export class Registry extends DurableObject<Env> {
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
     this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
     this.#addColumn("feishu_apps", "oauth_offline INTEGER NOT NULL DEFAULT 0");
+    this.#addColumn("feishu_apps", "group_documents INTEGER NOT NULL DEFAULT 0");
+    this.#addColumn("feishu_apps", "group_documents_gen INTEGER NOT NULL DEFAULT 0");
   }
 
   /** Adds a column to a table made by an earlier deploy. A no-op once it exists. */
@@ -176,14 +185,17 @@ export class Registry extends DurableObject<Env> {
    * token endpoints is used, and whether leave to renew (`offline_access`) is asked for. What is
    * not given is left as it is. Returns the settings, or nothing for an unknown app.
    */
-  async setFeishuOauth(appId: string, change: { token_endpoint?: "v2" | "v3"; offline_access?: boolean }): Promise<{ token_endpoint: "v2" | "v3"; offline_access: boolean } | null> {
+  async setFeishuOauth(appId: string, change: { token_endpoint?: "v2" | "v3"; offline_access?: boolean; group_documents?: boolean }): Promise<{ token_endpoint: "v2" | "v3"; offline_access: boolean; group_documents: boolean } | null> {
+    if (change.group_documents !== undefined && typeof change.group_documents !== "boolean") throw new Error("group_documents must be true or false");
     if (change.token_endpoint !== undefined && change.token_endpoint !== "v2" && change.token_endpoint !== "v3") throw new Error("token_endpoint must be v2 or v3");
     if (change.offline_access !== undefined && typeof change.offline_access !== "boolean") throw new Error("offline_access must be true or false");
     if (!(await this.feishuApp(appId))) return null;
     if (change.token_endpoint !== undefined) this.ctx.storage.sql.exec("UPDATE feishu_apps SET oauth_v2 = ? WHERE app_id = ?", change.token_endpoint === "v2" ? 1 : 0, appId);
     if (change.offline_access !== undefined) this.ctx.storage.sql.exec("UPDATE feishu_apps SET oauth_offline = ? WHERE app_id = ?", change.offline_access ? 1 : 0, appId);
+    // Only a change counts: setting it to what it is leaves what was read under it as it was.
+    if (change.group_documents !== undefined) this.ctx.storage.sql.exec("UPDATE feishu_apps SET group_documents = ?, group_documents_gen = group_documents_gen + 1 WHERE app_id = ? AND group_documents != ?", change.group_documents ? 1 : 0, appId, change.group_documents ? 1 : 0);
     const app = (await this.feishuApp(appId))!;
-    return { token_endpoint: app.oauth_v2 ? "v2" : "v3", offline_access: Boolean(app.oauth_offline) };
+    return { token_endpoint: app.oauth_v2 ? "v2" : "v3", offline_access: Boolean(app.oauth_offline), group_documents: Boolean(app.group_documents) };
   }
 
   /** The apps whose events arrive over a connection we hold open. */
