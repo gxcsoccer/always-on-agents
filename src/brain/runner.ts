@@ -118,7 +118,7 @@ export class Runner {
     if (this.#b.toolsOf(event.source).length === 0) return null;
     const principal = JSON.parse(event.principal) as Principal;
     const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-    const ordinary = event.kind === "message" && this.#b.isDecider(principal, event.source) && ["card", "question", "reply_only", "routed_from", "about_question"].every((each) => data[each] === undefined);
+    const ordinary = event.kind === "message" && this.#b.isDecider(principal, event.source) && plain(data);
     return ordinary ? principal.id : `#${event.id}`;
   }
 
@@ -530,7 +530,7 @@ export class Runner {
       if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return false;
       if (!this.#b.isDecider(principal, event.source) || principal.id !== scope.id) return false;
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      if (data.direct !== true || data.card !== undefined || data.question !== undefined || data.reply_only !== undefined || data.routed_from !== undefined) return false;
+      if (data.direct !== true || !plain(data)) return false;
       const same = originOf(event);
       return same !== undefined && JSON.stringify(same) === JSON.stringify(origin);
     };
@@ -733,6 +733,15 @@ function today(): string {
 /** How much of a run's room a message takes. */
 function sizeOf(event: InboxRow): number {
   return (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
+}
+
+/**
+ * Whether a message is a person's ordinary words: not a button pressed, an answer to a question,
+ * words that name an open question, a reply taken only as such, or something routed from
+ * elsewhere. One test for taking messages up together and for whose authority a run carries.
+ */
+function plain(data: Record<string, unknown>): boolean {
+  return ["card", "question", "reply_only", "routed_from", "about_question"].every((each) => data[each] === undefined);
 }
 
 /** What a message replies to, if anything. */

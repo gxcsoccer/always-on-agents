@@ -1112,6 +1112,8 @@ describe("the run loop, by itself", () => {
       await within(async ({ runner, event, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
         const earlier = event("the link", { status: "done", received_at: Date.now() - 60_000 });
+        // Words that named an open question are not among what they said shortly before.
+        event("deny AB12 https://x/docx/Other", { status: "done", received_at: Date.now() - 30_000, data: { direct: true, origin: ORIGIN, about_question: true } });
         event("summarise it");
         const id = (await runner.next())!;
         expect(runner.actingFor(id)).toEqual({ connector: "feishu", person: PERSON, origin: ORIGIN, said: [{ text: "summarise it", data: { direct: true, origin: ORIGIN } }], recent: [{ text: "the link", data: { direct: true, origin: ORIGIN } }], recentIds: [earlier] });
