@@ -100,37 +100,6 @@ export class RunTools {
   }
 
   /**
-   * What the agent's last answer here was written from, as of when the person wrote: see
-   * ToolContext.latest. Each message the run acts on is taken at the time it was written (as its
-   * connector gives it, where it does; it can arrive after things that happened later). None if
-   * any of them is marked as a reply to something, if an answer went out between a message's
-   * writing and its arriving, or if they do not all follow the same answer.
-   */
-  #latest(run: RunRow, acting: Acting, name: string, kept = false): { latest?: { source: Record<string, unknown>; sent_at: number } } {
-    const basis = this.#b.requests.basis(run.id);
-    if (basis.length === 0) return {};
-    const lasts = basis.map((each) => {
-      const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; written_at?: unknown };
-      if (data.replies_to !== undefined) return undefined;
-      const written = typeof data.written_at === "number" && data.written_at > 0 ? Math.min(data.written_at, each.received_at) : each.received_at;
-      // The last one they could have seen when they wrote, whatever it was: not the last one of some kind.
-      const at = (time: number) => this.#s.rows<{ outbox_id: number; reads: string; person: string | null; sent_at: number }>("SELECT outbox_id, reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, time)[0];
-      // The two clocks (theirs for when it was written, ours for when an answer was confirmed sent)
-      // are not one: if an answer went out between the writing and the arriving, which one they
-      // had before them cannot be told, and none is taken.
-      const [then, arrived] = [at(written), at(each.received_at)];
-      // The same for an answer whose sending had begun by the time this arrived and was not yet
-      // confirmed when it was written: it may have been before them already.
-      const under_way = this.#s.rows("SELECT 1 FROM outbox o JOIN runs r ON r.id = o.run_id WHERE r.session_id = ? AND o.authored = 1 AND o.first_attempt_at IS NOT NULL AND o.first_attempt_at <= ? AND (o.sent_at IS NULL OR o.sent_at > ?) AND o.status IN ('pending', 'sent', 'unverified', 'reconciling') LIMIT 1", run.session_id, each.received_at, written).length > 0;
-      return !under_way && then?.outbox_id === arrived?.outbox_id ? then : undefined;
-    });
-    const last = lasts[0];
-    if (!last || lasts.some((each) => each?.outbox_id !== last.outbox_id)) return {};
-    const source = eligibleSource(JSON.parse(last.reads) as Read[], acting, this.#b.toolsOf, last.person, kept);
-    return source && source.tool === name ? { latest: { source: source.request, sent_at: last.sent_at } } : {};
-  }
-
-  /**
    * A piece of work the run may ask about or stop, by its id: a task, as tasks always were; or
    * work done in a person's name, which is that person's alone and in the conversation it was
    * handed over in. Told from what is kept of it on either side: a request kept before there
@@ -180,6 +149,24 @@ export class RunTools {
         if (found.hands_to && !carried && !workersIn(acting, this.#b.toolsOf, this.#b.workers()).some((each) => each.tool === name)) throw new Error(`there is no worker to hand this to here`);
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
+        // (A new call names it in one way only, the one checked here: what a kept request was kept with is not for a new call to give.)
+        // (Given in that other way, it is not dropped and the work then handed over as something new: nothing is sent.)
+        if (found.hands_to && !carried && asked.from != null) {
+          if (asked.continue_from == null) throw new Error("the earlier piece of work to go on with is named in continue_from; nothing was sent");
+          delete asked.from;
+        }
+        // An earlier piece of work named to go on with has to be this person's own, handed to
+        // this worker in this conversation, and still standing: checked here, against the Brain's
+        // own record, whatever name the tool was called under. Anything else is not gone on with
+        // and nothing is sent; it is not turned into something new, nor into another piece.
+        // (A request carried on goes to what it was kept with.)
+        if (found.hands_to && !carried && asked.continue_from != null) {
+          const from = typeof asked.continue_from === "string" ? asked.continue_from : "";
+          const row = this.#s.rows<{ worker: string; state: string; session_key: string; person: string | null; condition: string | null; generation: number | null }>("SELECT worker, state, session_key, person, condition, generation FROM work WHERE id = ?", from)[0];
+          if (!row || row.worker !== found.hands_to || row.session_key !== String(session.session_key) || row.person !== acting.person || !(await this.#b.workStands({ id: from, ...row }))) {
+            throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was sent`);
+          }
+        }
         const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
         // In place of a request that still waits: that one ends in the same step this one is kept
         // or done. Ending a request changes something, so it needs what calling one off needs,
@@ -214,7 +201,7 @@ export class RunTools {
           // it turns out to be a request already kept, or cannot be kept).
           let standing: "open" | WorkEnd | undefined;
           const work = handsTo ? { work: (as: "open" | WorkEnd) => void (standing = as) } : {};
-          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), ...this.#latest(run, acting, name, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;

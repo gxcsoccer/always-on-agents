@@ -142,7 +142,7 @@ export function workTools(workers: { name: string; description: string; acts_as:
   return [
     tool(
       "hand_over",
-      `Hand a piece of work to a worker: something that takes more than a moment, or that a worker can do and you cannot. You are told when it is done, fails or needs something; do not wait for it. Choose the worker by what each can do:\n${listed}\nWork that goes on with an earlier piece (more depth, a correction, the next part) goes to the worker that did that piece, with its id in continue_from. A worker that does things as the person takes something new only when the person asks for that worker by name in this message; it is refused otherwise, and then you do it another way or ask them.`,
+      `Hand a piece of work to a worker: something that takes more than a moment, or that a worker can do and you cannot. You are told when it is done, fails or needs something; do not wait for it. Choose the worker by what each can do:\n${listed}\nWork that goes on with an earlier piece (more depth, a correction, the next part) goes to the worker that did that piece, with its id in continue_from.`,
       {
         worker: { type: "string", enum: workers.map((each) => each.name) },
         title: { type: "string", description: "A few words, shown to people." },
