@@ -278,6 +278,7 @@ Every field of a `Waiting` is the connector's own. The Brain stores them and han
 | `generation` | The state of the connector's own record that the wait belongs to. | Handed back to `holds`, which answers "gone" once the connector has moved past it; and to the tool, as `context.resuming.generation`. |
 | `until` | A time in milliseconds. The condition has to have come to hold before it. | The Brain compares it with the `since` that `holds` returns, and ends the wait when it has passed. |
 | `interaction` | A reference to what the person is to be shown so that they can bring the condition about. | Handed to the connector's own `channel.deliver` as `message.interaction`. |
+| `to` (optional) | Where the invitation is to go when that is not where the request was made: the person themselves (their direct chat with the bot, say). An invitation is for one person, and a conversation several people share is not the place for it. | The invitation is sent there. The conversation the request was made in gets one fixed line, only once the invitation **has reached** the person, saying it was sent to them directly; or that it could not be. Absent: the invitation goes back where the request came from. |
 | `request` | The call to make again, in the tool's own canonical form: only what identifies the thing asked for. | Stored in place of the arguments the model wrote, and passed to the tool's `run` as its arguments when the request is carried on. |
 
 What a connector must do to offer such a tool:

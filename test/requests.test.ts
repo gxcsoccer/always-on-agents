@@ -754,6 +754,44 @@ describe("keeping a request that has to wait", () => {
     });
   });
 
+  it("puts the way in before the person themselves where the tool says so, and tells the conversation only how that went", async () => {
+    const to = { connector: "feishu", address: { app_id: "cli_1", open_id: "ou_1" } };
+    const asking = (use: (bench_: ReturnType<typeof bench>, invite: () => Record<string, unknown>) => void, where?: typeof to) =>
+      within((all) => {
+        const active = all.run("r1");
+        const said = all.message("总结一下", {}, "r1");
+        all.requests.wait(active, { connector: "feishu", person: "ou_1", events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, ...(where ? { to: where } : {}) });
+        use(all, () => all.sent("invite:grant_1.nonce"));
+      });
+    // To the person, not to where the request was made.
+    await asking(({ requests, sent, store }, invite) => {
+      expect(invite().target).toBe(JSON.stringify(to));
+      expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+      // It reached them: the conversation is told so, once, without the way in itself.
+      requests.shown(invite() as never, true);
+      requests.shown(invite() as never, true);
+      expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
+      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere", interaction: null });
+    }, to);
+    // It did not reach them: that is what is said.
+    await asking(({ requests, sent }, invite) => {
+      requests.shown(invite() as never, false);
+      expect(sent("invited:grant_1.nonce:call_1")).toMatchObject({ target: TARGET, text: "notice:inviteNotSent" });
+    }, to);
+    // A request no longer waiting is told nothing.
+    await asking(({ requests, store }, invite) => {
+      requests.endRequest("call_1", "cancelled", "x");
+      requests.shown(invite() as never, true);
+      expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+    }, to);
+    // Where the way in goes to the conversation itself, as it always has, there is nothing more to say.
+    await asking(({ requests, store }, invite) => {
+      expect(invite().target).toBe(TARGET);
+      requests.shown(invite() as never, true);
+      expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+    });
+  });
+
   it("keeps nothing at all if any part of that step fails", async () => {
     await within(({ requests, store, host, run, message, audited, hints }) => {
       const active = run("r1");

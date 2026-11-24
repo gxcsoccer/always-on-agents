@@ -425,8 +425,10 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 
 /** Sends as the bot. A direct chat gets a new message; a group gets a reply to the message that asked. */
 export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
-  const { app_id: appId, chat_id: chatId, message_id: messageId, thread } = target.address;
-  if (!appId || !chatId) throw new Error("bad Feishu address");
+  // A chat, or a person directly (their own chat with the bot, by their id): one or the other.
+  const { app_id: appId, chat_id: chatId, open_id: openId, message_id: messageId, thread } = target.address;
+  if (!appId || (!chatId && !openId)) throw new Error("bad Feishu address");
+  const to = chatId ? { type: "chat_id", id: chatId } : { type: "open_id", id: openId };
   const token = await tenantAccessToken(env, appId);
   // Feishu drops a repeat of the same uuid within an hour, which makes a retry safe.
   const uuid = (await hex(message.idem)).slice(0, 40);
@@ -441,7 +443,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // attempt sends the very same thing.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
   const current = message.encoding !== 0;
-  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: chatId, msg_type: msgType, content, uuid });
+  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: to.id, msg_type: msgType, content, uuid });
   const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
@@ -453,7 +455,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify(body),
       })
-    : await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
+    : await fetch(`${API}/im/v1/messages?receive_id_type=${to.type}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify(body),

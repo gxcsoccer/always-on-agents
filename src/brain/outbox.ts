@@ -38,6 +38,8 @@ const NOTICES = {
   which: { en: "More than one of your requests could be meant. Which one?", zh: "你指的可能不止一件事，是哪一件？" },
   unchecked: { en: "I did not send what I had written for you: I could not confirm that the authorisation for what I had read still stands. Please ask again.", zh: "我写好的内容没有发给你：我没能确认读取所依据的授权是否仍然有效。请再问一次。" },
   invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
+  invitedElsewhere: { en: "I need you to authorise this before I can go on. I have sent you how in a direct message.", zh: "需要你先授权，我才能继续。授权卡片已私聊发你。" },
+  inviteNotSent: { en: "I need you to authorise this before I can go on, but I could not reach you in a direct message. Message me directly and ask again.", zh: "需要你先授权，我才能继续，但授权卡片没能私聊发给你。请私聊我再问一次。" },
   tomorrow: { en: "I have reached today's usage limit here and will pick this up tomorrow.", zh: "我今天的用量已经用完，明天接着处理。" },
   failed: { en: "Something went wrong on my side and I could not finish handling that. Please try again.", zh: "我这边出了问题，没能处理完。请再试一次。" },
 } as const;
@@ -53,7 +55,7 @@ export interface OutboxHost {
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
-  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf">;
+  readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf" | "shown">;
 }
 
 export class Outbox implements Wakes {
@@ -230,6 +232,8 @@ export class Outbox implements Wakes {
         if (taken) this.#s.log("request_answered", { claim_to_receipt_ms: Date.now() - taken });
         this.#b.requests.endRequest(row.continuation, "done", "answered");
       }
+      // A way in that reached the person: where it was put somewhere else than the request was made, that place is told.
+      if (row.interaction) this.#b.requests.shown(row, true);
       // It may have been closed while it was on its way.
       if (row.ask) this.#b.showClosed(row.idem);
       return true;
@@ -262,6 +266,8 @@ export class Outbox implements Wakes {
       this.#s.sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ?, uncertain = ? WHERE id = ?", dead ? gaveUp : status, attempts, nextAt, why, uncertain ? 1 : 0, row.id);
       if (dead) this.#s.log("message_undeliverable", { outbox_id: row.id, error: isPrivate ? DELIVERY_WITHHELD : String(err).slice(0, 300) });
       if (dead && row.continuation) this.#b.requests.endRequest(row.continuation, gaveUp === "dead" ? "failed" : "unverified", "its answer could not be delivered");
+      // A way in given up on: where it was put somewhere else than the request was made, that place is told it did not get there.
+      if (dead && row.interaction) this.#b.requests.shown(row, false);
       this.scrub("id = ?", row.id);
       return false;
     }

@@ -1,4 +1,4 @@
-import { handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
+import { deliverFeishu, handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -238,6 +238,27 @@ describe("the Feishu webhook endpoint", () => {
     expect(await quotedFeishu(env as any, { tenant: t, kind: "user", id: "ou_frank" }, event)).toBeUndefined();
     expect(await quotedFeishu(env as any, { tenant: "another", kind: "chat", id: "oc_group" }, event)).toEqual({});
     expect(asked).toEqual([]);
+  });
+
+  it("sends to a person directly when the address names them, and to a chat when it names that", async () => {
+    const { t, appId } = await app();
+    const asked: { url: string; body: any }[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: "t-1", expire: 7200 });
+      asked.push({ url: url.replace("https://open.feishu.cn/open-apis", ""), body: JSON.parse(String(init?.body)) });
+      return Response.json({ code: 0, data: { message_id: `om_${asked.length}` } });
+    });
+    const scope = { tenant: t, kind: "chat" as const, id: "oc_group" };
+    const message = { id: 1, idem: "m1", text: "hello", created_at: 0 };
+    expect(await deliverFeishu(env as any, scope, { connector: "feishu", address: { app_id: appId, open_id: "ou_frank" } }, message)).toEqual({ subject: "feishu:message:om_1", holder: "" });
+    expect(await deliverFeishu(env as any, scope, { connector: "feishu", address: { app_id: appId, chat_id: "oc_group" } }, { ...message, idem: "m2" })).toMatchObject({ subject: "feishu:message:om_2" });
+    expect(asked.map((each) => [each.url, each.body.receive_id])).toEqual([
+      ["/im/v1/messages?receive_id_type=open_id", "ou_frank"],
+      ["/im/v1/messages?receive_id_type=chat_id", "oc_group"],
+    ]);
+    // Neither named: nowhere to send.
+    await expect(deliverFeishu(env as any, scope, { connector: "feishu", address: { app_id: appId } }, message)).rejects.toThrow("bad Feishu address");
   });
 
   it("refuses unsigned, stale and plaintext events, and events for an app it does not know, all alike", async () => {

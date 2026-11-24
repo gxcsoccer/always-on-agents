@@ -27,6 +27,8 @@ function within<T>(use: (bench: ReturnType<typeof bench>) => T | Promise<T>): Pr
 function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const delivered: { target: Target; message: OutboundMessage }[] = [];
+  /** What the requests part was told about a way in: which message, and whether it reached the person. */
+  const shown: [string, boolean][] = [];
   const stamped: string[] = [];
   const ended: { id: string; status: string; why: string }[] = [];
   const closed: string[] = [];
@@ -49,6 +51,7 @@ function bench(state: DurableObjectState) {
       endRequest: (id, status, why) => void ended.push({ id, status, why }),
       sessionKeyOf: () => settings.sessionKey,
       readsOf: (runId) => settings.reads[runId] ?? [],
+      shown: (row, reached) => void shown.push([row.idem as string, reached]),
     },
   };
   const outbox = new Outbox(store, host);
@@ -65,7 +68,7 @@ function bench(state: DurableObjectState) {
   const said = (text: string) => void store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('feishu', ?, 'message', 'dm', '{}', ?, 'done', 1)", `om_${text}`, text);
   /** What was recorded as said to the person, in order. */
   const kept = () => store.rows<Record<string, any>>("SELECT * FROM said ORDER BY outbox_id").map(({ sent_at, ...rest }) => ({ ...rest, reads: JSON.parse(rest.reads) }));
-  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said, kept };
+  return { store, host, outbox, delivered, shown, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said, kept };
 }
 
 const fails = (err: Error) => () => {
@@ -174,6 +177,18 @@ describe("the outbox, by itself", () => {
         outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
         await outbox.flush();
         expect(delivered.map((each) => each.message)).toMatchObject([{ ask: { code: "A1" } }, { review: { summary: "fine" } }, { interaction: "int:1" }]);
+      });
+    });
+
+    it("tells the requests part how a way in fared: that it reached the person, or that it was given up", async () => {
+      await within(async ({ outbox, channel, set, shown }) => {
+        outbox.enqueue("plain", SESSION, null, "hello");
+        outbox.enqueue("i1", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
+        outbox.enqueue("i2", SESSION, null, "authorise", undefined, undefined, { interaction: "int:2" });
+        channel.i2 = fails(new DeliveryRejected("no"));
+        set("i2", { attempts: 5 });
+        await outbox.flush();
+        expect(shown).toEqual([["i1", true], ["i2", false]]);
       });
     });
 

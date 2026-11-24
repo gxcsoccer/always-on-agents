@@ -200,7 +200,8 @@ export class Requests implements Wakes {
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
-      this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: now.target });
+      // Where the tool says the way in is for the person themselves, it goes to them and not to where they asked.
+      this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: waiting.to ? JSON.stringify(waiting.to) : now.target });
       // The condition may already hold (the person used an earlier invitation a moment ago): ask.
       this.hint(now, `asked:${waiting.interaction}`);
     });
@@ -217,6 +218,24 @@ export class Requests implements Wakes {
     this.#b.enqueueMessage(`answer:${carried.id}`, run.session_id, run.id, text, undefined, undefined, { continuation: carried, authored });
     this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ?, reads = ?, authored = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, JSON.stringify(this.readsOf(run.id)), authored ? 1 : 0, `answer:${carried.id}`);
     return { ok: true };
+  }
+
+  /**
+   * How a way in fared, from the outbox: it reached the person, or was given up. Where it was put
+   * somewhere else than the request was made (see `Waiting.to`), the conversation the request was
+   * made in is told so, once for each request still waiting on it, in fixed words and without the
+   * way in itself. Said only now, so that it is never said of something that did not get there.
+   */
+  shown(row: Row, reached: boolean): void {
+    if (typeof row.interaction !== "string") return;
+    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting'", row.interaction)) {
+      if (waiting.target === row.target) continue;
+      try {
+        this.#b.enqueueMessage(`invited:${row.interaction}:${waiting.id}`, waiting.session_id, null, this.#b.notice(reached ? "invitedElsewhere" : "inviteNotSent", waiting.session_id), undefined, undefined, { target: waiting.target });
+      } catch {
+        // Nowhere to say it: nothing depends on it.
+      }
+    }
   }
 
   /** A reason to ask a waiting request's condition again. Never more than that. */
