@@ -41,7 +41,7 @@ describe("a connector's tools", () => {
     const other = { app: "a2", org: "o1" };
     const cases: [string, () => ReturnType<typeof brain>, (stub: any) => Promise<void>][] = [
       ["a group", () => brain("chat"), (stub) => stub.ingest(own("read my plan"))],
-      ["someone else's words in the batch", () => brain(), async (stub) => { await stub.ingest(own("read my plan")); await stub.ingest(own("and mine", { user: "mallory" })); }],
+      // (Someone else's words no longer share a run with the person's own: see "takes each person's ordinary messages on their own" in runner.test.ts.)
       ["the same person through the tenant's backend", () => brain(), (stub) => stub.ingest(message("read my plan", { user: "x", session_key: PRIVATE, data: { origin: ORIGIN, direct: true } }))],
       ["a conversation that is not the private one", () => brain(), (stub) => stub.ingest(own("read my plan", { session_key: "dm" }))],
       ["a connector the deployment does not trust", () => brain(), (stub) => stub.ingest(own("read my plan", { source: "newsfeed", session_key: privateSessionKey("newsfeed", ORIGIN) }))],

@@ -178,6 +178,34 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("takes each person's ordinary messages on their own where a connector's tools would act for a person, in order", async () => {
+      const read = { name: "feishu_read_document", effect: "read" } as ConnectorTool;
+      const taken = (tools: ConnectorTool[]) =>
+        within(async ({ runner, store, event, settings }) => {
+          settings.connectorTools = tools;
+          const bob = { kind: "human", id: "ou_2", explicit: true };
+          const group = { session_key: "chat", data: { origin: ORIGIN } };
+          event("a1", group);
+          event("a2", group);
+          event("b1", { ...group, principal: bob });
+          event("a3", group);
+          // A button pressed, and something no person wrote: neither is anyone's ordinary request.
+          event("approve AB12", { ...group, data: { origin: ORIGIN, card: true } });
+          event("", { ...group, source: "timer", kind: "timer", principal: { kind: "system", id: "timer" } });
+          event("a4", group);
+          const runs: string[][] = [];
+          for (let id = await runner.next(); id; id = await runner.next()) {
+            runs.push(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text));
+            store.sql.exec("UPDATE inbox SET status = 'done' WHERE run_id = ?", id);
+            store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+          }
+          return runs;
+        }, "chat:oc_1");
+      expect(await taken([read])).toEqual([["a1", "a2"], ["b1"], ["a3"], ["approve AB12"], [""], ["a4"]]);
+      // Where no tool acts for a person, a conversation's messages are taken together as before.
+      expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4"]]);
+    });
+
     it("takes a burst as several runs, by count and by size", async () => {
       await within(async ({ runner, store, event, inbox }) => {
         for (let i = 0; i < 45; i++) event(`m${i}`);

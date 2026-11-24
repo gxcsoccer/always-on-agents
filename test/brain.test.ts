@@ -662,7 +662,8 @@ describe("tasks and approvals", () => {
     await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
     // carol's comment is known to have been edited, but what it says now is not here yet.
     await stub.revise("test:note:neutral", 200, false, "h2");
-    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
+    model.replies([say("")], [call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
     await wake(stub);
     expect(toolOutputs().at(-1).error).toMatch(/new text has not arrived/);
     expect(await answersSent(id)).toHaveLength(0);
@@ -674,7 +675,8 @@ describe("tasks and approvals", () => {
     await first.stub.ingest(message("looks fine", { user: "carol", session_key: "chat", data: { subject: "test:note:c", revision: 100, holder: "h1" } }));
     await first.stub.ingest(message("[edited their earlier comment to] still fine", { user: "carol", session_key: "chat", data: { subject: "test:note:c", revision: 200, holder: "h2" } }));
     await first.stub.ingest(message(`approve ${first.code}`, { user: "bob", session_key: "chat" }));
-    model.replies([call("answer_task", { task_id: first.id, decision: "allow", reason: "" })], [say("")]);
+    // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
+    model.replies([say("")], [call("answer_task", { task_id: first.id, decision: "allow", reason: "" })], [say("")]);
     await wake(first.stub);
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
 
@@ -699,7 +701,8 @@ describe("tasks and approvals", () => {
       const newer = message("[edited their earlier comment to] still fine", { user: "carol", session_key: "chat", data: { subject: `test:note:${order}`, revision: 200, holder: "h2" } });
       for (const event of order === "oldest-first" ? [older, newer] : [newer, older]) await stub.ingest(event);
       await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
-      model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
+      model.replies([say("")], [call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
       await wake(stub);
       expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
     }
@@ -801,7 +804,8 @@ describe("tasks and approvals", () => {
     await stub.ingest(message("looks fine", { user: "carol", session_key: "chat", data: { subject: "test:note:gone", revision: 100, holder: "h1" } }));
     await stub.revise("test:note:gone", 200, false, "-");
     await stub.ingest(message(`approve ${code}`, { user: "bob", session_key: "chat" }));
-    model.replies([call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
+    // carol's comment is a run of its own, before bob's: each person's messages are taken up apart.
+    model.replies([say("")], [call("answer_task", { task_id: id, decision: "allow", reason: "" })], [say("")]);
     await wake(stub);
     expect(toolOutputs().at(-1)).toMatchObject({ ok: true, decision: "allow" });
   });

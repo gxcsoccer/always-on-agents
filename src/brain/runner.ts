@@ -99,9 +99,26 @@ export class Runner {
       // A message that replies to something other than what the ones before it reply to is about
       // something else: it starts a run of its own, in order, so each is read under its own binding.
       if (events.length > 0 && repliesTo(event) !== repliesTo(events.at(-1)!)) break;
+      // Where a connector's tools would act for a person, a run is one person's: their ordinary
+      // messages, and nothing else with them. Someone else's, a button pressed, an answer to a
+      // question, or anything no person wrote starts a run of its own.
+      if (events.length > 0 && this.#askerOf(event) !== this.#askerOf(events.at(-1)!)) break;
       events.push(event);
     }
     return events;
+  }
+
+  /**
+   * Whose ordinary request a message is, for telling one person's from the next: their id; ""
+   * for anything else that came through the same connector; null where the connector has no
+   * tools that act for a person, so the question does not arise.
+   */
+  #askerOf(event: InboxRow): string | null {
+    if (this.#b.toolsOf(event.source).length === 0) return null;
+    const principal = JSON.parse(event.principal) as Principal;
+    const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
+    const ordinary = event.kind === "message" && principal.kind === "human" && data.card === undefined && data.question === undefined && data.reply_only === undefined && data.routed_from === undefined;
+    return ordinary ? principal.id : "";
   }
 
   /** Starts a run over exactly these messages, those of them still pending. Anything that arrived since waits for the next. */
