@@ -123,7 +123,7 @@ export class RunTools {
           // Nothing was read. The answer the model gets is written here, not by the tool.
           waits = true;
           this.#b.outside.delete(callId);
-          return this.#b.requests.wait(run, { connector: acting.connector, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+          return this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
         } finally {
           // What this run has already written to send, and whatever it writes from here on.
           if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);

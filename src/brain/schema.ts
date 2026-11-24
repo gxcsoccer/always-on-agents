@@ -265,6 +265,25 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE inbox ADD COLUMN mark_attempts INTEGER NOT NULL DEFAULT 0;
    ALTER TABLE inbox ADD COLUMN mark_next_at INTEGER;
    CREATE INDEX inbox_mark ON inbox (status, mark_next_at) WHERE mark IS NOT NULL;`,
+  // 26: whose request a waiting request is. Where several people share a conversation, each
+  // person's requests are listed, called off and answered apart from everyone else's. Those kept
+  // before this are given the writer of the first message they rest on, where it is still on record.
+  // A "which one?" already put to a person is carried over to that person, with what it asked
+  // about and whether it has been answered. Whose it was is taken from the requests it asked
+  // about and from whoever wrote the message that answered it, where all that is on record
+  // agrees on one person; where it does not, or says nothing, the question is dropped.
+  `ALTER TABLE continuations ADD COLUMN person TEXT;
+   UPDATE continuations SET person = (SELECT json_extract(i.principal, '$.id') FROM inbox i WHERE i.id = json_extract(continuations.events, '$.said[0]'));
+   INSERT OR IGNORE INTO meta (key, value)
+     SELECT m.key || ':' || who.person, m.value FROM meta m JOIN (
+       SELECT key, MIN(person) AS person FROM (
+         SELECT m2.key AS key, c.person AS person FROM meta m2, json_each(m2.value, '$.ids') j JOIN continuations c ON c.id = j.value WHERE m2.key LIKE 'asked_which:%'
+         UNION
+         SELECT m3.key, json_extract(i.principal, '$.id') FROM meta m3 JOIN inbox i ON i.id = json_extract(m3.value, '$.chose') WHERE m3.key LIKE 'asked_which:%'
+       ) WHERE person IS NOT NULL GROUP BY key HAVING COUNT(DISTINCT person) = 1
+     ) who ON who.key = m.key
+     WHERE m.key NOT LIKE 'asked_which:%:%';
+   DELETE FROM meta WHERE key LIKE 'asked_which:%' AND key NOT LIKE 'asked_which:%:%';`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -229,7 +229,9 @@ export class BrainAgent extends DurableObject<Env> {
     // Someone who writes while a request of theirs waits may be saying that the wait is over
     // ("done"). That is not taken from their words: the condition's owner is asked again.
     if (inserted && event.kind === "message") {
-      for (const waiting of this.#store.rows<Continuation>("SELECT c.* FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.status = 'waiting' AND s.session_key = ?", event.session_key)) this.#requests.hint(waiting, `said:${event.source}:${event.source_id}`);
+      // Their own requests, that is: what someone else says in a shared conversation is no reason to ask about them.
+      // One kept before its person was recorded counts as theirs only in a private conversation.
+      for (const waiting of this.#store.rows<Continuation>("SELECT c.* FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.status = 'waiting' AND s.session_key = ? AND (c.person = ? OR (? = 1 AND c.person IS NULL))", event.session_key, event.principal.id, isPrivateSession(event.session_key) ? 1 : 0)) this.#requests.hint(waiting, `said:${event.source}:${event.source_id}`);
     }
     // Also on a duplicate: the first delivery may have been stored without its wake-up being scheduled.
     await this.#wakeBy(Date.now() + BATCH_WINDOW_MS);

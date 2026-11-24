@@ -5,6 +5,7 @@
  */
 import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds } from "../connectors";
 import type { Env } from "../env";
+import { isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
 import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
@@ -22,6 +23,8 @@ export const WAITING_NOTE =
 /** A request that waits, or is being carried on: see the `continuations` table. */
 export interface Continuation {
   id: string;
+  /** Whose request it is. Null only for one kept before this was recorded. */
+  person?: string | null;
   session_id: string;
   events: string;
   connector: string;
@@ -161,7 +164,7 @@ export class Requests implements Wakes {
    * of them. One step: the record, and the message that shows the way in, exist together or not
    * at all, so nothing can be acted on before there is a request to carry on.
    */
-  wait(run: RunRow, acting: { connector: string; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+  wait(run: RunRow, acting: { connector: string; person: string; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
     this.#s.transaction(() => {
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       if (existing && existing.status !== "resuming") throw new Error("that request has ended");
@@ -175,7 +178,8 @@ export class Requests implements Wakes {
         const target = [...basis].reverse().find((each) => each.reply_to)?.reply_to;
         if (!target) throw new Error("there is nowhere to send a message in this conversation");
         this.#s.sql.exec(
-          "INSERT INTO continuations (id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
+          "INSERT INTO continuations (person, id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
+          acting.person,
           id,
           run.session_id,
           JSON.stringify(acting.events),
@@ -290,7 +294,9 @@ export class Requests implements Wakes {
       this.#s.sql.exec("UPDATE continuations SET status = 'resuming', run_id = ?, call_id = ?, claimed_at = ? WHERE id = ?", runId, callId, Date.now(), id);
       // Whose request it is, worked out again from what they wrote, not remembered.
       const basis = this.basis(runId);
-      if (basis.length === 0 || !this.#b.actingFor(runId)) {
+      // And it has to be the person it was kept for.
+      const acting = basis.length === 0 ? undefined : this.#b.actingFor(runId);
+      if (!acting || (now.person != null && now.person !== acting.person)) {
         this.endRequest(id, "void", "what the person asked is no longer on record, or no longer theirs to ask here");
         return drop();
       }
@@ -349,15 +355,21 @@ export class Requests implements Wakes {
     };
     if (!row.continuation) return guarded();
     const record = () => this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", row.continuation)[0];
-    const unheard = (sessionId: string): "pending" | "claimed" | undefined =>
-      this.#s.rows<{ status: "pending" | "claimed" }>("SELECT status FROM inbox WHERE status IN ('pending', 'claimed') AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY status DESC LIMIT 1", sessionId)[0]?.status;
+    // The person's own words, that is: where others share the conversation, theirs say nothing about this request.
+    const unheard = (of: Continuation): "pending" | "claimed" | undefined =>
+      this.#s.rows<{ status: "pending" | "claimed" }>(
+        "SELECT status FROM inbox WHERE status IN ('pending', 'claimed') AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND (? IS NULL OR (json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') = ?)) ORDER BY status DESC LIMIT 1",
+        of.session_id,
+        of.person ?? null,
+        of.person ?? null,
+      )[0]?.status;
     // Words still to be handled in this wake-up are waited for briefly; ones a paused run holds, longer.
     const held = (status: "pending" | "claimed") => (status === "pending" ? "hold" : "wait");
     const before = record();
     if (!before || before.status !== "answering") return "void";
     // The time it had comes first: an answer is not kept waiting past it for anything.
     if (Date.now() - (before.claimed_at ?? 0) > HANDLING_LIMIT_MS) return "void";
-    const words = unheard(before.session_id);
+    const words = unheard(before);
     if (words) return held(words);
     let why: string | undefined;
     try {
@@ -369,20 +381,27 @@ export class Requests implements Wakes {
     // Something may have arrived, or the request ended, while the owner was being asked.
     const after = record();
     if (!after || after.status !== "answering") return "void";
-    const since = unheard(after.session_id);
+    const since = unheard(after);
     if (since) return held(since);
     const last = await guarded();
     if (last !== "send") return last;
     // And once more, without waiting for anything: its time, its request, the person's words.
     const final = record();
     if (!final || final.status !== "answering" || Date.now() - (final.claimed_at ?? 0) > HANDLING_LIMIT_MS) return "void";
-    const now = unheard(final.session_id);
+    const now = unheard(final);
     return now ? held(now) : "send";
   }
 
-  /** The requests in a conversation that can still be called off: nothing of theirs has been handed to the channel. */
-  cancellable(sessionId: string): Continuation[] {
-    return this.#s.rows<Continuation>("SELECT * FROM continuations WHERE session_id = ? AND status IN ('waiting', 'resuming', 'answering') ORDER BY created_at", sessionId).filter(
+  /**
+   * The requests in a conversation that can still be called off: nothing of theirs has been
+   * handed to the channel. With a person named, that person's only (and any kept before it was
+   * recorded whose they are): where several people share a conversation, nobody is shown, or
+   * can call off, another's.
+   */
+  cancellable(sessionId: string, person?: string): Continuation[] {
+    // One kept before its person was recorded is taken as theirs only in a private conversation, which has one person.
+    const legacy = isPrivateSession(this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", sessionId)[0]?.session_key ?? "") ? 1 : 0;
+    return this.#s.rows<Continuation>("SELECT * FROM continuations WHERE session_id = ? AND status IN ('waiting', 'resuming', 'answering') AND (? IS NULL OR person = ? OR (? = 1 AND person IS NULL)) ORDER BY created_at", sessionId, person ?? null, person ?? null, legacy).filter(
       (each) => each.status !== "answering" || this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'pending' AND started = 0", `answer:${each.id}`).length > 0,
     );
   }
@@ -403,13 +422,14 @@ export class Requests implements Wakes {
    * `by` names the call: a call that already ended the request is let through when replayed.
    */
   mayCancel(run: RunRow, requestId: string, by: string, ask = ""): { record: Continuation; choosing?: number } {
-    if (this.continuationOf(run.id) || !this.#b.actingFor(run.id)) throw new Error("a request can only be cancelled when the person themselves asks for that, in their own private conversation");
-    const done = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND session_id = ? AND status = 'cancelled' AND why = ?", requestId, run.session_id, calledOff(by))[0];
+    const acting = this.continuationOf(run.id) ? undefined : this.#b.actingFor(run.id);
+    if (!acting) throw new Error("a request can only be cancelled when the person themselves asks for that, in their own private conversation");
+    const done = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND session_id = ? AND status = 'cancelled' AND why = ? AND (person IS NULL OR person = ?)", requestId, run.session_id, calledOff(by), acting.person)[0];
     if (done) return { record: done };
     const events = this.basis(run.id);
     const repliedTo = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
-    const open = this.cancellable(run.session_id);
-    const which = `asked_which:${run.session_id}`;
+    const open = this.cancellable(run.session_id, acting.person);
+    const which = askedWhich(run.session_id, acting.person);
     const asked = JSON.parse(this.#s.meta(which) ?? "null") as { ids: string[]; question: string; chose?: number } | null;
     const question = asked ? this.#s.rows<{ status: string; receipt: string | null; sent_at: number | null }>("SELECT status, receipt, sent_at FROM outbox WHERE idem = ?", asked.question)[0] : undefined;
     // A reply to the system's own "which one?" is an answer to it, not a reply to something else.
@@ -425,7 +445,7 @@ export class Requests implements Wakes {
     // person, by its own receipt, and it has to stand alone: batched with another message, there
     // is no telling which of them chose.
     const delivered = question?.status === "sent" && question.receipt && question.sent_at != null ? question.sent_at : undefined;
-    const first = delivered === undefined ? undefined : this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND received_at >= ? AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY id LIMIT 1", delivered, run.session_id)[0];
+    const first = delivered === undefined ? undefined : this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND received_at >= ? AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND source = ? AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') = ? ORDER BY id LIMIT 1", delivered, run.session_id, acting.connector, acting.person)[0];
     if (asked && asked.chose === undefined && (repliedTo.length === 0 || toQuestion) && first !== undefined && events.length === 1 && first.id === events[0].id && asked.ids.includes(requestId)) return { record: chosen, choosing: first.id };
     // A reply to that question which is not its one answer (it has been answered, or this is not
     // the first message since) decides nothing, however few requests are still open.
@@ -450,7 +470,9 @@ export class Requests implements Wakes {
       this.endRequest(chosen.id, "cancelled", calledOff(by));
       this.#s.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL, error = NULL WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", `answer:${chosen.id}`);
       if (choosing !== undefined) {
-        const which = `asked_which:${chosen.session_id}`;
+        // Under the person who chose: the writer of the message that did, where the request itself was kept before its person was recorded.
+        const chooser = this.#s.rows<{ id: string | null }>("SELECT json_extract(principal, '$.id') AS id FROM inbox WHERE id = ?", choosing)[0]?.id;
+        const which = askedWhich(chosen.session_id, chosen.person ?? chooser);
         const asked = JSON.parse(this.#s.meta(which) ?? "null") as Record<string, unknown> | null;
         if (asked) this.#s.setMeta(which, JSON.stringify({ ...asked, chose: choosing }));
       }
@@ -538,4 +560,9 @@ export class Requests implements Wakes {
     });
     return [...requests, ...approvals];
   }
+}
+
+/** Where it is kept that a person was asked which of their requests they mean: one question per person and conversation. */
+function askedWhich(sessionId: string, person: string | null | undefined): string {
+  return `asked_which:${sessionId}:${person ?? ""}`;
 }

@@ -3,7 +3,9 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Env } from "../src/env";
+import { privateSessionKey } from "../src/events";
 import { type Acting, type Continuation, type Guard, Requests, type RequestsHost, type Source, calledOff } from "../src/brain/requests";
+import { migrate } from "../src/brain/schema";
 import { BrainStore, type InboxRow, type RunRow } from "../src/brain/store";
 
 /**
@@ -14,6 +16,7 @@ import { BrainStore, type InboxRow, type RunRow } from "../src/brain/store";
  */
 const SESSION = "s1";
 const SESSION_KEY = "dm";
+const PRIVATE_KEY = privateSessionKey("feishu", { app_id: "cli_1", tenant_key: "org_1" });
 const TARGET = JSON.stringify({ connector: "feishu", address: { chat_id: "oc_1" } });
 const ELSEWHERE = JSON.stringify({ connector: "feishu", address: { chat_id: "oc_then" } });
 const PERSON: Acting = { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" }, said: [], recent: [], recentIds: [] };
@@ -53,9 +56,10 @@ function bench(state: DurableObjectState) {
   let made = 0;
   /** A request as it is kept, waiting unless said otherwise. */
   const request = (id: string, over: Partial<Continuation> & { check_at?: number | null } = {}): Continuation => {
-    const row = { session_id: SESSION, events: JSON.stringify({ said: [], recent: [] }), connector: "feishu", tool: "feishu_read_document", args: "{}", target: TARGET, subject: "grant_1", condition: "cond_1", generation: 1, interaction: `int:${id}`, until: Date.now() + 3_600_000, status: "waiting", run_id: null, call_id: null, claimed_at: null, check_at: null, ...over };
+    const row = { person: null as string | null, session_id: SESSION, events: JSON.stringify({ said: [], recent: [] }), connector: "feishu", tool: "feishu_read_document", args: "{}", target: TARGET, subject: "grant_1", condition: "cond_1", generation: 1, interaction: `int:${id}`, until: Date.now() + 3_600_000, status: "waiting", run_id: null, call_id: null, claimed_at: null, check_at: null, ...over };
     store.sql.exec(
-      "INSERT INTO continuations (id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, run_id, call_id, claimed_at, check_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO continuations (person, id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, run_id, call_id, claimed_at, check_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      row.person,
       id,
       row.session_id,
       row.events,
@@ -82,17 +86,17 @@ function bench(state: DurableObjectState) {
   /** The id the source gave a stored message, which is not the row's own id. */
   const sourceId = (id: number) => store.rows<{ source_id: string }>("SELECT source_id FROM inbox WHERE id = ?", id)[0].source_id;
   /** A message of the person's as it is stored, claimed by a run if one is named. Its id. */
-  const message = (text: string | null, data: Record<string, unknown> = {}, runId: string | null = null): number => {
+  const message = (text: string | null, data: Record<string, unknown> = {}, runId: string | null = null, by = "ou_1", status?: string): number => {
     const id = `om_${++said}`;
     return store.rows<{ id: number }>(
       "INSERT INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, status, run_id, received_at) VALUES ('feishu', ?, 'message', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
       id,
       SESSION_KEY,
-      JSON.stringify({ kind: "human", id: "ou_1", explicit: true }),
+      JSON.stringify({ kind: "human", id: by, explicit: true }),
       text,
       JSON.stringify({ message_id: id, direct: true, ...data }),
       TARGET,
-      runId ? "claimed" : "done",
+      status ?? (runId ? "claimed" : "done"),
       runId,
       Date.now(),
     )[0].id;
@@ -342,7 +346,7 @@ describe("requests that wait, by themselves", () => {
 
   it("calls a request off: ended as cancelled by that call, its unsent answer emptied, a choice recorded only when it was one", async () => {
     await within(({ store, requests, request, kept, outgoing, sent, audited }) => {
-      const which = `asked_which:${SESSION}`;
+      const which = `asked_which:${SESSION}:`;
       const asked = { ids: ["r1", "r2"], question: "which:call_0" };
       store.setMeta(which, JSON.stringify(asked));
       const one = request("r1", { status: "answering" });
@@ -373,7 +377,180 @@ describe("requests that wait, by themselves", () => {
     // Where no question was asked, a choice has nowhere to be recorded and none is made up.
     await within(({ store, requests, request }) => {
       requests.cancel(request("r1"), "call_1", 7);
+      expect(store.meta(`asked_which:${SESSION}:`)).toBeUndefined();
+    });
+  });
+
+  it("gives a request kept before it was recorded the writer of the message it rests on", async () => {
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), (_instance: unknown, state: DurableObjectState) => {
+      const { store, request, kept, message } = bench(state);
+      const asked = message("read it", {}, null, "ou_7");
+      request("r_old", { events: JSON.stringify({ said: [asked], recent: [] }) });
+      request("r_gone", { events: JSON.stringify({ said: [99_999], recent: [] }) });
+      // As a deployment before this step has it.
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
+      expect(kept("r_old").person).toBe("ou_7");
+      expect(kept("r_gone").person).toBeNull();
+    });
+  });
+
+  it("carries over a question asked before whose requests were recorded, and keeps its one answer one", async () => {
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), async (_instance: unknown, state: DurableObjectState) => {
+      const { store, requests, request, message, run } = bench(state);
+      // A private conversation, as before the step: two requests of one person, and "which one?" already delivered.
+      store.sql.exec("UPDATE sessions SET session_key = ? WHERE id = ?", PRIVATE_KEY, SESSION);
+      const private_ = (text: string, runId: string | null = null) => {
+        const id = message(text, {}, runId);
+        store.sql.exec("UPDATE inbox SET session_key = ? WHERE id = ?", PRIVATE_KEY, id);
+        return id;
+      };
+      const asked = private_("read both");
+      request("r1", { events: JSON.stringify({ said: [asked], recent: [] }) });
+      request("r2", { events: JSON.stringify({ said: [asked], recent: [] }) });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('which:old', ?, 'which?', 'sent', 0, 0, ?, ?)", TARGET, Date.now(), JSON.stringify({ subject: "feishu:message:om_which", holder: "" }));
+      store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
       expect(store.meta(`asked_which:${SESSION}`)).toBeUndefined();
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!)).toEqual({ ids: ["r1", "r2"], question: "which:old" });
+
+      // Their reply to that question still picks one.
+      const picking = run("run_pick");
+      const choice = private_("第一个", "run_pick");
+      store.sql.exec("UPDATE inbox SET data = json_set(data, '$.replies_to', 'feishu:message:om_which') WHERE id = ?", choice);
+      const picked = requests.mayCancel(picking, "r1", "call_1");
+      expect(picked).toMatchObject({ record: { id: "r1" }, choosing: choice });
+      requests.cancel(picked.record, "call_1", picked.choosing);
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
+    });
+    // A request whose person was never recorded: the choice is still used up, under the person who made it.
+    await within(async ({ store, requests, request, kept, message, run, sent }) => {
+      store.sql.exec("UPDATE sessions SET session_key = ? WHERE id = ?", PRIVATE_KEY, SESSION);
+      request("r1");
+      request("r2");
+      const first = run("run_1");
+      store.sql.exec("UPDATE inbox SET session_key = ? WHERE id = ?", PRIVATE_KEY, message("取消", {}, "run_1"));
+      expect(() => requests.mayCancel(first, "r1", "call_1")).toThrow(/more than one request could be meant/);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, receipt = ? WHERE idem = 'which:call_1'", Date.now(), JSON.stringify({ subject: "feishu:message:om_w", holder: "" }));
+      const second = run("run_2");
+      const choice = message("第一个", {}, "run_2");
+      store.sql.exec("UPDATE inbox SET session_key = ? WHERE id = ?", PRIVATE_KEY, choice);
+      const picked = requests.mayCancel(second, "r1", "call_2");
+      expect(picked.choosing).toBe(choice);
+      requests.cancel(picked.record, "call_2", picked.choosing);
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
+      expect(() => requests.mayCancel(second, "r2", "call_3")).toThrow(/already been taken as choosing one request/);
+      void kept;
+      void sent;
+    });
+  });
+
+  it("keeps a choice made before the upgrade used up, when the request it chose is gone but who chose is known", async () => {
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), async (_instance: unknown, state: DurableObjectState) => {
+      const { store, requests, request, message, run } = bench(state);
+      store.sql.exec("UPDATE sessions SET session_key = ? WHERE id = ?", PRIVATE_KEY, SESSION);
+      const private_ = (text: string, runId: string | null = null) => {
+        const id = message(text, {}, runId);
+        store.sql.exec("UPDATE inbox SET session_key = ? WHERE id = ?", PRIVATE_KEY, id);
+        return id;
+      };
+      const asked = private_("read the second");
+      // The first was called off by the choice, and what it rested on is no longer on record.
+      request("r1", { status: "cancelled", events: JSON.stringify({ said: [99_999], recent: [] }) });
+      request("r2", { events: JSON.stringify({ said: [asked], recent: [] }) });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('which:old', ?, 'which?', 'sent', 0, 0, ?, ?)", TARGET, Date.now(), JSON.stringify({ subject: "feishu:message:om_which", holder: "" }));
+      run("run_pick");
+      const choice = private_("第一个", "run_pick");
+      store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old", chose: choice }));
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
+      const running = store.rows<RunRow>("SELECT * FROM runs WHERE id = 'run_pick'")[0];
+      expect(() => requests.mayCancel(running, "r2", "call_2")).toThrow(/already been taken as choosing one request/);
+    });
+    // Where what is on record points at more than one person, nothing is guessed: the question is dropped.
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), (_instance: unknown, state: DurableObjectState) => {
+      const { store, request, message } = bench(state);
+      request("r1", { events: JSON.stringify({ said: [message("one", {}, null, "ou_1")], recent: [] }) });
+      request("r2", { events: JSON.stringify({ said: [message("two", {}, null, "ou_2")], recent: [] }) });
+      store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
+      expect(store.rows("SELECT key FROM meta WHERE key LIKE 'asked_which:%'")).toEqual([]);
+    });
+  });
+
+  it("takes a request whose person was never recorded as anyone's only in a private conversation", async () => {
+    await within(({ store, requests, request }) => {
+      request("r_legacy");
+      // Here the conversation is one that several people share.
+      expect(requests.cancellable(SESSION, "ou_1")).toEqual([]);
+      store.sql.exec("UPDATE sessions SET session_key = ? WHERE id = ?", PRIVATE_KEY, SESSION);
+      expect(requests.cancellable(SESSION, "ou_1").map((each) => each.id)).toEqual(["r_legacy"]);
+    });
+  });
+
+  it("keeps each person's requests apart where several people share a conversation", async () => {
+    await within(async ({ store, host, requests, request, kept, message, run, outgoing, sent }) => {
+      const bob: Acting = { ...PERSON, person: "ou_2" };
+      request("r_a1", { person: "ou_1" });
+      request("r_a2", { person: "ou_1" });
+      request("r_b", { person: "ou_2" });
+      // Listed for the person whose run it is, and for nobody else.
+      expect(requests.cancellable(SESSION, "ou_1").map((each) => each.id)).toEqual(["r_a1", "r_a2"]);
+      expect(requests.cancellable(SESSION, "ou_2").map((each) => each.id)).toEqual(["r_b"]);
+      expect(requests.cancellable(SESSION, "ou_3")).toEqual([]);
+
+      // Bob cannot call off Alice's, and is not told what hers are.
+      host.acting = bob;
+      const his = run("run_bob");
+      message("不用了", {}, "run_bob", "ou_2");
+      let refusal = "";
+      try {
+        requests.mayCancel(his, "r_a1", "call_b1");
+      } catch (error) {
+        refusal = String(error);
+      }
+      expect(refusal).toMatch(/not a request this could be about/);
+      expect(refusal).not.toMatch(/r_a1|r_a2/);
+      expect(kept("r_a1").status).toBe("waiting");
+      // His own, the only one of his, he can.
+      expect(requests.mayCancel(his, "r_b", "call_b2").record.id).toBe("r_b");
+
+      // Alice has two: she is asked which. The question is hers alone.
+      host.acting = PERSON;
+      const hers = run("run_alice");
+      message("取消", {}, "run_alice", "ou_1");
+      expect(() => requests.mayCancel(hers, "r_a1", "call_a1")).toThrow(/more than one request could be meant/);
+      expect(sent("which:call_a1").text).not.toMatch(/r_b/);
+      expect(store.meta(`asked_which:${SESSION}:ou_1`)).toBeDefined();
+      expect(store.meta(`asked_which:${SESSION}:ou_2`)).toBeUndefined();
+      // The question reaches the chat; Bob writes first, then Alice. Hers is the answer to it, not his.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = ?, receipt = ? WHERE idem = 'which:call_a1'", Date.now(), JSON.stringify({ subject: "feishu:message:om_which", holder: "" }));
+      message("我也看看", {}, null, "ou_2");
+      const answering = run("run_alice_2");
+      const choice = message("第一个", {}, "run_alice_2", "ou_1");
+      expect(requests.mayCancel(answering, "r_a1", "call_a2")).toMatchObject({ record: { id: "r_a1" }, choosing: choice });
+      requests.cancel(kept("r_a1"), "call_a2", choice);
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
+
+      // An answer waits for its own person's unhandled words, not for anyone else's.
+      request("r_ans", { person: "ou_1", status: "answering", claimed_at: Date.now() });
+      outgoing("answer:r_ans", { continuation: "r_ans" });
+      const row = sent("answer:r_ans") as never;
+      message("大家好", {}, null, "ou_2", "pending");
+      expect(await requests.gate(row)).not.toBe("hold");
+      message("等等", {}, null, "ou_1", "pending");
+      expect(await requests.gate(row)).toBe("hold");
     });
   });
 
@@ -381,9 +558,9 @@ describe("requests that wait, by themselves", () => {
     await within(({ requests, host, request, message, sourceId, run, outgoing }) => {
       const asked = message("读一下这篇");
       const loose = message("顺便说一句");
-      request("r_a", { events: JSON.stringify({ said: [asked, loose], recent: [], bound: [asked] }) });
+      request("r_a", { person: "ou_1", events: JSON.stringify({ said: [asked, loose], recent: [], bound: [asked] }) });
       // Tied to no message by its tool: only what the system sent for it is about it.
-      request("r_b", { events: JSON.stringify({ said: [loose], recent: [] }) });
+      request("r_b", { person: "ou_1", events: JSON.stringify({ said: [loose], recent: [] }) });
       outgoing("answer:r_a", { continuation: "r_a", status: "sent", receipt: JSON.stringify({ subject: "feishu:message:om_answer_a" }) });
       outgoing("invite:int:r_b", { interaction: "int:r_b", status: "sent", receipt: JSON.stringify({ subject: "feishu:message:om_invite_b" }) });
       outgoing("unrelated", { status: "sent", receipt: JSON.stringify({ subject: "feishu:message:om_unrelated" }) });
