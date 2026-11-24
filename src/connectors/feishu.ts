@@ -86,7 +86,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, closeInvitation: closeInvitationFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
   holds: (env, scope, condition, generation) => authorisationHolds(env, scope, condition, generation),
 };
@@ -576,7 +576,8 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
 function plainCard(invitation: Invitation): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content: content.slice(0, 1_000) });
   return {
-    config: { wide_screen_mode: true },
+    // So that it can be replaced once it is over.
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: "blue", title: plain(invitation.title) },
     elements: [
       { tag: "div", text: plain(invitation.text) },
@@ -636,6 +637,24 @@ export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: 
   if (result.code === 99991663) await forgetTenantAccessToken(env, appId, token);
   const later = response.status === 429 || response.status >= 500 || result.code === undefined || [231015, 99991400, 99991663].includes(result.code);
   return later ? "retry" : "permanent";
+}
+
+/** Replaces an invitation's card with one that says it is over and has no button. Fixed words: nothing of the invitation is kept to repeat. */
+export async function closeInvitationFeishu(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void> {
+  const messageId = /^feishu:message:([A-Za-z0-9_-]{1,100})$/.exec(receipt.subject)?.[1];
+  const appId = target.address.app_id;
+  if (!messageId || !appId) return;
+  const plain = (content: string) => ({ tag: "plain_text", content });
+  const [template, title, text] = how === "used" ? ["green", "已授权", "授权已完成，不需要再操作。"] : ["grey", "这次请求已结束", "这张卡片不用再点了。还需要的话，请在聊天里再跟我说一遍。"];
+  const card = { config: { wide_screen_mode: true, update_multi: true }, header: { template, title: plain(title) }, elements: [{ tag: "div", text: plain(text) }] };
+  const token = await tenantAccessToken(env, appId);
+  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}`, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ content: JSON.stringify(card) }),
+  });
+  const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string };
+  if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
 }
 
 /** Replaces a question's card with one that says how it ended and has no buttons. */

@@ -302,6 +302,12 @@ export interface Channel {
    */
   amend?(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void>;
   /**
+   * Shows a delivered invitation as over where it is shown, once nothing waits on it any more:
+   * it stops offering its way in and says whether it was used ("used") or can no longer be
+   * ("over"). Best effort; nothing depends on it.
+   */
+  closeInvitation?(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void>;
+  /**
    * Required of a system where what was said can be changed afterwards (edited or deleted). Says
    * what a message says now, so that an approval is never acted on unseen. Such a connector gives
    * its events a `subject`, a `revision` and a `holder`; this is asked about that subject before

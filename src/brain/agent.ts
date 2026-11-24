@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, aside, canRevisit, deliver, direct, offeredFor, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, aside, closeInvitation, canRevisit, deliver, direct, offeredFor, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -160,6 +160,7 @@ export class BrainAgent extends DurableObject<Env> {
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
       direct,
       aside,
+      closeInvitation: (target, receipt, how) => this.ctx.waitUntil(closeInvitation(this.env, target, receipt, how).catch((err) => this.#store.log("invitation_not_closed", { error: String(err).slice(0, 300) }))),
     });
     this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks, this.#marks];
     migrate(ctx.storage);

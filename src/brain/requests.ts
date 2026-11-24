@@ -93,6 +93,8 @@ export interface RequestsHost {
   direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
   /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
   aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
+  /** Shows a delivered invitation as over where it was shown. Never holds anything up. */
+  closeInvitation(target: Target, receipt: Receipt, how: "used" | "over"): void;
 }
 
 /** The one person a run acts for, and their own messages it rests on. */
@@ -489,6 +491,7 @@ export class Requests implements Wakes {
       this.#b.append(now.session_id, runId, { type: "function_call", call_id: callId, name: now.tool, arguments: now.args } as Item);
       this.#s.setMeta("active_run", runId);
       this.#s.audit("(system)", "request.resumed", { request: id, run: runId });
+      if (now.interaction) this.#wayInOver(now.interaction, "used");
       return runId;
     });
   }
@@ -509,8 +512,22 @@ export class Requests implements Wakes {
 
   /** Ends a request, once. What ended it is kept; nothing ended is ever reopened. */
   endRequest(id: string, status: "done" | "failed" | "cancelled" | "expired" | "void" | "unverified", why: string): void {
+    // Its way in, if it was still waiting on one: looked up before it ends.
+    const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ? AND status = 'waiting'", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
+    if (ended.length > 0 && shown) this.#wayInOver(shown, "over");
+  }
+
+  /**
+   * A way in that no request waits on any more is shown as over wherever it was delivered: it
+   * was used, or it can no longer be. One that others still wait on stays as it is.
+   */
+  #wayInOver(interaction: string, how: "used" | "over"): void {
+    if (this.#s.rows("SELECT 1 FROM continuations WHERE status = 'waiting' AND interaction = ? LIMIT 1", interaction).length > 0) return;
+    for (const row of this.#s.rows<{ target: string; receipt: string }>("SELECT target, receipt FROM outbox WHERE idem IN (?, ?) AND receipt IS NOT NULL", `invite:${interaction}`, `invite:${interaction}:direct`)) {
+      this.#b.closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, how);
+    }
   }
 
   /**

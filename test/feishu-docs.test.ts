@@ -18,6 +18,8 @@ const APP: FeishuApp = { app_id: APP_ID, tenant: TENANT, app_secret: "app-secret
 const feishu = {
   /** Documents: who may open each, and what it says. */
   docs: new Map<string, { readers: string[]; text: string; blocks?: number[] }>(),
+  /** Cards replaced where they were shown. */
+  closed: [] as { message: string; card: any }[],
   /** Look-ups of what a document is made of (not reads of its content). */
   looks: [] as { path: string; bearer: string }[],
   /** Whether those look-ups fail. */
@@ -95,6 +97,7 @@ function installFakeFeishu() {
   feishu.codes.clear();
   feishu.sent.length = 0;
   feishu.bodies.length = 0;
+  feishu.closed.length = 0;
   feishu.reads.length = 0;
   feishu.looks.length = 0;
   feishu.blocksFail = false;
@@ -155,6 +158,11 @@ function installFakeFeishu() {
     if (url.host === "open.feishu.cn" && url.pathname.endsWith("/ephemeral/v1/send")) {
       feishu.sent.push({ to: `only:${body.chat_id}:${body.open_id}`, type: "interactive", content: body.card, uuid: `eph${feishu.sent.length}`, format: "interactive" });
       return Response.json({ code: 0, data: { message_id: `om_eph_${feishu.sent.length}` } });
+    }
+    // A card replaced where it was shown: an invitation that is over.
+    if (url.host === "open.feishu.cn" && init?.method === "PATCH" && /\/im\/v1\/messages\/[^/]+$/.test(url.pathname)) {
+      feishu.closed.push({ message: url.pathname.split("/").at(-1)!, card: JSON.parse(body.content) });
+      return Response.json({ code: 0, data: {} });
     }
     const replyingTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reply$/.exec(url.pathname)?.[1] : undefined;
     if (url.host === "open.feishu.cn" && (url.pathname.endsWith("/im/v1/messages") || replyingTo)) {
@@ -1687,6 +1695,28 @@ describe("a request that waits and is carried on", () => {
     expect(hal.heard()).toEqual(["晴", "总结"]);
     expect((await rowsOf(hal.stub, "SELECT 1 FROM outbox WHERE continuation IS NOT NULL")).length).toBe(1);
     expect(read()).toEqual(["DocHal000000000000001"]);
+  });
+
+  it("shows an invitation as over where it was shown, without its button: used once authorised, ended once called off", async () => {
+    const actions = (card: any) => JSON.stringify(card).includes('"tag":"action"');
+    const amy = owner("DocAmyClosed000000001");
+    await asksFor(amy, "DocAmyClosed000000001");
+    expect(actions(amy.cards()[0])).toBe(true);
+    expect(feishu.closed).toEqual([]);
+    carriesOn("周五发布。");
+    await authorises(amy);
+    await vi.waitFor(() => expect(feishu.closed).toHaveLength(1), { interval: 5 });
+    expect(feishu.closed[0].card.header.title.content).toBe("已授权");
+    expect(actions(feishu.closed[0].card)).toBe(false);
+
+    const jon = owner("DocJonClosed000000001");
+    const id = await asksFor(jon, "DocJonClosed000000001");
+    model.replies([call("cancel_request", { request_id: id })], [call("send_message", { text: "已取消" })], [say("")]);
+    await jon.says("算了");
+    await vi.waitFor(() => expect(feishu.closed).toHaveLength(2), { interval: 5 });
+    expect(feishu.closed[1].card.header.title.content).toBe("这次请求已结束");
+    expect(actions(feishu.closed[1].card)).toBe(false);
+    expect(feishu.closed[1].message).not.toBe(feishu.closed[0].message);
   });
 
   it("does not read or answer a request the person called off, though they authorise afterwards", async () => {

@@ -88,6 +88,11 @@ export async function deliver(env: Env, scope: Scope, target: Target, message: O
   return channel.deliver(env, scope, target, message);
 }
 
+/** Shows a delivered invitation as over, where the connector can. */
+export async function closeInvitation(env: Env, target: Target, receipt: Receipt, how: "used" | "over"): Promise<void> {
+  await byName.get(target.connector)?.channel?.closeInvitation?.(env, target, receipt, how);
+}
+
 /** Shows a delivered approval question as closed, where the connector can. */
 export async function amend(env: Env, target: Target, receipt: Receipt, ask: ApprovalQuestion, outcome: Outcome): Promise<void> {
   await byName.get(target.connector)?.channel?.amend?.(env, target, receipt, ask, outcome);
