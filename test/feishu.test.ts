@@ -222,7 +222,7 @@ describe("fetching the message a group message was written in reply to", () => {
   it("asks Feishu for that one message as the app, and gives the asker's own words", async () => {
     const asked = feishu(item({}));
     expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1" });
-    expect(asked).toEqual([{ url: "https://open.feishu.cn/open-apis/im/v1/messages/om_parent", bearer: "Bearer t-app" }]);
+    expect(asked).toEqual([{ url: "https://open.feishu.cn/open-apis/im/v1/messages/om_parent?user_id_type=open_id", bearer: "Bearer t-app" }]);
   });
 
   it("names the people mentioned in it, flattens a post, and cuts what is long", async () => {
@@ -232,6 +232,13 @@ describe("fetching the message a group message was written in reply to", () => {
     expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [img]");
     feishu(item({ body: { content: JSON.stringify({ text: "x".repeat(5_000) }) } }));
     expect((await look()).text).toHaveLength(1_000);
+    // A link with nowhere to lead is its words; a post with nothing in it is not something read.
+    feishu(item({ msg_type: "post", body: { content: JSON.stringify({ content: [[{ tag: "a", text: "bare" }]] }) } }));
+    expect((await look()).text).toBe("bare");
+    feishu(item({ msg_type: "post", body: { content: "{}" } }));
+    expect(await look()).toEqual({});
+    feishu(item({ msg_type: "post", body: { content: "null" } }));
+    expect(await look()).toEqual({});
     feishu(item({ msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
     expect((await look()).text).toBe("[a image message, which I cannot read yet]");
   });

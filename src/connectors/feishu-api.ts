@@ -23,8 +23,8 @@ export async function forgetTenantAccessToken(env: Env, appId: string, token: st
   await registry(env).forgetFeishuToken(appId, token);
 }
 
-/** The app's tenant_access_token, cached in the registry until shortly before it expires. */
-export async function tenantAccessToken(env: Env, appId: string): Promise<string> {
+/** The app's tenant_access_token, cached in the registry until shortly before it expires. `signal` stops a request for a new one. */
+export async function tenantAccessToken(env: Env, appId: string, signal?: AbortSignal): Promise<string> {
   const app = await registry(env).feishuApp(appId);
   if (!app) throw new Error("unknown Feishu app");
   if (app.token && app.token_expires_at && app.token_expires_at - Date.now() > 5 * 60_000) return app.token;
@@ -32,6 +32,8 @@ export async function tenantAccessToken(env: Env, appId: string): Promise<string
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ app_id: app.app_id, app_secret: app.app_secret }),
+    // Given up when whoever asked no longer waits for it.
+    ...(signal ? { signal } : {}),
   });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
   if (!response.ok || result.code !== 0 || !result.tenant_access_token) throw new Error(`Feishu token request failed: ${response.status} code ${result.code} ${String(result.msg).slice(0, 200)}`);

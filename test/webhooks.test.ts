@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { call, installFakeModel, model, say, wake } from "./helpers";
+import { call, installFakeModel, model, modelCalls, say, wake } from "./helpers";
 
 beforeEach(() => installFakeModel());
 
@@ -199,10 +199,14 @@ describe("the Feishu webhook endpoint", () => {
   it("files and acknowledges a group reply without asking Feishu anything; the replied-to message is fetched for the Brain when it asks", async () => {
     const { t, appId } = await app();
     const asked: string[] = [];
-    let lapsed = 1;
+    let lapsed = 0;
     let issued = 0;
+    const modelFetch = globalThis.fetch;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input);
+      if (url.startsWith("https://model.test/")) return modelFetch(input, init);
+      // What the agent says back is no part of this either.
+      if (url.endsWith("/reply")) return Response.json({ code: 0, data: { message_id: "om_said" } });
       // The "got it" reaction on the message is no part of this; nor is which call asked for the app's token.
       if (url.endsWith("/reactions")) return Response.json({ code: 0, data: {} });
       if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: `t-${++issued}`, expire: 7200 });
@@ -215,13 +219,19 @@ describe("the Feishu webhook endpoint", () => {
     const body = message(appId, "om_r1", "@_user_1 look into it", "group", [mention]);
     expect(await (await deliver(appId, { ...body, event: { ...body.event, message: { ...body.event.message, parent_id: "om_parent" } } })).json()).toMatchObject({ accepted: true });
     expect(asked.filter((each) => each.startsWith("/im/v1/messages/om_parent"))).toEqual([]);
+    // The Brain asks through the connector as it takes the message up, and the model is shown what came back.
+    model.replies([say("ok")]);
+    await wake(brainFor(`${t}:chat:oc_group`));
+    expect(JSON.stringify(modelCalls.at(-1).input)).toContain("written as a reply to their own earlier message: \\\"the notes https://x.feishu.cn/docx/D1\\\"");
+    expect(asked.filter((each) => each.startsWith("/im/v1/messages/om_parent"))).toHaveLength(1);
     asked.length = 0;
+    lapsed = 1;
     const event = { principal: { kind: "human" as const, id: "ou_frank", explicit: true }, data: { replies_to: "feishu:message:om_parent", origin: { app_id: appId, tenant_key: "org" } } };
     expect(await quotedFeishu(env as any, { tenant: t, kind: "chat", id: "oc_group" }, event)).toEqual({ text: "the notes https://x.feishu.cn/docx/D1" });
     // Asked twice, the second time with a newer token.
     expect(asked).toHaveLength(2);
-    expect(asked[0]).toMatch(/^\/im\/v1\/messages\/om_parent as Bearer t-\d+$/);
-    expect(asked[1]).toMatch(/^\/im\/v1\/messages\/om_parent as Bearer t-\d+$/);
+    expect(asked[0]).toMatch(/^\/im\/v1\/messages\/om_parent\?user_id_type=open_id as Bearer t-\d+$/);
+    expect(asked[1]).toMatch(/^\/im\/v1\/messages\/om_parent\?user_id_type=open_id as Bearer t-\d+$/);
     expect(asked[1]).not.toBe(asked[0]);
     // Not in a direct chat, and not through an app of another tenant.
     asked.length = 0;

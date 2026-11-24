@@ -338,13 +338,13 @@ export async function quotedFeishu(env: Env, scope: Scope, event: { principal: {
   const app = await registry(env).feishuApp(origin.app_id);
   if (!app || app.tenant !== scope.tenant) return {};
   const who = { open_id: event.principal.id, tenant_key: origin.tenant_key };
-  const bearer = await tenantAccessToken(env, app.app_id);
+  const bearer = await tenantAccessToken(env, app.app_id, event.signal);
   const found = await quotedBy(bearer, app, scope.id, parent, who, event.signal);
   if (found !== "lapsed") return found;
   // The app's token lapsed before its time: forgotten, and the message asked for once more.
   await forgetTenantAccessToken(env, app.app_id, bearer);
   if (event.signal?.aborted) return {};
-  const again = await quotedBy(await tenantAccessToken(env, app.app_id), app, scope.id, parent, who, event.signal);
+  const again = await quotedBy(await tenantAccessToken(env, app.app_id, event.signal), app, scope.id, parent, who, event.signal);
   return again === "lapsed" ? {} : again;
 }
 
@@ -359,9 +359,10 @@ export async function quotedFeishu(env: Env, scope: Scope, event: { principal: {
 export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }, signal?: AbortSignal): Promise<Quoted | "lapsed"> {
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return {};
   try {
-    const response = await fetch(`${API}/im/v1/messages/${messageId}`, { headers: { authorization: `Bearer ${bearer}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000) });
+    const response = await fetch(`${API}/im/v1/messages/${messageId}?user_id_type=open_id`, { headers: { authorization: `Bearer ${bearer}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000) });
     const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { items?: any[] } };
     if (result.code === 99991663) return "lapsed";
+    // The sender's id is asked for as an open_id, which is what the asker is known by.
     // A forwarded bundle comes back as several messages: only the one asked for counts.
     const found = response.ok && result.code === 0 ? result.data?.items?.find((each) => each?.message_id === messageId) : undefined;
     const sender = found?.sender ?? {};
@@ -370,7 +371,8 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const content = JSON.parse(found.body.content);
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, app.bot_open_id) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
-    return { text: text.slice(0, MAX_QUOTED) };
+    // Nothing could be made of it: not something read.
+    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED) };
   } catch {
     return {};
   }
@@ -382,7 +384,7 @@ function flat(post: any): string {
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
   const piece = (each: any): string => {
     if (each?.tag === "text" || each?.tag === "md" || each?.tag === "code_block") return String(each.text ?? "");
-    if (each?.tag === "a") return each.text && each.text !== each.href ? `${String(each.text)} (${String(each.href ?? "")})` : String(each.href ?? "");
+    if (each?.tag === "a") return each.text && each.href && each.text !== each.href ? `${String(each.text)} (${String(each.href)})` : String(each.text || each.href || "");
     if (each?.tag === "at") return `${token(each.user_name)} `;
     return `[${String(each?.tag ?? "?")}]`;
   };

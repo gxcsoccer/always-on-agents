@@ -194,18 +194,30 @@ export class Runner {
    */
   async #quote(events: InboxRow[]): Promise<void> {
     const sessionId = events[0] ? (this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", events[0].session_key)[0]?.id ?? "") : "";
-    const unknown = events.flatMap((event) => {
+    // Asked about once for each person and message replied to, however many messages say so.
+    const unknown = new Map<string, { asking: { principal: Principal; data: Record<string, unknown> }; source: string; ids: number[] }>();
+    for (const event of events) {
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      return event.kind === "message" && typeof data.replies_to === "string" && data.quoted === undefined && this.#repliedTo(event, sessionId, []) === "" ? [{ event, data }] : [];
-    });
-    if (unknown.length === 0) return;
+      const principal = JSON.parse(event.principal) as Principal;
+      const subject = data.replies_to;
+      // Only a person's ordinary message, about a message there is no record of at all: not one
+      // that reached the agent (whoever wrote it, and whether or not its words are still kept),
+      // not one the agent or the system sent, and not an answer to a question.
+      if (event.kind !== "message" || principal.kind !== "human" || typeof subject !== "string" || data.quoted !== undefined || data.question !== undefined) continue;
+      if (this.#parentOf(event, subject) || this.#s.rows("SELECT 1 FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject).length > 0 || this.#repliedTo(event, sessionId, []) !== "") continue;
+      const key = JSON.stringify([event.source, principal.id, subject, data.origin ?? null]);
+      const same = unknown.get(key);
+      if (same) same.ids.push(event.id);
+      else unknown.set(key, { asking: { principal, data }, source: event.source, ids: [event.id] });
+    }
+    if (unknown.size === 0) return;
     const stop = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<Quoted>((resolve) => (timer = setTimeout(() => resolve({}), QUOTED_WAIT_MS)));
     await Promise.all(
-      unknown.map(async ({ event, data }) => {
-        const found = await Promise.race([this.#b.quoted(event.source, { principal: JSON.parse(event.principal) as Principal, data, signal: stop.signal }), late]).catch((): Quoted => ({}));
-        if (found) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text } : {}), event.id);
+      [...unknown.values()].map(async ({ asking, source, ids }) => {
+        const found = await Promise.race([this.#b.quoted(source, { ...asking, signal: stop.signal }), late]).catch((): Quoted => ({}));
+        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text } : {}), id);
       }),
     );
     clearTimeout(timer);

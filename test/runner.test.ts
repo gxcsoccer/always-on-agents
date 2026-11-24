@@ -139,6 +139,8 @@ function bench(state: DurableObjectState) {
   return { store, tenant, runner, host, settings, model, asked, results, outside, log, event, run, items, inbox, of, go };
 }
 
+afterEach(() => void vi.useRealTimers());
+
 describe("the run loop, by itself", () => {
   describe("claiming", () => {
     it("takes into one run only messages that reply to the same thing, leaving the next one pending", async () => {
@@ -279,6 +281,8 @@ describe("the run loop, by itself", () => {
         vi.useFakeTimers();
         event("a", { data: { replies_to: "feishu:message:om_p" } });
         event("b", { data: { replies_to: "feishu:message:om_p" }, principal: { kind: "human", id: "ou_2", explicit: true } });
+        // The same person again about the same message: asked about once for both.
+        event("a2", { data: { replies_to: "feishu:message:om_p" } });
         const taking = runner.next();
         await vi.advanceTimersByTimeAsync(10);
         expect(asked()).toEqual(["feishu:message:om_p", "feishu:message:om_p"]);
@@ -289,10 +293,44 @@ describe("the run loop, by itself", () => {
         vi.useRealTimers();
         // What no longer answers in time is told to stop.
         expect(signals.every((each) => each.aborted)).toBe(true);
-        expect(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", run).map((each) => each.text)).toEqual(["a", "b"]);
+        expect(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", run).map((each) => each.text)).toEqual(["a", "b", "a2"]);
         expect(store.rows<{ status: string }>("SELECT status FROM inbox WHERE text = 'c'")[0].status).toBe("pending");
         expect(items(run)[0].content).not.toContain("c\n");
         void release;
+      });
+    });
+
+    it("gives one answer to every message of the same person about the same message", async () => {
+      await within(async ({ runner, store, event, settings, log }) => {
+        settings.quoted = { text: "the notes" };
+        event("one", { data: { replies_to: "feishu:message:om_p" } });
+        event("two", { data: { replies_to: "feishu:message:om_p" } });
+        const run = (await runner.next())!;
+        expect(log.filter((each) => each[0] === "quoted")).toHaveLength(1);
+        expect(store.rows<{ data: string }>("SELECT data FROM inbox WHERE run_id = ?", run).map((each) => JSON.parse(each.data).quoted)).toEqual([{ text: "the notes" }, { text: "the notes" }]);
+      });
+    });
+
+    it("does not ask about a message that is on record, whoever wrote it and whatever is left of it, nor about an answer to a question", async () => {
+      await within(async ({ runner, store, event, items, settings, log }) => {
+        settings.quoted = { text: "fetched again" };
+        const next = async () => (store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'"), store.sql.exec("DELETE FROM meta WHERE key = 'active_run'"), items((await runner.next())!)[0].content as string);
+        // Someone else's message that reached the agent: already in the conversation.
+        event("from bob", { source_id: "om_bob", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
+        event("about that", { data: { replies_to: "feishu:message:om_bob" } });
+        expect(await next()).not.toContain("written as a reply");
+        // Their own, whose words are no longer kept: not brought back.
+        event("old", { source_id: "om_old", status: "done" });
+        store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");
+        event("about the old one", { data: { replies_to: "feishu:message:om_old" } });
+        expect(await next()).not.toContain("written as a reply");
+        // A question the system put (sent by no run), and a message filed as its answer.
+        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('ask1', ?, 'q', 'sent', 0, 0, 1, ?)", TARGET, JSON.stringify({ subject: "feishu:message:om_card", holder: "b" }));
+        event("yes", { data: { replies_to: "feishu:message:om_card" } });
+        expect(await next()).not.toContain("not shown to you");
+        event("yes", { data: { replies_to: "feishu:message:om_gone_card", question: "ask:1" } });
+        expect(await next()).not.toContain("not shown to you");
+        expect(log.filter((each) => each[0] === "quoted")).toEqual([]);
       });
     });
 
