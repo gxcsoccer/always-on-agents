@@ -81,9 +81,11 @@ export class RunTools {
         // A call that was told to wait has that for its answer, also when the run is replayed
         // after an interruption: the connector is not asked a second time, whatever has happened
         // since. Carrying the request on is another run's to do.
-        if (!carried && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) {
+        // The same for a call that was answered with a request another call of the run had already made.
+        const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${callId}`) ?? "null") as { request: string } | null)?.request;
+        if (!carried && (folded !== undefined || this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0)) {
           this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
-          return { waiting: true, request: callId, note: WAITING_NOTE };
+          return { waiting: true, request: folded ?? callId, note: WAITING_NOTE };
         }
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
@@ -156,12 +158,14 @@ export class RunTools {
             return result;
           }
           // Nothing was read. The answer the model gets is written here, not by the tool.
+          const kept = this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+          // Only once the request is kept: one that could not be is an ordinary failure of the call.
           waits = true;
           this.#b.outside.delete(callId);
           // From here the run can only reply and read again, as after reading: what it could not
           // read here it must not go and fetch some other way.
           if (!carried) this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
-          return this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+          return kept;
         } finally {
           // What this run has already written to send, and whatever it writes from here on.
           if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);

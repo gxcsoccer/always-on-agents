@@ -521,6 +521,8 @@ export class Runner {
       // What the run read, by the tool's own canonical call (never anything the model wrote, nor what came back): kept on the note below.
       const read = this.#b.requests.readsOf(runId);
       this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
+      // And its notes of calls answered with a request another call had made: no call of it is made again now.
+      this.#s.sql.exec("DELETE FROM meta WHERE key LIKE 'waited:%' AND json_valid(value) AND json_extract(value, '$.run') = ?", runId);
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.

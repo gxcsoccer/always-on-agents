@@ -402,6 +402,29 @@ describe("a run's tools", () => {
       });
     });
 
+    it("answers a call that was folded into a request already kept, when it is replayed, without asking the connector again: also once that request has ended", async () => {
+      await within(async ({ tools, tool, store }) => {
+        // As the requests part leaves it when the same thing was asked twice over: the second call's answer is the first's request.
+        store.setMeta("waited:c2", JSON.stringify({ request: "c1", run: "r1" }));
+        expect(await tools().connectorTool("c2", "feishu_read_document", {})).toMatchObject({ waiting: true, request: "c1" });
+        expect(tool.given).toEqual([]);
+        expect(store.rows("SELECT 1 FROM audit WHERE action = 'tool.used'")).toEqual([]);
+        expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBe("waited");
+      });
+    });
+
+    it("is not closed by a wait that could not be kept", async () => {
+      await within(async ({ tools, tool, host, store, outside }) => {
+        tool.answer = async () => ({ waiting: { on: "feishu", subject: "grant", condition: "c", generation: 1, until: Date.now() + 60_000, interaction: "int:1", request: {} } });
+        (host.requests as any).wait = () => {
+          throw new Error("there is nowhere to send a message in this conversation");
+        };
+        await expect(tools().connectorTool("c1", "feishu_read_document", {})).rejects.toThrow("nowhere to send");
+        expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBeNull();
+        expect(outside.has("c1")).toBe(true);
+      });
+    });
+
     describe("a tool that settles the matter itself", () => {
       it("ends the run for good and has the system say the one fixed line it named; nothing was read", async () => {
         await within(async ({ tools, tool, outside, of, store }) => {

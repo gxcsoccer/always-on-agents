@@ -822,6 +822,8 @@ describe("keeping a request that has to wait", () => {
         const said = (JSON.parse(kept("call_1").events) as { said: number[] }).said;
         const again = requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { ...acting, events: { said, recent: [] } }, "call_1b", "feishu_read_document", { ...waiting, privately: "here" });
         expect(again).toMatchObject({ waiting: true, request: "call_1" });
+        // Kept, so that the second call has this for its answer if it is made again after an interruption.
+        expect(JSON.parse(store.meta("waited:call_1b")!)).toEqual({ request: "call_1", run: "r1" });
         expect(store.rows("SELECT id FROM continuations")).toEqual([{ id: "call_1" }]);
         expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
         expect(hints().length).toBe(before);

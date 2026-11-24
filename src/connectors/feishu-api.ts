@@ -98,3 +98,16 @@ export async function chatFacts(bearer: string, chatId: string, signal?: AbortSi
     member: { status: member.status, ...(member.code === undefined ? {} : { code: member.code }), ...(typeof member.data.is_in_chat === "boolean" ? { is_in_chat: member.data.is_in_chat } : {}) },
   };
 }
+
+/**
+ * The same, with the app's own token. One Feishu says has lapsed before its time is forgotten
+ * and a fresh one asked with, once: a stale token is not taken for an answer about the chat.
+ */
+export async function chatFactsFor(env: Env, appId: string, chatId: string, named?: { name?: string }): Promise<ChatFacts> {
+  const LAPSED = 99991663;
+  const token = await tenantAccessToken(env, appId);
+  const first = await chatFacts(token, chatId, undefined, named);
+  if (first.info.code !== LAPSED && first.member.code !== LAPSED) return first;
+  await forgetTenantAccessToken(env, appId, token);
+  return chatFacts(await tenantAccessToken(env, appId), chatId, undefined, named);
+}

@@ -147,6 +147,8 @@ function installFakeFeishu() {
     if (aboutChat) {
       const chat = chats.get(aboutChat[1]);
       if (chat?.limited) return Response.json({ code: 99991400, msg: "too many" }, { status: 429 });
+      // The app's token lapsed before its time: said once for each of the two questions, then a fresh one works.
+      if (chat?.lapsedOnce && (chat as any).lapsed !== 2) return (((chat as any).lapsed = ((chat as any).lapsed ?? 0) + 1), Response.json({ code: 99991663, msg: "token" }, { status: 400 }));
       if (!chat || chat.fails) return Response.json({ code: 99991400, msg: "busy" }, { status: 500 });
       return aboutChat[2] ? Response.json({ code: 0, data: { is_in_chat: chat.botIn !== false } }) : Response.json({ code: 0, data: { name: "a chat's name", external: chat.external, tenant_key: chat.org ?? ORG, chat_mode: chat.mode ?? "group", chat_status: "normal" } });
     }
@@ -276,7 +278,7 @@ const rowsOf = (stub: any, query: string, ...args: unknown[]): Promise<any[]> =>
 /** Messages the bot was never sent, which Feishu hands over when asked for one by its id. */
 const quotable = new Map<string, { chat_id: string; open_id: string; text: string }>();
 /** The chats Feishu knows of in these tests, and what it says of each. */
-const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean }>();
+const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean; lapsedOnce?: boolean }>();
 
 /** A person writing to the bot in a chat several people share, through an app whose operator turned reading there on. */
 function inGroup(chatId: string, person: ReturnType<typeof someone>) {
@@ -2805,7 +2807,7 @@ describe("a sign that a message arrived", () => {
 describe("reading a document for the one who asked, where several people talk", () => {
   const turn = (on: boolean) => (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${APP_ID}/oauth`, { method: "POST", headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, body: JSON.stringify({ group_documents: on }) })) as Promise<Response>;
   let groups = 0;
-  const chat = (about: { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean } = { external: false }) => {
+  const chat = (about: { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; lapsedOnce?: boolean } = { external: false }) => {
     const id = `oc_g${++groups}`;
     chats.set(id, about);
     return id;
@@ -2950,6 +2952,44 @@ describe("reading a document for the one who asked, where several people talk", 
     model.replies([readCall("DocGroupFay0000000001")], [call("send_message", { text: "读了" })], [say("")]);
     await here.says("总结一下", "om_earlier_fay");
     expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupFay0000000001/raw_content"]);
+    expect(here.heard()).toEqual(["读了"]);
+  });
+
+  it("asks which is meant when the earlier message they reply to links several documents, and reads none of them", async () => {
+    const jo = someone();
+    feishu.docs.set("DocGroupJo00000000001", { readers: [jo.openId], text: "One." });
+    feishu.docs.set("DocGroupJo00000000002", { readers: [jo.openId], text: "Two." });
+    await authorised(jo, "DocGroupJo00000000001");
+    const id = chat();
+    const here = inGroup(id, jo);
+    quotable.set("om_earlier_jo", { chat_id: id, open_id: jo.openId, text: `看看 ${link("DocGroupJo00000000001")} 和 ${link("DocGroupJo00000000002")}` });
+    model.replies([readCall("DocGroupJo00000000002")], [call("send_message", { text: "哪一篇？" })], [say("")]);
+    await here.says("总结一下", "om_earlier_jo");
+    expect(feishu.reads).toEqual([]);
+    expect(toolOutputs()[0].error).toMatch(/links several documents/);
+  });
+
+  it("names the document on the card by the link the person wrote, not by whatever host the model wrote", async () => {
+    const kim = someone();
+    feishu.docs.set("DocGroupKim0000000001", { readers: [kim.openId], text: "Kim's." });
+    const id = chat();
+    const here = inGroup(id, kim);
+    quotable.set("om_earlier_kim", { chat_id: id, open_id: kim.openId, text: `看看 ${link("DocGroupKim0000000001")}` });
+    model.replies([call("feishu_read_document", { document: "https://made-up.feishu.cn/docx/DocGroupKim0000000001" })], [say("")]);
+    await here.says("总结一下", "om_earlier_kim");
+    const card = JSON.stringify(here.shown()[0].content);
+    expect(card).toContain(link("DocGroupKim0000000001"));
+    expect(card).not.toContain("made-up");
+  });
+
+  it("asks again with a fresh token of the app's when Feishu says the one it holds has lapsed, instead of taking the chat for unknown", async () => {
+    const lee = someone();
+    feishu.docs.set("DocGroupLee0000000001", { readers: [lee.openId], text: "Lee's." });
+    await authorised(lee, "DocGroupLee0000000001");
+    const id = chat({ external: false, lapsedOnce: true });
+    const here = inGroup(id, lee);
+    model.replies([readCall("DocGroupLee0000000001")], [call("send_message", { text: "读了" })], [say("")]);
+    await here.says(`读一下 ${link("DocGroupLee0000000001")}`);
     expect(here.heard()).toEqual(["读了"]);
   });
 

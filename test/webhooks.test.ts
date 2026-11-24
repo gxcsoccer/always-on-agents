@@ -268,7 +268,7 @@ describe("the Feishu webhook endpoint", () => {
     expect(JSON.stringify(asked[0].body.card)).toContain("accounts.feishu.cn");
     // Taken, even where Feishu does not say which message it became: a second one is never made for that.
     answer = () => Response.json({ code: 0, data: {} });
-    expect(await deliverFeishu(env as any, scope, here, message)).toEqual({ subject: "feishu:message:", holder: "" });
+    expect(await deliverFeishu(env as any, scope, here, message)).toBeUndefined();
     // Told to come back later: nothing was shown. Refused: nothing was shown. Anything else: no telling.
     answer = () => Response.json({ code: 99991400, msg: "too many" }, { status: 429 });
     expect(await deliverFeishu(env as any, scope, here, message).catch((error) => error)).toBeInstanceOf(DeliveryDeferred);

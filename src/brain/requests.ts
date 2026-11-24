@@ -179,7 +179,12 @@ export class Requests implements Wakes {
       : this.#s
           .rows<Continuation>("SELECT * FROM continuations WHERE status = 'waiting' AND session_id = ? AND person = ? AND connector = ? AND tool = ? AND interaction = ? AND args = ?", run.session_id, acting.person, acting.connector, tool, waiting.interaction, JSON.stringify(waiting.request))
           .find((each) => JSON.stringify([...(JSON.parse(each.events) as { said: number[] }).said].sort()) === JSON.stringify([...acting.events.said].sort()));
-    if (twice && !replacing) return { waiting: true, request: twice.id, note: WAITING_NOTE };
+    if (twice && !replacing) {
+      // Which request this call was answered with, kept: made again after an interruption it has
+      // the same answer, whatever has become of that request since (see RunTools.connectorTool).
+      this.#s.setMeta(`waited:${id}`, JSON.stringify({ request: twice.id, run: run.id }));
+      return { waiting: true, request: twice.id, note: WAITING_NOTE };
+    }
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
       // says from where the request verifiably came and who made it. The tool names no address.

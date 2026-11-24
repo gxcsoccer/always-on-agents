@@ -17,7 +17,7 @@
 import type { Env } from "../env";
 import { registry } from "../registry";
 import { type Scope, scopeName } from "../events";
-import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFacts, tenantAccessToken } from "./feishu-api";
+import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFactsFor } from "./feishu-api";
 import { OFFLINE, SCOPES, type Who, grantName, grantsKey, lifetime, sameSet } from "./feishu-grant";
 import { type ConnectorTool, type Holds, type ToolContext, type Waiting, isWaiting } from "./types";
 
@@ -50,11 +50,27 @@ export const readDocument: ConnectorTool = {
 
 /** The documents a person's message linked, as the connector recorded them when it arrived. */
 function documentsOf(message: { data: Record<string, unknown> }): DocumentRef[] {
-  // Its own, and those of the person's own earlier message it was written in reply to, where that
-  // had to be fetched (a group sends the agent only what mentions it): the connector recorded both.
+  return [...ownDocuments(message), ...quotedDocuments(message)];
+}
+
+const whole = <T extends DocumentRef>(each: T | undefined): each is T => Boolean(each) && (each!.kind === "docx" || each!.kind === "wiki") && typeof each!.token === "string" && /^[A-Za-z0-9]{10,64}$/.test(each!.token);
+
+/** The documents a message itself links. */
+function ownDocuments(message: { data: Record<string, unknown> }): DocumentRef[] {
+  return (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]) : []).filter(whole);
+}
+
+/**
+ * The documents linked by the person's own earlier message this one was written in reply to,
+ * where that had to be fetched (a group sends the agent only what mentions it): each with the
+ * link as written there, where the connector kept it. Not this message's own: what it points at.
+ */
+function quotedDocuments(message: { data: Record<string, unknown> }): (DocumentRef & { link?: string })[] {
   const quoted = (message.data.quoted as { documents?: unknown } | undefined)?.documents;
-  const all = [...(Array.isArray(message.data.documents) ? message.data.documents : []), ...(Array.isArray(quoted) ? quoted : [])] as DocumentRef[];
-  return all.filter((each) => each && (each.kind === "docx" || each.kind === "wiki") && typeof each.token === "string" && /^[A-Za-z0-9]{10,64}$/.test(each.token));
+  return (Array.isArray(quoted) ? (quoted as (DocumentRef & { link?: unknown })[]) : []).filter((each) => whole(each)).map((each) => {
+    const named = typeof each.link === "string" ? documentOf(each.link) : undefined;
+    return { kind: each.kind, token: each.token, ...(named && named.kind === each.kind && named.token === each.token ? { link: each.link as string } : {}) };
+  });
 }
 
 /**
@@ -187,26 +203,37 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // widen any of this, and neither can a word that merely looks like a document's id.
   const documents = documentsOf;
   const matches = (each: DocumentRef) => each.kind === target.kind && each.token === target.token;
-  const now = context.said.flatMap(documents);
+  // What this request itself links. What the message it replies to links is not that: it is
+  // what the reply points at, and is judged as such below.
+  const now = context.said.flatMap(ownDocuments);
   let chosen = now;
   // The messages that named the document read: the link recorded for it is the one written there.
   let naming: { text: string; data: Record<string, unknown> }[] = context.said;
   const repliedTo = context.said.map((message) => message.data.replies_to).filter((each): each is string => typeof each === "string");
   // Messages that link this very document: written now, and earlier.
-  const linkingNow = context.said.filter((message) => documents(message).some(matches));
+  const linkingNow = context.said.filter((message) => ownDocuments(message).some(matches));
+  // The link the person wrote for this document in a message they replied to that had to be fetched.
+  let quotedLink: string | undefined;
   const linkingEarlier = context.recent.filter((message) => documents(message).some(matches));
   if (now.length === 0 && repliedTo.length > 0 && !context.answering) {
     // Every message they replied to has to be one of their own, on record, and together they
     // have to name one document. Anything less does not say which document is meant, and what
     // they linked last is not read in its place. They point at it afresh each time.
-    const parents = [...new Set(repliedTo)].map((subject) => context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`));
-    const named = parents.flatMap((message) => (message ? documents(message) : []));
+    // On record here; or, where the agent was never sent it, as the connector fetched it for the message that replies to it.
+    const pointed = [...new Set(repliedTo)].map((subject) => {
+      const parent = context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`);
+      const fetched = parent ? [] : context.said.filter((message) => message.data.replies_to === subject).flatMap(quotedDocuments);
+      return { parent, links: parent ? ownDocuments(parent) : fetched, fetched };
+    });
+    const parents = pointed.map((each) => each.parent);
+    const named = pointed.flatMap((each) => each.links);
     const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
-    if (parents.some((message) => !message || documents(message).length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
+    if (pointed.some((each) => each.links.length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
     if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
     chosen = distinct;
+    quotedLink = pointed.flatMap((each) => each.fetched).find((each) => matches(each) && each.link)?.link;
     naming = parents.flatMap((each) => (each ? [each] : []));
-    for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
+    for (const each of parents) if (each) context.relied?.("recent", context.recent.indexOf(each));
     if (context.said.length === 1) context.relied?.("said", 0);
   } else {
     // A reply to one of the agent's answers, linking nothing new for this document: only the one
@@ -233,7 +260,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   }
   // Which of the messages just written name this document: a reply to one of those is about it.
   context.said.forEach((message, index) => {
-    if (documents(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
+    if (ownDocuments(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
   });
   // Where several people talk, the agent is sent only what mentions it: a link they posted without that never arrived.
   const shared = context.scope.kind === "chat";
@@ -258,7 +285,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     const named: { name?: string } = {};
     let facts: ChatFacts;
     try {
-      facts = await chatFacts(await tenantAccessToken(env, app.app_id), context.scope.id, undefined, named);
+      facts = await chatFactsFor(env, app.app_id, context.scope.id, named);
     } catch {
       facts = { info: { status: 0, missing: [] }, member: { status: 0 } };
     }
@@ -275,7 +302,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // As the person wrote it (their host) in the message that named it; the model's host only failing that.
   // The latest of those messages that links it, if several do.
   const theirs = [...naming].reverse().flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
-  const canonical = theirs?.link ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
+  const canonical = theirs?.link ?? quotedLink ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
   const grant = env.FEISHU_GRANTS.getByName(name);
   const { generation, credential, unreadable } = await grant.held();
   // The authorisation was taken away, or replaced, while this read was under way: what the old
@@ -422,10 +449,10 @@ export async function authorisationHolds(env: Env, scope: Scope, condition: stri
     const held = await env.FEISHU_GRANTS.getByName(part[1]).covers(needed, generation);
     if (held.state !== "holds") return held;
     // Could not be asked just now: the caller puts it off and asks again; it is not taken for a no.
-    const facts = await chatFacts(await tenantAccessToken(env, app.app_id), scope.id);
-    // Not answered, or told to come back later: not a no.
-    const unasked = (status: number) => status === 0 || status === 429 || status >= 500;
-    if (unasked(facts.info.status) || unasked(facts.member.status)) throw new Error("Feishu cannot be asked about the chat just now");
+    const facts = await chatFactsFor(env, app.app_id, scope.id);
+    // Not answered, told to come back later, or the app's own token turned away: not a no.
+    const unasked = (answer: { status: number; code?: number }) => answer.status === 0 || answer.status === 429 || answer.status >= 500 || answer.code === 99991663;
+    if (unasked(facts.info) || unasked(facts.member)) throw new Error("Feishu cannot be asked about the chat just now");
     return chatIs(facts, part[4]) === "internal" ? held : { state: "gone" };
   }
   const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);

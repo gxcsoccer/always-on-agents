@@ -19,9 +19,9 @@
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
-import { API, chatFacts, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
+import { API, chatFactsFor, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 export { type ChatFacts, chatFacts } from "./feishu-api";
-import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
+import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, linksIn, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
 import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
@@ -48,9 +48,9 @@ export const feishuConnector: Connector = {
     // What Feishu says about one chat, asked from here because the operator's own machine may not
     // reach Feishu: a few fixed facts, never a name, a member or a message.
     if (path[0] === "feishu-apps" && path[1] && path[2] === "chats" && path.length === 4 && method === "GET") {
-      if (!/^oc_[A-Za-z0-9]{1,64}$/.test(path[3])) return json({ error: "not a chat id" }, 400);
+      if (!/^oc_[A-Za-z0-9_-]{1,100}$/.test(path[3])) return json({ error: "not a chat id" }, 400);
       if (!(await registry(env).feishuApp(path[1]))) return json({ error: "unknown app" }, 404);
-      return json(await chatFacts(await tenantAccessToken(env, path[1]), path[3]));
+      return json(await chatFactsFor(env, path[1], path[3]));
     }
     // One person's authorisation to read their documents: whether it stands, and taking it away.
     if (path[0] === "feishu-grants" && path.length === 4 && (method === "GET" || method === "DELETE")) {
@@ -390,7 +390,8 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
     // In words the person typed, an address counts; a link counts for where it leads, never for what it shows.
-    const linked = found.msg_type === "post" ? linkedIn(content) : documentsIn(text);
+    // Taken from what was written, as for a message that arrives; a message of another kind links nothing.
+    const linked = found.msg_type === "text" ? linksIn(String(content.text ?? "")) : found.msg_type === "post" ? linkedIn(content) : [];
     const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
     return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}) };
@@ -400,11 +401,15 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
 }
 
 /** The documents a rich-text message links: addresses written in its plain words, and where its links lead. */
-function linkedIn(post: any): DocumentRef[] {
+function linkedIn(post: any): (DocumentRef & { link: string })[] {
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
-  const piece = (each: any): DocumentRef[] => {
-    if (each?.tag === "a") return typeof each.href === "string" ? [documentOf(each.href)].flatMap((found) => found ?? []) : [];
-    return each?.tag === "text" || each?.tag === "md" ? documentsIn(String(each.text ?? "")) : [];
+  const piece = (each: any): (DocumentRef & { link: string })[] => {
+    // Where the link leads, down to its path, as a written one is kept.
+    if (each?.tag === "a") {
+      const found = typeof each.href === "string" ? documentOf(each.href) : undefined;
+      return found ? [{ ...found, link: `${new URL(each.href).origin}/${found.kind}/${found.token}` }] : [];
+    }
+    return each?.tag === "text" || each?.tag === "md" ? linksIn(String(each.text ?? "")) : [];
   };
   return ((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap(piece) : []));
 }
@@ -533,7 +538,8 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // something to count as delivered.
   // (A card shown to one person was taken all the same: there is no finding it again, and no second one is made for that.)
   if (!result.data?.message_id && !only) throw new Error("Feishu accepted the message without naming it");
-  return { subject: `feishu:message:${result.data?.message_id ?? ""}`, holder: "" };
+  if (!result.data?.message_id) return undefined;
+  return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
 }
 
 /** Feishu's limit for a post, in bytes of the request, with a margin. */
