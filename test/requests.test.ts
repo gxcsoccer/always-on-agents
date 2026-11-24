@@ -837,13 +837,23 @@ describe("keeping a request that has to wait", () => {
         expect(() => requests.shown(invite() as never, "failed")).not.toThrow();
         expect(kept("call_1").direct).toBe(2);
         expect(sent("invite:grant_1.nonce:direct")).toBeUndefined();
+        // Nothing is said yet where they asked: it is still going to them directly, and that is what will be said.
+        expect(sent(told("grant_1.nonce", "call_1"))).toBeUndefined();
+        // And it is looked at again soon, by itself, well before the request's time is up.
+        const next = requests.nextWakeAt(Date.now())!;
+        expect(next - Date.now()).toBeLessThanOrEqual(5_000);
+        expect(kept("call_1").until - next).toBeGreaterThan(60_000);
         host.enqueueMessage = enqueue;
         requests.deadlines(Date.now());
         requests.deadlines(Date.now());
         expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL ORDER BY id")).toEqual([{ idem: "invite:grant_1.nonce" }, { idem: "invite:grant_1.nonce:direct" }]);
         expect(kept("call_1").direct).toBe(1);
-        // Shown, as far as anyone looking can tell, once that one has arrived.
+        // Made up for: nothing more to look at before the request's own time.
+        expect(requests.nextWakeAt(Date.now())).toBe(kept("call_1").until);
+        // Shown, as far as anyone looking can tell, once that one has arrived; and where they asked is told that, in one line.
         store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.shown(sent("invite:grant_1.nonce:direct") as never, "reached");
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: "notice:invitedElsewhere" });
         expect(requests.waits().find((each) => each.id === "call_1")).toMatchObject({ shown: true });
       });
       // Not for one whose outcome is unknown, nor for a request that has ended.

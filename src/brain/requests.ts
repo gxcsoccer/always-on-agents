@@ -124,6 +124,8 @@ export class Requests implements Wakes {
       const ahead = looks.filter((at) => at > now);
       candidates.push(ahead.length === looks.length ? Math.min(...ahead) : Math.min(now + 60_000, ...ahead));
     }
+    // And soon, where going to someone directly is still to be written down (see `deadlines`).
+    if (this.#unredirected(now).length > 0) candidates.push(now + 2_000);
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
@@ -282,16 +284,28 @@ export class Requests implements Wakes {
     // Shown where they asked, for them alone, and certainly not arrived: it goes to them
     // directly instead. Once: from then on it is a way in sent somewhere else, and how that
     // goes is said as for any such. The one that failed is left as it is.
-    if (how === "failed") {
-      for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) this.#redirect(waiting);
-      // Those just moved wait for word of the new one; the rest are told below.
-      // (Word of the first one's failure says nothing more once the second exists, however that one fares.)
-      if (String(row.idem) === `invite:${row.interaction}` && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `invite:${row.interaction}:direct`).length > 0) {
-        for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) this.#tell(waiting, how);
-        return;
+    const original = String(row.idem) === `invite:${row.interaction}`;
+    const directly = (waiting: Continuation) => (JSON.parse(waiting.events) as { directly?: Target }).directly !== undefined;
+    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) {
+      // One with somewhere to go directly is on its way there, now or at the next look: what
+      // became of the first try is not said. What is said is how the second one fares.
+      if (how === "failed" && waiting.direct === 2 && directly(waiting)) {
+        this.#redirect(waiting);
+        continue;
       }
+      if (original && waiting.direct === 1 && directly(waiting)) continue;
+      this.#tell(waiting, how);
     }
-    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) this.#tell(waiting, how);
+  }
+
+  /** Requests still waiting, in time, whose way in was certainly not shown where they asked and has not yet been sent to them directly although it can be. */
+  #unredirected(now: number): Continuation[] {
+    return this.#s
+      .rows<Continuation>(
+        "SELECT c.* FROM continuations c JOIN outbox o ON o.idem = 'invite:' || c.interaction WHERE c.status = 'waiting' AND c.direct = 2 AND c.until > ? AND o.status = 'dead' AND o.uncertain = 0 AND NOT EXISTS (SELECT 1 FROM outbox d WHERE d.idem = 'invite:' || c.interaction || ':direct')",
+        now,
+      )
+      .filter((each) => (JSON.parse(each.events) as { directly?: Target }).directly !== undefined);
   }
 
   /**
@@ -310,8 +324,7 @@ export class Requests implements Wakes {
       });
       return true;
     } catch {
-      // Looked at again shortly, whatever else is or is not due by then.
-      void this.#b.wakeBy(Date.now() + 2_000).catch(() => undefined);
+      // Looked at again shortly (see nextWakeAt).
       return false;
     }
   }
@@ -377,11 +390,7 @@ export class Requests implements Wakes {
   deadlines(now: number): void {
     // A way in certainly not shown where the person asked, whose going to them directly instead
     // was not written down when that was found out: done now, for requests still waiting in time.
-    for (const waiting of this.#s.rows<Continuation>(
-      "SELECT c.* FROM continuations c JOIN outbox o ON o.idem = 'invite:' || c.interaction WHERE c.status = 'waiting' AND c.direct = 2 AND c.until > ? AND o.status = 'dead' AND o.uncertain = 0 AND NOT EXISTS (SELECT 1 FROM outbox d WHERE d.idem = 'invite:' || c.interaction || ':direct')",
-      now,
-    ))
-      this.#redirect(waiting);
+    for (const waiting of this.#unredirected(now)) this.#redirect(waiting);
     for (const waiting of this.#s.rows<Continuation & { check_at: number | null }>("SELECT * FROM continuations WHERE status = 'waiting' AND (until <= ? OR check_at <= ?)", now, now)) {
       if (waiting.check_at != null && waiting.check_at <= now) {
         this.#s.sql.exec("UPDATE continuations SET check_at = NULL WHERE id = ?", waiting.id);
