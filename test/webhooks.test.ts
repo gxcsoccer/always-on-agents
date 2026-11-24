@@ -286,6 +286,10 @@ describe("the Feishu webhook endpoint", () => {
     expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: appId, chat_id: "oc_group", message_id: "om_q" } })).toEqual(here);
     expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: "cli_other", chat_id: "oc_group" } })).toBeUndefined();
     expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: appId, open_id: "ou_frank" } })).toBeUndefined();
+    // What a message sent to an address is written under: the message a reply in a chat names, and nothing else.
+    const under = feishuConnector.channel!.under!;
+    expect(under({ connector: "feishu", address: { app_id: appId, chat_id: "oc_group", message_id: "om_q" } })).toBe("feishu:message:om_q");
+    expect([{ app_id: appId, chat_id: "oc_group" }, { app_id: appId, open_id: "ou_frank" }, { app_id: appId, chat_id: "oc_group", message_id: "om_q", thread: "1" }, { app_id: appId, chat_id: "oc_group", visible_to: "ou_frank" }, { app_id: appId, chat_id: "oc_group", message_id: "not an id!" }].map((address) => under({ connector: "feishu", address: address as any }))).toEqual([undefined, undefined, undefined, undefined, undefined]);
     const window = feishuConnector.channel!.dedupeMs as (target: any) => number;
     expect([window(here), window({ connector: "feishu", address: { app_id: appId, chat_id: "oc_group" } })]).toEqual([0, 3_600_000]);
   });

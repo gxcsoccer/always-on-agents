@@ -300,6 +300,11 @@ export interface Channel {
    */
   aside?(origin: Record<string, string>, person: string, from: Target): Target | undefined;
   /**
+   * The message something sent to this address is written under, named as a message's
+   * `data.replies_to` names it; undefined where it is under nothing. From the address alone.
+   */
+  under?(target: Target): string | undefined;
+  /**
    * The message this one was written in reply to, where the Brain was never sent it (a group
    * sends the agent only what mentions it). Asked once, before the run that takes the message
    * up, with a limit on how long it may take; nothing depends on it. Its words are given only
@@ -442,6 +447,10 @@ export interface Quoted {
   text?: string;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
-  /** What that message was itself written in reply to, named as a message's `data.replies_to` names it. Only for the person's own. */
+  /**
+   * What that message was itself written in reply to, named as a message's `data.replies_to`
+   * names it. Also given, alone, for a message that is not the person's own: nothing of what it
+   * says, only where it points, so the chain of replies can be followed past it.
+   */
   replies_to?: string;
 }

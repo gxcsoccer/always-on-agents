@@ -111,6 +111,15 @@ export function aside(name: string, origin: Record<string, string>, person: stri
   }
 }
 
+/** The message something sent to this address is written under, where the connector says. */
+export function under(target: Target): string | undefined {
+  try {
+    return byName.get(target.connector)?.channel?.under?.(target);
+  } catch {
+    return undefined;
+  }
+}
+
 /** The message one was written in reply to, where the connector can fetch it. Never throws; undefined where it does not apply. */
 export async function quoted(env: Env, name: string, scope: Scope, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined> {
   const ask = byName.get(name)?.channel?.quoted;
