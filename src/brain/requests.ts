@@ -5,6 +5,7 @@
  */
 import { type ApprovalQuestion, type CodeReview, type Holds, type Outcome, type Receipt, type Waiting, holds } from "../connectors";
 import type { Env } from "../env";
+import { isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
 import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
@@ -293,7 +294,9 @@ export class Requests implements Wakes {
       this.#s.sql.exec("UPDATE continuations SET status = 'resuming', run_id = ?, call_id = ?, claimed_at = ? WHERE id = ?", runId, callId, Date.now(), id);
       // Whose request it is, worked out again from what they wrote, not remembered.
       const basis = this.basis(runId);
-      if (basis.length === 0 || !this.#b.actingFor(runId)) {
+      // And it has to be the person it was kept for.
+      const acting = basis.length === 0 ? undefined : this.#b.actingFor(runId);
+      if (!acting || (now.person != null && now.person !== acting.person)) {
         this.endRequest(id, "void", "what the person asked is no longer on record, or no longer theirs to ask here");
         return drop();
       }
@@ -396,7 +399,9 @@ export class Requests implements Wakes {
    * can call off, another's.
    */
   cancellable(sessionId: string, person?: string): Continuation[] {
-    return this.#s.rows<Continuation>("SELECT * FROM continuations WHERE session_id = ? AND status IN ('waiting', 'resuming', 'answering') AND (? IS NULL OR person IS NULL OR person = ?) ORDER BY created_at", sessionId, person ?? null, person ?? null).filter(
+    // One kept before its person was recorded is taken as theirs only in a private conversation, which has one person.
+    const legacy = isPrivateSession(this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", sessionId)[0]?.session_key ?? "") ? 1 : 0;
+    return this.#s.rows<Continuation>("SELECT * FROM continuations WHERE session_id = ? AND status IN ('waiting', 'resuming', 'answering') AND (? IS NULL OR person = ? OR (? = 1 AND person IS NULL)) ORDER BY created_at", sessionId, person ?? null, person ?? null, legacy).filter(
       (each) => each.status !== "answering" || this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'pending' AND started = 0", `answer:${each.id}`).length > 0,
     );
   }
@@ -465,7 +470,9 @@ export class Requests implements Wakes {
       this.endRequest(chosen.id, "cancelled", calledOff(by));
       this.#s.sql.exec("UPDATE outbox SET status = 'void', text = '', review = NULL, error = NULL WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", `answer:${chosen.id}`);
       if (choosing !== undefined) {
-        const which = askedWhich(chosen.session_id, chosen.person);
+        // Under the person who chose: the writer of the message that did, where the request itself was kept before its person was recorded.
+        const chooser = this.#s.rows<{ id: string | null }>("SELECT json_extract(principal, '$.id') AS id FROM inbox WHERE id = ?", choosing)[0]?.id;
+        const which = askedWhich(chosen.session_id, chosen.person ?? chooser);
         const asked = JSON.parse(this.#s.meta(which) ?? "null") as Record<string, unknown> | null;
         if (asked) this.#s.setMeta(which, JSON.stringify({ ...asked, chose: choosing }));
       }

@@ -268,8 +268,14 @@ export const MIGRATIONS: string[] = [
   // 26: whose request a waiting request is. Where several people share a conversation, each
   // person's requests are listed, called off and answered apart from everyone else's. Those kept
   // before this are given the writer of the first message they rest on, where it is still on record.
+  // A "which one?" already put to a person is carried over to that person, with what it asked
+  // about and whether it has been answered; one whose person cannot be told is dropped.
   `ALTER TABLE continuations ADD COLUMN person TEXT;
-   UPDATE continuations SET person = (SELECT json_extract(i.principal, '$.id') FROM inbox i WHERE i.id = json_extract(continuations.events, '$.said[0]'));`,
+   UPDATE continuations SET person = (SELECT json_extract(i.principal, '$.id') FROM inbox i WHERE i.id = json_extract(continuations.events, '$.said[0]'));
+   INSERT OR IGNORE INTO meta (key, value)
+     SELECT m.key || ':' || c.person, m.value FROM meta m JOIN continuations c ON c.id = json_extract(m.value, '$.ids[0]')
+     WHERE m.key LIKE 'asked_which:%' AND m.key NOT LIKE 'asked_which:%:%' AND c.person IS NOT NULL;
+   DELETE FROM meta WHERE key LIKE 'asked_which:%' AND key NOT LIKE 'asked_which:%:%';`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
