@@ -195,8 +195,10 @@ export interface ToolContext {
    * written from that the person linked themselves among `said` and `recent`, as this tool's
    * canonical call; absent when there is no such single thing (written from nothing read, from
    * several, or from one no longer in reach), in which case nothing is to be read on its strength.
+   * `nothing`: every answer replied to was written without anything being read. Such an answer
+   * points at nothing, so the reply is as any other message of the person's.
    */
-  answering?: { source?: Record<string, unknown> };
+  answering?: { source?: Record<string, unknown>; nothing?: true };
   /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
   /**
