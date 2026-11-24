@@ -205,16 +205,18 @@ export class Runner {
     const sessionId = this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", event.session_key)[0]?.id ?? "";
     const replied: number[] = [];
     const chain: Link[] = [];
-    this.#repliedTo(event, sessionId, replied, chain);
+    const note = this.#repliedTo(event, sessionId, replied, chain);
     // In the units the messages themselves are measured in (sizeOf), with room for what is written around each when it is shown.
     const words = (id: number) => (this.#s.rows<{ text: string }>("SELECT text FROM said WHERE outbox_id = ?", id)[0]?.text.length ?? 0) + SHOWN_AROUND;
     return [
+      // What is written into the turn itself about what the message replies to.
+      { key: `note:${event.id}`, size: note.length },
       ...replied.map((id) => ({ key: `said:${id}`, size: words(id) })),
       ...chain.map((each) => {
         if (each.kind === "said") return { key: `said:${each.id}`, size: words(each.id) };
         if (each.kind === "inbox") return { key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + MAX_LINKS_TEXT + SHOWN_AROUND };
         // Kept with the message itself, so already measured with it (sizeOf counts its data): only what is written around it.
-        return { key: each.kind === "fetched" ? `fetched:${each.event}:${each.level}` : `${each.kind}:${event.id}`, size: SHOWN_AROUND };
+        return { key: each.kind === "fetched" ? `fetched:${each.event}:${each.level}` : `${each.kind}:${event.id}`, size: 200 };
       }),
     ];
   }
@@ -236,7 +238,8 @@ export class Runner {
   #repliedDirectly(event: InboxRow, sessionId: string, subject: string, replied: number[], chain: Link[]): string {
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
-    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))})`;
+    // (Where its words are cut short, the links beyond the cut are named too: any of them may be what is meant.)
+    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))}${parent.text.length > 500 ? linked(addressesIn(parent.text.slice(200))).replace("\n", " ") : ""})`;
     // Words of the agent's that reached the person in this very conversation: pointed at, and
     // shown to the model as the agent's own when the transcript is put together, while they are kept.
     const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];

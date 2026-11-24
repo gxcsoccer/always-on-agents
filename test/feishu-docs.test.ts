@@ -3135,6 +3135,34 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(feishu.reads).toHaveLength(1);
   });
 
+  it("carries on a request that rested on what was linked lately when it was made, however that looks once the person has authorised", async () => {
+    const una = someone();
+    feishu.docs.set("DocGroupUna0000000001", { readers: [una.openId], text: "Una's notes." });
+    const id = chat();
+    const here = inGroup(id, una);
+    // Her own message with the link, never sent to the bot; she replies to it, and then asks about it in a message of its own.
+    quotable.set("om_notes_una", { chat_id: id, open_id: una.openId, text: `笔记 ${link("DocGroupUna0000000001")}` });
+    model.replies([call("send_message", { text: "好的" })], [say("")]);
+    await here.says("先记一下", "om_notes_una");
+    model.replies([readCall("DocGroupUna0000000001")], [say("")]);
+    await here.says("请读刚才那篇");
+    expect(here.shown()).toHaveLength(1);
+    expect((await here.requests()).map((each) => each.status)).toEqual(["waiting"]);
+    // By the time she authorises, the day is over; and (as an earlier version kept it) when that message was written is not on record at all.
+    await rowsOf(here.stub, "UPDATE inbox SET data = json_remove(data, '$.quoted.at') WHERE json_extract(data, '$.quoted') IS NOT NULL");
+    carriesOn("读好了");
+    expect((await consent(linkOn(here.shown()[0].content), una)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupUna0000000001/raw_content"]);
+    expect(here.heard().at(-1)).toBe("读好了");
+    // A new message of hers gets nothing from evidence kept that way.
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupUna0000000001")], [call("send_message", { text: "请贴链接" })], [say("")]);
+    await here.says("再读一遍");
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked/);
+    expect(feishu.reads).toEqual([]);
+  });
+
   it("reads, for a reply to an answer of the agent's, also another document the person linked further up that chain, as the model names", async () => {
     const tom = someone();
     for (const doc of ["DocGroupTom0000000001", "DocGroupTom0000000002", "DocGroupTom0000000003"]) feishu.docs.set(doc, { readers: [tom.openId], text: `text of ${doc}` });

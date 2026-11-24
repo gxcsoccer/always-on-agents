@@ -44,7 +44,8 @@ export const readDocument: ConnectorTool = {
   run: reported,
   links: (message, request) => {
     const target = documentOf(String(request.document ?? ""));
-    return target !== undefined && documentsOf(message).some((each) => each.kind === target.kind && each.token === target.token);
+    // By the same measure a new request is read by: an answer is not said to be written from something they could not have read again now.
+    return target !== undefined && linkedLately(message).some((each) => each.kind === target.kind && each.token === target.token);
   },
 };
 
@@ -254,7 +255,11 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const linkingNow = context.said.filter((message) => ownDocuments(message).some(matches));
   // The link the person wrote for this document in a message they replied to that had to be fetched.
   let quotedLink: string | undefined;
-  const linkingEarlier = context.recent.filter((message) => linkedLately(message).some(matches));
+  // What counted as linked lately is judged when the request is made. One being carried on
+  // rests on the very messages kept for it then (the Brain hands back exactly those), as they
+  // were taken then: time that has passed while the person authorised changes nothing.
+  const lately = context.resuming ? documentsOf : linkedLately;
+  const linkingEarlier = context.recent.filter((message) => lately(message).some(matches));
   // What the chain of replies leads back to, of their own linking. Where it holds several
   // documents, which is meant is the model's to say from what it is shown: any of them can be read.
   const led = ledBackTo(context);
@@ -276,8 +281,9 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     // Also where it replies to an answer of the agent's: what the person linked up the chain is theirs to have read.
     fromChain();
   } else {
-    // A reply to one of the agent's answers, linking nothing new for this document: only the one
-    // thing that answer was written from and the person can still point at, if there is one.
+    // A reply to one of the agent's answers, linking nothing new for this document, and nothing
+    // of theirs up its chain names it either: the one thing that answer was written from and
+    // the person can still point at, if there is one.
     // (One that read nothing points at no document: the reply is then an ordinary request.)
     if (context.answering && !context.answering.nothing && linkingNow.length === 0) {
       const source = documentOf(String(context.answering.source?.document ?? ""));

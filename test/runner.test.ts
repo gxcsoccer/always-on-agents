@@ -1098,6 +1098,15 @@ describe("the run loop, by itself", () => {
         });
       });
 
+      it("names the links at the end of a long message of their own that they reply to directly, although its words are cut short", async () => {
+        await within(async (b) => {
+          b.event(`${"背景".repeat(400)} https://x.feishu.cn/docx/DocTailA0000000001 https://x.feishu.cn/docx/DocTailB0000000001`, { source_id: "om_long", status: "done" });
+          b.event("读第二篇", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_long" } });
+          await b.go();
+          expect(String(b.asked[0].input.at(-1)!.content)).toContain("(links in it: https://x.feishu.cn/docx/DocTailA0000000001 https://x.feishu.cn/docx/DocTailB0000000001)");
+        });
+      });
+
       it("shows an answer of the agent's once where one message replies to it and another leads back to it", async () => {
         await within(async (b) => {
           earlier(b, "r0", "summarise A");
@@ -1152,7 +1161,7 @@ describe("the run loop, by itself", () => {
             const taken = (await b.runner.next())!;
             return b.inbox().filter((row) => row.run_id === taken).length;
           });
-        expect(await burst("x".repeat(8_000), 36_000)).toBe(3);
+        expect(await burst("x".repeat(8_000), 35_000)).toBe(3);
         expect(await burst("x".repeat(8_000), 38_000)).toBe(2);
         expect(await burst("🙂".repeat(4_000), 38_000)).toBe(2);
         // Two messages taken up together that lead to the same answer: its words are shown once.
