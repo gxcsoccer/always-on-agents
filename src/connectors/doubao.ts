@@ -392,26 +392,30 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   // answer for the same key and words, so a second try after silence does not do it twice.
   await grant.advance(context.callId, "submitting");
   const contents = [{ type: "text", text: op.text }];
-  const send = () => (op.fresh ? asPerson(token, "POST", "/sessions", { uuid: op.uuid, initial_events: [{ type: "user.message", contents }] }) : asPerson(token, "POST", `/sessions/${encodeURIComponent(op.session!)}/events`, { uuid: op.uuid, events: [{ type: "user.message", contents }] }));
-  // It was already being sent once (this call is made again after an interruption), or the first try brought no answer.
-  let again = op.stage === "submitting";
+  // It was already being sent once (this call is made again after an interruption): it may have been taken then.
+  let maybeTaken = op.stage === "submitting";
   let sent: Awaited<ReturnType<typeof asPerson>> | undefined;
   for (let tries = 0; tries < 2 && !sent; tries++) {
-    // Not past its time, on any try. And only while everything it was asked under still stands,
-    // asked now: the same authorisation, the same pairing, the very token.
-    if (late()) break;
-    const still = tries === 0 ? undefined : await grant.held();
-    if (still && (still.generation !== op.generation || still.pairing !== op.pairing || still.version !== version)) break;
+    // The last thing before each send, with nothing waited for in between: everything it was
+    // asked under still stands, asked now (the same authorisation, the same pairing, a token
+    // that is still good), and then that its time is not up.
+    const now = await grant.held();
+    if (now.generation !== op.generation || now.pairing !== op.pairing || !now.token || now.version !== version || late()) break;
+    const going = op.fresh ? asPerson(now.token, "POST", "/sessions", { uuid: op.uuid, initial_events: [{ type: "user.message", contents }] }) : asPerson(now.token, "POST", `/sessions/${encodeURIComponent(op.session!)}/events`, { uuid: op.uuid, events: [{ type: "user.message", contents }] });
     try {
-      const got = await send();
-      if (got.status >= 500 || got.status === 429) again = true;
+      const got = await going;
+      // No answer worth the name: it may have been taken.
+      if (got.status >= 500 || got.status === 429) maybeTaken = true;
       else sent = got;
     } catch {
-      again = true;
+      maybeTaken = true;
     }
   }
+  const again = maybeTaken;
   if (!sent) {
-    // Tried, and not known to have failed: it may have been taken.
+    // Never sent at all (what it rested on changed, or its time ran out, before the first try): said as that.
+    if (!maybeTaken) return await grant.advance(context.callId, "failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
+    // Tried, and not known to have failed.
     await grant.advance(context.callId, "lost");
     return { error: UNCERTAIN };
   }
