@@ -91,7 +91,8 @@ export interface RequestsHost {
 }
 
 /** The one person a run acts for, and their own messages it rests on. */
-export type Acting = { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] };
+/** `shared` is set where the conversation is one several people share: only tools that say they may be used there are. */
+export type Acting = { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] };
 
 export class Requests implements Wakes {
   readonly #s: BrainStore;

@@ -1177,6 +1177,83 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    describe("where several people talk", () => {
+      const SHARED = { name: "feishu_read_document", effect: "read", shared: true, description: "", parameters: {} } as unknown as ConnectorTool;
+      const OWN_ONLY = { name: "feishu_own_only", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool;
+      const HERE = { origin: ORIGIN, shared: true };
+      const asks = (b: ReturnType<typeof bench>, text: string, over: Record<string, unknown> = {}) => b.event(text, { session_key: "chat", data: HERE, ...over } as never);
+
+      it("is the one person whose ordinary messages to the agent started the run, where the connector says its tools may be used", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED, OWN_ONLY];
+          const mine = asks(b, "the link", { status: "done", received_at: Date.now() - 60_000 });
+          // Someone else's, another conversation's, and one from before the connector said so: not among what this person said here.
+          asks(b, "another link", { status: "done", received_at: Date.now() - 50_000, principal: { kind: "human", id: "ou_2", explicit: true } });
+          asks(b, "in a thread", { status: "done", received_at: Date.now() - 40_000, session_key: "thread:om_t" });
+          asks(b, "before", { status: "done", received_at: Date.now() - 30_000, data: { origin: ORIGIN } });
+          asks(b, "summarise it");
+          const id = (await b.runner.next())!;
+          expect(b.runner.actingFor(id)).toEqual({ connector: "feishu", person: PERSON, origin: ORIGIN, shared: true, said: [{ text: "summarise it", data: HERE }], recent: [{ text: "the link", data: HERE }], recentIds: [mine] });
+          // Only the tools that say they may be used where several people talk are offered, and may be used.
+          await b.runner.execute(id);
+          expect(b.asked[0].tools.map((each) => each.name).filter((name) => name.startsWith("feishu_"))).toEqual(["feishu_read_document"]);
+          void OWN_ONLY;
+        }, "chat:oc_1");
+      });
+
+      it("is nobody unless the connector says so on every message, the person addressed the agent, and it is one person in one conversation", async () => {
+        const cases: Record<string, unknown>[] = [
+          { data: { origin: ORIGIN } },
+          { data: { origin: ORIGIN, direct: true } },
+          { data: { ...HERE, card: "x" } },
+          { data: { ...HERE, question: "ask:1" } },
+          { data: { ...HERE, about_question: true } },
+          { data: { shared: true } },
+          { principal: { kind: "human", id: PERSON, explicit: false } },
+          { principal: { kind: "human", id: PERSON, explicit: true, unlinked: true } },
+          { kind: "timer.fired", principal: { kind: "timer", id: "t", explicit: false } },
+        ];
+        for (const over of cases) {
+          await within(async (b) => {
+            b.settings.connectorTools = [SHARED];
+            asks(b, "hello", over);
+            const id = (await b.runner.next())!;
+            expect(b.runner.actingFor(id)).toBeUndefined();
+          }, "chat:oc_1");
+        }
+        // No tool of the connector's says it may be used here.
+        await within(async (b) => {
+          b.settings.connectorTools = [OWN_ONLY];
+          asks(b, "hello");
+          expect(b.runner.actingFor((await b.runner.next())!)).toBeUndefined();
+        }, "chat:oc_1");
+        // In a person's own scope the mark means nothing: it is their private conversation or nothing.
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          asks(b, "hello");
+          expect(b.runner.actingFor((await b.runner.next())!)).toBeUndefined();
+        });
+      });
+
+      it("shows what a turn that read said afterwards only to a run that itself acts for someone there", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', 'chat', 1, 1)");
+          b.store.sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES ('old', 's0', 'done', 1)");
+          b.runner.append("s0", "old", { role: "user", content: "summarise the doc" });
+          b.store.sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES ('s0', 99, 'old', 0, ?, 2)", JSON.stringify({ role: "assistant", content: "[note]" }));
+          b.store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (1, 'old', 's0', 'the doc says three things', 1, '[]')");
+          // Not marked by the connector: the run acts for nobody, and is not shown those words.
+          asks(b, "what about it?", { data: { origin: ORIGIN } });
+          await b.go();
+          expect(JSON.stringify(b.asked[0].input)).not.toContain("three things");
+          asks(b, "and now?");
+          await b.go();
+          expect(JSON.stringify(b.asked[1].input)).toContain("the doc says three things");
+        }, "chat:oc_1");
+      });
+    });
+
     it("is nobody outside a person's own scope, without connector tools, or for anything but their plain messages", async () => {
       const cases: [string, Record<string, unknown>][] = [
         ["a button press", { data: { direct: true, origin: ORIGIN, card: "x" } }],

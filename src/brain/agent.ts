@@ -138,6 +138,7 @@ export class BrainAgent extends DurableObject<Env> {
     this.#outbox = new Outbox(this.#store, {
       deliver: (target, message) => deliver(this.env, this.#store.scope(), target, message),
       sawOutside: (runId) => this.#runner.sawOutside(runId),
+      actedFor: (runId) => this.#runner.actingFor(runId) !== undefined,
       showClosed: (ask) => this.#tasks.showClosed(ask),
       // Built after this part: read when it is used.
       get requests() {

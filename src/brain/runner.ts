@@ -16,7 +16,7 @@ import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
-import { READ_OUTSIDE, type RunTools, eligibleSource } from "./run-tools";
+import { READ_OUTSIDE, type RunTools, eligibleSource, toolsIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
@@ -273,7 +273,7 @@ export class Runner {
       // Calls that act for the person go first, whatever order the model gave them in: what they
       // lead to (the run has read, has to wait, is settled) then decides about the others.
       const acting = open.length > 1 ? this.actingFor(runId) : undefined;
-      const personal = new Set(acting ? this.#b.toolsOf(acting.connector).map((each) => each.name) : []);
+      const personal = new Set(acting ? toolsIn(acting, this.#b.toolsOf).map((each) => each.name) : []);
       const dangling = [...open.filter((each) => personal.has(each.name)), ...open.filter((each) => !personal.has(each.name))];
       if (dangling.length > 0) {
         for (const call of dangling) {
@@ -525,7 +525,7 @@ export class Runner {
    * empty. Anything else and there is no such person. Worked out from the stored events each
    * time it is needed, never remembered.
    */
-  actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
+  actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
     return this.actingOn(this.#b.requests.basis(runId), this.#b.requests.resumed(runId) ? (JSON.parse(this.#b.requests.resumed(runId)!.events) as { recent: number[] }).recent : undefined);
   }
 
@@ -533,22 +533,29 @@ export class Runner {
    * The same judgement over given messages: `events` as what was asked, and, if `kept` is given,
    * exactly those earlier messages as what came shortly before (instead of looking for them).
    */
-  actingOn(events: InboxRow[], kept?: number[]): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
+  actingOn(events: InboxRow[], kept?: number[]): { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
     const scope = this.#s.scope();
-    if (scope.kind !== "user") return undefined;
     if (events.length === 0) return undefined;
     const source = events[0].source;
     const origin = originOf(events[0]);
-    if (!origin || this.#b.toolsOf(source).length === 0) return undefined;
-    const conversation = privateSessionKey(source, origin);
+    // A person's own scope, and their private conversation there. Or a place several people
+    // share, where the person is whoever wrote the first of these messages, the conversation is
+    // the one it came in, and only tools that say they may be used there count.
+    const shared = scope.kind === "chat";
+    if (scope.kind !== "user" && !shared) return undefined;
+    if (!origin || toolsIn({ connector: source, ...(shared ? { shared: true as const } : {}) }, this.#b.toolsOf).length === 0) return undefined;
+    const person = shared ? (JSON.parse(events[0].principal) as Principal).id : scope.id;
+    const conversation = shared ? events[0].session_key : privateSessionKey(source, origin);
     // A request, in the person's own words, made here: through that connector, in that private
     // conversation, by the person whose scope this is, with that same verified origin.
     const own = (event: InboxRow): boolean => {
       const principal = JSON.parse(event.principal) as Principal;
       if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return false;
-      if (!this.#b.isDecider(principal, event.source) || principal.id !== scope.id) return false;
+      if (!this.#b.isDecider(principal, event.source) || principal.id !== person) return false;
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      if (data.direct !== true || !plain(data)) return false;
+      // What the connector itself says of the message, as it verified it: written to the agent
+      // alone, or written where its tools may be used for the writer in front of the others.
+      if ((shared ? data.shared : data.direct) !== true || !plain(data)) return false;
       const same = originOf(event);
       return same !== undefined && JSON.stringify(same) === JSON.stringify(origin);
     };
@@ -578,7 +585,7 @@ export class Runner {
         recent = [...older, ...recent].sort((a, b) => a.id - b.id);
       }
     }
-    return { connector: source, person: scope.id, origin, said: events.map(said), recent: recent.map(said), recentIds: recent.map((each) => each.id) };
+    return { connector: source, person, origin, ...(shared ? { shared: true as const } : {}), said: events.map(said), recent: recent.map(said), recentIds: recent.map((each) => each.id) };
   }
 
   /**
@@ -627,7 +634,10 @@ export class Runner {
     const rows = this.#s.rows<{ run_id: string | null; is_user: number; item: string; outside: number }>("SELECT run_id, is_user, item, outside FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, from);
     // Each scrubbed turn's delivered words go after the last of its kept items. One query for all of them.
     const wordsOf = new Map<string, Item[]>();
-    for (const each of this.#s.rows<{ run_id: string; text: string }>(
+    // Where several people talk, those words are shown only to a run that itself acts for one of
+    // them there: they were written from what one person could read.
+    const mayShow = this.#s.scope().kind !== "chat" || (runId !== undefined && this.actingFor(runId) !== undefined);
+    for (const each of mayShow === false ? [] : this.#s.rows<{ run_id: string; text: string }>(
       "SELECT run_id, text FROM said WHERE session_id = ? AND run_id IN (SELECT DISTINCT run_id FROM items WHERE session_id = ? AND seq >= ? AND is_user = 0 AND outside = 2) ORDER BY outbox_id",
       sessionId,
       sessionId,
@@ -677,7 +687,7 @@ export class Runner {
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
     const acting = this.actingFor(runId);
     const own = TOOLS;
-    const all = acting ? [...own, ...this.#b.toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
+    const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
   }
 
@@ -697,7 +707,7 @@ export class Runner {
     if (!this.sawOutside(runId) && closed !== "waited") return true;
     if (name === "send_message") return true;
     const acting = this.actingFor(runId);
-    return acting !== undefined && this.#b.toolsOf(acting.connector).some((each) => each.name === name && each.effect === "read");
+    return acting !== undefined && toolsIn(acting, this.#b.toolsOf).some((each) => each.name === name && each.effect === "read");
   }
 
   #instructions(runId: string): string {

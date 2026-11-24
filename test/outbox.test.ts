@@ -37,7 +37,7 @@ function bench(state: DurableObjectState) {
   const channel: Record<string, (message: OutboundMessage) => Receipt | void> = {};
   /** What the requests part says of a message before each attempt, by its key. */
   const gates: Record<string, "send" | "hold" | "wait" | "void" | "unasked"> = {};
-  const settings = { sessionKey: 'private:feishu:[["app_id","cli_1"]]', reads: {} as Record<string, unknown[]> };
+  const settings = { sessionKey: 'private:feishu:[["app_id","cli_1"]]', reads: {} as Record<string, unknown[]>, acted: [] as string[] };
   const host: OutboxHost = {
     deliver: async (target, message) => {
       delivered.push({ target, message });
@@ -45,6 +45,7 @@ function bench(state: DurableObjectState) {
     },
     sawOutside: (runId) => outside.has(runId),
     showClosed: (ask) => void closed.push(ask),
+    actedFor: (runId) => settings.acted.includes(runId),
     requests: {
       stampGuards: (runId) => void stamped.push(runId),
       gate: async (row) => gates[row.idem as string] ?? "send",
@@ -686,6 +687,23 @@ describe("the outbox, by itself", () => {
         ]);
         // The outbox's own copy of a private message is still emptied once it has gone out.
         expect(row("msg:c1")).toMatchObject({ status: "sent", text: "" });
+      });
+    });
+
+    it("keeps them where several people talk only for a run that acted for one of them there", async () => {
+      await within(async ({ outbox, run, settings, kept }) => {
+        settings.sessionKey = "chat";
+        run("r1");
+        run("r2");
+        settings.acted = ["r2"];
+        outbox.enqueue("msg:c1", SESSION, "r1", "an ordinary answer", undefined, undefined, { authored: true });
+        outbox.enqueue("msg:c2", SESSION, "r2", "the document says three things", undefined, undefined, { authored: true });
+        // The system's own words are never kept as the agent's.
+        outbox.notify("settled:r2", SESSION, null, "a fixed line");
+        await outbox.flush();
+        await outbox.flush();
+        await outbox.flush();
+        expect(kept().map((each) => each.text)).toEqual(["the document says three things"]);
       });
     });
 

@@ -138,6 +138,12 @@ export interface ConnectorTool {
    * may still do in it.
    */
   effect: "read";
+  /**
+   * Whether the tool may also be used where several people talk (a group, say), for the one of
+   * them who asked. Without it the tool exists only in a person's private conversation. A tool
+   * that says so answers for what that takes: what it reads there is said in front of the others.
+   */
+  shared?: boolean;
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;

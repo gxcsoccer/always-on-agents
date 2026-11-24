@@ -382,6 +382,14 @@ describe("a run's tools", () => {
       });
     });
 
+    it("is not there, where several people talk, unless it says it may be used there", async () => {
+      await within(async ({ tools, tool, settings }) => {
+        settings.acting = { ...PERSON, shared: true };
+        await expect(tools().connectorTool("c1", "feishu_read_document", {})).rejects.toThrow('there is no tool "feishu_read_document" in this run');
+        expect(tool.given).toEqual([]);
+      });
+    });
+
     it("closes the run to everything but a reply and reading again once a call of it has to wait, also when that call is replayed", async () => {
       await within(async ({ tools, tool, store }) => {
         tool.answer = async () => ({ waiting: { on: "feishu", subject: "grant", condition: "c", generation: 1, until: Date.now() + 60_000, interaction: "int:1", request: {} } });

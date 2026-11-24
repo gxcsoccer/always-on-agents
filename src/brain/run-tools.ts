@@ -71,7 +71,7 @@ export class RunTools {
       connectorTool: async (callId, name, args) => {
         // Decided afresh at the moment of use, from what is stored: also after an interruption.
         const acting = this.#b.actingFor(run.id);
-        const found = acting && this.#b.toolsOf(acting.connector).find((each) => each.name === name);
+        const found = acting && toolsIn(acting, this.#b.toolsOf).find((each) => each.name === name);
         if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
         const carried = this.#b.requests.continuationOf(run.id);
         // A run that carries a request on makes one call: the one made for it, with what the
@@ -245,6 +245,11 @@ export class RunTools {
 
 type Read = { connector: string; tool: string; args: string; identity: string };
 
+/** The connector's tools that may be used for this person where they are: all of them in private, and where several people talk only those that say so. */
+export function toolsIn(acting: Pick<Acting, "connector" | "shared">, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {
+  return toolsOf(acting.connector).filter((each) => !acting.shared || each.shared === true);
+}
+
 /**
  * The one thing an answer was written from, if it was written from exactly one, and the person
  * can still point at it: linked by them in the messages the run acts on or in their own earlier
@@ -254,7 +259,7 @@ type Read = { connector: string; tool: string; args: string; identity: string };
 export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[]): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
   if (!acting) return undefined;
   const own = [...acting.said, ...acting.recent];
-  const tools = toolsOf(acting.connector);
+  const tools = toolsIn(acting, toolsOf);
   // An answer written from several things rests on all of them: none of them alone is its source,
   // whichever of them the person can still point at.
   const distinct = [...new Map(reads.map((each) => [`${each.connector}\u0000${each.identity}`, each])).values()];

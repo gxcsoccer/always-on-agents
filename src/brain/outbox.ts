@@ -59,6 +59,8 @@ export interface OutboxHost {
   sawOutside(runId: string): boolean;
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
+  /** Whether this run acted for one person, with their own tools, in the conversation it answered. */
+  actedFor(runId: string): boolean;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
   readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf" | "shown">;
 }
@@ -303,7 +305,9 @@ export class Outbox implements Wakes {
   #isOwnPrivateMessage(row: Row): boolean {
     // Written by the model, under one of the keys its own messages go by; never the system's fixed words.
     const own = row.authored === 1 && typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
-    return own && !row.ask && !row.review && typeof row.run_id === "string" && isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id));
+    // In a person's private conversation, always. Where several people talk, only what a run
+    // that acted for one of them there said: that is what its record is then cleared down to.
+    return own && !row.ask && !row.review && typeof row.run_id === "string" && (isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id)) || this.#b.actedFor(row.run_id));
   }
 
   scrub(which: "id = ?" | "run_id = ?", value: number | string): void {
