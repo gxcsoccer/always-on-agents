@@ -175,8 +175,10 @@ export class FeishuGrant extends DurableObject<Env> {
     this.#settle(stored, now, (each) => each.scope.includes(OFFLINE) === lasting);
     // One made for a question is that question's alone, and only while no answer to it is being
     // exchanged; one made for nobody's question in particular is shared as before.
-    const same = (each: Pending) => (ask ? each.ask?.brain === ask.brain && each.ask.key === ask.key && each.redeeming === undefined : each.ask === undefined);
-    let pending = stored.pending.find((each) => same(each) && each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS && scope.every((wanted) => each.scope.includes(wanted)));
+    // A question keeps its one for as long as that lasts, also near its end and while an answer
+    // to it is being exchanged: asking again neither gives it more time nor takes a second place.
+    const same = (each: Pending) => (ask ? each.ask?.brain === ask.brain && each.ask.key === ask.key : each.ask === undefined && each.expires_at - now > INVITATION_MIN_LEFT_MS);
+    let pending = stored.pending.find((each) => same(each) && each.redirect === redirect && scope.every((wanted) => each.scope.includes(wanted)));
     if (!pending) {
       pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS, ...(ask ? { ask } : {}) };
       const all = [...stored.pending, pending];
@@ -226,7 +228,7 @@ export class FeishuGrant extends DurableObject<Env> {
     // and when the person asks again it is named again and sent by the Brain.)
     const stored = await this.#load();
     if (!stored?.owed) return;
-    const own = await this.#own(stored).catch(() => "");
+    const own = this.#owedOf(stored).some((each) => each.to === "") ? await this.#own(stored).catch(() => "") : "";
     // Each Brain is told on its own, and what it heard clears only what it was told.
     const heard: Owed[] = [];
     const tried = this.#owedOf(stored);
@@ -258,7 +260,7 @@ export class FeishuGrant extends DurableObject<Env> {
    * Takes an invitation out of the record, once: what came back from Feishu names it by its nonce.
    * Returns nothing for one that is unknown, used, expired, or from before the grant was dropped.
    */
-  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number } | null> {
+  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number; ask: boolean } | null> {
     const stored = await this.#load();
     if (!stored) return null;
     const now = Date.now();
@@ -271,7 +273,7 @@ export class FeishuGrant extends DurableObject<Env> {
     else if (found && !found.ask) stored.pending = stored.pending.filter((each) => each !== found);
     void this.ctx.storage.put("grant", stored);
     if (!found || !claimed) return null;
-    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation };
+    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation, ask: found.ask !== undefined };
   }
 
   /**
@@ -290,10 +292,8 @@ export class FeishuGrant extends DurableObject<Env> {
     const refresh = token.refresh ? { sealed: await seal(key, token.refresh.token, `${version}:refresh`), expires_at: token.refresh.expires_at, endpoint: token.refresh.endpoint } : undefined;
     // A token already held that can no longer be opened (the key changed) is no reason to turn
     // this one away. Which version that is, is found out here, before the read that decides.
-    const first = await this.#load();
-    const before = first?.grant;
+    const before = (await this.#load())?.grant;
     const unreadable = before && !(await open(key, before.sealed, before.version).then(() => true, () => false)) ? before.version : undefined;
-    const own = first ? await this.#own(first) : "";
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
     // An invitation made for a question: it has to be the one being exchanged, still in its time,
@@ -301,9 +301,11 @@ export class FeishuGrant extends DurableObject<Env> {
     // the word owed to the Brain it was asked in. Anything else leaves everything as it is.
     const now = Date.now();
     this.#settle(stored, now);
+    // `nonce` is given only for what was claimed as a question's invitation. It has to be on
+    // record still, as that, at this last read: one that is not there any more is not taken for
+    // an invitation of the other kind.
     const asked = nonce === undefined ? undefined : stored.pending.find((each) => each.nonce === nonce);
-    if (nonce !== undefined && (stored.outcomes ?? []).some((each) => each.nonce === nonce)) return void this.ctx.storage.put("grant", stored), false;
-    if (asked?.ask && asked.redeeming === undefined) return false;
+    if (nonce !== undefined && (!asked?.ask || asked.redeeming === undefined)) return void this.ctx.storage.put("grant", stored), false;
     const done = (event: string) => {
       if (!asked?.ask) return;
       this.#record(stored, asked, "done", now);
@@ -321,7 +323,8 @@ export class FeishuGrant extends DurableObject<Env> {
     const earlier = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant : undefined;
     const since = Object.fromEntries(token.scope.split(" ").filter(Boolean).map((each) => [each, (earlier?.scope.split(" ").includes(each) ? earlier.since?.[each] : undefined) ?? Date.now()]));
     stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version, since, ...(refresh ? { refresh } : {}) };
-    this.#owe(stored, own, version);
+    // The person's own Brain, named when it is told: naming it now could fail and lose the token.
+    this.#owe(stored, "", version);
     done(version);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
@@ -354,6 +357,8 @@ export class FeishuGrant extends DurableObject<Env> {
     const outcome = (stored.outcomes ?? []).find((each) => each.nonce === nonce);
     if (outcome?.state !== "done") return { state: "gone" };
     const grant = stored.grant;
+    // Only for what this invitation asked the person for: what they allowed some other way since is not its doing.
+    if (scope.some((each) => !outcome.scope.includes(each))) return { state: "gone" };
     if (!grant || !usable(grant, now) || scope.some((each) => !grant.scope.split(" ").includes(each))) return { state: "not_yet" };
     return { state: "holds", since: outcome.at };
   }

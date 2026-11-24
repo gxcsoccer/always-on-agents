@@ -712,6 +712,18 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("ends as done, and says nothing more, when it is entered for the last time it could be", async () => {
+      await within(async ({ runner, event, store, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        store.sql.exec("UPDATE runs SET closed = 'settled', entries = 5 WHERE id = ?", id);
+        await runner.execute(id);
+        expect(run(id)).toMatchObject({ status: "done", error: null });
+        expect(of("notify")).toEqual([]);
+        expect(asked).toEqual([]);
+      });
+    });
+
     it("can only reply and read again once a call of it had to wait", async () => {
       await within(async ({ runner, event, store, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool, { name: "feishu_write", effect: "write", description: "", parameters: {} } as unknown as ConnectorTool];

@@ -249,6 +249,15 @@ export class Runner {
   async execute(runId: string): Promise<void> {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
+    // A tool ended the matter itself: that is how the run ends, however often it was entered.
+    if (entered.closed === "settled") {
+      const run = this.#stillActive(runId);
+      if (!run) return;
+      this.#s.transaction(() => {
+        for (const call of danglingCalls(this.#transcript(run.session_id, runId))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+      });
+      return this.#finish(runId, "done");
+    }
     if (entered.entries > MAX_RUN_ENTRIES) return this.#abandon(runId, "the run kept failing and was abandoned");
     // A run an earlier version left part way after reopening an answer kept for follow-ups, which
     // are retired: nothing more of it is done, not even a call it left behind.

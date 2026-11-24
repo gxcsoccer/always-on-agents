@@ -368,7 +368,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   if (!state || !grantsKey(env)) return page("这个链接无法使用", "请回到飞书，重新向我发起请求。", 400);
   const grant = env.FEISHU_GRANTS.getByName(state[1]);
   const invitation = await grant.redeem(state[2]);
-  if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经失效", "链接只能使用一次，并且 10 分钟内有效。请回到飞书，重新向我发起请求。", 400);
+  if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经用过或已失效", "链接只能使用一次，并且 10 分钟内有效。如果你刚刚已经完成授权，请回到飞书等待结果；否则请重新向我发起请求。", 400);
   const { who } = invitation;
   const code = url.searchParams.get("code") ?? "";
   // An invitation made for one question was claimed by this answer. However it ends short of
@@ -433,7 +433,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,
     scope: granted.join(" "),
     ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
-  }, state[2]);
+  }, invitation.ask ? state[2] : undefined);
   if (!kept) return refused("superseded");
   // The grant tells the person's Brain, and keeps telling it until it is heard.
   // Said so that it is true for every invitation: one whose request is waiting is carried on; one

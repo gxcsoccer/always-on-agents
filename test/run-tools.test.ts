@@ -420,7 +420,7 @@ describe("a run's tools", () => {
       it("says nothing when it names no line", async () => {
         await within(async ({ tools, tool, of, store }) => {
           tool.answer = async () => ({ settled: {} });
-          expect(await tools().connectorTool("c1", "feishu_read_document", {})).toMatchObject({ settled: true });
+          expect(await tools().connectorTool("c1", "feishu_read_document", {})).toEqual({ settled: true, note: expect.stringMatching(/^This ends here\. Nothing has been said/) });
           expect(of("notify")).toEqual([]);
           expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBe("settled");
         });
@@ -439,11 +439,13 @@ describe("a run's tools", () => {
 
       it("ends the request being carried on, which then has no answer", async () => {
         await within(async ({ tools, tool, settings, of }) => {
-          settings.carried = { id: "req_1", status: "resuming", call_id: "c1", tool: "feishu_read_document", args: "{}", claimed_at: Date.now(), generation: 1 };
+          settings.carried = { id: "req_1", status: "resuming", call_id: "c1", tool: "feishu_read_document", args: "{}", claimed_at: Date.now(), generation: 1, target: "where-it-was-asked" };
           tool.answer = async () => ({ settled: { say: "chatUnknown" } });
           expect(await tools().connectorTool("c1", "feishu_read_document", {})).toMatchObject({ settled: true });
           expect(of("endRequest")).toEqual([["req_1", "void", "the tool settled it"]]);
-          expect(of("notify")).toEqual([["settled:r1", SESSION, null, "notice:chatUnknown"]]);
+          // Said where that request was made, not wherever the conversation points by now.
+          expect(of("enqueue")).toEqual([["settled:r1", SESSION, null, "notice:chatUnknown", undefined, undefined, { target: "where-it-was-asked" }]]);
+          expect(of("notify")).toEqual([]);
         });
       });
     });

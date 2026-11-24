@@ -18,6 +18,7 @@ const MAX_ACTIVE_TIMERS = 50;
 const MAX_MEMORY_FILES = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
 export const SETTLED_NOTE = "The system has dealt with this itself and has told the person what they need to know. There is nothing more to do or say in this run.";
+const SETTLED_SILENT = "This ends here. Nothing has been said to the person about it, and there is nothing more to do or say in this run.";
 const UNUSABLE = { error: "the tool's answer could not be used; nothing was read and nothing waits" };
 export const READ_OUTSIDE = "this run has read text from outside through a tool. From then on it can only reply to the person with send_message and read again; no other tool can be used in it. If the person wants something else done, they can ask for it in a new message";
 
@@ -130,9 +131,17 @@ export class RunTools {
               this.#s.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", run.id);
               if (carried) this.#b.requests.endRequest(carried.id, "void", "the tool settled it");
               // The system's line, not this run's: it is not held back with what the run wrote.
-              if (say !== undefined && this.#b.outbox.isNotice(say)) this.#b.outbox.notify(`settled:${run.id}`, run.session_id, null, this.#b.outbox.notice(say, run.session_id));
+              // A request being carried on is told where it was asked, not wherever the conversation points by now.
+              if (say === undefined || !this.#b.outbox.isNotice(say)) return;
+              const text = this.#b.outbox.notice(say, run.session_id);
+              if (!carried) return this.#b.outbox.notify(`settled:${run.id}`, run.session_id, null, text);
+              try {
+                this.#b.outbox.enqueue(`settled:${run.id}`, run.session_id, null, text, undefined, undefined, { target: carried.target });
+              } catch {
+                // Nowhere to say it.
+              }
             });
-            return { settled: true, note: SETTLED_NOTE };
+            return { settled: true, note: say === undefined ? SETTLED_SILENT : SETTLED_NOTE };
           }
           if (!isWaiting(result)) {
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);

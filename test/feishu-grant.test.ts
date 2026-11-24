@@ -50,6 +50,42 @@ describe("an invitation made for one question", () => {
     expect([await p.asks("om_3"), await p.asks("om_1")]).not.toContain(own);
   });
 
+  it("stays the question's one invitation for as long as it lasts: near its end, and while an answer to it is being exchanged", async () => {
+    const p = await someone();
+    const nonce = await p.asks("om_1");
+    await p.change((record) => (record.pending[0].expires_at = Date.now() + 110_000));
+    expect(await p.asks("om_1")).toBe(nonce);
+    await p.inside((grant) => grant.redeem(nonce));
+    expect(await p.asks("om_1")).toBe(nonce);
+    expect((await p.stored()).pending).toHaveLength(1);
+    // Asked for again it is not given more time, and while it is being exchanged there is no card to show.
+    expect((await p.stored()).pending[0].expires_at).toBeLessThan(Date.now() + 120_000);
+    expect(await p.inside((grant) => grant.card(nonce))).toBeNull();
+  });
+
+  it("keeps nothing when what was claimed as a question's invitation is no longer on record at all", async () => {
+    const p = await someone();
+    const nonce = await p.asks("om_1");
+    expect(await p.inside((grant) => grant.redeem(nonce))).toMatchObject({ ask: true });
+    // Much later: the invitation ran out, and the record of that has been cleared too.
+    await p.change((record) => {
+      record.pending = [];
+      delete record.outcomes;
+    });
+    expect(await p.inside((grant) => grant.install(1, TOKEN, nonce))).toBe(false);
+    expect((await p.stored()).grant).toBeUndefined();
+  });
+
+  it("holds only for what it asked the person for, whatever else they have allowed since", async () => {
+    const p = await someone();
+    const nonce = await p.asks("om_1");
+    await p.inside((grant) => grant.redeem(nonce));
+    await p.inside((grant) => grant.install(1, TOKEN, nonce));
+    await p.inside((grant) => grant.install(1, { ...TOKEN, access_token: "u-wide", scope: "docx:document:readonly wiki:node:read" }));
+    expect(await p.inside((grant) => grant.answered(nonce, ["docx:document:readonly", "wiki:node:read"], 1))).toEqual({ state: "gone" });
+    expect(await p.answered(nonce)).toMatchObject({ state: "holds" });
+  });
+
   it("is pushed out by a fourth: what it led to is over, and the others stand", async () => {
     const p = await someone();
     const [a, b, c] = [await p.asks("om_1"), await p.asks("om_2"), await p.asks("om_3")];
@@ -201,6 +237,33 @@ describe("telling the Brains that an invitation was answered", () => {
     await runDurableObjectAlarm(p.stub);
     expect((await p.stored()).owed).toBeUndefined();
     expect(told.filter((each) => each.startsWith(CHAT))).toHaveLength(2);
+  });
+
+  it("keeps the token although the person's own Brain cannot be named just then, and tells it once it can", async () => {
+    const p = await someone();
+    await (env as any).REGISTRY.getByName("global").createTenant("acme", "acme").catch(() => undefined);
+    await (env as any).REGISTRY.getByName("global").setFeishuApp("acme", { app_id: p.who.app_id, app_secret: "s", transport: "long_connection" });
+    await p.asks("om_1");
+    const told: string[] = [];
+    let down = true;
+    await p.inside((grant: any) => {
+      const real = grant.env;
+      grant.env = {
+        ...real,
+        REGISTRY: { getByName: (name: string) => (down ? { feishuApp: () => Promise.reject(new Error("the registry cannot be reached")) } : real.REGISTRY.getByName(name)) },
+        BRAIN: { getByName: (name: string) => ({ conditionReported: async () => (told.push(name), { ok: true }) }) },
+      };
+    });
+    expect(await p.inside((grant) => grant.install(1, TOKEN))).toBe(true);
+    expect((await p.stored()).grant).toBeDefined();
+    await runDurableObjectAlarm(p.stub);
+    expect(told).toEqual([]);
+    expect((await p.stored()).owed).toHaveLength(1);
+    down = false;
+    await p.inside((_grant, state) => state.storage.setAlarm(Date.now()));
+    await runDurableObjectAlarm(p.stub);
+    expect(told).toEqual([`acme:user:${p.who.open_id}`]);
+    expect((await p.stored()).owed).toBeUndefined();
   });
 
   it("still tells the person's own Brain what was owed to it before there was more than one to tell", async () => {
