@@ -194,6 +194,9 @@ describe("timers and memory", () => {
     const tool = modelCalls[0].tools.find((t: any) => t.name === "hand_over");
     expect(tool.parameters.properties.worker.enum).toEqual(["sandbox"]);
     expect(Object.keys(tool.parameters.properties)).toEqual(["worker", "title", "brief", "continue_from", "repository"]);
+    // Beside each worker's own description in the tool: the deployment's guidance on choosing between them, as it is written.
+    expect(modelCalls[0].instructions).toContain("Where to hand work (this deployment's guidance)\nWhich worker for what");
+    expect(modelCalls[0].instructions.indexOf("Where to hand work")).toBeLessThan(modelCalls[0].instructions.indexOf("Standing instructions from the people here"));
     const { work_id: id, status } = toolOutputs().at(-1);
     expect(status).toBe("running");
 

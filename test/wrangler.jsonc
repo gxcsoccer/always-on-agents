@@ -5,6 +5,8 @@
   "main": "./entry.ts",
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Markdown shipped with the Worker (the guidance on which worker a piece of work goes to) is read as text.
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "vars": {
     "OPENAI_BASE_URL": "https://model.test/v1",
     "OPENAI_API_KEY": "test-key",

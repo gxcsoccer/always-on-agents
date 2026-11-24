@@ -9,14 +9,21 @@ import { githubConnector } from "./connectors/github";
 import type { Connector } from "./connectors/types";
 import { sandboxWorker } from "./workers/sandbox/worker";
 import type { Worker } from "./workers/types";
+import guidance from "./workers.md";
 
-const config: { connectors: Connector[]; workers: Worker[]; trusted: string[] } = {
+const config: { connectors: Connector[]; workers: Worker[]; guidance: string; trusted: string[] } = {
   connectors: [consoleConnector, githubConnector, feishuConnector, doubaoConnector],
   /**
    * Where the agent can hand work to (see `src/workers/types.ts`). Taking one out stops new work
    * going to it; what it was already doing can still report, be answered and be stopped.
    */
   workers: [sandboxWorker, doubaoWorker],
+  /**
+   * Which worker a piece of work goes to: guidance for the agent, in words (`src/workers.md`).
+   * It is the deployment's to write; nobody in a conversation can change it. Each worker says
+   * what it is in its own description; this says how to choose between them here.
+   */
+  guidance,
   /**
    * The connectors whose account of who said something is believed: only through these can a
    * person approve an action, be credited with a request, or change the agent's standing

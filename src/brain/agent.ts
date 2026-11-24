@@ -22,7 +22,7 @@ import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
 import { registry } from "../registry";
-import { workerNamed, workers } from "../workers";
+import { guidance, workerNamed, workers } from "../workers";
 import { sandboxWorker } from "../workers/sandbox/worker";
 import { migrate } from "./schema";
 import { BrainStore, type Row, type Wakes } from "./store";
@@ -112,6 +112,7 @@ export class BrainAgent extends DurableObject<Env> {
       outside: this.#outside,
       isDecider: (principal, source) => this.#isDecider(principal, source),
       toolsOf,
+      guidance,
       workers,
       workStands: (work) => this.#workStands(work),
       registry: () => registry(this.env),

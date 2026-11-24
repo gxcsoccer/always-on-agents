@@ -83,6 +83,8 @@ export interface PromptParts {
   index?: string;
   /** Work handed to workers that is under way, and (for work done in the person's name) what was handed over lately: its id, who has it, what it is, how it stands. */
   work: { id: string; worker: string; title: string; state: string; last_progress?: string | null }[];
+  /** The deployment's guidance on which worker a piece of work goes to, where the run has workers to hand work to. */
+  guidance?: string;
   /** Requests in this conversation that wait on something or are being carried on, with the person's own words. */
   requests?: { id: string; asked: string }[];
 }
@@ -90,6 +92,8 @@ export interface PromptParts {
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
 export function buildInstructions(parts: PromptParts): string {
   const sections = [BASE, SITUATION[parts.situation], `Where you are\n${SCOPE[parts.scope.kind]}`];
+  // The deployment's own words, so they stand with the stable text and before anything a conversation wrote.
+  if (parts.guidance) sections.push(`Where to hand work (this deployment's guidance)\n${parts.guidance}`);
   sections.push(`Standing instructions from the people here (instructions.md)\n${loaded(parts.instructions, MAX_LOADED_INSTRUCTIONS, "instructions.md", "(none yet)")}`);
   // index.md is written by the agent itself, possibly while reading untrusted material, so it is
   // presented as the agent's notes and never as instructions.
