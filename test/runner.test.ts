@@ -1190,6 +1190,29 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("tells the operator the shape of what a run is shown, and nothing anyone said", async () => {
+      await within(async (b) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool];
+        b.event("SECRET plan https://x/docx/SECRETDOC", { source_id: "om_first", status: "done", received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = (event: { data?: Record<string, unknown> }) => (event.data?.replies_to === "feishu:message:om_unseen" ? { text: "SECRET question", replies_to: "feishu:message:om_first" } : {});
+        b.event("SECRET words", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        b.model.push(answer([says("SECRET answer")]));
+        const id = (await b.go())!;
+        const shape = b.runner.shapeOf(id)!;
+        expect(JSON.stringify(shape)).not.toContain("SECRET");
+        expect(shape.waiting).toBe(true);
+        expect(shape.acting).toBe(true);
+        expect(shape.tools).toContain("feishu_read_document");
+        expect(shape.shown.slice(-4, -1)).toMatchObject([
+          { role: "user", label: "[An earlier message of theirs that this leads back to, written at 2026-11-23T07:00:00.000Z:]" },
+          { role: "user", label: "[An earlier message of theirs that this leads back to, which you were not sent:]" },
+          { role: "user", notes: [expect.stringMatching(/^\(written as a reply to an earlier message of their own/), expect.stringMatching(/^\(that stands in a chain of replies/)] },
+        ]);
+        expect(shape.shown.at(-1)).toMatchObject({ role: expect.stringMatching(/assistant|message/), chars: 13 });
+        expect(b.runner.shapeOf("no-such-run")).toBeUndefined();
+      });
+    });
+
     it("shows the message of the agent's a person replied to as the agent's own words, without keeping them again", async () => {
       await within(async (b) => {
         earlier(b, "r0", "summarise A");
