@@ -36,6 +36,8 @@ const world = {
   dropAnswers: 0,
   /** How many of the next writes get no answer and are not taken either. */
   unreachable: 0,
+  /** Doubao's account service gives no answer at all. */
+  accountsDown: false,
   /** How many of the next writes Doubao takes and answers "ok" to, without saying what it made of them. */
   bareAnswers: 0,
   /** Runs while a write is being made, before Doubao takes it. */
@@ -60,6 +62,7 @@ function installWorld() {
   world.writes.length = 0;
   world.dropAnswers = 0;
   world.unreachable = 0;
+  world.accountsDown = false;
   world.scope = SCOPE;
   world.narrows = true;
   world.bareAnswers = 0;
@@ -83,6 +86,7 @@ function installWorld() {
       // Reactions and the like: taken, and of no interest here.
       return Response.json({ code: 0, data: {} });
     }
+    if (world.accountsDown && url.host === "accounts.doubao.com") throw new Error("network");
     if (url.host === "accounts.doubao.com" && url.pathname === "/oauth/v3/token") {
       const consent = world.codes.get(body.code);
       world.codes.delete(body.code);
@@ -346,6 +350,65 @@ describe("handing work to Doubao Work", () => {
     await dee.settle();
     expect(world.writes).toHaveLength(1);
     expect((await dee.requests()).map((each) => each.status)).toEqual(["void", "waiting"]);
+  });
+
+  it("ends the wait as well when Doubao cannot be reached while the authorisation is being checked", async () => {
+    await pair();
+    const dee = someone();
+    model.replies([asks("写周报")], [say("")]);
+    await dee.says("让豆包写周报");
+    world.accountsDown = true;
+    const link = linkOn(dee.cards()[0]);
+    expect((await consent(link, dee)).status).toBe(400);
+    world.accountsDown = false;
+    await dee.settle();
+    expect(await dee.requests()).toMatchObject([{ status: "void" }]);
+    expect(dee.heard().filter((each) => each.startsWith("授权没有完成"))).toHaveLength(1);
+    expect((await consent(link, dee)).status).toBe(400);
+    expect(await (await dee.grant()).status()).toMatchObject({ authorised: false });
+  });
+
+  it("answers each request by its own invitation, however many came to nothing since", async () => {
+    await pair();
+    const dee = someone();
+    const grant = await dee.grant();
+    const who = { chat_app_id: CHAT_APP, tenant_key: ORG, open_id: dee.openId, union_id: dee.unionId };
+    const app = await (env as any).REGISTRY.getByName("global").doubaoApp(CHAT_APP);
+    world.scope = `${SCOPE} doubao:session:read`;
+    world.narrows = false;
+    const nonces: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      const made = await grant.invite(who, "https://agent.test/v1/doubao/oauth/callback", app, 1);
+      nonces.push(made.nonce);
+      const card = await grant.card(await grantName(who), made.nonce);
+      expect((await consent(new URL(card.action.url), dee)).status).toBe(400);
+    }
+    expect(new Set(nonces).size).toBe(25);
+    // Then one works.
+    world.narrows = true;
+    const good = await grant.invite(who, "https://agent.test/v1/doubao/oauth/callback", app, 1);
+    expect((await consent(new URL((await grant.card(await grantName(who), good.nonce)).action.url), dee)).status).toBe(200);
+    const scope = { tenant: TENANT, kind: "user" as const, id: dee.openId };
+    const on = async (nonce: string) => doubaoConnector.holds!(env as any, scope, `doubao|auth|${await grantName(who)}|${nonce}`, 1);
+    expect(await on(nonces[0])).toEqual({ state: "gone", refused: true });
+    expect(await on(nonces[24])).toEqual({ state: "gone", refused: true });
+    expect(await on(good.nonce)).toMatchObject({ state: "holds" });
+    // One nobody was ever shown is nobody's to wait on.
+    expect(await on("never_made_never_made_never_made")).toEqual({ state: "gone" });
+  });
+
+  it("says that waiting has stopped, and not to ask again, when a new authorisation fails for work already handed over", async () => {
+    await pair();
+    const dee = someone();
+    await handsOver(dee);
+    for (const token of world.tokens.values()) token.good = false;
+    await dee.later();
+    world.scope = `${SCOPE} doubao:session:read`;
+    world.narrows = false;
+    expect((await consent(linkOn(dee.cards().at(-1)), dee)).status).toBe(400);
+    await dee.settle();
+    expect(dee.heard().at(-1)).toBe("重新授权没有完成，我不再等之前交出去处理的那件事了。它可能还在那边继续，你可以直接去那边看。");
+    expect(world.writes).toHaveLength(1);
   });
 
   it("does not take up a request whose own way in failed, even after another one worked", async () => {

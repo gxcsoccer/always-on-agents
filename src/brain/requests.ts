@@ -449,10 +449,10 @@ export class Requests implements Wakes {
       if (!now || now.status !== "waiting" || now.condition !== before.condition || now.generation !== before.generation || now.until !== before.until) return drop();
       // Someone who was told that a thing was under way hears once that it is no longer waited for: whatever it was waiting on last.
       const promised = () => this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
-      const tell = (which: "underWayOver" | "underWayGone") => void (promised() && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
+      const tell = (which: "underWayOver" | "underWayGone" | "underWayRefused") => void (promised() && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
-        tell("underWayGone");
+        tell(answer.refused ? "underWayRefused" : "underWayGone");
         // The way in they were shown did not work: said once for that way in, however many requests waited on it.
         if (answer.refused && now.interaction && !promised()) this.#b.enqueueMessage(`refused:${now.interaction}`, now.session_id, null, this.#b.notice("notAuthorised", now.session_id), undefined, undefined, { target: now.target });
         return drop();
