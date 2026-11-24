@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, aside, canRevisit, deliver, direct, quoted, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, aside, canRevisit, deliver, direct, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -103,6 +103,7 @@ export class BrainAgent extends DurableObject<Env> {
       registry: () => registry(this.env),
       respond,
       quoted: (connector, event) => quoted(this.env, connector, this.#store.scope(), event),
+      under,
       // Built after this part: read when they are used.
       get requests() {
         return brain.#requests;

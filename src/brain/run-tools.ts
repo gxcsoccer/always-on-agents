@@ -7,6 +7,7 @@
  */
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
+import { chainLevels } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, WAITING_NOTE } from "./requests";
@@ -55,19 +56,29 @@ export class RunTools {
    * as it reached them, and if so the one thing every such answer was written from that the
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
-  #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
-    // What each message points at: the message it replies to; or, where that is the person's own
-    // message the connector had to fetch, and that one was written in reply to an answer of the
-    // agent's, that answer (one step further up, as the model is shown it).
+  #answering(run: RunRow, acting: Acting, kept = false): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
+    // Which answer of the agent's each message points at: the message it replies to, or the
+    // nearest one further up the chain of replies it stands in, as long as nothing of the
+    // person's own in between names a document itself (what they link comes first).
     const delivered = (subject: unknown): subject is string => typeof subject === "string" && this.#s.rows("SELECT 1 FROM said WHERE session_id = ? AND receipt_subject = ? LIMIT 1", run.session_id, subject).length > 0;
+    const naming = (source: string, subject: string, person: unknown): boolean => {
+      const prefix = `${source}:message:`;
+      // Only in this conversation, as everything else that follows the chain.
+      const row = subject.startsWith(prefix) ? this.#s.rows<{ data: string | null; principal: string }>("SELECT i.data, i.principal FROM inbox i WHERE i.source = ? AND i.source_id = ? AND i.session_key = (SELECT session_key FROM sessions WHERE id = ?) LIMIT 1", source, subject.slice(prefix.length), run.session_id)[0] : undefined;
+      const documents = row && (JSON.parse(row.principal) as { id?: unknown }).id === person ? (JSON.parse(row.data ?? "{}") as { documents?: unknown }).documents : undefined;
+      return Array.isArray(documents) && documents.length > 0;
+    };
     const subjects = this.#b.requests
       .basis(run.id)
       .map((each) => {
-        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; replies_to?: unknown; documents?: unknown } };
-        // Not where the fetched message names something itself: what it links comes first.
-        const names = Array.isArray(data.quoted?.documents) && data.quoted.documents.length > 0;
-        const further = typeof data.quoted?.text === "string" && !names ? data.quoted.replies_to : undefined;
-        return !delivered(data.replies_to) && delivered(further) ? further : data.replies_to;
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { documents?: unknown } };
+        const person = (JSON.parse(each.principal ?? "{}") as { id?: unknown }).id;
+        const levels: { subject?: unknown; documents?: unknown }[] = [{ subject: data.replies_to, documents: data.quoted?.documents }, ...chainLevels(data as Record<string, unknown>)];
+        for (const level of levels) {
+          if (delivered(level.subject)) return level.subject;
+          if (typeof level.subject !== "string" || (Array.isArray(level.documents) && level.documents.length > 0) || naming(String(each.source ?? ""), level.subject, person)) break;
+        }
+        return data.replies_to;
       })
       .filter((each): each is string => typeof each === "string");
     if (subjects.length === 0) return {};
@@ -77,7 +88,7 @@ export class RunTools {
     // (And every message replied to has to be such an answer: a reply to anything else as well
     // keeps what that one points at.)
     if (answers.length === new Set(subjects).size && answers.every((each) => (JSON.parse(each.reads) as Read[]).length === 0)) return { answering: { nothing: true } };
-    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person));
+    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person, kept));
     const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
     return { answering: one ? { source: one.request } : {} };
   }
@@ -134,7 +145,7 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
@@ -288,7 +299,7 @@ export function toolsIn(acting: Pick<Acting, "connector" | "shared">, toolsOf: (
  * messages here (as the tool that read it judges). None for an answer written from nothing read,
  * from several (even if only one of them is still in reach), or from one they linked too long ago.
  */
-export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[], writtenFor?: string | null): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
+export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[], writtenFor?: string | null, kept = false): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
   if (!acting) return undefined;
   // An answer written for someone else is something that was said here, and no more: what it
   // was read from is not this person's to have read again on its strength. Where several people
@@ -309,7 +320,7 @@ export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsO
     } catch {
       return [];
     }
-    return tool?.links && own.some((message) => tool.links!(message, request)) ? [{ tool: each.tool, request, identity: each.identity }] : [];
+    return tool?.links && own.some((message) => tool.links!(message, request, kept)) ? [{ tool: each.tool, request, identity: each.identity }] : [];
   });
   return eligible.length === 1 ? eligible[0] : undefined;
 }

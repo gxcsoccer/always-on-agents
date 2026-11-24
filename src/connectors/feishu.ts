@@ -86,7 +86,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
   holds: (env, scope, condition, generation) => authorisationHolds(env, scope, condition, generation),
 };
@@ -383,9 +383,24 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // A forwarded bundle comes back as several messages: only the one asked for counts.
     const found = response.ok && result.code === 0 ? result.data?.items?.find((each) => each?.message_id === messageId) : undefined;
     const sender = found?.sender ?? {};
-    if (!found || found.chat_id !== chatId || sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return {};
-    if (found.deleted || typeof found.body?.content !== "string") return {};
-    const content = JSON.parse(found.body.content);
+    // Nothing of a message from another chat, or one that was recalled.
+    if (!found || found.chat_id !== chatId || found.deleted) return {};
+    // What it was itself written in reply to, as for a message that arrives: not inside a topic,
+    // where every post points at the topic's first message. Only the message it replies to
+    // itself: where the exchange started (`root_id`) is not that.
+    const above = found.parent_id;
+    const further = !found.thread_id && typeof above === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(above) ? { replies_to: `feishu:message:${above}` } : {};
+    // Someone else's, or the app's own: nothing it says or links, only where it points, so that
+    // what stands further up the chain of replies can still be found.
+    if (sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return further;
+    // Their own, with nothing that can be read in it: the chain still goes on from it.
+    if (typeof found.body?.content !== "string") return further;
+    let content: any;
+    try {
+      content = JSON.parse(found.body.content);
+    } catch {
+      return further;
+    }
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
@@ -394,12 +409,9 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const linked = found.msg_type === "text" ? linksIn(String(content.text ?? "")) : found.msg_type === "post" ? linkedIn(content) : [];
     const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
-    // What it was itself written in reply to, as for a message that arrives: not inside a topic,
-    // where every post points at the topic's first message.
-    // Only the message it replies to itself: where the exchange started (`root_id`) is not that.
-    const above = found.parent_id;
-    const further = !found.thread_id && typeof above === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(above) ? { replies_to: `feishu:message:${above}` } : {};
-    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...further };
+    // When it was written, as Feishu says (milliseconds): what it links is something they linked then, not now.
+    const at = Number(found.create_time);
+    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
   } catch {
     return {};
   }
@@ -474,6 +486,15 @@ export function asideFeishu(origin: Record<string, string>, person: string, from
   const { app_id: appId, chat_id: chatId } = from.address;
   if (from.connector !== "feishu" || !chatId || !appId || appId !== origin.app_id || !person) return undefined;
   return { connector: "feishu", address: { app_id: appId, chat_id: chatId, visible_to: person } };
+}
+
+/**
+ * The message something sent to this address is written under: a reply in a chat names it. A
+ * plain message to a chat or a person, a post in a topic and a card for one person are under nothing.
+ */
+export function underFeishu(target: Target): string | undefined {
+  const { message_id: messageId, thread, visible_to: only, open_id: openId } = target.address;
+  return target.connector === "feishu" && messageId && /^[A-Za-z0-9_-]{1,100}$/.test(messageId) && thread !== "1" && !only && !openId ? `feishu:message:${messageId}` : undefined;
 }
 
 export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {

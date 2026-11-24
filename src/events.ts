@@ -106,3 +106,21 @@ export function isPrivateSession(sessionKey: string): boolean {
 
 /** Events a worker sends back to the Brain that started it. */
 export type WorkerEventKind = "progress" | "needs_input" | "withdrawn" | "result" | "failed" | "lost" | "recovered";
+
+/**
+ * One message further up the chain of replies a message stands in, as kept with that message
+ * (`data.chain`): its name; where it had to be fetched, the person's own words and what they
+ * link, or that it is not theirs. A last entry `cut` says the chain goes on but was not followed.
+ */
+export type ChainLevel = { subject?: string; text?: string; documents?: unknown[]; hidden?: true; cut?: true };
+
+/**
+ * What stands above the message a message replies to, nearest first. Read the same way by
+ * everything that goes by it. A message kept before the whole chain was followed has one such
+ * level at most: what its fetched parent, the person's own, was written in reply to.
+ */
+export function chainLevels(data: Record<string, unknown> | undefined): ChainLevel[] {
+  if (Array.isArray(data?.chain)) return (data.chain as unknown[]).filter((each): each is ChainLevel => typeof each === "object" && each !== null);
+  const quoted = data?.quoted as { text?: unknown; replies_to?: unknown } | undefined;
+  return typeof quoted?.text === "string" && typeof quoted.replies_to === "string" ? [{ subject: quoted.replies_to }] : [];
+}

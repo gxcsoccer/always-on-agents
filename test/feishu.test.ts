@@ -306,8 +306,20 @@ describe("which documents a fetched message links", () => {
     // Only the message it replies to itself: where it started is not that.
     expect(await fetched({ root_id: "om_root" })).toEqual({ text: "说了啥？" });
     expect(await fetched({ parent_id: "om_answer", root_id: "om_root" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
-    // Not for someone else's message: nothing of it is passed on, where it points included.
-    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    // Someone else's message, or the app's own: nothing of what it says or links, only what it was written in reply to, so the chain can be followed past it.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "app", id: "cli_test" } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    // Their own, with nothing in it that can be read: no words, but the chain goes on from it all the same.
+    expect(await fetched({ parent_id: "om_answer", body: { content: JSON.stringify({ text: "" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ parent_id: "om_answer", body: { content: "{not json" } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ parent_id: "om_answer", body: {} })).toEqual({ replies_to: "feishu:message:om_answer" });
+    // When it was written goes along, as Feishu says it.
+    expect(await fetched({ create_time: "1795000000000" })).toEqual({ text: "说了啥？", at: 1795000000000 });
+    // Not out of another chat, not once recalled, and not inside a topic.
+    expect(await fetched({ parent_id: "om_answer", chat_id: "oc_other" })).toEqual({});
+    expect(await fetched({ parent_id: "om_answer", deleted: true })).toEqual({});
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
   });
 
   it("goes by where a link leads, never by the words shown for it", async () => {

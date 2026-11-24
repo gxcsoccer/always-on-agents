@@ -140,7 +140,7 @@ function installFakeFeishu() {
     const fetched = url.host === "open.feishu.cn" && (init?.method ?? "GET") === "GET" ? /\/im\/v1\/messages\/([^/]+)$/.exec(url.pathname)?.[1] : undefined;
     if (fetched) {
       const found = quotable.get(fetched);
-      return found ? Response.json({ code: 0, data: { items: [{ message_id: fetched, chat_id: found.chat_id, msg_type: "text", sender: { sender_type: "user", id: found.open_id, tenant_key: ORG }, body: { content: JSON.stringify({ text: found.text }) }, ...(found.parent ? { parent_id: found.parent } : {}) }] } }) : Response.json({ code: 230110 }, { status: 404 });
+      return found ? Response.json({ code: 0, data: { items: [{ message_id: fetched, chat_id: found.chat_id, msg_type: "text", sender: { sender_type: "user", id: found.open_id, tenant_key: ORG }, body: { content: JSON.stringify({ text: found.text }) }, create_time: String(found.at ?? Date.now()), ...(found.parent ? { parent_id: found.parent } : {}) }] } }) : Response.json({ code: 230110 }, { status: 404 });
     }
     // What Feishu says of a chat, and a card shown to one member of it.
     const aboutChat = url.host === "open.feishu.cn" ? /\/im\/v1\/chats\/([^/]+)(\/members\/is_in_chat)?$/.exec(url.pathname) : undefined;
@@ -276,7 +276,7 @@ const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const rowsOf = (stub: any, query: string, ...args: unknown[]): Promise<any[]> => runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
 /** A person, their scope's Brain, and their direct chat with the bot. */
 /** Messages the bot was never sent, which Feishu hands over when asked for one by its id. */
-const quotable = new Map<string, { chat_id: string; open_id: string; text: string; parent?: string }>();
+const quotable = new Map<string, { chat_id: string; open_id: string; text: string; parent?: string; at?: number }>();
 /** The chats Feishu knows of in these tests, and what it says of each. */
 const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean; lapsedOnce?: boolean }>();
 
@@ -959,7 +959,7 @@ describe("reading a Feishu document as the person who asked", () => {
     // B was linked last, and she points at the message that linked A: A is read, and B is not.
     const first = await ask("这个再看一下", aboutA, "DocPiaA00000000000001", "DocPiaB00000000000001");
     expect(first[0]).toEqual({ text: "text of DocPiaA00000000000001" });
-    expect(first[1].error).toMatch(/only a document the person linked/);
+    expect(first[1].error).toMatch(/link other documents, not that one/);
     expect(names()).toEqual(["DocPiaA00000000000001"]);
     // The model is shown what the message was written in reply to, in her own words.
     const shown = modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1);
@@ -986,9 +986,9 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(input[turn - 1]).toMatchObject({ role: "assistant", content: expect.stringMatching(/^\[The message of yours they are replying to, sent at \d{4}-\d{2}-\d{2}T[\d:.]+Z, written from https:\/\/example\.feishu\.cn\/docx\/DocPiaA00000000000001:\]\n/) });
   });
 
-  it("reads nothing for a reply without a link to a message of the person's own that links several documents", async () => {
+  it("reads whichever the model names of the documents a replied-to message of the person's own links, and none it does not link", async () => {
     const rosa = someone();
-    for (const id of ["DocRosaA0000000000001", "DocRosaB0000000000001"]) feishu.docs.set(id, { readers: [rosa.openId], text: `text of ${id}` });
+    for (const id of ["DocRosaA0000000000001", "DocRosaB0000000000001", "DocRosaC0000000000001"]) feishu.docs.set(id, { readers: [rosa.openId], text: `text of ${id}` });
     await authorised(rosa, "DocRosaA0000000000001");
     const both = `${link("DocRosaA0000000000001")} ${link("DocRosaB0000000000001")}`;
     model.replies([say("你希望我做什么？")]);
@@ -996,13 +996,13 @@ describe("reading a Feishu document as the person who asked", () => {
     feishu.reads.length = 0;
     feishu.looks.length = 0;
 
-    model.replies([readCall("DocRosaB0000000000001"), readCall("DocRosaA0000000000001")], [call("send_message", { text: "你指哪一篇？" })], [say("")]);
-    await rosa.says("这篇写了什么", undefined, await messageId(rosa, both));
-    const refused = expect.stringMatching(/replied to links several documents/);
-    expect(toolOutputs().slice(0, 2).map((each: any) => each.error)).toEqual([refused, refused]);
-    expect(feishu.reads).toEqual([]);
-    expect(feishu.looks).toEqual([]);
-    expect(JSON.stringify(modelCalls)).not.toContain("text of DocRosaB");
+    // Which of the two is meant is the model's to say from what it is shown; a third, which the message does not link, is not hers to have read on its strength.
+    model.replies([readCall("DocRosaB0000000000001"), readCall("DocRosaC0000000000001")], [call("send_message", { text: "B 写的是…" })], [say("")]);
+    await rosa.says("第二篇写了什么", undefined, await messageId(rosa, both));
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocRosaB0000000000001" });
+    expect(toolOutputs()[1].error).toMatch(/link other documents, not that one/);
+    expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocRosaB0000000000001"]);
+    feishu.reads.length = 0;
 
     // The same link twice in the message replied to is still one document.
     const twice = `${link("DocRosaB0000000000001")} 和 ${link("DocRosaB0000000000001")}`;
@@ -1041,9 +1041,33 @@ describe("reading a Feishu document as the person who asked", () => {
     // As a reply, the message pointed at is part of what she says now.
     const pointed = await ask("这个再看一下", aboutA, "DocQuinA0000000000001", "DocQuinB0000000000001");
     expect(pointed[0]).toEqual({ text: "text of DocQuinA0000000000001" });
-    expect(pointed[1].error).toMatch(/only a document the person linked/);
+    expect(pointed[1].error).toMatch(/link other documents, not that one/);
     expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocQuinA0000000000001"]);
     expect(modelCalls.at(-1).input.filter((each: any) => each.role === "user").map((each: any) => (typeof each.content === "string" ? each.content : JSON.stringify(each.content))).at(-1)).toContain(`(written as a reply to their own earlier message: ${JSON.stringify(`总结 ${link("DocQuinA0000000000001")}`)})`);
+  });
+
+  it("reads an old document through the chain of replies for that request alone: a later message that does not stand in it cannot have it read", async () => {
+    const sol = someone();
+    feishu.docs.set("DocSolOld000000000001", { readers: [sol.openId], text: "The old plan." });
+    await authorised(sol, "DocSolOld000000000001");
+    model.replies([say("")]);
+    await sol.says(`存一下 ${link("DocSolOld000000000001")}`);
+    const first = await messageId(sol, `存一下 ${link("DocSolOld000000000001")}`);
+    model.replies([say("")]);
+    await sol.says("这篇之后再看", undefined, first);
+    const second = await messageId(sol, "这篇之后再看");
+    // Three days on: none of it is among what she said lately.
+    await rowsOf(sol.stub, "UPDATE inbox SET received_at = received_at - 3 * 86400000");
+    feishu.reads.length = 0;
+    // A reply to her reply: two steps up the chain stands the message with the link.
+    model.replies([readCall("DocSolOld000000000001")], [call("send_message", { text: "看了" })], [say("")]);
+    await sol.says("现在看吧", undefined, second);
+    expect(toolOutputs()[0]).toEqual({ text: "The old plan." });
+    // The next message is about nothing in particular: the old link is not hers to have read on its strength.
+    model.replies([readCall("DocSolOld000000000001")], [call("send_message", { text: "请发链接" })], [say("")]);
+    await sol.says("再读一遍那篇旧的");
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked/);
+    expect(feishu.reads).toHaveLength(1);
   });
 
   it("lets the same call finish again after an interruption, and another call read the same link", async () => {
@@ -3050,18 +3074,19 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(feishu.reads).toHaveLength(1);
   });
 
-  it("asks which is meant when the earlier message they reply to links several documents, and reads none of them", async () => {
+  it("reads whichever the model names where the earlier message they reply to links several documents, and nothing it does not link", async () => {
     const jo = someone();
-    feishu.docs.set("DocGroupJo00000000001", { readers: [jo.openId], text: "One." });
-    feishu.docs.set("DocGroupJo00000000002", { readers: [jo.openId], text: "Two." });
+    for (const doc of ["DocGroupJo00000000001", "DocGroupJo00000000002", "DocGroupJo00000000003"]) feishu.docs.set(doc, { readers: [jo.openId], text: `text of ${doc}` });
     await authorised(jo, "DocGroupJo00000000001");
     const id = chat();
     const here = inGroup(id, jo);
     quotable.set("om_earlier_jo", { chat_id: id, open_id: jo.openId, text: `看看 ${link("DocGroupJo00000000001")} 和 ${link("DocGroupJo00000000002")}` });
-    model.replies([readCall("DocGroupJo00000000002")], [call("send_message", { text: "哪一篇？" })], [say("")]);
-    await here.says("总结一下", "om_earlier_jo");
-    expect(feishu.reads).toEqual([]);
-    expect(toolOutputs()[0].error).toMatch(/links several documents/);
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupJo00000000002"), readCall("DocGroupJo00000000003")], [call("send_message", { text: "第二篇是…" })], [say("")]);
+    await here.says("总结一下第二篇", "om_earlier_jo");
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocGroupJo00000000002" });
+    expect(toolOutputs()[1].error).toMatch(/link other documents, not that one/);
+    expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocGroupJo00000000002"]);
   });
 
   it("names the document on the card by the link the person wrote, not by whatever host the model wrote", async () => {
@@ -3090,6 +3115,96 @@ describe("reading a document for the one who asked, where several people talk", 
     const card = JSON.stringify(here.shown()[0].content);
     expect(card).toContain(link("DocGroupMax0000000001"));
     expect(card).not.toContain("made-up");
+  });
+
+  it("does not let a later message, one that stands in no such chain, have read what an earlier one only pointed at from long ago", async () => {
+    const ray = someone();
+    feishu.docs.set("DocGroupRay0000000001", { readers: [ray.openId], text: "Ray's old plan." });
+    await authorised(ray, "DocGroupRay0000000001");
+    const id = chat();
+    const here = inGroup(id, ray);
+    // His own message with the link, never sent to the bot, written a week ago.
+    quotable.set("om_old_ray", { chat_id: id, open_id: ray.openId, text: `旧方案 ${link("DocGroupRay0000000001")}`, at: Date.now() - 7 * 86_400_000 });
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupRay0000000001")], [call("send_message", { text: "看了" })], [say("")]);
+    await here.says("看一下", "om_old_ray");
+    expect(feishu.reads).toHaveLength(1);
+    model.replies([readCall("DocGroupRay0000000001")], [call("send_message", { text: "请贴链接" })], [say("")]);
+    await here.says("再读一遍那篇");
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked/);
+    expect(feishu.reads).toHaveLength(1);
+  });
+
+  it("carries on a request that rested on what was linked lately when it was made, however that looks once the person has authorised", async () => {
+    const una = someone();
+    feishu.docs.set("DocGroupUna0000000001", { readers: [una.openId], text: "Una's notes." });
+    const id = chat();
+    const here = inGroup(id, una);
+    // Her own message with the link, never sent to the bot; she replies to it, and then asks about it in a message of its own.
+    quotable.set("om_notes_una", { chat_id: id, open_id: una.openId, text: `笔记 ${link("DocGroupUna0000000001")}` });
+    model.replies([call("send_message", { text: "好的" })], [say("")]);
+    await here.says("先记一下", "om_notes_una");
+    model.replies([readCall("DocGroupUna0000000001")], [say("")]);
+    await here.says("请读刚才那篇");
+    expect(here.shown()).toHaveLength(1);
+    expect((await here.requests()).map((each) => each.status)).toEqual(["waiting"]);
+    // By the time she authorises, the day is over; and (as an earlier version kept it) when that message was written is not on record at all.
+    await rowsOf(here.stub, "UPDATE inbox SET data = json_remove(data, '$.quoted.at') WHERE json_extract(data, '$.quoted') IS NOT NULL");
+    carriesOn("读好了");
+    expect((await consent(linkOn(here.shown()[0].content), una)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupUna0000000001/raw_content"]);
+    expect(here.heard().at(-1)).toBe("读好了");
+    // A new message of hers gets nothing from evidence kept that way.
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupUna0000000001")], [call("send_message", { text: "请贴链接" })], [say("")]);
+    await here.says("再读一遍");
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked/);
+    expect(feishu.reads).toEqual([]);
+  });
+
+  it("carries on a reply to an answer of the agent's by what that answer was written from as it stood when the request was made", async () => {
+    const vic = someone();
+    feishu.docs.set("DocGroupVic0000000001", { readers: [vic.openId], text: "Vic's notes." });
+    await authorised(vic, "DocGroupVic0000000001");
+    const id = chat();
+    const here = inGroup(id, vic);
+    quotable.set("om_notes_vic", { chat_id: id, open_id: vic.openId, text: `笔记 ${link("DocGroupVic0000000001")}` });
+    model.replies([call("send_message", { text: "记下了" })], [say("")]);
+    await here.says("先记一下", "om_notes_vic");
+    model.replies([readCall("DocGroupVic0000000001")], [call("send_message", { text: "笔记的摘要。" })], [say("")]);
+    await here.says("读刚才记下的");
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "笔记的摘要。").at(-1)!.uuid}`;
+    // His authorisation has gone by the time he asks about the answer: he is shown how to give it again.
+    await (await vic.grant()).drop(vic.who);
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupVic0000000001")], [say("")]);
+    await here.says("第二段展开", answer);
+    expect(here.shown()).toHaveLength(1);
+    // The day runs out while he authorises (and, as an earlier version kept it, when the quoted message was written is not on record).
+    await rowsOf(here.stub, "UPDATE inbox SET data = json_remove(data, '$.quoted.at') WHERE json_extract(data, '$.quoted') IS NOT NULL");
+    carriesOn("第二段是…");
+    expect((await consent(linkOn(here.shown()[0].content), vic)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupVic0000000001/raw_content"]);
+    expect(here.heard().at(-1)).toBe("第二段是…");
+  });
+
+  it("reads, for a reply to an answer of the agent's, also another document the person linked further up that chain, as the model names", async () => {
+    const tom = someone();
+    for (const doc of ["DocGroupTom0000000001", "DocGroupTom0000000002", "DocGroupTom0000000003"]) feishu.docs.set(doc, { readers: [tom.openId], text: `text of ${doc}` });
+    await authorised(tom, "DocGroupTom0000000001");
+    const here = inGroup(chat(), tom);
+    model.replies([readCall("DocGroupTom0000000001")], [call("send_message", { text: "第一篇的总结。" })], [say("")]);
+    await here.says(`先总结第一篇 ${link("DocGroupTom0000000001")} ${link("DocGroupTom0000000002")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "第一篇的总结。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    // The answer was sent under his message, which links both: either is his to have read; a third is not.
+    model.replies([readCall("DocGroupTom0000000002"), readCall("DocGroupTom0000000003")], [call("send_message", { text: "第二篇是…" })], [say("")]);
+    await here.says("那第二篇呢", answer);
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocGroupTom0000000002" });
+    expect(toolOutputs()[1].error).toBeDefined();
+    expect(feishu.reads.map((each) => each.path.split("/").at(-2))).toEqual(["DocGroupTom0000000002"]);
   });
 
   it("asks again with a fresh token of the app's when Feishu says the one it holds has lapsed, instead of taking the chat for unknown", async () => {

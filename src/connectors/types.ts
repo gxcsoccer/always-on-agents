@@ -156,7 +156,11 @@ export interface ConnectorTool {
    * (as it identified a read) names. Lets the Brain tell, without knowing the tool, which of the
    * things an earlier answer was written from the person can still point at.
    */
-  links?(message: { text: string; data: Record<string, unknown> }, request: Record<string, unknown>): boolean;
+  /**
+   * `kept`: the messages are the ones kept for a request that is being carried on, to be taken as
+   * they were taken when it was made (time that has passed since does not make them say less).
+   */
+  links?(message: { text: string; data: Record<string, unknown> }, request: Record<string, unknown>, kept?: boolean): boolean;
 }
 
 /**
@@ -300,6 +304,11 @@ export interface Channel {
    */
   aside?(origin: Record<string, string>, person: string, from: Target): Target | undefined;
   /**
+   * The message something sent to this address is written under, named as a message's
+   * `data.replies_to` names it; undefined where it is under nothing. From the address alone.
+   */
+  under?(target: Target): string | undefined;
+  /**
    * The message this one was written in reply to, where the Brain was never sent it (a group
    * sends the agent only what mentions it). Asked once, before the run that takes the message
    * up, with a limit on how long it may take; nothing depends on it. Its words are given only
@@ -442,6 +451,12 @@ export interface Quoted {
   text?: string;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
-  /** What that message was itself written in reply to, named as a message's `data.replies_to` names it. Only for the person's own. */
+  /** When that message was written, in milliseconds, where the outside system says. */
+  at?: number;
+  /**
+   * What that message was itself written in reply to, named as a message's `data.replies_to`
+   * names it. Also given, alone, for a message that is not the person's own: nothing of what it
+   * says, only where it points, so the chain of replies can be followed past it.
+   */
   replies_to?: string;
 }
