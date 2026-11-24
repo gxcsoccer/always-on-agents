@@ -193,7 +193,10 @@ export class Requests implements Wakes {
       // connector can; directly otherwise. Never where the others would see it.
       const asked = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
       const here = waiting.privately === "here" && asked ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(asked) as Target) : undefined;
-      const aside = waiting.privately ? (here ?? this.#b.direct(acting.connector, acting.origin, acting.person)) : undefined;
+      // Where they are reached directly: used at once where it cannot be shown where they asked,
+      // and kept beside the request for the one case that it could, and then certainly was not.
+      const directly = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
+      const aside = waiting.privately ? (here ?? directly) : undefined;
       if (waiting.privately && !aside) throw new Error("the person cannot be reached directly through this connector, so the way in was not sent and nothing waits");
       // 1: put before them somewhere else than they asked. 2: where they asked, for them alone.
       const where = here ? 2 : aside ? 1 : 0;
@@ -213,7 +216,7 @@ export class Requests implements Wakes {
           acting.person,
           id,
           run.session_id,
-          JSON.stringify(acting.events),
+          JSON.stringify({ ...acting.events, ...(here && directly ? { directly } : {}) }),
           acting.connector,
           tool,
           // What to call again, as the tool itself put it: never what the model wrote.
@@ -276,6 +279,25 @@ export class Requests implements Wakes {
    */
   shown(row: Row, how: "reached" | "failed" | "unknown"): void {
     if (typeof row.interaction !== "string") return;
+    // Shown where they asked, for them alone, and certainly not arrived: it goes to them
+    // directly instead. Once: from then on it is a way in sent somewhere else, and how that
+    // goes is said as for any such. The one that failed is left as it is.
+    if (how === "failed") {
+      for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) {
+        const directly = (JSON.parse(waiting.events) as { directly?: Target }).directly;
+        if (!directly) continue;
+        this.#s.transaction(() => {
+          this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ? AND direct = 2", waiting.id);
+          this.#b.enqueueMessage(`invite:${row.interaction}:direct`, waiting.session_id, null, this.#b.notice("invite", waiting.session_id), undefined, undefined, { interaction: row.interaction as string, target: JSON.stringify(directly) });
+        });
+      }
+      // Those just moved wait for word of the new one; the rest are told below.
+      // (Word of the first one's failure says nothing more once the second exists, however that one fares.)
+      if (String(row.idem) === `invite:${row.interaction}` && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `invite:${row.interaction}:direct`).length > 0) {
+        for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 2", row.interaction)) this.#tell(waiting, how);
+        return;
+      }
+    }
     for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) this.#tell(waiting, how);
   }
 

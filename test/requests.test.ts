@@ -799,19 +799,50 @@ describe("keeping a request that has to wait", () => {
       );
     });
 
-    it("says so where the request was made when it was not shown, or when that cannot be told; it is not sent anywhere else", async () => {
-      await asking(async ({ requests, store, sent }, invite) => {
+    it("goes to the person directly instead, once, when it was certainly not shown there; how that goes is said as for any sent directly", async () => {
+      await asking(({ requests, store, kept, sent }, invite) => {
         store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
         requests.shown(invite() as never, "failed");
+        // The one that failed stays as it is; another is made, for the same way in, to them directly.
         expect(invite()).toMatchObject({ target: HERE, status: "dead" });
-        const line = sent(told("grant_1.nonce", "call_1"));
-        expect(line).toMatchObject({ target: TARGET, text: "notice:inviteNotShown" });
-        expect(await requests.gate(line as never)).toBe("send");
+        const direct = () => sent("invite:grant_1.nonce:direct");
+        expect(direct()).toMatchObject({ target: DIRECT, interaction: "grant_1.nonce" });
+        expect(kept("call_1").direct).toBe(1);
+        expect(sent(told("grant_1.nonce", "call_1"))).toBeUndefined();
+        // Told again that the first failed (a repeat): nothing more is made.
+        requests.shown(invite() as never, "failed");
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
+        // It reaches them there: the conversation is told so. Had it failed too, that is said, and it is not moved again.
+        requests.shown(direct() as never, "reached");
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere" });
       });
+      await asking(({ requests, store, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        store.sql.exec("UPDATE outbox SET status = 'dead' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.shown(sent("invite:grant_1.nonce:direct") as never, "failed");
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(2);
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: "notice:inviteNotSent" });
+      });
+    });
+
+    it("says so where the request was made when they cannot be reached directly either, or when it cannot be told whether it was shown", async () => {
+      await asking(
+        async ({ requests, store, sent }, invite) => {
+          store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+          requests.shown(invite() as never, "failed");
+          expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+          const line = sent(told("grant_1.nonce", "call_1"));
+          expect(line).toMatchObject({ target: TARGET, text: "notice:inviteNotShown" });
+          expect(await requests.gate(line as never)).toBe("send");
+        },
+        ({ settings }) => (settings.noDirect = "1"),
+      );
       await asking(({ requests, store, sent }, invite) => {
         store.sql.exec("UPDATE outbox SET status = 'unverified', started = 1, uncertain = 1 WHERE idem = 'invite:grant_1.nonce'");
         requests.shown(invite() as never, "unknown");
         expect(invite()).toMatchObject({ target: HERE, status: "unverified" });
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
         expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:inviteUnknownHere" });
       });
     });
