@@ -284,6 +284,27 @@ export class Runner {
       const acting = open.length > 1 ? this.actingFor(runId) : undefined;
       const personal = new Set(acting ? toolsIn(acting, this.#b.toolsOf).map((each) => each.name) : []);
       const dangling = [...open.filter((each) => personal.has(each.name)), ...open.filter((each) => !personal.has(each.name))];
+      // A request being carried on makes its one call only while what it waited for still holds,
+      // asked now: also when the run was interrupted after the request was claimed, however
+      // long ago. No longer so, and nothing is read; not to be asked just now, and it is put off.
+      const making = dangling.length > 0 ? this.#b.requests.continuationOf(runId) : undefined;
+      if (making?.status === "resuming") {
+        let why: string | undefined;
+        try {
+          why = await this.#b.requests.mayNotDisclose(making);
+        } catch (err) {
+          return this.#retryLater(runId, err);
+        }
+        if (!this.#stillActive(runId)) return;
+        if (why) {
+          this.#s.transaction(() => {
+            for (const call of dangling) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+            this.#b.requests.endRequest(making.id, "void", why);
+          });
+          this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("withheld", run.session_id));
+          break;
+        }
+      }
       if (dangling.length > 0) {
         for (const call of dangling) {
           if (this.#stillActive(runId)?.closed === "settled") {

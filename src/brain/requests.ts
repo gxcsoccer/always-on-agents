@@ -172,6 +172,14 @@ export class Requests implements Wakes {
    * at all, so nothing can be acted on before there is a request to carry on.
    */
   wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+    // The same messages asking for the same thing through the same way in, a second time (the
+    // model called the tool twice): that is the request already kept, and it is answered once.
+    const twice = this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", id).length > 0
+      ? undefined
+      : this.#s
+          .rows<Continuation>("SELECT * FROM continuations WHERE status = 'waiting' AND session_id = ? AND person = ? AND connector = ? AND tool = ? AND interaction = ? AND args = ?", run.session_id, acting.person, acting.connector, tool, waiting.interaction, JSON.stringify(waiting.request))
+          .find((each) => JSON.stringify([...(JSON.parse(each.events) as { said: number[] }).said].sort()) === JSON.stringify([...acting.events.said].sort()));
+    if (twice && !replacing) return { waiting: true, request: twice.id, note: WAITING_NOTE };
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
       // says from where the request verifiably came and who made it. The tool names no address.

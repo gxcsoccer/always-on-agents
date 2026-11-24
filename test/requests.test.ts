@@ -816,6 +816,21 @@ describe("keeping a request that has to wait", () => {
       });
     });
 
+    it("is one request when the same messages ask for the same thing twice over: one answer will come of it", async () => {
+      await asking(({ requests, store, kept, hints }) => {
+        const before = hints().length;
+        const said = (JSON.parse(kept("call_1").events) as { said: number[] }).said;
+        const again = requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { ...acting, events: { said, recent: [] } }, "call_1b", "feishu_read_document", { ...waiting, privately: "here" });
+        expect(again).toMatchObject({ waiting: true, request: "call_1" });
+        expect(store.rows("SELECT id FROM continuations")).toEqual([{ id: "call_1" }]);
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+        expect(hints().length).toBe(before);
+        // Something else asked for by the same messages is its own request.
+        requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { ...acting, events: { said, recent: [] } }, "call_other", "feishu_read_document", { ...waiting, request: { document: "another" }, privately: "here" });
+        expect(store.rows("SELECT id FROM continuations ORDER BY rowid")).toEqual([{ id: "call_1" }, { id: "call_other" }]);
+      });
+    });
+
     it("is never put where everyone would see it: with no way to show it to the person alone, nothing waits", async () => {
       await within((all) => {
         all.settings.noAside = "1";

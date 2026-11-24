@@ -1877,9 +1877,9 @@ describe("a request that waits and is carried on", () => {
       feishu.reads.length = 0;
       modelCalls.length = 0;
       const request = await asksFor(quin, "DocQuin00000000000001");
-      // (The first time it is asked is when the request is taken up; the second is the check before the model.)
+      // (The first time it is asked is when the request is taken up; the second just before its call is made; the third is the check before the model.)
       await whenAsked(quin, async (_grant, holds, time, restore) => {
-        if (time < 2) return holds;
+        if (time < 3) return holds;
         restore();
         throw new Error("the grant cannot be asked just now");
       });
@@ -2573,15 +2573,15 @@ describe("a request that waits and is carried on", () => {
       feishu.reads.length = 0;
       modelCalls.length = 0;
       const id = await asksFor(lia, "DocLia000000000000001");
-      // The grant is asked three times on the way to the model: when the request is taken up,
-      // for the request's own check, and for what the read was made under. The third answer is
+      // The grant is asked four times on the way to the model: when the request is taken up,
+      // just before its call is made, for the request's own check, and for what the read was made under. The last answer is
       // slow. Whether the hour the request had runs out while it is awaited is the difference
       // between the two rounds. (An hour cannot be waited for here: the time it was taken up is
       // moved back while the Brain waits for that answer.)
       let waiting = false;
       let release = false;
       await whenAsked(lia, async (_grant, holds, time, restore) => {
-        if (time < 3) return holds;
+        if (time < 4) return holds;
         restore();
         waiting = true;
         while (!release) await sleep(5);

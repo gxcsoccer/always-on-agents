@@ -1070,6 +1070,41 @@ describe("the run loop, by itself", () => {
       return id;
     };
 
+    it("does not make its call once what it waited for no longer holds, and puts the call off while that cannot be asked", async () => {
+      const claimed = async (b: ReturnType<typeof bench>) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        b.event("hello");
+        const id = (await b.runner.next())!;
+        const session = b.store.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", id)[0].session_id;
+        b.settings.carried = { id: "req_1", status: "resuming", claimed_at: Date.now(), call_id: "c0", tool: "feishu_read_document" };
+        // Claimed, its call written down, and then interrupted before the call was made.
+        b.runner.append(session, id, { type: "function_call", call_id: "c0", name: "feishu_read_document", arguments: "{}" });
+        return id;
+      };
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.mayNotDisclose = "what it waited for no longer holds";
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.asked).toEqual([]);
+        expect(b.of("endRequest")).toEqual([["req_1", "void", "what it waited for no longer holds"]]);
+        expect(b.run(id).status).toBe("done");
+      });
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.mayNotDisclose = new Error("the owner cannot be asked");
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.run(id)).toMatchObject({ status: "running" });
+        expect(b.run(id).retry_at).toBeGreaterThan(Date.now());
+        // Asked again later, it holds: the call is made.
+        b.settings.mayNotDisclose = undefined;
+        b.store.sql.exec("UPDATE runs SET retry_at = NULL WHERE id = ?", id);
+        await b.runner.execute(id);
+        expect(b.of("tool").map(([name]) => name)).toEqual(["connectorTool"]);
+      });
+    });
+
     it("is not put before the model once its condition no longer holds; the person is told", async () => {
       await within(async (b) => {
         const id = await carrying(b);
