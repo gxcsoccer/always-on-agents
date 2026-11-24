@@ -2734,6 +2734,24 @@ describe("a sign that a message arrived", () => {
   });
 });
 
+describe("asking, as the operator, what Feishu says about a chat", () => {
+  const ask = (app: string, chat: string, key = "test-admin") => (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${app}/chats/${chat}`, { headers: { authorization: `Bearer ${key}` } })) as Promise<Response>;
+
+  it("is for the operator alone, about an app that is known and something that is a chat id", async () => {
+    expect((await ask(APP_ID, "oc_1", "someone-else")).status).toBe(401);
+    expect((await ask("cli_unknown", "oc_1")).status).toBe(404);
+    expect((await ask(APP_ID, "ou_someone")).status).toBe(400);
+    expect((await ask(APP_ID, "oc_1%2F..%2Fx")).status).toBe(400);
+  });
+
+  it("answers with how Feishu answered and nothing it was not asked for", async () => {
+    const facts = (await (await ask(APP_ID, "oc_1")).json()) as any;
+    expect(Object.keys(facts).sort()).toEqual(["info", "member"]);
+    expect(typeof facts.info.status).toBe("number");
+    expect(Array.isArray(facts.info.missing)).toBe(true);
+  });
+});
+
 describe("an authorisation that lasts", () => {
   const settings = (change: Record<string, unknown>) =>
     (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${APP_ID}/oauth`, { method: "POST", headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, body: JSON.stringify(change) })) as Promise<Response>;

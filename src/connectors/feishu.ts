@@ -24,6 +24,37 @@ import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback,
 import { grantOf } from "./feishu-grant";
 import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
+/** What Feishu said about one chat: how each of the two questions was answered, and the few fields read from it. */
+export interface ChatFacts {
+  info: { status: number; code?: number; external?: boolean; tenant_key?: string; chat_mode?: string; chat_status?: string; missing: string[] };
+  member: { status: number; code?: number; is_in_chat?: boolean };
+}
+
+/**
+ * Asks Feishu, as the app, what kind of chat this is and whether the app's bot is in it. Only
+ * these fields are taken from the answers, each only if it is of the kind Feishu documents; the
+ * chat's name, owner and everything else are left behind. A call that could not be made is status 0.
+ */
+export async function chatFacts(bearer: string, chatId: string, signal?: AbortSignal): Promise<ChatFacts> {
+  const ask = async (path: string): Promise<{ status: number; code?: number; data: Record<string, unknown> }> => {
+    try {
+      const response = await fetch(`${API}/im/v1/chats/${encodeURIComponent(chatId)}${path}`, { headers: { authorization: `Bearer ${bearer}` }, ...(signal ? { signal } : {}) });
+      const body = ((await response.json().catch(() => null)) ?? {}) as { code?: unknown; data?: unknown };
+      const data = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : {};
+      return { status: response.status, ...(typeof body.code === "number" && Number.isInteger(body.code) ? { code: body.code } : {}), data };
+    } catch {
+      return { status: 0, data: {} };
+    }
+  };
+  const [info, member] = await Promise.all([ask(""), ask("/members/is_in_chat")]);
+  const text = (name: string) => (typeof info.data[name] === "string" && info.data[name] !== "" ? { [name]: String(info.data[name]).slice(0, 100) } : {});
+  const read = { ...(typeof info.data.external === "boolean" ? { external: info.data.external } : {}), ...text("tenant_key"), ...text("chat_mode"), ...text("chat_status") };
+  return {
+    info: { status: info.status, ...(info.code === undefined ? {} : { code: info.code }), ...read, missing: ["external", "tenant_key", "chat_mode", "chat_status"].filter((name) => !(name in read)) },
+    member: { status: member.status, ...(member.code === undefined ? {} : { code: member.code }), ...(typeof member.data.is_in_chat === "boolean" ? { is_in_chat: member.data.is_in_chat } : {}) },
+  };
+}
+
 export const feishuConnector: Connector = {
   name: "feishu",
   async http(request, env, path, ingress) {
@@ -42,6 +73,13 @@ export const feishuConnector: Connector = {
       if (offline !== undefined && typeof offline !== "boolean") return json({ error: "offline_access must be true or false" }, 400);
       const now = await registry(env).setFeishuOauth(path[1], { token_endpoint: endpoint, offline_access: offline });
       return now ? json({ ok: true, ...now }) : json({ error: "unknown app" }, 404);
+    }
+    // What Feishu says about one chat, asked from here because the operator's own machine may not
+    // reach Feishu: a few fixed facts, never a name, a member or a message.
+    if (path[0] === "feishu-apps" && path[1] && path[2] === "chats" && path.length === 4 && method === "GET") {
+      if (!/^oc_[A-Za-z0-9]{1,64}$/.test(path[3])) return json({ error: "not a chat id" }, 400);
+      if (!(await registry(env).feishuApp(path[1]))) return json({ error: "unknown app" }, 404);
+      return json(await chatFacts(await tenantAccessToken(env, path[1]), path[3]));
     }
     // One person's authorisation to read their documents: whether it stands, and taking it away.
     if (path[0] === "feishu-grants" && path.length === 4 && (method === "GET" || method === "DELETE")) {
