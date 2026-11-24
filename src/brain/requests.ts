@@ -305,6 +305,8 @@ export class Requests implements Wakes {
    */
   shown(row: Row, how: "reached" | "failed" | "unknown"): void {
     if (typeof row.interaction !== "string") return;
+    // It has only now arrived, and nothing waits on it any more: what became of it meanwhile is shown on it.
+    if (how === "reached" && this.#s.rows("SELECT 1 FROM continuations WHERE interaction = ? AND status = 'waiting' LIMIT 1", row.interaction).length === 0) this.#wayInOver(row.interaction);
     // Shown where they asked, for them alone, and certainly not arrived: it goes to them
     // directly instead. Once: from then on it is a way in sent somewhere else, and how that
     // goes is said as for any such. The one that failed is left as it is.
@@ -494,7 +496,7 @@ export class Requests implements Wakes {
       this.#b.append(now.session_id, runId, { type: "function_call", call_id: callId, name: now.tool, arguments: now.args } as Item);
       this.#s.setMeta("active_run", runId);
       this.#s.audit("(system)", "request.resumed", { request: id, run: runId });
-      if (now.interaction) this.#wayInOver(now.interaction, "used");
+      if (now.interaction) this.#wayInOver(now.interaction);
       return runId;
     });
   }
@@ -518,25 +520,24 @@ export class Requests implements Wakes {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
-    if (ended.length > 0 && shown) this.#wayInOver(shown, "over");
+    if (ended.length > 0 && shown) this.#wayInOver(shown);
   }
 
   /**
-   * A way in that no request waits on any more is shown as over wherever it was delivered, if
-   * whoever made it says it can no longer be used: it was used, ran out, or came to nothing. One
-   * that still works stays as it is (the next request may be shown the same one), and so does one
-   * that others still wait on. Shown as over once: what it was first shown as stays.
+   * A delivered way in is shown as over wherever it was shown, if whoever made it says it can no
+   * longer be used: it was used, ran out, or came to nothing. One that still works stays as it
+   * is, whoever waits on it or does not (the next request may be shown the same one). Shown as
+   * over once. Whether it is shown as used is told when the look is made, not when it was asked
+   * for: a request has been taken up through it, or none has.
    */
-  #wayInOver(interaction: string, how: "used" | "over"): void {
-    const waited = () => this.#s.rows("SELECT 1 FROM continuations WHERE status = 'waiting' AND interaction = ? LIMIT 1", interaction).length > 0;
-    if (waited()) return;
+  #wayInOver(interaction: string): void {
     for (const row of this.#s.rows<{ id: number; target: string; receipt: string }>("SELECT id, target, receipt FROM outbox WHERE idem IN (?, ?) AND receipt IS NOT NULL AND closed IS NULL", `invite:${interaction}`, `invite:${interaction}:direct`)) {
       // One look at a time for each card, each after the one before: a later reason to look (it
-      // has since been used, say) is not lost to an earlier look that is still out, and what a
-      // card is first shown as stays. Each looks at things as they stand when its turn comes.
+      // has since been used, say) is not lost to an earlier look that is still out.
       const look = (this.#closing.get(row.id) ?? Promise.resolve())
         .then(async () => {
-          if (waited() || this.#s.rows("SELECT 1 FROM outbox WHERE id = ? AND closed IS NULL", row.id).length === 0) return;
+          if (this.#s.rows("SELECT 1 FROM outbox WHERE id = ? AND closed IS NULL", row.id).length === 0) return;
+          const how = this.#s.rows("SELECT 1 FROM continuations WHERE interaction = ? AND status IN ('resuming', 'answering', 'done') LIMIT 1", interaction).length > 0 ? "used" : "over";
           if (await this.#b.closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, interaction, how)) this.#s.sql.exec("UPDATE outbox SET closed = ? WHERE id = ? AND closed IS NULL", how, row.id);
         })
         .catch((err) => this.#s.log("invitation_not_closed", { error: String(err).slice(0, 300) }))

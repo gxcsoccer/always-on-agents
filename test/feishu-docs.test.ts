@@ -161,7 +161,13 @@ function installFakeFeishu() {
     }
     // A card replaced where it was shown: an invitation that is over.
     if (url.host === "open.feishu.cn" && init?.method === "PATCH" && /\/im\/v1\/messages\/[^/]+$/.test(url.pathname)) {
+      // One shown to a single member of a chat cannot be replaced, as with Feishu itself.
+      if (url.pathname.split("/").at(-1)!.startsWith("om_eph_")) return Response.json({ code: 230001, msg: "not a message that can be updated" }, { status: 400 });
       feishu.closed.push({ message: url.pathname.split("/").at(-1)!, card: JSON.parse(body.content) });
+      return Response.json({ code: 0, data: {} });
+    }
+    if (url.host === "open.feishu.cn" && url.pathname.endsWith("/ephemeral/v1/delete")) {
+      feishu.closed.push({ message: String(body.message_id), card: null });
       return Response.json({ code: 0, data: {} });
     }
     const replyingTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reply$/.exec(url.pathname)?.[1] : undefined;
@@ -2925,6 +2931,9 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(here.heard()).toEqual(["读好了：Bea 的笔记。"]);
     expect((await here.requests()).map((each) => each.status)).toEqual(["done"]);
     expect(model.remaining()).toBe(0);
+    // The card only they were shown is taken away: one of those cannot be replaced.
+    await vi.waitFor(() => expect(feishu.closed).toHaveLength(1), { interval: 5 });
+    expect(feishu.closed[0]).toMatchObject({ message: expect.stringMatching(/^om_eph_/), card: null });
   });
 
   it("makes one invitation for each document asked about, each card saying which, and answers only the one whose card was used", async () => {

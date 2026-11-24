@@ -408,7 +408,7 @@ describe("handing work to Doubao Work", () => {
     expect(await dee.requests()).toMatchObject([{ status: "void" }]);
     expect(dee.heard().filter((each) => each === NOT_DONE)).toHaveLength(1);
     // The card that led nowhere no longer offers its way in.
-    await vi.waitFor(() => expect(world.closed.map((each) => each.header.title.content)).toEqual(["这次请求已结束"]), { interval: 5 });
+    await vi.waitFor(() => expect(world.closed.map((each) => each.header.title.content)).toEqual(["授权入口已关闭"]), { interval: 5 });
     // The same link once more changes nothing and says nothing more.
     expect((await consent(first, dee)).status).toBe(400);
     await dee.quiet();

@@ -641,7 +641,11 @@ export async function unreceivedFeishu(env: Env, _scope: Scope, event: { data?: 
   return later ? "retry" : "permanent";
 }
 
-/** Replaces an invitation's card with one that says it is over and has no button. Fixed words: nothing of the invitation is kept to repeat. */
+/**
+ * Replaces an invitation's card with one that says it is over and has no button. Fixed words:
+ * nothing of the invitation is kept to repeat. One shown to a single member of a chat cannot be
+ * replaced, only taken away, and is.
+ */
 export async function closeInvitationFeishu(env: Env, target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean> {
   const messageId = /^feishu:message:([A-Za-z0-9_-]{1,100})$/.exec(receipt.subject)?.[1];
   const appId = target.address.app_id;
@@ -650,15 +654,16 @@ export async function closeInvitationFeishu(env: Env, target: Target, receipt: R
   // (If that cannot be asked just now, it is not known to be over: this throws, and the card stays.)
   if (await invitationFor(env, interaction)) return false;
   const plain = (content: string) => ({ tag: "plain_text", content });
-  const [template, title, text] = how === "used" ? ["green", "已授权", "授权已完成，不需要再操作。"] : ["grey", "这次请求已结束", "这张卡片不用再点了。还需要的话，请在聊天里再跟我说一遍。"];
+  // "over" says no more than that: whoever sees it may have had what they asked for meanwhile.
+  const [template, title, text] = how === "used" ? ["green", "已授权", "授权已完成，不需要再操作。"] : ["grey", "授权入口已关闭", "这张卡片不用再点了。"];
   const card = { config: { wide_screen_mode: true, update_multi: true }, header: { template, title: plain(title) }, elements: [{ tag: "div", text: plain(text) }] };
   const token = await tenantAccessToken(env, appId);
-  const response = await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    method: "PATCH",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ content: JSON.stringify(card) }),
-  });
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" };
+  const response = target.address.visible_to
+    ? await fetch(`${API}/ephemeral/v1/delete`, { method: "POST", headers, body: JSON.stringify({ message_id: messageId }) })
+    : await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}`, { method: "PATCH", headers, body: JSON.stringify({ content: JSON.stringify(card) }) });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string };
+  if (result.code === 99991663) await forgetTenantAccessToken(env, appId, token);
   if (!response.ok || result.code !== 0) throw new Error(`Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`);
   return true;
 }
