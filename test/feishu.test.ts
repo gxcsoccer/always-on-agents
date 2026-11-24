@@ -214,54 +214,72 @@ describe("fetching the message a group message was written in reply to", () => {
     });
     return asked;
   };
-  const item = (over: Record<string, unknown>) => ({ code: 0, data: { items: [{ message_id: "om_parent", msg_type: "text", chat_id: "oc_chat", sender: { id: "ou_alice", id_type: "open_id", sender_type: "user", tenant_key: "t" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/Doc1" }) }, ...over }] } });
+  const one = (over: Record<string, unknown>) => ({ message_id: "om_parent", msg_type: "text", chat_id: "oc_chat", sender: { id: "ou_alice", id_type: "open_id", sender_type: "user", tenant_key: "t" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/Doc1" }) }, ...over });
+  const item = (over: Record<string, unknown>) => ({ code: 0, data: { items: [one(over)] } });
+  const alice = { open_id: "ou_alice", tenant_key: "t" };
+  const look = () => quotedBy("t-app", app, "oc_chat", "om_parent", alice);
 
-  it("asks Feishu for that one message as the app, and gives its words and whether the same person wrote it", async () => {
+  it("asks Feishu for that one message as the app, and gives the asker's own words", async () => {
     const asked = feishu(item({}));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual({ own: true, text: "the notes https://x.feishu.cn/docx/Doc1" });
+    expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1" });
     expect(asked).toEqual([{ url: "https://open.feishu.cn/open-apis/im/v1/messages/om_parent", bearer: "Bearer t-app" }]);
-    feishu(item({}));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_bob")).toEqual({ own: false, text: "the notes https://x.feishu.cn/docx/Doc1" });
   });
 
   it("names the people mentioned in it, flattens a post, and cuts what is long", async () => {
-    feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2 look" }) }, mentions: [{ key: "@_user_1", id: "ou_bot", name: "Agent" }, { key: "@_user_2", id: "ou_carol", name: "Carol Approve" }] }));
-    expect((await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice"))).toEqual({ own: true, text: "and @CarolApprove look" });
+    feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2\nlook" }) }, mentions: [{ key: "@_user_1", id: "ou_bot", name: "Agent" }, { key: "@_user_2", id: "ou_carol", name: "Carol Approve" }] }));
+    expect(await look()).toEqual({ text: "and @CarolApprove look" });
     feishu(item({ msg_type: "post", body: { content: JSON.stringify({ title: "Plan", content: [[{ tag: "text", text: "see " }, { tag: "a", text: "the doc", href: "https://x.feishu.cn/docx/Doc2" }], [{ tag: "at", user_id: "ou_carol", user_name: "Carol" }, { tag: "img", image_key: "k" }]] }) } }));
-    expect((await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice"))?.text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [img]");
+    expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [img]");
     feishu(item({ body: { content: JSON.stringify({ text: "x".repeat(5_000) }) } }));
-    expect((await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice"))?.text).toHaveLength(1_000);
+    expect((await look()).text).toHaveLength(1_000);
     feishu(item({ msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
-    expect((await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice"))?.text).toBe("[a image message, which I cannot read yet]");
+    expect((await look()).text).toBe("[a image message, which I cannot read yet]");
   });
 
-  it("leaves the agent's own messages to the agent's own record", async () => {
-    feishu(item({ sender: { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" } }));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toBeUndefined();
+  it("gives nobody else's words: another member's, a bot's, the agent's own, someone from another organisation, or another message of a forwarded bundle", async () => {
+    for (const sender of [
+      { id: "ou_bob", sender_type: "user", tenant_key: "t" },
+      { id: "cli_other", id_type: "app_id", sender_type: "app", tenant_key: "t" },
+      { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" },
+      { id: "ou_alice", sender_type: "user", tenant_key: "elsewhere" },
+      { id: "ou_alice", sender_type: "anonymous", tenant_key: "t" },
+    ]) {
+      feishu(item({ sender }));
+      expect(await look()).toEqual({});
+    }
+    // Only the message asked for counts, wherever it stands among those returned.
+    feishu({ code: 0, data: { items: [one({ message_id: "om_inner", body: { content: JSON.stringify({ text: "inner" }) } })] } });
+    expect(await look()).toEqual({});
+    feishu({ code: 0, data: { items: [one({ message_id: "om_inner", body: { content: JSON.stringify({ text: "inner" }) } }), one({})] } });
+    expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1" });
   });
 
   it("says only that there was one when it cannot be read: refused, gone, from another chat, malformed, or no answer", async () => {
-    const unread = { own: false };
     feishu({ code: 230027, msg: "Lack of necessary permissions" }, 400);
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual(unread);
+    expect(await look()).toEqual({});
     feishu(item({ deleted: true, body: undefined }));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual(unread);
+    expect(await look()).toEqual({});
     feishu(item({ chat_id: "oc_elsewhere" }));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual(unread);
+    expect(await look()).toEqual({});
     feishu(item({ body: { content: "not json" } }));
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual(unread);
+    expect(await look()).toEqual({});
     vi.stubGlobal("fetch", async () => {
       throw new Error("no route");
     });
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toEqual(unread);
+    expect(await look()).toEqual({});
     // An id that is not one is not asked about.
     const asked = feishu(item({}));
-    expect(await quotedBy("t-app", app, "oc_chat", "../x", "ou_alice")).toEqual(unread);
+    expect(await quotedBy("t-app", app, "oc_chat", "../x", alice)).toEqual({});
     expect(asked).toEqual([]);
   });
 
   it("reports a lapsed app token as such, so the caller can get a fresh one", async () => {
     feishu({ code: 99991663, msg: "invalid access token" }, 400);
-    expect(await quotedBy("t-app", app, "oc_chat", "om_parent", "ou_alice")).toBe("lapsed");
+    expect(await look()).toBe("lapsed");
+  });
+
+  it("keeps an ordinary message on one line, as approvals are read from it", () => {
+    const envelope = { schema: "2.0", header: { event_id: "ev1", event_type: "im.message.receive_v1", app_id: "cli_test", tenant_key: "t", token: "v" }, event: { sender: { sender_type: "user", tenant_key: "t", sender_id: { open_id: "ou_alice" } }, message: { message_id: "om_1", chat_id: "oc_chat", chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: "approve\nall  AB12" }) } } };
+    expect(normalize(app, envelope)?.event.text).toBe("approve all AB12");
   });
 });

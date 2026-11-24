@@ -24,7 +24,7 @@
  * the deployment's secrets.
  */
 import type { Env } from "../env";
-import type { Scope, Target } from "../events";
+import type { Principal, Scope, Target } from "../events";
 
 export interface Connector {
   /** Lowercase; also the first path segment of its routes and the `source` of its events. */
@@ -243,6 +243,14 @@ export interface Channel {
    */
   unreceived?(env: Env, scope: Scope, event: { data?: Record<string, unknown>; reply_to?: Target }, mark: string): Promise<"removed" | "retry" | "permanent">;
   /**
+   * The message this one was written in reply to, where the Brain was never sent it (a group
+   * sends the agent only what mentions it). Asked once, before the run that takes the message
+   * up, with a limit on how long it may take; nothing depends on it. Its words are given only
+   * when the same person wrote it; otherwise only that there was one. Undefined where this does
+   * not apply.
+   */
+  quoted?(env: Env, scope: Scope, event: { principal: Principal; data?: Record<string, unknown> }): Promise<Quoted | undefined>;
+  /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,
    * and a second copy could no longer be told from the first.
@@ -370,3 +378,8 @@ export type Outcome =
   | { state: "withdrawn" }
   /** An answer was sent and it can no longer be found out whether it took effect. */
   | { state: "unknown" };
+
+/** A message another was written in reply to: the person's own words where they could be read and are theirs; empty when there was one that is not shown. */
+export interface Quoted {
+  text?: string;
+}

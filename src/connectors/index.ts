@@ -8,8 +8,8 @@
 import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
-import type { Scope, Target } from "../events";
-import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Receipt, Standing } from "./types";
+import type { Principal, Scope, Target } from "../events";
+import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Quoted, Receipt, Standing } from "./types";
 
 export type * from "./types";
 export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isWaiting } from "./types";
@@ -90,6 +90,13 @@ export async function received(env: Env, name: string, scope: Scope, event: { so
   const show = byName.get(name)?.channel?.received;
   if (!show) return undefined;
   return show(env, scope, event).catch(() => undefined);
+}
+
+/** The message one was written in reply to, where the connector can fetch it. Never throws; undefined where it does not apply. */
+export async function quoted(env: Env, name: string, scope: Scope, event: { principal: Principal; data?: Record<string, unknown> }): Promise<Quoted | undefined> {
+  const ask = byName.get(name)?.channel?.quoted;
+  if (!ask) return undefined;
+  return ask(env, scope, event).catch(() => ({}));
 }
 
 /** Takes off a mark `received` put on. Never throws. */

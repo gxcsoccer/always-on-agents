@@ -1,4 +1,4 @@
-import { handleFeishuWebhook } from "../src/connectors/feishu";
+import { handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -196,31 +196,38 @@ describe("the Feishu webhook endpoint", () => {
     expect(await (await deliver(appId, message(appId, "om_3", "lunch?", "group"))).json()).toEqual({ ignored: true });
   });
 
-  it("fetches what a group message was written in reply to and files it with the message; in a direct chat nothing is fetched", async () => {
+  it("files and acknowledges a group reply without asking Feishu anything; the replied-to message is fetched for the Brain when it asks", async () => {
     const { t, appId } = await app();
     const asked: string[] = [];
     let lapsed = 1;
-    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    let issued = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input);
-      asked.push(url.replace("https://open.feishu.cn/open-apis", ""));
-      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: `t-${asked.length}`, expire: 7200 });
+      // The "got it" reaction on the message is no part of this; nor is which call asked for the app's token.
+      if (url.endsWith("/reactions")) return Response.json({ code: 0, data: {} });
+      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: `t-${++issued}`, expire: 7200 });
+      asked.push(`${url.replace("https://open.feishu.cn/open-apis", "")} as ${String((init?.headers as Record<string, string>)?.authorization)}`);
       // The first token has lapsed early: a fresh one is got and the look-up made again.
       if (lapsed-- > 0) return Response.json({ code: 99991663 }, { status: 400 });
-      return Response.json({ code: 0, data: { items: [{ msg_type: "text", chat_id: "oc_group", sender: { id: "ou_frank", sender_type: "user" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/D1" }) } }] } });
+      return Response.json({ code: 0, data: { items: [{ message_id: "om_parent", msg_type: "text", chat_id: "oc_group", sender: { id: "ou_frank", sender_type: "user", tenant_key: "org" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/D1" }) } }] } });
     });
     const mention = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
-    const reply = (id: string, chat: "p2p" | "group") => {
-      const body = message(appId, id, "@_user_1 look into it", chat, [mention]);
-      return { ...body, event: { ...body.event, message: { ...body.event.message, parent_id: "om_parent" } } };
-    };
-    expect(await (await deliver(appId, reply("om_r1", "group"))).json()).toMatchObject({ accepted: true });
-    expect(asked).toEqual(["/auth/v3/tenant_access_token/internal", "/im/v1/messages/om_parent", "/auth/v3/tenant_access_token/internal", "/im/v1/messages/om_parent"]);
-    const filed = async (scope: string) => runInDurableObject(brainFor(scope), (_: unknown, state: DurableObjectState) => state.storage.sql.exec<{ data: string }>("SELECT data FROM inbox WHERE kind = 'message'").toArray().map((each) => JSON.parse(each.data)));
-    expect((await filed(`${t}:chat:oc_group`))[0]).toMatchObject({ replies_to: "feishu:message:om_parent", quoted: { own: true, text: "the notes https://x.feishu.cn/docx/D1" } });
+    const body = message(appId, "om_r1", "@_user_1 look into it", "group", [mention]);
+    expect(await (await deliver(appId, { ...body, event: { ...body.event, message: { ...body.event.message, parent_id: "om_parent" } } })).json()).toMatchObject({ accepted: true });
+    expect(asked.filter((each) => each.startsWith("/im/v1/messages/om_parent"))).toEqual([]);
     asked.length = 0;
-    expect(await (await deliver(appId, reply("om_r2", "p2p"))).json()).toMatchObject({ accepted: true });
+    const event = { principal: { kind: "human" as const, id: "ou_frank", explicit: true }, data: { replies_to: "feishu:message:om_parent", origin: { app_id: appId, tenant_key: "org" } } };
+    expect(await quotedFeishu(env as any, { tenant: t, kind: "chat", id: "oc_group" }, event)).toEqual({ text: "the notes https://x.feishu.cn/docx/D1" });
+    // Asked twice, the second time with a newer token.
+    expect(asked).toHaveLength(2);
+    expect(asked[0]).toMatch(/^\/im\/v1\/messages\/om_parent as Bearer t-\d+$/);
+    expect(asked[1]).toMatch(/^\/im\/v1\/messages\/om_parent as Bearer t-\d+$/);
+    expect(asked[1]).not.toBe(asked[0]);
+    // Not in a direct chat, and not through an app of another tenant.
+    asked.length = 0;
+    expect(await quotedFeishu(env as any, { tenant: t, kind: "user", id: "ou_frank" }, event)).toBeUndefined();
+    expect(await quotedFeishu(env as any, { tenant: "another", kind: "chat", id: "oc_group" }, event)).toEqual({});
     expect(asked).toEqual([]);
-    expect((await filed(`${t}:user:ou_frank`))[0].quoted).toBeUndefined();
   });
 
   it("refuses unsigned, stale and plaintext events, and events for an app it does not know, all alike", async () => {

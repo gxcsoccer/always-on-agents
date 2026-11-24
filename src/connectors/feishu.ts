@@ -22,7 +22,7 @@ import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -77,7 +77,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -180,23 +180,6 @@ export async function receiveFeishu(env: Env, app: FeishuApp, body: any, defer?:
 
   const normalized = normalize(app, body);
   if (!normalized) return { ignored: true };
-  // In a group the agent is sent only what mentions it. A message written as a reply to another
-  // points at something it may never have been given, so that one is fetched and goes with it.
-  // (In a direct chat everything written there has already arrived.)
-  const parent = /^feishu:message:(.+)$/.exec(String(normalized.event.data?.replies_to ?? ""))?.[1];
-  if (parent && normalized.scope.kind === "chat") {
-    const unread: Quoted = { own: false };
-    const look = async () => {
-      const bearer = await tenantAccessToken(env, app.app_id);
-      const found = await quotedBy(bearer, app, normalized.scope.id, parent, normalized.event.principal.id);
-      // The app's token can lapse before its time: forgotten, so the next one asked for is fresh.
-      if (found === "lapsed") await forgetTenantAccessToken(env, app.app_id, bearer);
-      return found;
-    };
-    let quoted = await look().catch(() => unread);
-    if (quoted === "lapsed") quoted = await look().catch(() => unread);
-    if (quoted) normalized.event.data = { ...normalized.event.data, quoted: quoted === "lapsed" ? unread : quoted };
-  }
   const brain = env.BRAIN.getByName(scopeName(normalized.scope));
   return { ...(await brain.ingest(normalized.event)), scope: scopeName(normalized.scope) };
 }
@@ -336,46 +319,59 @@ function named(text: string, mentions: any[], botOpenId: string | null): string 
   // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
   return text
     .replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown")
-    .replace(/[^\S\n]+/g, " ")
-    .replace(/ ?\n ?/g, "\n")
+    .replace(/\s+/g, " ")
     .trim();
-}
-
-/** A message someone replied to: whether the same person wrote it, and its words where they could be read. */
-export interface Quoted {
-  own: boolean;
-  text?: string;
 }
 
 /** How much of a quoted message is kept. */
 const MAX_QUOTED = 1_000;
 
 /**
- * The message a group message was written in reply to, asked of Feishu as the app (which has to
- * be in that group and allowed to read its messages). Its words are someone's in the group, not
- * necessarily the asker's, and are only ever shown as a quotation. One of the agent's own is left
- * out: what the agent said, the Brain knows and keeps or forgets by its own rules. Whatever
- * cannot be read is reported as there, unread, so the model knows something was pointed at.
+ * The message a group message was written in reply to, for the Brain, which asks when it has no
+ * record of that message: in a group the agent is sent only what mentions it. Nothing in a direct
+ * chat, where everything written has already arrived.
  */
-export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: string): Promise<Quoted | "lapsed" | undefined> {
-  const unread: Quoted = { own: false };
-  if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return unread;
+export async function quotedFeishu(env: Env, scope: Scope, event: { principal: { id: string }; data?: Record<string, unknown> }): Promise<Quoted | undefined> {
+  const origin = event.data?.origin as { app_id?: unknown; tenant_key?: unknown } | undefined;
+  const parent = /^feishu:message:(.+)$/.exec(String(event.data?.replies_to ?? ""))?.[1];
+  if (scope.kind !== "chat" || !parent || typeof origin?.app_id !== "string" || typeof origin.tenant_key !== "string") return undefined;
+  const app = await registry(env).feishuApp(origin.app_id);
+  if (!app || app.tenant !== scope.tenant) return {};
+  const who = { open_id: event.principal.id, tenant_key: origin.tenant_key };
+  const bearer = await tenantAccessToken(env, app.app_id);
+  const found = await quotedBy(bearer, app, scope.id, parent, who);
+  if (found !== "lapsed") return found;
+  // The app's token lapsed before its time: forgotten, and the message asked for once more.
+  await forgetTenantAccessToken(env, app.app_id, bearer);
+  const again = await quotedBy(await tenantAccessToken(env, app.app_id), app, scope.id, parent, who);
+  return again === "lapsed" ? {} : again;
+}
+
+/**
+ * That one message, asked of Feishu as the app (which has to be in the group and allowed to read
+ * its messages). Its words are given only when it is beyond doubt the asker's own: the very
+ * message, in the same chat, written by that person of that organisation. Anyone else's (another
+ * member's, a bot's, someone from outside) is not handed on: the agent takes requests from the
+ * people who address it, and what others wrote does not ride in on a reply. Whatever is not
+ * given is still reported as there, so the model knows something was pointed at.
+ */
+export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }): Promise<Quoted | "lapsed"> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return {};
   try {
     const response = await fetch(`${API}/im/v1/messages/${messageId}`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(2_000) });
     const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { items?: any[] } };
     if (result.code === 99991663) return "lapsed";
-    const found = result.data?.items?.[0];
-    if (!response.ok || result.code !== 0 || !found || found.chat_id !== chatId) return unread;
-    const sender = found.sender ?? {};
-    if (sender.sender_type === "app" && sender.id === app.app_id) return undefined;
-    const own = sender.sender_type === "user" && sender.id === asker;
-    if (found.deleted || typeof found.body?.content !== "string") return unread;
+    // A forwarded bundle comes back as several messages: only the one asked for counts.
+    const found = response.ok && result.code === 0 ? result.data?.items?.find((each) => each?.message_id === messageId) : undefined;
+    const sender = found?.sender ?? {};
+    if (!found || found.chat_id !== chatId || sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return {};
+    if (found.deleted || typeof found.body?.content !== "string") return {};
     const content = JSON.parse(found.body.content);
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, app.bot_open_id) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
-    return { own, text: text.slice(0, MAX_QUOTED) };
+    return { text: text.slice(0, MAX_QUOTED) };
   } catch {
-    return unread;
+    return {};
   }
 }
 
