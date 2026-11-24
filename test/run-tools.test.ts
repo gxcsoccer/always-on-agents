@@ -372,7 +372,7 @@ describe("a run's tools", () => {
         tool.answer = async (context) => (context.relied("recent", 1), { waiting });
         expect(await tools().connectorTool("c1", "feishu_read_document", { url: "u" })).toEqual({ waiting: "kept" });
         expect(outside.has("c1")).toBe(false);
-        expect(of("wait")).toEqual([[expect.objectContaining({ id: "r1" }), { connector: "feishu", events: { said: [7, 8], recent: [42], bound: [42] } }, "c1", "feishu_read_document", waiting, undefined]]);
+        expect(of("wait")).toEqual([[expect.objectContaining({ id: "r1" }), { connector: "feishu", person: "ou_1", events: { said: [7, 8], recent: [42], bound: [42] } }, "c1", "feishu_read_document", waiting, undefined]]);
         expect(store.rows<{ private: number }>("SELECT private FROM outbox")[0].private).toBe(0);
       });
     });

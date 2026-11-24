@@ -265,6 +265,11 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE inbox ADD COLUMN mark_attempts INTEGER NOT NULL DEFAULT 0;
    ALTER TABLE inbox ADD COLUMN mark_next_at INTEGER;
    CREATE INDEX inbox_mark ON inbox (status, mark_next_at) WHERE mark IS NOT NULL;`,
+  // 26: whose request a waiting request is. Where several people share a conversation, each
+  // person's requests are listed, called off and answered apart from everyone else's. Those kept
+  // before this are given the writer of the first message they rest on, where it is still on record.
+  `ALTER TABLE continuations ADD COLUMN person TEXT;
+   UPDATE continuations SET person = (SELECT json_extract(i.principal, '$.id') FROM inbox i WHERE i.id = json_extract(continuations.events, '$.said[0]'));`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

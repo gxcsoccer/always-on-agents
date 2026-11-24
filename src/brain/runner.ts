@@ -667,6 +667,7 @@ export class Runner {
       const principal = JSON.parse(event.principal) as Principal;
       return principal.kind === "human" && principal.explicit === true;
     });
+    const asker = this.actingFor(runId)?.person;
     return buildInstructions({
       scope: this.#s.scope(),
       situation: waiting ? "conversation" : "background",
@@ -674,7 +675,8 @@ export class Runner {
       instructions: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
       tasks: this.#s.rows<Row>("SELECT id, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at") as any,
-      requests: this.#b.requests.cancellable(this.#s.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "").map((each) => ({ id: each.id, asked: this.#b.requests.askedFor(each) })),
+      // The requests of the person this run stands for, which only they can call off; none where it stands for nobody.
+      requests: (asker ? this.#b.requests.cancellable(this.#s.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", runId)[0]?.session_id ?? "", asker) : []).map((each) => ({ id: each.id, asked: this.#b.requests.askedFor(each) })),
     });
   }
 
