@@ -203,6 +203,12 @@ describe("turning a Feishu message into an event", () => {
     const post = normalize(app, envelope({ chat_type: "p2p", message_type: "post", content: JSON.stringify({ title: "", content: [[{ tag: "img", image_key: "img_1" }], [{ tag: "text", text: "我想回复他，应该怎么回复？" }, { tag: "a", text: "方案", href: "https://x.feishu.cn/docx/DocPost0000000000001" }]] }) }));
     expect(post?.event.text).toBe("[a picture, which I cannot see yet]\n我想回复他，应该怎么回复？方案 (https://x.feishu.cn/docx/DocPost0000000000001)");
     expect((post?.event.data as any).documents).toMatchObject([{ token: "DocPost0000000000001" }]);
+    // In a chat: the bot's own mention is dropped as in a plain message, so a decision typed after it reads the same; a colleague is named from the event's list.
+    const mentionBot = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
+    const mentionCarol = { key: "@_user_2", id: { open_id: "ou_carol" }, name: "Carol Lee" };
+    const inChat = normalize(app, envelope({ chat_type: "group", message_type: "post", mentions: [mentionBot, mentionCarol], content: JSON.stringify({ title: "", content: [[{ tag: "at", user_id: "@_user_1", user_name: "Agent" }, { tag: "text", text: " approve K7PW" }], [{ tag: "at", user_id: "@_user_2" }, { tag: "text", text: "看一下" }]] }) }));
+    expect(inChat?.event.text.split("\n")[0]).toBe("approve K7PW");
+    expect(inChat?.event.text.split("\n")[1]).toMatch(/^@Carol\S*Lee 看一下$/);
   });
 });
 
