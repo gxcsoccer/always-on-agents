@@ -886,6 +886,8 @@ export class Runner {
     // people talk; in a person's own scope, theirs.
     // (Where the run acts for nobody there, the one person who wrote everything it was started
     // by: their own words, fetched for their own message, are theirs to be shown with it.)
+    // (A request being carried on is read by the messages kept for it, as they were taken when it was made.)
+    const carrying = runId !== undefined && this.#b.requests.resumed(runId) !== undefined;
     const scope = this.#s.scope();
     const writer = scope.kind === "chat" && !acting && leads && runId ? this.#writerOf(runId) : undefined;
     const through = acting ? { connector: acting.connector, origin: acting.origin } : writer;
@@ -924,7 +926,7 @@ export class Runner {
           } else if (each.kind === "said") {
             const words = quotedOf.get(each.id);
             if (!words) continue;
-            const source = eligibleSource(JSON.parse(words.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, words.person);
+            const source = eligibleSource(JSON.parse(words.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, words.person, carrying);
             const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
             lead(`[A message of yours further up the chain of replies, sent at ${new Date(words.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${words.text}`, "assistant");
           } else lead(each.kind === "cut" ? "[The chain of replies goes further back than was followed.]" : "[A message here that this leads back to is not shown to you: someone else's, or one that could not be read.]");
@@ -936,7 +938,7 @@ export class Runner {
         quoted.forEach((each, at) => {
           // What it was written from, by the tool's canonical call, where that is the one thing the
           // person can still point at: what they are asking about, even once that turn is out of sight.
-          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, each.person);
+          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, each.person, carrying);
           const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
           entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 && !led });
         });

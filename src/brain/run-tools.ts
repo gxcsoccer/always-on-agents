@@ -56,7 +56,7 @@ export class RunTools {
    * as it reached them, and if so the one thing every such answer was written from that the
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
-  #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
+  #answering(run: RunRow, acting: Acting, kept = false): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
     // Which answer of the agent's each message points at: the message it replies to, or the
     // nearest one further up the chain of replies it stands in, as long as nothing of the
     // person's own in between names a document itself (what they link comes first).
@@ -88,7 +88,7 @@ export class RunTools {
     // (And every message replied to has to be such an answer: a reply to anything else as well
     // keeps what that one points at.)
     if (answers.length === new Set(subjects).size && answers.every((each) => (JSON.parse(each.reads) as Read[]).length === 0)) return { answering: { nothing: true } };
-    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person));
+    const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person, kept));
     const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
     return { answering: one ? { source: one.request } : {} };
   }
@@ -145,7 +145,7 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
@@ -299,7 +299,7 @@ export function toolsIn(acting: Pick<Acting, "connector" | "shared">, toolsOf: (
  * messages here (as the tool that read it judges). None for an answer written from nothing read,
  * from several (even if only one of them is still in reach), or from one they linked too long ago.
  */
-export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[], writtenFor?: string | null): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
+export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsOf: (connector: string) => ConnectorTool[], writtenFor?: string | null, kept = false): { tool: string; request: Record<string, unknown>; identity: string } | undefined {
   if (!acting) return undefined;
   // An answer written for someone else is something that was said here, and no more: what it
   // was read from is not this person's to have read again on its strength. Where several people
@@ -320,7 +320,7 @@ export function eligibleSource(reads: Read[], acting: Acting | undefined, toolsO
     } catch {
       return [];
     }
-    return tool?.links && own.some((message) => tool.links!(message, request)) ? [{ tool: each.tool, request, identity: each.identity }] : [];
+    return tool?.links && own.some((message) => tool.links!(message, request, kept)) ? [{ tool: each.tool, request, identity: each.identity }] : [];
   });
   return eligible.length === 1 ? eligible[0] : undefined;
 }

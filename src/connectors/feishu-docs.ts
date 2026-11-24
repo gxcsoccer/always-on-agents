@@ -42,10 +42,11 @@ export const readDocument: ConnectorTool = {
   shared: true,
   parameters: { document: { type: "string" } },
   run: reported,
-  links: (message, request) => {
+  links: (message, request, kept) => {
     const target = documentOf(String(request.document ?? ""));
-    // By the same measure a new request is read by: an answer is not said to be written from something they could not have read again now.
-    return target !== undefined && linkedLately(message).some((each) => each.kind === target.kind && each.token === target.token);
+    // By the same measure the read itself goes by: for a new request, what counts as linked
+    // lately now; for one being carried on, the messages kept for it as they were taken then.
+    return target !== undefined && (kept ? documentsOf : linkedLately)(message).some((each) => each.kind === target.kind && each.token === target.token);
   },
 };
 

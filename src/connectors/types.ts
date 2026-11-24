@@ -156,7 +156,11 @@ export interface ConnectorTool {
    * (as it identified a read) names. Lets the Brain tell, without knowing the tool, which of the
    * things an earlier answer was written from the person can still point at.
    */
-  links?(message: { text: string; data: Record<string, unknown> }, request: Record<string, unknown>): boolean;
+  /**
+   * `kept`: the messages are the ones kept for a request that is being carried on, to be taken as
+   * they were taken when it was made (time that has passed since does not make them say less).
+   */
+  links?(message: { text: string; data: Record<string, unknown> }, request: Record<string, unknown>, kept?: boolean): boolean;
 }
 
 /**
