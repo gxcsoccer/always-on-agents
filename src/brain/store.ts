@@ -27,6 +27,8 @@ export interface RunRow {
   entries: number;
   steps: number;
   retry_at: number | null;
+  /** Set once a tool of the run closed it: "settled" (nothing more is done in it) or "waited" (it can only reply and read again). */
+  closed: string | null;
 }
 
 /** The states a task ends in. */

@@ -2,7 +2,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { documentOf, documentsIn, readDocument } from "../src/connectors/feishu-docs";
+import { authorisationHolds, documentOf, documentsIn, readDocument } from "../src/connectors/feishu-docs";
 import { challengeOf, grantName, grantOf } from "../src/connectors/feishu-grant";
 import { deliverFeishu, normalize } from "../src/connectors/feishu";
 import { scopeName } from "../src/events";
@@ -137,6 +137,25 @@ function installFakeFeishu() {
       await feishu.duringAppToken?.();
       return Response.json({ code: 0, tenant_access_token: "t-app", expire: 7200 });
     }
+    const fetched = url.host === "open.feishu.cn" && (init?.method ?? "GET") === "GET" ? /\/im\/v1\/messages\/([^/]+)$/.exec(url.pathname)?.[1] : undefined;
+    if (fetched) {
+      const found = quotable.get(fetched);
+      return found ? Response.json({ code: 0, data: { items: [{ message_id: fetched, chat_id: found.chat_id, msg_type: "text", sender: { sender_type: "user", id: found.open_id, tenant_key: ORG }, body: { content: JSON.stringify({ text: found.text }) } }] } }) : Response.json({ code: 230110 }, { status: 404 });
+    }
+    // What Feishu says of a chat, and a card shown to one member of it.
+    const aboutChat = url.host === "open.feishu.cn" ? /\/im\/v1\/chats\/([^/]+)(\/members\/is_in_chat)?$/.exec(url.pathname) : undefined;
+    if (aboutChat) {
+      const chat = chats.get(aboutChat[1]);
+      if (chat?.limited) return Response.json({ code: 99991400, msg: "too many" }, { status: 429 });
+      // The app's token lapsed before its time: said once for each of the two questions, then a fresh one works.
+      if (chat?.lapsedOnce && (chat as any).lapsed !== 2) return (((chat as any).lapsed = ((chat as any).lapsed ?? 0) + 1), Response.json({ code: 99991663, msg: "token" }, { status: 400 }));
+      if (!chat || chat.fails) return Response.json({ code: 99991400, msg: "busy" }, { status: 500 });
+      return aboutChat[2] ? Response.json({ code: 0, data: { is_in_chat: chat.botIn !== false } }) : Response.json({ code: 0, data: { name: "a chat's name", external: chat.external, tenant_key: chat.org ?? ORG, chat_mode: chat.mode ?? "group", chat_status: "normal" } });
+    }
+    if (url.host === "open.feishu.cn" && url.pathname.endsWith("/ephemeral/v1/send")) {
+      feishu.sent.push({ to: `only:${body.chat_id}:${body.open_id}`, type: "interactive", content: body.card, uuid: `eph${feishu.sent.length}`, format: "interactive" });
+      return Response.json({ code: 0, data: { message_id: `om_eph_${feishu.sent.length}` } });
+    }
     const replyingTo = url.host === "open.feishu.cn" ? /\/im\/v1\/messages\/([^/]+)\/reply$/.exec(url.pathname)?.[1] : undefined;
     if (url.host === "open.feishu.cn" && (url.pathname.endsWith("/im/v1/messages") || replyingTo)) {
       if (bearer !== "t-app") return Response.json({ code: 99991663 }, { status: 401 });
@@ -256,6 +275,57 @@ const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 /** Rows of a Brain's own records, for looking at what it kept. */
 const rowsOf = (stub: any, query: string, ...args: unknown[]): Promise<any[]> => runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
 /** A person, their scope's Brain, and their direct chat with the bot. */
+/** Messages the bot was never sent, which Feishu hands over when asked for one by its id. */
+const quotable = new Map<string, { chat_id: string; open_id: string; text: string }>();
+/** The chats Feishu knows of in these tests, and what it says of each. */
+const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean; lapsedOnce?: boolean }>();
+
+/** A person writing to the bot in a chat several people share, through an app whose operator turned reading there on. */
+function inGroup(chatId: string, person: ReturnType<typeof someone>) {
+  const stub = (env as any).BRAIN.getByName(scopeName({ tenant: TENANT, kind: "chat", id: chatId })) as any;
+  let n = 0;
+  const ids: string[] = [];
+  const event = (text: string, replyingTo?: string, stamped = true) =>
+    normalize({ ...APP, group_documents: stamped ? 1 : 0 }, {
+      schema: "2.0",
+      header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: APP_ID },
+      event: {
+        sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: person.openId } },
+        message: { message_id: (ids.push(`om_${chatId}_${person.openId}_${++n}`), ids.at(-1)), chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "bot" }], ...(replyingTo ? { parent_id: replyingTo } : {}) },
+      },
+    })!.event;
+  const quiet = async () => {
+    const busy = () =>
+      runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => {
+        const some = (query: string) => state.storage.sql.exec(query).toArray().length > 0;
+        const run = state.storage.sql.exec("SELECT r.retry_at FROM runs r JOIN meta m ON m.value = r.id WHERE m.key = 'active_run'").toArray()[0] as { retry_at: number | null } | undefined;
+        const next = state.storage.sql.exec("SELECT next_at FROM outbox WHERE status = 'pending' ORDER BY id LIMIT 1").toArray()[0] as { next_at: number } | undefined;
+        return (run !== undefined && !(run.retry_at && run.retry_at > Date.now())) || some("SELECT 1 FROM inbox WHERE status = 'pending'") || (next !== undefined && next.next_at <= Date.now());
+      });
+    for (let i = 0; i < 300; i++) {
+      await wake(stub);
+      if (!(await busy())) return;
+      await sleep(10);
+    }
+    throw new Error("the chat's Brain did not come to rest");
+  };
+  const says = async (text: string, replyingTo?: string, stamped = true) => {
+    await stub.ingest(event(text, replyingTo, stamped));
+    await quiet();
+  };
+  /** What the bot said in the chat for everyone, in words; and the cards only this person was shown there. */
+  const heard = () => feishu.sent.filter((each) => (each.to === chatId || ids.some((id) => each.to === `reply:${id}`)) && each.type === "text").map((each) => String(each.content.text));
+  const shown = () => feishu.sent.filter((each) => each.to === `only:${chatId}:${person.openId}`);
+  const everyone = () => feishu.sent.filter((each) => (each.to === chatId || ids.some((id) => each.to === `reply:${id}`)) && each.type === "interactive");
+  const requests = (): Promise<{ id: string; status: string; why: string | null; direct: number }[]> => rowsOf(stub, "SELECT id, status, why, direct FROM continuations ORDER BY rowid");
+  /** Everything that follows from the person's grant changing: both Brains are told, and this one does what it then does. */
+  const settle = async () => {
+    await person.settle();
+    await quiet();
+  };
+  return { stub, says, quiet, heard, shown, everyone, requests, settle, ids };
+}
+
 function someone() {
   const openId = `ou_p${++people}`;
   const stub = (env as any).BRAIN.getByName(scopeName({ tenant: TENANT, kind: "user", id: openId })) as any;
@@ -317,7 +387,7 @@ function someone() {
     });
   };
   /** What the grant still owes the Brain: word of a token it has not yet been told of. */
-  const owed = async () => (await runInDurableObject(await grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant")))?.owed as { event: string; attempts: number } | undefined;
+  const owed = async () => (await runInDurableObject(await grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant")))?.owed?.[0] as { event: string; attempts: number } | undefined;
   /** Lets everything that is due happen: the grant telling the Brain, the Brain carrying on and sending. */
   const settle = async () => {
     await runDurableObjectAlarm(await grant());
@@ -1164,7 +1234,7 @@ describe("reading a Feishu document as the person who asked", () => {
       expect(await authorise()).toEqual({ endpoint: "v3", app: APP_ID });
       expect((await admin("cli_unknown", "v2")).status).toBe(404);
       expect((await admin(APP_ID, "v1")).status).toBe(400);
-      expect(await (await admin(APP_ID, "v2")).json()).toEqual({ ok: true, token_endpoint: "v2", offline_access: false });
+      expect(await (await admin(APP_ID, "v2")).json()).toEqual({ ok: true, token_endpoint: "v2", offline_access: false, group_documents: false });
       expect(await authorise()).toEqual({ endpoint: "v2", app: APP_ID });
       // Only that app, and it survives the app being registered again.
       expect((await registry.feishuApp("cli_other")).oauth_v2).toBe(0);
@@ -1809,9 +1879,9 @@ describe("a request that waits and is carried on", () => {
       feishu.reads.length = 0;
       modelCalls.length = 0;
       const request = await asksFor(quin, "DocQuin00000000000001");
-      // (The first time it is asked is when the request is taken up; the second is the check before the model.)
+      // (The first time it is asked is when the request is taken up; the second just before its call is made; the third is the check before the model.)
       await whenAsked(quin, async (_grant, holds, time, restore) => {
-        if (time < 2) return holds;
+        if (time < 3) return holds;
         restore();
         throw new Error("the grant cannot be asked just now");
       });
@@ -2505,15 +2575,15 @@ describe("a request that waits and is carried on", () => {
       feishu.reads.length = 0;
       modelCalls.length = 0;
       const id = await asksFor(lia, "DocLia000000000000001");
-      // The grant is asked three times on the way to the model: when the request is taken up,
-      // for the request's own check, and for what the read was made under. The third answer is
+      // The grant is asked four times on the way to the model: when the request is taken up,
+      // just before its call is made, for the request's own check, and for what the read was made under. The last answer is
       // slow. Whether the hour the request had runs out while it is awaited is the difference
       // between the two rounds. (An hour cannot be waited for here: the time it was taken up is
       // moved back while the Brain waits for that answer.)
       let waiting = false;
       let release = false;
       await whenAsked(lia, async (_grant, holds, time, restore) => {
-        if (time < 3) return holds;
+        if (time < 4) return holds;
         restore();
         waiting = true;
         while (!release) await sleep(5);
@@ -2734,6 +2804,295 @@ describe("a sign that a message arrived", () => {
   });
 });
 
+describe("reading a document for the one who asked, where several people talk", () => {
+  const turn = (on: boolean) => (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${APP_ID}/oauth`, { method: "POST", headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, body: JSON.stringify({ group_documents: on }) })) as Promise<Response>;
+  let groups = 0;
+  const chat = (about: { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; lapsedOnce?: boolean } = { external: false }) => {
+    const id = `oc_g${++groups}`;
+    chats.set(id, about);
+    return id;
+  };
+  beforeEach(async () => {
+    expect(await (await turn(true)).json()).toMatchObject({ ok: true, group_documents: true });
+  });
+  afterEach(async () => void (await turn(false)));
+
+  it("reads it with their own authorisation and answers in the chat", async () => {
+    const ann = someone();
+    feishu.docs.set("DocGroupAnn0000000001", { readers: [ann.openId], text: "Ann's plan has three steps." });
+    await authorised(ann, "DocGroupAnn0000000001");
+    const here = inGroup(chat(), ann);
+    model.replies([readCall("DocGroupAnn0000000001")], [call("send_message", { text: "三步。" })], [say("")]);
+    await here.says(`总结一下 ${link("DocGroupAnn0000000001")}`);
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupAnn0000000001/raw_content"]);
+    expect(here.heard()).toEqual(["三步。"]);
+    expect(here.shown()).toEqual([]);
+    expect(model.remaining()).toBe(0);
+  });
+
+  it("shows the one who asked, and nobody else, how to authorise; once they have, answers there by itself", async () => {
+    const bea = someone();
+    feishu.docs.set("DocGroupBea0000000001", { readers: [bea.openId], text: "Bea's notes." });
+    const here = inGroup(chat(), bea);
+    model.replies([readCall("DocGroupBea0000000001")], [say("")]);
+    await here.says(`读一下 ${link("DocGroupBea0000000001")}`);
+    expect(feishu.reads).toEqual([]);
+    // One card, for their eyes only, in the chat; nothing for everyone, and nothing in their private chat.
+    expect(here.shown()).toHaveLength(1);
+    expect(here.everyone()).toEqual([]);
+    expect(here.heard()).toEqual([]);
+    expect(bea.cards()).toEqual([]);
+    expect(JSON.stringify(here.shown()[0].content)).toContain(link("DocGroupBea0000000001"));
+    expect(await here.requests()).toMatchObject([{ status: "waiting", direct: 2 }]);
+    // They authorise through that card: the request is carried on and answered where it was asked.
+    carriesOn("读好了：Bea 的笔记。");
+    expect((await consent(linkOn(here.shown()[0].content), bea)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupBea0000000001/raw_content"]);
+    expect(here.heard()).toEqual(["读好了：Bea 的笔记。"]);
+    expect((await here.requests()).map((each) => each.status)).toEqual(["done"]);
+    expect(model.remaining()).toBe(0);
+  });
+
+  it("makes one invitation for each document asked about, each card saying which, and answers only the one whose card was used", async () => {
+    const hal = someone();
+    feishu.docs.set("DocGroupHal0000000001", { readers: [hal.openId], text: "First." });
+    feishu.docs.set("DocGroupHal0000000002", { readers: [hal.openId], text: "Second." });
+    const here = inGroup(chat(), hal);
+    model.replies([readCall("DocGroupHal0000000001"), readCall("DocGroupHal0000000002")], [say("")]);
+    await here.says(`对比 ${link("DocGroupHal0000000001")} 和 ${link("DocGroupHal0000000002")}`);
+    const cards = here.shown();
+    expect(cards).toHaveLength(2);
+    expect(cards.map((each) => [JSON.stringify(each.content).includes("DocGroupHal0000000001"), JSON.stringify(each.content).includes("DocGroupHal0000000002")])).toEqual([[true, false], [false, true]]);
+    expect(new Set(cards.map((each) => linkOn(each.content).searchParams.get("state"))).size).toBe(2);
+    // The card says where the answer will go, by the chat's name as Feishu gives it.
+    expect(JSON.stringify(cards[0].content)).toContain("a chat's name");
+    // The second card is used: the second document is read and answered; the first still waits.
+    carriesOn("第二篇读好了");
+    expect((await consent(linkOn(cards[1].content), hal)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupHal0000000002/raw_content"]);
+    expect((await here.requests()).map((each) => each.status).sort()).toEqual(["done", "waiting"]);
+    // The same question taken up again gets the same invitation, not a new one.
+    const grant = await hal.grant();
+    expect((await runInDurableObject(grant, (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"))).pending).toHaveLength(1);
+  });
+
+  it("is put off, not ended, when Feishu cannot be asked about the chat just then", async () => {
+    const ivy = someone();
+    await authorised(ivy, "DocGroupIvy0000000001").catch(() => undefined);
+    const id = chat();
+    const scope = { tenant: TENANT, kind: "chat" as const, id };
+    const turnNow = (await (env as any).REGISTRY.getByName("global").feishuApp(APP_ID)).group_documents_gen;
+    const read = `chat|${await grantName(ivy.who)}|${APP_ID}|${turnNow}|${ORG}|docx:document:readonly`;
+    chats.set(id, { external: false, limited: true });
+    await expect(authorisationHolds(env as any, scope, read, 1)).rejects.toThrow();
+    chats.set(id, { external: false });
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("holds");
+  });
+
+  it("is not carried on because they authorised some other way: only the card made for that question does it", async () => {
+    const cy = someone();
+    feishu.docs.set("DocGroupCy00000000001", { readers: [cy.openId], text: "Cy's." });
+    const here = inGroup(chat(), cy);
+    model.replies([readCall("DocGroupCy00000000001")], [say("")]);
+    await here.says(`读一下 ${link("DocGroupCy00000000001")}`);
+    // In their private chat, for something asked there.
+    await authorised(cy, "DocGroupCy00000000001");
+    await here.settle();
+    expect(here.heard()).toEqual([]);
+    expect((await here.requests()).map((each) => each.status)).toEqual(["waiting"]);
+    // Asked again there, it is simply read.
+    model.replies([readCall("DocGroupCy00000000001")], [call("send_message", { text: "好了" })], [say("")]);
+    await here.says(`再读一下 ${link("DocGroupCy00000000001")}`);
+    expect(here.heard()).toEqual(["好了"]);
+  });
+
+  it("ends in the system's own words, reading nothing and asking nobody to authorise, where the chat is not the organisation's own or that cannot be told", async () => {
+    const cases: [Parameters<typeof chat>[0], RegExp][] = [
+      [{ external: true }, /外部群/],
+      [{ external: false, org: "another_org" }, /无法确认/],
+      [{ external: false, botIn: false }, /无法确认/],
+      [{ external: false, fails: true }, /无法确认/],
+    ];
+    for (const [about, line] of cases) {
+      const dan = someone();
+      feishu.docs.set("DocGroupDan0000000001", { readers: [dan.openId], text: "Dan's." });
+      await authorised(dan, "DocGroupDan0000000001");
+      const here = inGroup(chat(about), dan);
+      // The model asks to read and to hand the link to a worker, in one go; then it is not asked again.
+      model.replies([call("dispatch_task", { title: "fetch", brief: "fetch the link", repository: null }), readCall("DocGroupDan0000000001")]);
+      await here.says(`读一下 ${link("DocGroupDan0000000001")}`);
+      expect(feishu.reads).toEqual([]);
+      expect(here.heard()).toHaveLength(1);
+      expect(here.heard()[0]).toMatch(line);
+      expect(here.shown()).toEqual([]);
+      expect(await rowsOf(here.stub, "SELECT 1 FROM tasks")).toEqual([]);
+      expect(model.remaining()).toBe(0);
+    }
+  });
+
+  it("is not there at all while the operator has not turned it on: the chat is as it was", async () => {
+    await turn(false);
+    const eve = someone();
+    const here = inGroup(chat(), eve);
+    model.replies([call("send_message", { text: "我读不了。" })], [say("")]);
+    await here.says(`读一下 ${link("DocGroupEve0000000001")}`, undefined, false);
+    expect((modelCalls.at(-1) as any).tools.map((each: any) => each.name)).not.toContain("feishu_read_document");
+    expect(here.heard()).toEqual(["我读不了。"]);
+  });
+
+  it("reads the document linked in the person's own earlier message there, which the bot was never sent, when they reply to it", async () => {
+    const fay = someone();
+    feishu.docs.set("DocGroupFay0000000001", { readers: [fay.openId], text: "Fay's." });
+    await authorised(fay, "DocGroupFay0000000001");
+    const id = chat();
+    const here = inGroup(id, fay);
+    quotable.set("om_earlier_fay", { chat_id: id, open_id: fay.openId, text: `看看这个 ${link("DocGroupFay0000000001")}` });
+    model.replies([readCall("DocGroupFay0000000001")], [call("send_message", { text: "读了" })], [say("")]);
+    await here.says("总结一下", "om_earlier_fay");
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupFay0000000001/raw_content"]);
+    expect(here.heard()).toEqual(["读了"]);
+  });
+
+  it("asks which is meant when the earlier message they reply to links several documents, and reads none of them", async () => {
+    const jo = someone();
+    feishu.docs.set("DocGroupJo00000000001", { readers: [jo.openId], text: "One." });
+    feishu.docs.set("DocGroupJo00000000002", { readers: [jo.openId], text: "Two." });
+    await authorised(jo, "DocGroupJo00000000001");
+    const id = chat();
+    const here = inGroup(id, jo);
+    quotable.set("om_earlier_jo", { chat_id: id, open_id: jo.openId, text: `看看 ${link("DocGroupJo00000000001")} 和 ${link("DocGroupJo00000000002")}` });
+    model.replies([readCall("DocGroupJo00000000002")], [call("send_message", { text: "哪一篇？" })], [say("")]);
+    await here.says("总结一下", "om_earlier_jo");
+    expect(feishu.reads).toEqual([]);
+    expect(toolOutputs()[0].error).toMatch(/links several documents/);
+  });
+
+  it("names the document on the card by the link the person wrote, not by whatever host the model wrote", async () => {
+    const kim = someone();
+    feishu.docs.set("DocGroupKim0000000001", { readers: [kim.openId], text: "Kim's." });
+    const id = chat();
+    const here = inGroup(id, kim);
+    quotable.set("om_earlier_kim", { chat_id: id, open_id: kim.openId, text: `看看 ${link("DocGroupKim0000000001")}` });
+    model.replies([call("feishu_read_document", { document: "https://made-up.feishu.cn/docx/DocGroupKim0000000001" })], [say("")]);
+    await here.says("总结一下", "om_earlier_kim");
+    const card = JSON.stringify(here.shown()[0].content);
+    expect(card).toContain(link("DocGroupKim0000000001"));
+    expect(card).not.toContain("made-up");
+  });
+
+  it("still names it by the link the person wrote when they ask about it again in a later message of their own", async () => {
+    const max = someone();
+    feishu.docs.set("DocGroupMax0000000001", { readers: [max.openId], text: "Max's." });
+    const id = chat();
+    const here = inGroup(id, max);
+    quotable.set("om_earlier_max", { chat_id: id, open_id: max.openId, text: `看看 ${link("DocGroupMax0000000001")}` });
+    model.replies([call("send_message", { text: "好的" })], [say("")]);
+    await here.says("先记一下", "om_earlier_max");
+    model.replies([call("feishu_read_document", { document: "https://made-up.feishu.cn/docx/DocGroupMax0000000001" })], [say("")]);
+    await here.says("请总结刚才那篇");
+    const card = JSON.stringify(here.shown()[0].content);
+    expect(card).toContain(link("DocGroupMax0000000001"));
+    expect(card).not.toContain("made-up");
+  });
+
+  it("asks again with a fresh token of the app's when Feishu says the one it holds has lapsed, instead of taking the chat for unknown", async () => {
+    const lee = someone();
+    feishu.docs.set("DocGroupLee0000000001", { readers: [lee.openId], text: "Lee's." });
+    await authorised(lee, "DocGroupLee0000000001");
+    const id = chat({ external: false, lapsedOnce: true });
+    const here = inGroup(id, lee);
+    model.replies([readCall("DocGroupLee0000000001")], [call("send_message", { text: "读了" })], [say("")]);
+    await here.says(`读一下 ${link("DocGroupLee0000000001")}`);
+    expect(here.heard()).toEqual(["读了"]);
+  });
+
+  it("no longer counts what was read once it is turned off, or off and on again, or the chat is no longer the organisation's own", async () => {
+    const gus = someone();
+    await authorised(gus, "DocGroupGus0000000001").catch(() => undefined);
+    const id = chat();
+    const scope = { tenant: TENANT, kind: "chat" as const, id };
+    const name = await grantName(gus.who);
+    const turnNow = async () => (await (env as any).REGISTRY.getByName("global").feishuApp(APP_ID)).group_documents_gen;
+    const under = async () => `chat|${name}|${APP_ID}|${await turnNow()}|${ORG}|docx:document:readonly`;
+    const read = await under();
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("holds");
+    chats.set(id, { external: true });
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("gone");
+    chats.set(id, { external: false, fails: true });
+    await expect(authorisationHolds(env as any, scope, read, 1)).rejects.toThrow();
+    chats.set(id, { external: false });
+    await turn(false);
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("gone");
+    await turn(true);
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("gone");
+    expect((await authorisationHolds(env as any, scope, await under(), 1)).state).toBe("holds");
+    // And never from a person's own scope, whatever the words say.
+    expect((await authorisationHolds(env as any, { tenant: TENANT, kind: "user", id: gus.openId }, await under(), 1)).state).toBe("gone");
+  });
+});
+
+describe("the answer to an invitation made for one question", () => {
+  const DOCS = ["docx:document:readonly"];
+  /** Such an invitation for this person, as the page Feishu would show for it. */
+  const asked = async (person: ReturnType<typeof someone>) => {
+    const grant = await person.grant();
+    const made = (await grant.invite(person.who, "https://agent.test/v1/feishu/oauth/callback", DOCS, { generation: (await grant.held()).generation }, { brain: `${TENANT}:chat:oc_asked`, key: "om_asked" })) as { nonce: string; generation: number };
+    const card = (await grant.card(made.nonce)) as any;
+    return { grant, ...made, authorize: linkOn(card) };
+  };
+
+  it("is done when the person it was made for completes it, once; the same link again changes nothing", async () => {
+    const pat = someone();
+    const { grant, nonce, generation, authorize } = await asked(pat);
+    expect((await consent(authorize, pat)).status).toBe(200);
+    expect(await grant.answered(nonce, DOCS, generation)).toMatchObject({ state: "holds" });
+    expect((await consent(authorize, pat)).status).toBe(400);
+    expect(await grant.answered(nonce, DOCS, generation)).toMatchObject({ state: "holds" });
+    expect(feishu.exchanges.filter((each) => each.app === APP_ID).length).toBeGreaterThan(0);
+  });
+
+  it("is over when it is turned down, when another account completes it, or when the exchange fails", async () => {
+    const denied = someone();
+    const first = await asked(denied);
+    await consent(first.authorize, denied, "deny");
+    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toEqual({ state: "gone" });
+
+    const victim = someone();
+    const second = await asked(victim);
+    expect((await consent(second.authorize, someone())).status).toBe(403);
+    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toEqual({ state: "gone" });
+    expect((await second.grant.status()).authorised).toBe(false);
+
+    const unlucky = someone();
+    const third = await asked(unlucky);
+    const back = new URL(third.authorize.searchParams.get("redirect_uri")!);
+    back.searchParams.set("state", third.authorize.searchParams.get("state")!);
+    back.searchParams.set("code", "a-code-feishu-never-gave");
+    expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
+    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toEqual({ state: "gone" });
+  });
+});
+
+describe("asking, as the operator, what Feishu says about a chat", () => {
+  const ask = (app: string, chat: string, key = "test-admin") => (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${app}/chats/${chat}`, { headers: { authorization: `Bearer ${key}` } })) as Promise<Response>;
+
+  it("is for the operator alone, about an app that is known and something that is a chat id", async () => {
+    expect((await ask(APP_ID, "oc_1", "someone-else")).status).toBe(401);
+    expect((await ask("cli_unknown", "oc_1")).status).toBe(404);
+    expect((await ask(APP_ID, "ou_someone")).status).toBe(400);
+    expect((await ask(APP_ID, "oc_1%2F..%2Fx")).status).toBe(400);
+  });
+
+  it("answers with how Feishu answered and nothing it was not asked for", async () => {
+    const facts = (await (await ask(APP_ID, "oc_1")).json()) as any;
+    expect(Object.keys(facts).sort()).toEqual(["info", "member"]);
+    expect(typeof facts.info.status).toBe("number");
+    expect(Array.isArray(facts.info.missing)).toBe(true);
+  });
+});
+
 describe("an authorisation that lasts", () => {
   const settings = (change: Record<string, unknown>) =>
     (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/feishu-apps/${APP_ID}/oauth`, { method: "POST", headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, body: JSON.stringify(change) })) as Promise<Response>;
@@ -2753,7 +3112,7 @@ describe("an authorisation that lasts", () => {
   const cards = () => feishu.sent.filter((each) => each.type === "interactive").length;
 
   beforeEach(async () => {
-    expect(await (await settings({ offline_access: true, token_endpoint: "v3" })).json()).toEqual({ ok: true, token_endpoint: "v3", offline_access: true });
+    expect(await (await settings({ offline_access: true, token_endpoint: "v3" })).json()).toEqual({ ok: true, token_endpoint: "v3", offline_access: true, group_documents: false });
   });
 
   it("is asked for only where the operator turned it on, and is renewed without the person", async () => {

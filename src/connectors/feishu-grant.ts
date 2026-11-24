@@ -46,6 +46,39 @@ interface Pending {
   expires_at: number;
   /** What the person is asked to allow, and all the token will be asked for. */
   scope: string[];
+  /**
+   * The one question this invitation was made for, where several people talk: the Brain it was
+   * asked in and what names the question there. Such an invitation is that question's alone,
+   * and what became of it is kept under its own name (see `outcomes`).
+   */
+  ask?: Ask;
+  /** Since when an answer that came back for it is being exchanged. Only one is at a time. */
+  redeeming?: number;
+}
+
+/** The question an invitation was made for: the Brain it was asked in, and its name there. */
+export interface Ask {
+  brain: string;
+  key: string;
+  /** What was asked about, as verified where it was asked (a document's link, say): shown on the card, so it can be told which question it is for. */
+  label?: string;
+  /** The name of where it was asked, as the outside system gives it: shown on the card, so it can be told where the answer will go. */
+  place?: string;
+}
+
+/** What became of an invitation made for one question. */
+interface Outcome {
+  nonce: string;
+  state: "done" | "void";
+  at: number;
+  scope: string[];
+}
+
+/** Word a Brain has not yet heard: which Brain, and of what. */
+interface Owed {
+  to: string;
+  event: string;
+  attempts: number;
 }
 
 interface Stored {
@@ -69,8 +102,14 @@ interface Stored {
      */
     since?: Record<string, number>;
   };
-  /** Set with a token that was just kept, until the person's Brain has been told (see `alarm`). */
-  owed?: { event: string; attempts: number };
+  /**
+   * Set with a token that was just kept or an invitation that was just answered, for each Brain
+   * to tell, until that Brain has heard (see `alarm`). One entry alone, without `to`, is from
+   * before there was more than one Brain to tell: it is for the person's own.
+   */
+  owed?: Owed[] | { event: string; attempts: number };
+  /** What became of invitations made for one question each, kept for an hour. */
+  outcomes?: Outcome[];
   /**
    * The earlier message whose link has been read on the strength of a later one, and the tool
    * call that read it. See `finish`.
@@ -97,6 +136,10 @@ export interface Seen {
 }
 /** How long an invitation to authorise can be used. Feishu's own code lasts five minutes after consent. */
 const INVITATION_TTL_MS = 10 * 60_000;
+/** How long an answer that came back may take to be exchanged before the invitation is given up. */
+const REDEEMING_LIMIT_MS = 2 * 60_000;
+/** How long what became of an invitation stays on record, and with it how long its answer may take to go out. */
+const OUTCOME_TTL_MS = 60 * 60_000;
 /** An invitation with less time left than this is not offered again; a new one is made. */
 const INVITATION_MIN_LEFT_MS = 3 * 60_000;
 const MAX_PENDING = 3;
@@ -115,7 +158,7 @@ export class FeishuGrant extends DurableObject<Env> {
    * An invitation that still has time left is named again rather than replaced, so asking twice
    * shows the person one card.
    */
-  async invite(who: Who, redirect: string, scope: string[], seen: Seen): Promise<"superseded" | { nonce: string; expires_at: number; generation: number }> {
+  async invite(who: Who, redirect: string, scope: string[], seen: Seen, ask?: Ask): Promise<"superseded" | { nonce: string; expires_at: number; generation: number }> {
     if (scope.length === 0 || scope.some((each) => !SCOPES.includes(each))) throw new Error("not a scope this connector asks for");
     const fresh = { nonce: random(32), verifier: random(48) };
     // Nothing is awaited between reading the record and writing it back, so two calls cannot interleave.
@@ -133,11 +176,18 @@ export class FeishuGrant extends DurableObject<Env> {
     // from before the app's setting changed. It could no longer be completed, so it is closed:
     // not offered again, and its link no longer works.
     const lasting = scope.includes(OFFLINE);
-    stored.pending = stored.pending.filter((each) => each.expires_at > now && each.scope.includes(OFFLINE) === lasting);
-    let pending = stored.pending.find((each) => each.redirect === redirect && each.expires_at - now > INVITATION_MIN_LEFT_MS && scope.every((wanted) => each.scope.includes(wanted)));
+    this.#settle(stored, now, (each) => each.scope.includes(OFFLINE) === lasting);
+    // One made for a question is that question's alone, and only while no answer to it is being
+    // exchanged; one made for nobody's question in particular is shared as before.
+    // A question keeps its one for as long as that lasts, also near its end and while an answer
+    // to it is being exchanged: asking again neither gives it more time nor takes a second place.
+    const same = (each: Pending) => (ask ? each.ask?.brain === ask.brain && each.ask.key === ask.key : each.ask === undefined && each.expires_at - now > INVITATION_MIN_LEFT_MS);
+    let pending = stored.pending.find((each) => same(each) && each.redirect === redirect && scope.every((wanted) => each.scope.includes(wanted)));
     if (!pending) {
-      pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS };
-      stored.pending = [...stored.pending, pending].slice(-MAX_PENDING);
+      pending = { ...fresh, redirect, scope, expires_at: now + INVITATION_TTL_MS, ...(ask ? { ask } : {}) };
+      const all = [...stored.pending, pending];
+      for (const pushed of all.slice(0, -MAX_PENDING)) this.#record(stored, pushed, "void", now);
+      stored.pending = all.slice(-MAX_PENDING);
     }
     void this.ctx.storage.put("grant", stored);
     return { nonce: pending.nonce, expires_at: pending.expires_at, generation: stored.generation };
@@ -150,10 +200,10 @@ export class FeishuGrant extends DurableObject<Env> {
   async card(nonce: string): Promise<unknown | null> {
     const stored = await this.#load();
     const pending = stored?.pending.find((each) => each.nonce === nonce);
-    if (!stored || !pending || pending.expires_at <= Date.now()) return null;
+    if (!stored || !pending || pending.expires_at <= Date.now() || pending.redeeming !== undefined) return null;
     const state = `${await grantName(stored.who)}.${pending.nonce}`;
     const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: stored.who.app_id, response_type: "code", redirect_uri: pending.redirect, scope: pending.scope.join(" "), state, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
-    return invitationCard(url, pending.scope.includes(OFFLINE));
+    return invitationCard(url, pending.scope.includes(OFFLINE), pending.ask ? { label: pending.ask.label ?? "", place: pending.ask.place ?? "" } : undefined);
   }
 
   /**
@@ -182,37 +232,52 @@ export class FeishuGrant extends DurableObject<Env> {
     // and when the person asks again it is named again and sent by the Brain.)
     const stored = await this.#load();
     if (!stored?.owed) return;
-    const { event, attempts } = stored.owed;
-    let heard = false;
-    try {
-      const app = await registry(this.env).feishuApp(stored.who.app_id);
-      if (app) heard = (await this.env.BRAIN.getByName(scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id })).conditionReported("feishu", await grantName(stored.who), event)).ok;
-    } catch {
-      heard = false;
-    }
+    const own = this.#owedOf(stored).some((each) => each.to === "") ? await this.#own(stored).catch(() => "") : "";
+    // Each Brain is told on its own, and what it heard clears only what it was told.
+    const heard: Owed[] = [];
+    const tried = this.#owedOf(stored);
+    await Promise.all(
+      tried.map(async (each) => {
+        const to = each.to || own;
+        try {
+          if (to && (await this.env.BRAIN.getByName(to).conditionReported("feishu", await grantName(stored.who), each.event)).ok) heard.push(each);
+        } catch {
+          // Tried again below.
+        }
+      }),
+    );
     const after = await this.#load();
-    if (after?.owed?.event !== event) return;
-    // Cleared only when the Brain said it heard. Until then it is tried again, less often as
-    // time goes on but without end.
-    if (heard) delete after.owed;
-    else after.owed = { event, attempts: attempts + 1 };
+    if (!after?.owed) return;
+    const same = (a: Owed, b: Owed) => a.to === b.to && a.event === b.event;
+    // Cleared only where the Brain said it heard. The rest is tried again, less often as time
+    // goes on but without end; word that became owed meanwhile is untouched.
+    const left = this.#owedOf(after)
+      .filter((each) => !heard.some((told) => same(told, each)))
+      .map((each) => (tried.some((was) => same(was, each)) ? { ...each, attempts: each.attempts + 1 } : each));
+    if (left.length > 0) after.owed = left;
+    else delete after.owed;
     void this.ctx.storage.put("grant", after);
-    if (!heard) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)));
+    if (left.length > 0) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(Math.min(...left.map((each) => each.attempts)), 10)));
   }
 
   /**
    * Takes an invitation out of the record, once: what came back from Feishu names it by its nonce.
    * Returns nothing for one that is unknown, used, expired, or from before the grant was dropped.
    */
-  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number } | null> {
+  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number; ask: boolean } | null> {
     const stored = await this.#load();
     if (!stored) return null;
+    const now = Date.now();
+    this.#settle(stored, now);
     const found = stored.pending.find((each) => each.nonce === nonce);
-    if (!found) return null;
-    stored.pending = stored.pending.filter((each) => each !== found);
+    // One made for a question is claimed, not taken out: it stays, as being exchanged, until the
+    // exchange is recorded as done or failed. A second answer for it finds it claimed.
+    const claimed = found?.ask ? found.redeeming === undefined : found !== undefined;
+    if (found?.ask && claimed) found.redeeming = now;
+    else if (found && !found.ask) stored.pending = stored.pending.filter((each) => each !== found);
     void this.ctx.storage.put("grant", stored);
-    if (found.expires_at <= Date.now()) return null;
-    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation };
+    if (!found || !claimed) return null;
+    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation, ask: found.ask !== undefined };
   }
 
   /**
@@ -221,7 +286,7 @@ export class FeishuGrant extends DurableObject<Env> {
    * either order. A token that covers no more than a usable one already held changes nothing, so
    * finishing the older, narrower invitation last does not take away what the wider one gave.
    */
-  async install(generation: number, token: { access_token: string; expires_at: number; scope: string; refresh?: { token: string; expires_at: number; endpoint: "v2" | "v3" } }): Promise<boolean> {
+  async install(generation: number, token: { access_token: string; expires_at: number; scope: string; refresh?: { token: string; expires_at: number; endpoint: "v2" | "v3" } }, nonce?: string): Promise<boolean> {
     // Sealed under a version of its own. All that is awaited comes before the record is read:
     // from the read to the write nothing else can run, so the decision below is about the grant
     // as it is at the moment of writing, however many installs overlap.
@@ -235,16 +300,112 @@ export class FeishuGrant extends DurableObject<Env> {
     const unreadable = before && !(await open(key, before.sealed, before.version).then(() => true, () => false)) ? before.version : undefined;
     const stored = await this.#load();
     if (!stored || stored.generation !== generation) return false;
-    const has = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
-    if (has && token.scope.split(" ").every((each) => has.includes(each))) return true;
+    // An invitation made for a question: it has to be the one being exchanged, still in its time,
+    // at this very moment. Then it is done, in the same write that keeps the token, and so is
+    // the word owed to the Brain it was asked in. Anything else leaves everything as it is.
+    const now = Date.now();
+    this.#settle(stored, now);
+    // `nonce` is given only for what was claimed as a question's invitation. It has to be on
+    // record still, as that, at this last read: one that is not there any more is not taken for
+    // an invitation of the other kind.
+    const asked = nonce === undefined ? undefined : stored.pending.find((each) => each.nonce === nonce);
+    if (nonce !== undefined && (!asked?.ask || asked.redeeming === undefined)) return void this.ctx.storage.put("grant", stored), false;
+    const done = (event: string) => {
+      if (!asked?.ask) return;
+      this.#record(stored, asked, "done", now);
+      stored.pending = stored.pending.filter((each) => each !== asked);
+      this.#owe(stored, asked.ask.brain, `${event}:${asked.nonce}`);
+    };
+    const has = stored.grant && usable(stored.grant, now) && stored.grant.version !== unreadable ? stored.grant.scope.split(" ") : undefined;
+    if (has && token.scope.split(" ").every((each) => has.includes(each))) {
+      done(stored.grant!.version);
+      void this.ctx.storage.put("grant", stored);
+      if (asked?.ask) void this.ctx.storage.setAlarm(now);
+      return true;
+    }
     // What the token it replaces already covered, and still could, has been held since then.
     const earlier = stored.grant && usable(stored.grant, Date.now()) && stored.grant.version !== unreadable ? stored.grant : undefined;
     const since = Object.fromEntries(token.scope.split(" ").filter(Boolean).map((each) => [each, (earlier?.scope.split(" ").includes(each) ? earlier.since?.[each] : undefined) ?? Date.now()]));
     stored.grant = { sealed, expires_at: token.expires_at, scope: token.scope, version, since, ...(refresh ? { refresh } : {}) };
-    stored.owed = { event: version, attempts: 0 };
+    // The person's own Brain, named when it is told: naming it now could fail and lose the token.
+    this.#owe(stored, "", version);
+    done(version);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
     return true;
+  }
+
+  /** An answer that came back for an invitation made for a question was turned down, or was not the person's: it is over. */
+  async fail(nonce: string): Promise<void> {
+    const stored = await this.#load();
+    const found = stored?.pending.find((each) => each.nonce === nonce);
+    if (!stored || !found?.ask) return;
+    this.#record(stored, found, "void", Date.now());
+    stored.pending = stored.pending.filter((each) => each !== found);
+    void this.ctx.storage.put("grant", stored);
+  }
+
+  /**
+   * What became of one invitation made for a question: the answer to "does the condition this
+   * question waits on hold?". It holds once the person themselves answered that very invitation
+   * and what it gave them is still theirs to use; that they are authorised some other way says
+   * nothing here. "gone" once it can no longer come to hold: turned down, run out, pushed out,
+   * the grant taken away, or its hour on record over.
+   */
+  async answered(nonce: string, scope: string[], generation: number): Promise<{ state: "holds"; since: number } | { state: "not_yet" | "gone" }> {
+    const stored = await this.#load();
+    if (!stored || stored.generation !== generation) return { state: "gone" };
+    const now = Date.now();
+    if (this.#settle(stored, now)) void this.ctx.storage.put("grant", stored);
+    if (stored.pending.some((each) => each.nonce === nonce && each.ask)) return { state: "not_yet" };
+    const outcome = (stored.outcomes ?? []).find((each) => each.nonce === nonce);
+    if (outcome?.state !== "done") return { state: "gone" };
+    const grant = stored.grant;
+    // Only for what this invitation asked the person for: what they allowed some other way since is not its doing.
+    if (scope.some((each) => !outcome.scope.includes(each))) return { state: "gone" };
+    if (!grant || !usable(grant, now) || scope.some((each) => !grant.scope.split(" ").includes(each))) return { state: "not_yet" };
+    return { state: "holds", since: outcome.at };
+  }
+
+  /** Notes what became of an invitation made for a question; others leave no record. */
+  #record(stored: Stored, pending: Pending, state: Outcome["state"], now: number): void {
+    if (!pending.ask || (stored.outcomes ?? []).some((each) => each.nonce === pending.nonce)) return;
+    stored.outcomes = [...(stored.outcomes ?? []), { nonce: pending.nonce, state, at: now, scope: pending.scope }];
+  }
+
+  /**
+   * Brings the record up to now: invitations that ran out, or whose exchange never reported
+   * back, are over; what became of an invitation is forgotten after its hour. `keep` closes
+   * further ones. Says whether anything changed.
+   */
+  #settle(stored: Stored, now: number, keep: (each: Pending) => boolean = () => true): boolean {
+    const over = stored.pending.filter((each) => each.expires_at <= now || (each.redeeming !== undefined && now - each.redeeming > REDEEMING_LIMIT_MS) || !keep(each));
+    for (const each of over) this.#record(stored, each, "void", now);
+    const outcomes = (stored.outcomes ?? []).filter((each) => now - each.at <= OUTCOME_TTL_MS);
+    const changed = over.length > 0 || outcomes.length !== (stored.outcomes ?? []).length;
+    stored.pending = stored.pending.filter((each) => !over.includes(each));
+    if (outcomes.length > 0) stored.outcomes = outcomes;
+    else delete stored.outcomes;
+    return changed;
+  }
+
+  /** The name of the person's own Brain. */
+  async #own(stored: Stored): Promise<string> {
+    const app = await registry(this.env).feishuApp(stored.who.app_id);
+    return app ? scopeName({ tenant: app.tenant, kind: "user", id: stored.who.open_id }) : "";
+  }
+
+  /** Notes that a Brain is to be told of something. Word of the same thing is owed once. */
+  #owe(stored: Stored, to: string, event: string): void {
+    const owed = this.#owedOf(stored);
+    if (!owed.some((each) => each.to === to && each.event === event)) owed.push({ to, event, attempts: 0 });
+    stored.owed = owed;
+  }
+
+  /** What is owed, as a list: one entry from before there was a list is for the person's own Brain (named when it is told). */
+  #owedOf(stored: Stored): Owed[] {
+    if (!stored.owed) return [];
+    return Array.isArray(stored.owed) ? stored.owed : [{ to: "", event: stored.owed.event, attempts: stored.owed.attempts }];
   }
 
   /** One renewal at a time: everyone who needs the token while it is being renewed waits for the same one. */
@@ -431,13 +592,15 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 }
 
-function invitationCard(url: string, lasting: boolean): unknown {
+function invitationCard(url: string, lasting: boolean, asked?: { label: string; place: string }): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   return {
     config: { wide_screen_mode: true },
     header: { template: "blue", title: plain("需要你的授权") },
     elements: [
       { tag: "div", text: plain("要读取你的飞书文档，需要你先授权。授权后我只能以你的身份读取文档，你打不开的文档我也读不到。") },
+      // For a question asked where several people talk: which one, and where the answer will go. Only the person asked sees this card.
+      ...(asked !== undefined ? [{ tag: "div", text: plain(`这张卡片只有你看得到，是为你刚才在群${asked.place ? `「${asked.place}」` : ""}里问的${asked.label ? `这篇文档（${asked.label.slice(0, 200)}）` : "文档"}发的。授权后我会在群里你那条消息下面接着回答。`) }] : []),
       { tag: "action", actions: [{ tag: "button", text: plain("去授权"), type: "primary", url }] },
       // Said before it is given: this authorisation renews itself, and how to end it.
       ...(lasting ? [{ tag: "div", text: plain("这次授权会长期有效：到期后我会自动续期，不再每次请你授权，直到被解除或满一年。需要解除时，可以在飞书的授权管理里取消，或联系管理员。") }] : []),

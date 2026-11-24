@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, canRevisit, deliver, direct, quoted, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, aside, canRevisit, deliver, direct, quoted, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -138,6 +138,7 @@ export class BrainAgent extends DurableObject<Env> {
     this.#outbox = new Outbox(this.#store, {
       deliver: (target, message) => deliver(this.env, this.#store.scope(), target, message),
       sawOutside: (runId) => this.#runner.sawOutside(runId),
+      actedFor: (runId) => this.#runner.actingFor(runId) !== undefined,
       showClosed: (ask) => this.#tasks.showClosed(ask),
       // Built after this part: read when it is used.
       get requests() {
@@ -157,6 +158,7 @@ export class BrainAgent extends DurableObject<Env> {
       enqueueMessage: (...args) => this.#outbox.enqueue(...args),
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
       direct,
+      aside,
     });
     this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks, this.#marks];
     migrate(ctx.storage);

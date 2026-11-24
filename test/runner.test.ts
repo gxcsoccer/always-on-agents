@@ -681,6 +681,75 @@ describe("the run loop, by itself", () => {
     });
   });
 
+  describe("a run a tool has closed", () => {
+    it("does nothing more once a tool settled the matter: calls left open are closed unrun, and the model is not asked again", async () => {
+      await within(async ({ runner, event, store, model, results, items, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        results.memoryList = () => (store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id), { settled: true });
+        model.push(answer([calls("memory_list", "call_1"), calls("send_message", "call_2", { text: "hi" }), calls("dispatch_task", "call_3")]));
+        await runner.execute(id);
+        expect(of("tool").map(([name]) => name)).toEqual(["memoryList"]);
+        expect(asked).toHaveLength(1);
+        expect(run(id).status).toBe("done");
+        const outputs = items(id).filter((each) => each.type === "function_call_output").map((each) => [each.call_id, JSON.parse(each.output)]);
+        expect(outputs).toEqual([["call_1", { settled: true }], ["call_2", { error: "not carried out" }], ["call_3", { error: "not carried out" }]]);
+      });
+    });
+
+    it("does nothing either when entered again after an interruption", async () => {
+      await within(async ({ runner, event, store, items, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        const session = store.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", id)[0].session_id;
+        runner.append(session, id, { type: "function_call", call_id: "c0", name: "feishu_read_document", arguments: "{}" });
+        store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id);
+        await runner.execute(id);
+        expect(of("tool")).toEqual([]);
+        expect(asked).toEqual([]);
+        expect(run(id).status).toBe("done");
+        expect(JSON.parse(items(id).at(-1)!.output)).toEqual({ error: "not carried out" });
+      });
+    });
+
+    it("ends as done, and says nothing more, when it is entered for the last time it could be", async () => {
+      await within(async ({ runner, event, store, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        store.sql.exec("UPDATE runs SET closed = 'settled', entries = 5 WHERE id = ?", id);
+        await runner.execute(id);
+        expect(run(id)).toMatchObject({ status: "done", error: null });
+        expect(of("notify")).toEqual([]);
+        expect(asked).toEqual([]);
+      });
+    });
+
+    it("can only reply and read again once a call of it had to wait", async () => {
+      await within(async ({ runner, event, store, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool, { name: "feishu_write", effect: "write", description: "", parameters: {} } as unknown as ConnectorTool];
+        event("hello");
+        const id = (await runner.next())!;
+        expect(runner.mayUse(id, "dispatch_task")).toBe(true);
+        store.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ?", id);
+        expect(["send_message", "feishu_read_document", "feishu_write", "dispatch_task", "memory_write"].map((name) => runner.mayUse(id, name))).toEqual([true, true, false, false, false]);
+        store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id);
+        expect(["send_message", "feishu_read_document", "dispatch_task"].map((name) => runner.mayUse(id, name))).toEqual([false, false, false]);
+      });
+    });
+
+    it("carries out first the calls that act for the person, whatever order the model gave them in", async () => {
+      await within(async ({ go, event, model, of, settings, items }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool];
+        event("hello");
+        model.push(answer([calls("list_timers", "call_1"), calls("feishu_read_document", "call_2"), calls("memory_list", "call_3")]), answer([says("ok")]));
+        const id = (await go())!;
+        expect(of("tool").map(([name]) => name)).toEqual(["connectorTool", "listTimers", "memoryList"]);
+        void items;
+        void id;
+      });
+    });
+  });
+
   describe("a run that stopped being the active one while it waited", () => {
     it("does not record what the model said once another run is active", async () => {
       await within(async ({ runner, event, host, store, items, run }) => {
@@ -1001,6 +1070,62 @@ describe("the run loop, by itself", () => {
       return id;
     };
 
+    it("does not make its call once what it waited for no longer holds, and puts the call off while that cannot be asked", async () => {
+      const claimed = async (b: ReturnType<typeof bench>) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        b.event("hello");
+        const id = (await b.runner.next())!;
+        const session = b.store.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", id)[0].session_id;
+        b.settings.carried = { id: "req_1", status: "resuming", claimed_at: Date.now(), call_id: "c0", tool: "feishu_read_document" };
+        // Claimed, its call written down, and then interrupted before the call was made.
+        b.runner.append(session, id, { type: "function_call", call_id: "c0", name: "feishu_read_document", arguments: "{}" });
+        return id;
+      };
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.mayNotDisclose = "what it waited for no longer holds";
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.asked).toEqual([]);
+        expect(b.of("endRequest")).toEqual([["req_1", "void", "what it waited for no longer holds"]]);
+        expect(b.run(id).status).toBe("done");
+      });
+      // Called off before its call was made: the call is closed unrun, nothing is asked of anyone, and nothing more is said.
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.carried = { ...b.settings.carried, status: "cancelled" };
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.of("toolsFor")).toEqual([]);
+        expect(b.of("recordUsage")).toEqual([]);
+        expect(b.of("notify")).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+      });
+      // Called off while its condition's owner was being asked: it is not then told that it stopped.
+      await within(async (b) => {
+        const id = await claimed(b);
+        const carried = b.settings.carried!;
+        b.host.requests.mayNotDisclose = async () => ((b.settings.carried = { ...carried, status: "cancelled" }), "what it waited for no longer holds");
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.of("notify")).toEqual([]);
+        expect(b.run(id).status).toBe("done");
+      });
+      await within(async (b) => {
+        const id = await claimed(b);
+        b.settings.mayNotDisclose = new Error("the owner cannot be asked");
+        await b.runner.execute(id);
+        expect(b.of("tool")).toEqual([]);
+        expect(b.run(id)).toMatchObject({ status: "running" });
+        expect(b.run(id).retry_at).toBeGreaterThan(Date.now());
+        // Asked again later, it holds: the call is made.
+        b.settings.mayNotDisclose = undefined;
+        b.store.sql.exec("UPDATE runs SET retry_at = NULL WHERE id = ?", id);
+        await b.runner.execute(id);
+        expect(b.of("tool").map(([name]) => name)).toEqual(["connectorTool"]);
+      });
+    });
+
     it("is not put before the model once its condition no longer holds; the person is told", async () => {
       await within(async (b) => {
         const id = await carrying(b);
@@ -1117,6 +1242,96 @@ describe("the run loop, by itself", () => {
         event("summarise it");
         const id = (await runner.next())!;
         expect(runner.actingFor(id)).toEqual({ connector: "feishu", person: PERSON, origin: ORIGIN, said: [{ text: "summarise it", data: { direct: true, origin: ORIGIN } }], recent: [{ text: "the link", data: { direct: true, origin: ORIGIN } }], recentIds: [earlier] });
+      });
+    });
+
+    describe("where several people talk", () => {
+      const SHARED = { name: "feishu_read_document", effect: "read", shared: true, description: "", parameters: {} } as unknown as ConnectorTool;
+      const OWN_ONLY = { name: "feishu_own_only", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool;
+      const HERE = { origin: ORIGIN, shared: true };
+      const asks = (b: ReturnType<typeof bench>, text: string, over: Record<string, unknown> = {}) => b.event(text, { session_key: "chat", data: HERE, ...over } as never);
+
+      it("is the one person whose ordinary messages to the agent started the run, where the connector says its tools may be used", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED, OWN_ONLY];
+          const mine = asks(b, "the link", { status: "done", received_at: Date.now() - 60_000 });
+          // Someone else's, another conversation's, and one from before the connector said so: not among what this person said here.
+          asks(b, "another link", { status: "done", received_at: Date.now() - 50_000, principal: { kind: "human", id: "ou_2", explicit: true } });
+          asks(b, "in a thread", { status: "done", received_at: Date.now() - 40_000, session_key: "thread:om_t" });
+          asks(b, "before", { status: "done", received_at: Date.now() - 30_000, data: { origin: ORIGIN } });
+          asks(b, "summarise it");
+          const id = (await b.runner.next())!;
+          expect(b.runner.actingFor(id)).toEqual({ connector: "feishu", person: PERSON, origin: ORIGIN, shared: true, said: [{ text: "summarise it", data: HERE }], recent: [{ text: "the link", data: HERE }], recentIds: [mine] });
+          // Only the tools that say they may be used where several people talk are offered, and may be used.
+          await b.runner.execute(id);
+          expect(b.asked[0].tools.map((each) => each.name).filter((name) => name.startsWith("feishu_"))).toEqual(["feishu_read_document"]);
+          void OWN_ONLY;
+        }, "chat:oc_1");
+      });
+
+      it("finds what the person said there shortly before however much the others have said since", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          const mine = asks(b, "the link", { status: "done", received_at: Date.now() - 60_000 });
+          for (let i = 0; i < 230; i++) asks(b, `chatter ${i}`, { status: "done", received_at: Date.now() - 50_000, principal: { kind: "human", id: `ou_other_${i % 7}`, explicit: true } });
+          asks(b, "summarise it");
+          const id = (await b.runner.next())!;
+          expect(b.runner.actingFor(id)?.recentIds).toEqual([mine]);
+        }, "chat:oc_1");
+      });
+
+      it("is nobody unless the connector says so on every message, the person addressed the agent, and it is one person in one conversation", async () => {
+        const cases: Record<string, unknown>[] = [
+          { data: { origin: ORIGIN } },
+          { data: { origin: ORIGIN, direct: true } },
+          { data: { ...HERE, card: "x" } },
+          { data: { ...HERE, question: "ask:1" } },
+          { data: { ...HERE, about_question: true } },
+          { data: { shared: true } },
+          { principal: { kind: "human", id: PERSON, explicit: false } },
+          { principal: { kind: "human", id: PERSON, explicit: true, unlinked: true } },
+          { kind: "timer.fired", principal: { kind: "timer", id: "t", explicit: false } },
+        ];
+        for (const over of cases) {
+          await within(async (b) => {
+            b.settings.connectorTools = [SHARED];
+            asks(b, "hello", over);
+            const id = (await b.runner.next())!;
+            expect(b.runner.actingFor(id)).toBeUndefined();
+          }, "chat:oc_1");
+        }
+        // No tool of the connector's says it may be used here.
+        await within(async (b) => {
+          b.settings.connectorTools = [OWN_ONLY];
+          asks(b, "hello");
+          expect(b.runner.actingFor((await b.runner.next())!)).toBeUndefined();
+        }, "chat:oc_1");
+        // In a person's own scope the mark means nothing: it is their private conversation or nothing.
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          asks(b, "hello");
+          expect(b.runner.actingFor((await b.runner.next())!)).toBeUndefined();
+        });
+      });
+
+      it("shows what a turn that read said afterwards only to a run that itself acts for someone there", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          b.store.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s0', 'chat', 1, 1)");
+          b.store.sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES ('old', 's0', 'done', 1)");
+          b.runner.append("s0", "old", { role: "user", content: "summarise the doc" });
+          b.store.sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES ('s0', 99, 'old', 0, ?, 2)", JSON.stringify({ role: "assistant", content: "[note]" }));
+          b.store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (1, 'old', 's0', 'the doc says three things', 1, '[]')");
+          // Not marked by the connector: the run acts for nobody, and is not shown those words.
+          b.store.sql.exec("UPDATE said SET receipt_subject = 'feishu:message:om_bot'");
+          // Not even when that very message is what they reply to.
+          asks(b, "what about it?", { data: { origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
+          await b.go();
+          expect(JSON.stringify(b.asked[0].input)).not.toContain("three things");
+          asks(b, "and now?");
+          await b.go();
+          expect(JSON.stringify(b.asked[1].input)).toContain("the doc says three things");
+        }, "chat:oc_1");
       });
     });
 

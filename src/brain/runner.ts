@@ -16,7 +16,7 @@ import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
-import { READ_OUTSIDE, type RunTools, eligibleSource } from "./run-tools";
+import { READ_OUTSIDE, type RunTools, eligibleSource, toolsIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
@@ -239,7 +239,7 @@ export class Runner {
     await Promise.all(
       [...unknown.values()].map(async ({ asking, source, ids }) => {
         const found = await Promise.race([this.#b.quoted(source, { ...asking, signal: stop.signal }), late]).catch((): Quoted => ({}));
-        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text } : {}), id);
+        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}) } : {}), id);
       }),
     );
     clearTimeout(timer);
@@ -249,6 +249,15 @@ export class Runner {
   async execute(runId: string): Promise<void> {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
+    // A tool ended the matter itself: that is how the run ends, however often it was entered.
+    if (entered.closed === "settled") {
+      const run = this.#stillActive(runId);
+      if (!run) return;
+      this.#s.transaction(() => {
+        for (const call of danglingCalls(this.#transcript(run.session_id, runId))) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+      });
+      return this.#finish(runId, "done");
+    }
     if (entered.entries > MAX_RUN_ENTRIES) return this.#abandon(runId, "the run kept failing and was abandoned");
     // A run an earlier version left part way after reopening an answer kept for follow-ups, which
     // are retired: nothing more of it is done, not even a call it left behind.
@@ -261,9 +270,60 @@ export class Runner {
 
       // Tool calls without a recorded output: either the model just asked for them, or an earlier
       // attempt died mid-call. Either way, execute and record. Tools are idempotent per call id.
-      const dangling = danglingCalls(items);
+      const open = danglingCalls(items);
+      // A tool ended the matter itself: nothing more is done in this run, also when it is entered
+      // again after an interruption. Calls left open are closed unrun and the model is not asked.
+      if (run.closed === "settled") {
+        this.#s.transaction(() => {
+          for (const call of open) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+        });
+        break;
+      }
+      // Calls that act for the person go first, whatever order the model gave them in: what they
+      // lead to (the run has read, has to wait, is settled) then decides about the others.
+      const acting = open.length > 1 ? this.actingFor(runId) : undefined;
+      const personal = new Set(acting ? toolsIn(acting, this.#b.toolsOf).map((each) => each.name) : []);
+      const dangling = [...open.filter((each) => personal.has(each.name)), ...open.filter((each) => !personal.has(each.name))];
+      // A request being carried on makes its one call only while what it waited for still holds,
+      // asked now: also when the run was interrupted after the request was claimed, however
+      // long ago. No longer so, and nothing is read; not to be asked just now, and it is put off.
+      const making = dangling.length > 0 ? this.#b.requests.continuationOf(runId) : undefined;
+      /** Closes the calls left open, unrun. */
+      const leave = () =>
+        this.#s.transaction(() => {
+          for (const call of dangling) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+        });
+      // One that is no longer being carried on (called off, told to wait again, ended): nothing
+      // of it is done, nobody is asked anything, and nothing more is said.
+      if (making && making.status !== "resuming") {
+        leave();
+        break;
+      }
+      if (making?.status === "resuming") {
+        let why: string | undefined;
+        try {
+          why = await this.#b.requests.mayNotDisclose(making);
+        } catch (err) {
+          return this.#retryLater(runId, err);
+        }
+        if (!this.#stillActive(runId)) return;
+        // It may have been called off while the owner was asked: then that is how it ended, and it is not told otherwise.
+        const still = this.#b.requests.continuationOf(runId)?.status === "resuming";
+        if (why || !still) {
+          leave();
+          if (still) {
+            this.#b.requests.endRequest(making.id, "void", why!);
+            this.#b.outbox.notify(`withheld:${runId}`, run.session_id, null, this.#b.outbox.notice("withheld", run.session_id));
+          }
+          break;
+        }
+      }
       if (dangling.length > 0) {
         for (const call of dangling) {
+          if (this.#stillActive(runId)?.closed === "settled") {
+            this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+            continue;
+          }
           // Decided at the moment of use, a repeat after an interruption included.
           const output = this.mayUse(runId, call.name) ? await executeTool(this.#b.tools.for(run), call) : JSON.stringify({ error: READ_OUTSIDE });
           const outside = this.#b.outside.delete(call.call_id);
@@ -474,6 +534,8 @@ export class Runner {
       // What the run read, by the tool's own canonical call (never anything the model wrote, nor what came back): kept on the note below.
       const read = this.#b.requests.readsOf(runId);
       this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `sources:${runId}`);
+      // And its notes of calls answered with a request another call had made: no call of it is made again now.
+      this.#s.sql.exec("DELETE FROM meta WHERE key LIKE 'waited:%' AND json_valid(value) AND json_extract(value, '$.run') = ?", runId);
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
@@ -508,7 +570,7 @@ export class Runner {
    * empty. Anything else and there is no such person. Worked out from the stored events each
    * time it is needed, never remembered.
    */
-  actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
+  actingFor(runId: string): { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
     return this.actingOn(this.#b.requests.basis(runId), this.#b.requests.resumed(runId) ? (JSON.parse(this.#b.requests.resumed(runId)!.events) as { recent: number[] }).recent : undefined);
   }
 
@@ -516,22 +578,29 @@ export class Runner {
    * The same judgement over given messages: `events` as what was asked, and, if `kept` is given,
    * exactly those earlier messages as what came shortly before (instead of looking for them).
    */
-  actingOn(events: InboxRow[], kept?: number[]): { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
+  actingOn(events: InboxRow[], kept?: number[]): { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] } | undefined {
     const scope = this.#s.scope();
-    if (scope.kind !== "user") return undefined;
     if (events.length === 0) return undefined;
     const source = events[0].source;
     const origin = originOf(events[0]);
-    if (!origin || this.#b.toolsOf(source).length === 0) return undefined;
-    const conversation = privateSessionKey(source, origin);
+    // A person's own scope, and their private conversation there. Or a place several people
+    // share, where the person is whoever wrote the first of these messages, the conversation is
+    // the one it came in, and only tools that say they may be used there count.
+    const shared = scope.kind === "chat";
+    if (scope.kind !== "user" && !shared) return undefined;
+    if (!origin || toolsIn({ connector: source, ...(shared ? { shared: true as const } : {}) }, this.#b.toolsOf).length === 0) return undefined;
+    const person = shared ? (JSON.parse(events[0].principal) as Principal).id : scope.id;
+    const conversation = shared ? events[0].session_key : privateSessionKey(source, origin);
     // A request, in the person's own words, made here: through that connector, in that private
     // conversation, by the person whose scope this is, with that same verified origin.
     const own = (event: InboxRow): boolean => {
       const principal = JSON.parse(event.principal) as Principal;
       if (event.kind !== "message" || event.source !== source || event.session_key !== conversation) return false;
-      if (!this.#b.isDecider(principal, event.source) || principal.id !== scope.id) return false;
+      if (!this.#b.isDecider(principal, event.source) || principal.id !== person) return false;
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      if (data.direct !== true || !plain(data)) return false;
+      // What the connector itself says of the message, as it verified it: written to the agent
+      // alone, or written where its tools may be used for the writer in front of the others.
+      if ((shared ? data.shared : data.direct) !== true || !plain(data)) return false;
       const same = originOf(event);
       return same !== undefined && JSON.stringify(same) === JSON.stringify(origin);
     };
@@ -549,7 +618,7 @@ export class Runner {
       recent = ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids);
       if (recent.length !== ids.length || !recent.every((each) => each.text !== null && own(each))) return undefined;
     } else {
-      recent = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND id < ? AND received_at >= ? ORDER BY id DESC LIMIT ?", conversation, source, first.id, first.received_at - RECENT_REQUEST_MS, MAX_RECENT_REQUESTS * 4)
+      recent = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND json_extract(principal, '$.id') = ? AND id < ? AND received_at >= ? ORDER BY id DESC LIMIT ?", conversation, source, person, first.id, first.received_at - RECENT_REQUEST_MS, MAX_RECENT_REQUESTS * 4)
         .filter(own)
         .slice(0, MAX_RECENT_REQUESTS)
         .reverse();
@@ -561,7 +630,7 @@ export class Runner {
         recent = [...older, ...recent].sort((a, b) => a.id - b.id);
       }
     }
-    return { connector: source, person: scope.id, origin, said: events.map(said), recent: recent.map(said), recentIds: recent.map((each) => each.id) };
+    return { connector: source, person, origin, ...(shared ? { shared: true as const } : {}), said: events.map(said), recent: recent.map(said), recentIds: recent.map((each) => each.id) };
   }
 
   /**
@@ -610,7 +679,10 @@ export class Runner {
     const rows = this.#s.rows<{ run_id: string | null; is_user: number; item: string; outside: number }>("SELECT run_id, is_user, item, outside FROM items WHERE session_id = ? AND seq >= ? ORDER BY seq", sessionId, from);
     // Each scrubbed turn's delivered words go after the last of its kept items. One query for all of them.
     const wordsOf = new Map<string, Item[]>();
-    for (const each of this.#s.rows<{ run_id: string; text: string }>(
+    // Where several people talk, those words are shown only to a run that itself acts for one of
+    // them there: they were written from what one person could read.
+    const mayShow = this.#s.scope().kind !== "chat" || (runId !== undefined && this.actingFor(runId) !== undefined);
+    for (const each of mayShow === false ? [] : this.#s.rows<{ run_id: string; text: string }>(
       "SELECT run_id, text FROM said WHERE session_id = ? AND run_id IN (SELECT DISTINCT run_id FROM items WHERE session_id = ? AND seq >= ? AND is_user = 0 AND outside = 2) ORDER BY outbox_id",
       sessionId,
       sessionId,
@@ -621,7 +693,7 @@ export class Runner {
     // The words people replied to, for every reply in the window, in one query.
     const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
     const quotedOf = new Map(
-      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+      pointed.length === 0 || !mayShow ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
@@ -660,7 +732,7 @@ export class Runner {
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
     const acting = this.actingFor(runId);
     const own = TOOLS;
-    const all = acting ? [...own, ...this.#b.toolsOf(acting.connector).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
+    const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
   }
 
@@ -673,11 +745,14 @@ export class Runner {
   mayUse(runId: string, name: string): boolean {
     const carried = this.#b.requests.continuationOf(runId);
     // The one call made for it (checked again, by its id, where it is carried out) and its answer.
+    const closed = this.#s.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = ?", runId)[0]?.closed;
+    if (closed === "settled") return false;
     if (carried) return name === "send_message" || (carried.status === "resuming" && name === carried.tool);
-    if (!this.sawOutside(runId)) return true;
+    // A run with a call that has to wait is held to the same as one that has read.
+    if (!this.sawOutside(runId) && closed !== "waited") return true;
     if (name === "send_message") return true;
     const acting = this.actingFor(runId);
-    return acting !== undefined && this.#b.toolsOf(acting.connector).some((each) => each.name === name && each.effect === "read");
+    return acting !== undefined && toolsIn(acting, this.#b.toolsOf).some((each) => each.name === name && each.effect === "read");
   }
 
   #instructions(runId: string): string {

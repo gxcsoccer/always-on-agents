@@ -40,7 +40,11 @@ const NOTICES = {
   invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
   invitedElsewhere: { en: "I need you to authorise this before I can go on. I have sent you how in a direct message.", zh: "需要你先授权，我才能继续。授权卡片已私聊发你。" },
   inviteNotSent: { en: "I need you to authorise this before I can go on, but I could not reach you in a direct message. Message me directly and ask again.", zh: "需要你先授权，我才能继续，但授权卡片没能私聊发给你。请私聊我再问一次。" },
+  inviteNotShown: { en: "I need you to authorise this before I can go on, but I could not show you how here. Message me directly with the link.", zh: "需要你先授权，我才能继续，但授权卡片没能在这里发给你。请私聊我，把链接发给我。" },
+  inviteUnknownHere: { en: "I need you to authorise this before I can go on. The card for that may not have reached you; if you do not see it, ask me again.", zh: "需要你先授权，我才能继续。授权卡片可能没有发出去，没看到的话请再 @ 我问一次。" },
   inviteUnknown: { en: "I need you to authorise this before I can go on. I cannot tell whether what I sent you in a direct message arrived; please look there first.", zh: "需要你先授权，我才能继续。我无法确认授权卡片是否送达，请先看看和我的私聊。" },
+  externalChat: { en: "This chat includes people from outside the organisation, so I do not answer about documents here. Message me directly with the link.", zh: "这是外部群，文档内容不在这里回复，请私聊我发链接。" },
+  chatUnknown: { en: "I cannot confirm right now whether document contents may be answered in this chat. Please try again later, or message me directly.", zh: "现在无法确认这个群能不能回复文档内容，请稍后再试，或私聊我。" },
   tomorrow: { en: "I have reached today's usage limit here and will pick this up tomorrow.", zh: "我今天的用量已经用完，明天接着处理。" },
   failed: { en: "Something went wrong on my side and I could not finish handling that. Please try again.", zh: "我这边出了问题，没能处理完。请再试一次。" },
 } as const;
@@ -57,6 +61,8 @@ export interface OutboxHost {
   sawOutside(runId: string): boolean;
   /** Replaces a delivered question by its closed form. Never holds anything up. */
   showClosed(ask: string): void;
+  /** Whether this run acted for one person, with their own tools, in the conversation it answered. */
+  actedFor(runId: string): boolean;
   /** Requests that wait: whether a message may go out, and how the request it answers ended. */
   readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf" | "shown">;
 }
@@ -112,6 +118,11 @@ export class Outbox implements Wakes {
     return NOTICES[which][/[\u4e00-\u9fff]/.test(last) ? "zh" : "en"];
   }
 
+  /** Whether this names one of the system's fixed lines. */
+  isNotice(name: unknown): name is NoticeKey {
+    return typeof name === "string" && Object.hasOwn(NOTICES, name);
+  }
+
   /** A message from the system rather than the model. Having nowhere to send it must never fail the caller. */
   notify(idem: string, sessionId: string, runId: string | null, text: string, continuation?: Continuation): void {
     try {
@@ -162,7 +173,7 @@ export class Outbox implements Wakes {
         }
         // An earlier attempt whose outcome was never heard, in a system that would no longer
         // drop a repeat: it may have arrived, and a second copy could not be told from the first.
-        const window = row.ask ? undefined : dedupeWindow((JSON.parse(row.target) as Target).connector);
+        const window = row.ask ? undefined : dedupeWindow(JSON.parse(row.target) as Target);
         const stale = Boolean(row.uncertain) && window !== undefined && row.first_attempt_at != null && Date.now() - row.first_attempt_at >= window;
         if (gate === "void" || unasked || stale) {
           // Not sent (again). What it said is removed. If an attempt may have reached the person,
@@ -176,6 +187,8 @@ export class Outbox implements Wakes {
           if (how === "void" && !calledOff && !row.interaction && session && (row.guard || row.continuation)) this.notify(`withheld:${row.run_id ?? row.idem}`, session, null, this.notice(unasked ? "unchecked" : "notSent", session));
           if (row.continuation) this.#b.requests.endRequest(row.continuation, how, how === "void" ? "it no longer stood when its answer was to be sent" : "its answer may have been delivered; that could not be verified");
           if (how === "unverified") this.#s.log("message_unverified", { outbox_id: row.id });
+          // A way in whose one attempt was begun and never heard of (the process stopped in between, say): where it was to be shown is told so.
+          if (stale && gate !== "void" && row.interaction) this.#b.requests.shown(row, "unknown");
           continue;
         }
         if (await this.#attempt(row, "pending")) continue;
@@ -268,14 +281,16 @@ export class Outbox implements Wakes {
       // A way in is not kept at the head of the queue, where it would hold back everything else
       // said in the conversation while its own time runs out: refused, it is given up at once;
       // unanswered, after a few quick tries.
-      const dead = tooFar || attempts > OUTBOX_RETRY_DELAYS_MS.length || (Boolean(row.interaction) && (err instanceof DeliveryRejected || attempts >= MAX_INVITE_ATTEMPTS));
+      // Where the outside system never drops a repeat, an attempt that may have arrived is the last.
+      const window = row.ask ? undefined : dedupeWindow(JSON.parse(row.target) as Target);
+      const dead = tooFar || attempts > OUTBOX_RETRY_DELAYS_MS.length || (uncertain && window === 0) || (Boolean(row.interaction) && (err instanceof DeliveryRejected || attempts >= MAX_INVITE_ATTEMPTS));
       const nextAt = Math.max(Date.now() + (OUTBOX_RETRY_DELAYS_MS[attempts - 1] ?? 0), notBefore);
       // An error can quote what was being sent. For a message from a run that read outside text, only the fact is kept.
       const isPrivate = this.#s.rows<{ private: number }>("SELECT private FROM outbox WHERE id = ?", row.id)[0]?.private === 1;
       const why = isPrivate ? DELIVERY_WITHHELD : `${tooFar ? "asked to wait longer than a message is held for; " : ""}${String(err)}`.slice(0, 500);
       // Given up on: where the system has a horizon for repeats and an attempt may have arrived,
       // that is what is recorded, not that it failed. Approval questions keep their own reckoning.
-      const gaveUp = uncertain && !row.ask && dedupeWindow((JSON.parse(row.target) as Target).connector) !== undefined ? "unverified" : "dead";
+      const gaveUp = uncertain && window !== undefined ? "unverified" : "dead";
       this.#s.sql.exec("UPDATE outbox SET status = ?, attempts = ?, next_at = ?, error = ?, uncertain = ? WHERE id = ?", dead ? gaveUp : status, attempts, nextAt, why, uncertain ? 1 : 0, row.id);
       if (dead) this.#s.log("message_undeliverable", { outbox_id: row.id, error: isPrivate ? DELIVERY_WITHHELD : String(err).slice(0, 300) });
       if (dead && row.continuation) this.#b.requests.endRequest(row.continuation, gaveUp === "dead" ? "failed" : "unverified", "its answer could not be delivered");
@@ -296,7 +311,14 @@ export class Outbox implements Wakes {
   #isOwnPrivateMessage(row: Row): boolean {
     // Written by the model, under one of the keys its own messages go by; never the system's fixed words.
     const own = row.authored === 1 && typeof row.idem === "string" && (row.idem.startsWith("msg:") || row.idem.startsWith("answer:"));
-    return own && !row.ask && !row.review && typeof row.run_id === "string" && isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id));
+    // In a person's private conversation, always. Where several people talk, only what a run
+    // that acted for one of them there said: that is what its record is then cleared down to.
+    return own && !row.ask && !row.review && typeof row.run_id === "string" && (isPrivateSession(this.#b.requests.sessionKeyOf(row.target, row.run_id)) || this.#b.actedFor(row.run_id) || this.#answersFor(row));
+  }
+
+  /** Whether this is the answer of a request kept for one person: by the time it goes out the run that wrote it is no longer carrying the request on. */
+  #answersFor(row: Row): boolean {
+    return typeof row.continuation === "string" && this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND run_id = ? AND person IS NOT NULL", row.continuation, row.run_id).length > 0;
   }
 
   scrub(which: "id = ?" | "run_id = ?", value: number | string): void {

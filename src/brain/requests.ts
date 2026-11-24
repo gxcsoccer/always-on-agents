@@ -88,10 +88,13 @@ export interface RequestsHost {
   notice(which: NoticeKey, sessionId: string): string;
   /** Where a person is reached directly through a connector, from a verified origin; undefined where they cannot be. */
   direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
+  /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
+  aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
 }
 
 /** The one person a run acts for, and their own messages it rests on. */
-export type Acting = { connector: string; person: string; origin: Record<string, string>; said: Said[]; recent: Said[]; recentIds: number[] };
+/** `shared` is set where the conversation is one several people share: only tools that say they may be used there are. */
+export type Acting = { connector: string; person: string; origin: Record<string, string>; shared?: true; said: Said[]; recent: Said[]; recentIds: number[] };
 
 export class Requests implements Wakes {
   readonly #s: BrainStore;
@@ -121,6 +124,8 @@ export class Requests implements Wakes {
       const ahead = looks.filter((at) => at > now);
       candidates.push(ahead.length === looks.length ? Math.min(...ahead) : Math.min(now + 60_000, ...ahead));
     }
+    // And soon, where going to someone directly is still to be written down (see `deadlines`).
+    if (this.#unredirected(now).length > 0) candidates.push(now + 2_000);
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
@@ -169,16 +174,38 @@ export class Requests implements Wakes {
    * at all, so nothing can be acted on before there is a request to carry on.
    */
   wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+    // The same messages asking for the same thing through the same way in, a second time (the
+    // model called the tool twice): that is the request already kept, and it is answered once.
+    const twice = this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", id).length > 0
+      ? undefined
+      : this.#s
+          .rows<Continuation>("SELECT * FROM continuations WHERE status = 'waiting' AND session_id = ? AND person = ? AND connector = ? AND tool = ? AND interaction = ? AND args = ?", run.session_id, acting.person, acting.connector, tool, waiting.interaction, JSON.stringify(waiting.request))
+          .find((each) => JSON.stringify([...(JSON.parse(each.events) as { said: number[] }).said].sort()) === JSON.stringify([...acting.events.said].sort()));
+    if (twice && !replacing) {
+      // Which request this call was answered with, kept: made again after an interruption it has
+      // the same answer, whatever has become of that request since (see RunTools.connectorTool).
+      this.#s.setMeta(`waited:${id}`, JSON.stringify({ request: twice.id, run: run.id }));
+      return { waiting: true, request: twice.id, note: WAITING_NOTE };
+    }
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
       // says from where the request verifiably came and who made it. The tool names no address.
-      const aside = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
-      if (waiting.privately && !aside) throw new Error("the person cannot be reached directly through this connector, so the way in was not sent and nothing waits");
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
+      // "here": in the conversation the request was made in, for their eyes only, where the
+      // connector can; directly otherwise. Never where the others would see it.
+      const asked = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
+      const here = waiting.privately === "here" && asked ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(asked) as Target) : undefined;
+      // Where they are reached directly: used at once where it cannot be shown where they asked,
+      // and kept beside the request for the one case that it could, and then certainly was not.
+      const directly = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
+      const aside = waiting.privately ? (here ?? directly) : undefined;
+      if (waiting.privately && !aside) throw new Error("the person cannot be reached directly through this connector, so the way in was not sent and nothing waits");
+      // 1: put before them somewhere else than they asked. 2: where they asked, for them alone.
+      const where = here ? 2 : aside ? 1 : 0;
       if (existing && existing.status !== "resuming") throw new Error("that request has ended");
       if (existing) {
         // Carried on and told to wait once more: the same request, waiting on what it needs now.
-        this.#s.sql.exec("UPDATE continuations SET status = 'waiting', subject = ?, condition = ?, generation = ?, interaction = ?, until = ?, direct = ?, claimed_at = NULL, check_at = NULL WHERE id = ?", waiting.subject, waiting.condition, waiting.generation, waiting.interaction, waiting.until, aside ? 1 : 0, id);
+        this.#s.sql.exec("UPDATE continuations SET status = 'waiting', subject = ?, condition = ?, generation = ?, interaction = ?, until = ?, direct = ?, claimed_at = NULL, check_at = NULL WHERE id = ?", waiting.subject, waiting.condition, waiting.generation, waiting.interaction, waiting.until, where, id);
       } else {
         const basis = this.basis(run.id);
         // Its answer goes back where the person's own message came from, as that message said:
@@ -187,11 +214,11 @@ export class Requests implements Wakes {
         if (!target) throw new Error("there is nowhere to send a message in this conversation");
         this.#s.sql.exec(
           "INSERT INTO continuations (direct, person, id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
-          aside ? 1 : 0,
+          where,
           acting.person,
           id,
           run.session_id,
-          JSON.stringify(acting.events),
+          JSON.stringify({ ...acting.events, ...(here && directly ? { directly } : {}) }),
           acting.connector,
           tool,
           // What to call again, as the tool itself put it: never what the model wrote.
@@ -214,7 +241,10 @@ export class Requests implements Wakes {
       // was given up, now that the person asks afresh: as long as it is certain that it never
       // arrived. One that may have (kept as unverified) is not sent a second time. A time it
       // was told not to be sent before still holds.
-      const again = this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
+      // (Not one that has since gone to the person directly: that one stands for it from then on.)
+      const moved = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}:direct`)[0];
+      if (moved && aside) this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ?", id);
+      const again = !moved && this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
       // It is being tried again: word of how the earlier try went is no longer true, and is
       // not sent (again). Where it has certainly not reached anyone, it is set aside and what
       // comes of this try is said in its place; where an attempt may have arrived, it is kept
@@ -222,7 +252,8 @@ export class Requests implements Wakes {
       if (again) this.#s.sql.exec("UPDATE outbox SET status = CASE WHEN uncertain = 0 THEN 'void' ELSE 'unverified' END WHERE idem LIKE 'invited:%' AND status = 'pending' AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[0]') = ?", waiting.interaction);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
-        const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
+        const sent = moved?.status ?? this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
+        if (moved) now.direct = 1;
         if (sent === "sent") this.#tell(now, "reached");
         else if (sent === "dead") this.#tell(now, "failed");
         else if (sent === "unverified") this.#tell(now, "unknown");
@@ -254,7 +285,52 @@ export class Requests implements Wakes {
    */
   shown(row: Row, how: "reached" | "failed" | "unknown"): void {
     if (typeof row.interaction !== "string") return;
-    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 1", row.interaction)) this.#tell(waiting, how);
+    // Shown where they asked, for them alone, and certainly not arrived: it goes to them
+    // directly instead. Once: from then on it is a way in sent somewhere else, and how that
+    // goes is said as for any such. The one that failed is left as it is.
+    const original = String(row.idem) === `invite:${row.interaction}`;
+    const directly = (waiting: Continuation) => (JSON.parse(waiting.events) as { directly?: Target }).directly !== undefined;
+    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) {
+      // One with somewhere to go directly is on its way there, now or at the next look: what
+      // became of the first try is not said. What is said is how the second one fares.
+      if (how === "failed" && waiting.direct === 2 && directly(waiting)) {
+        this.#redirect(waiting);
+        continue;
+      }
+      if (original && waiting.direct === 1 && directly(waiting)) continue;
+      this.#tell(waiting, how);
+    }
+  }
+
+  /** Requests still waiting, in time, whose way in was certainly not shown where they asked and has not yet been sent to them directly although it can be. */
+  #unredirected(now: number): Continuation[] {
+    return this.#s
+      .rows<Continuation>(
+        "SELECT c.* FROM continuations c JOIN outbox o ON o.idem = 'invite:' || c.interaction WHERE c.status = 'waiting' AND c.direct = 2 AND c.until > ? AND o.status = 'dead' AND o.uncertain = 0 AND NOT EXISTS (SELECT 1 FROM outbox d WHERE d.idem = 'invite:' || c.interaction || ':direct')",
+        now,
+      )
+      .filter((each) => (JSON.parse(each.events) as { directly?: Target }).directly !== undefined);
+  }
+
+  /**
+   * Sends a way in that was certainly not shown where the person asked to them directly, where
+   * that is known: the request becomes one whose way in was sent somewhere else, and the new
+   * message exists, in one step. If that step cannot be kept just now it is made up for at the
+   * next look (see `deadlines`); the same key each time, so there is one such message at most.
+   */
+  #redirect(waiting: Continuation): boolean {
+    const directly = (JSON.parse(waiting.events) as { directly?: Target }).directly;
+    if (!directly) return false;
+    try {
+      this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE continuations SET direct = 1 WHERE id = ? AND direct = 2", waiting.id);
+        this.#b.enqueueMessage(`invite:${waiting.interaction}:direct`, waiting.session_id, null, this.#b.notice("invite", waiting.session_id), undefined, undefined, { interaction: waiting.interaction, target: JSON.stringify(directly) });
+      });
+      return true;
+    } catch {
+      // Looked at again shortly (see nextWakeAt).
+      return false;
+    }
   }
 
   #tell(waiting: Continuation, how: "reached" | "failed" | "unknown"): void {
@@ -262,8 +338,11 @@ export class Requests implements Wakes {
     const on = JSON.parse(waiting.events) as { said: number[]; bound?: number[] };
     const said = on.said.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${on.said.map(() => "?").join(",")}) ORDER BY id`, ...on.said);
     if (!this.#anchor(said, on.bound ?? []).sure) return;
+    // Shown where they asked: it is in front of them, and there is nothing to add.
+    const here = waiting.direct === 2;
+    if (here && how === "reached") return;
     try {
-      const which = how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
+      const which = here ? (how === "failed" ? "inviteNotShown" : "inviteUnknownHere") : how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
       const text = this.#b.notice(which, waiting.session_id);
       this.#b.enqueueMessage(told(waiting), waiting.session_id, null, text, undefined, undefined, { target: waiting.target });
       // One line per request. While it has certainly not reached anyone, it says how things
@@ -313,6 +392,9 @@ export class Requests implements Wakes {
    * deadline never stand in for each other, whichever comes first.
    */
   deadlines(now: number): void {
+    // A way in certainly not shown where the person asked, whose going to them directly instead
+    // was not written down when that was found out: done now, for requests still waiting in time.
+    for (const waiting of this.#unredirected(now)) this.#redirect(waiting);
     for (const waiting of this.#s.rows<Continuation & { check_at: number | null }>("SELECT * FROM continuations WHERE status = 'waiting' AND (until <= ? OR check_at <= ?)", now, now)) {
       if (waiting.check_at != null && waiting.check_at <= now) {
         this.#s.sql.exec("UPDATE continuations SET check_at = NULL WHERE id = ?", waiting.id);
@@ -414,7 +496,7 @@ export class Requests implements Wakes {
     if (row.interaction) return this.#s.rows("SELECT 1 FROM continuations WHERE interaction = ? AND status = 'waiting' AND until > ? LIMIT 1", row.interaction, Date.now()).length > 0 ? "send" : "void";
     // Word of how a way in fared is for a request that still waits on it, and for no other.
     const about = toldOf(String(row.idem));
-    if (about) return this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND interaction = ? AND status = 'waiting' AND direct = 1 AND until > ? LIMIT 1", about.request, about.interaction, Date.now()).length > 0 ? "send" : "void";
+    if (about) return this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND interaction = ? AND status = 'waiting' AND direct IN (1, 2) AND until > ? LIMIT 1", about.request, about.interaction, Date.now()).length > 0 ? "send" : "void";
     // Written after reading under a condition: not handed over once that is over. Asked last,
     // after everything else that is waited for, so nothing comes between its answer and the send.
     const guarded = async (): Promise<"send" | "void" | "unasked"> => {
@@ -622,7 +704,7 @@ export class Requests implements Wakes {
       kind: "request" as const,
       id: each.id,
       state: ({ resuming: "continuing", answering: "answer to be sent", done: "done", failed: "failed", cancelled: "withdrawn", expired: "withdrawn", void: "withdrawn", unverified: "cannot be verified" } as Record<string, string>)[each.status] ?? "waiting",
-      shown: shown(`invite:${each.interaction}`),
+      shown: shown(`invite:${each.interaction}`) || shown(`invite:${each.interaction}:direct`),
       since: each.created_at,
     }));
     const approvals = this.#s.rows<{ idem: string; closed: string | null; created_at: number; status: string }>("SELECT idem, closed, created_at, status FROM outbox WHERE ask IS NOT NULL ORDER BY id DESC LIMIT 20").map((each) => {

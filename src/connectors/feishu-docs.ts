@@ -16,7 +16,8 @@
  */
 import type { Env } from "../env";
 import { registry } from "../registry";
-import { API, TOKEN_V2, TOKEN_V3 } from "./feishu-api";
+import { type Scope, scopeName } from "../events";
+import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFactsFor } from "./feishu-api";
 import { OFFLINE, SCOPES, type Who, grantName, grantsKey, lifetime, sameSet } from "./feishu-grant";
 import { type ConnectorTool, type Holds, type ToolContext, type Waiting, isWaiting } from "./types";
 
@@ -36,6 +37,9 @@ export const readDocument: ConnectorTool = {
   description:
     "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, as plain text in their message). Only a document the person linked themselves can be read: in this request, or in their own messages here over the last day. For a follow-up, answer from what you already said if that is enough; read again only when more is needed. If you are not sure which document they mean, ask them.",
   effect: "read",
+  // Also where several people talk, for the one who asked: only in a chat that is the
+  // organisation's own, with the bot in it, through an app whose operator turned this on (see `read`).
+  shared: true,
   parameters: { document: { type: "string" } },
   run: reported,
   links: (message, request) => {
@@ -46,7 +50,39 @@ export const readDocument: ConnectorTool = {
 
 /** The documents a person's message linked, as the connector recorded them when it arrived. */
 function documentsOf(message: { data: Record<string, unknown> }): DocumentRef[] {
-  return Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]).filter(Boolean) : [];
+  return [...ownDocuments(message), ...quotedDocuments(message)];
+}
+
+const whole = <T extends DocumentRef>(each: T | undefined): each is T => Boolean(each) && (each!.kind === "docx" || each!.kind === "wiki") && typeof each!.token === "string" && /^[A-Za-z0-9]{10,64}$/.test(each!.token);
+
+/** The documents a message itself links. */
+function ownDocuments(message: { data: Record<string, unknown> }): DocumentRef[] {
+  return (Array.isArray(message.data.documents) ? (message.data.documents as DocumentRef[]) : []).filter(whole);
+}
+
+/**
+ * The documents linked by the person's own earlier message this one was written in reply to,
+ * where that had to be fetched (a group sends the agent only what mentions it): each with the
+ * link as written there, where the connector kept it. Not this message's own: what it points at.
+ */
+function quotedDocuments(message: { data: Record<string, unknown> }): (DocumentRef & { link?: string })[] {
+  const quoted = (message.data.quoted as { documents?: unknown } | undefined)?.documents;
+  return (Array.isArray(quoted) ? (quoted as (DocumentRef & { link?: unknown })[]) : []).filter((each) => whole(each)).map((each) => {
+    const named = typeof each.link === "string" ? documentOf(each.link) : undefined;
+    return { kind: each.kind, token: each.token, ...(named && named.kind === each.kind && named.token === each.token ? { link: each.link as string } : {}) };
+  });
+}
+
+/**
+ * Whether a chat is the organisation's own, with the bot in it, as Feishu says right now:
+ * "internal" only when every part of that was said outright. "external" when Feishu said the chat
+ * includes people from outside. Anything else (a call that failed, a field that was not there,
+ * another organisation's chat, the bot not in it) is not known.
+ */
+export function chatIs(facts: ChatFacts, tenantKey: string): "internal" | "external" | "unknown" {
+  if (facts.info.status === 200 && facts.info.code === 0 && facts.info.external === true) return "external";
+  const internal = facts.info.status === 200 && facts.info.code === 0 && facts.info.external === false && facts.info.tenant_key === tenantKey && tenantKey !== "" && facts.member.status === 200 && facts.member.code === 0 && facts.member.is_in_chat === true;
+  return internal ? "internal" : "unknown";
 }
 
 /**
@@ -167,26 +203,37 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // widen any of this, and neither can a word that merely looks like a document's id.
   const documents = documentsOf;
   const matches = (each: DocumentRef) => each.kind === target.kind && each.token === target.token;
-  const now = context.said.flatMap(documents);
+  // What this request itself links. What the message it replies to links is not that: it is
+  // what the reply points at, and is judged as such below.
+  const now = context.said.flatMap(ownDocuments);
   let chosen = now;
   // The messages that named the document read: the link recorded for it is the one written there.
   let naming: { text: string; data: Record<string, unknown> }[] = context.said;
   const repliedTo = context.said.map((message) => message.data.replies_to).filter((each): each is string => typeof each === "string");
   // Messages that link this very document: written now, and earlier.
-  const linkingNow = context.said.filter((message) => documents(message).some(matches));
+  const linkingNow = context.said.filter((message) => ownDocuments(message).some(matches));
+  // The link the person wrote for this document in a message they replied to that had to be fetched.
+  let quotedLink: string | undefined;
   const linkingEarlier = context.recent.filter((message) => documents(message).some(matches));
   if (now.length === 0 && repliedTo.length > 0 && !context.answering) {
     // Every message they replied to has to be one of their own, on record, and together they
     // have to name one document. Anything less does not say which document is meant, and what
     // they linked last is not read in its place. They point at it afresh each time.
-    const parents = [...new Set(repliedTo)].map((subject) => context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`));
-    const named = parents.flatMap((message) => (message ? documents(message) : []));
+    // On record here; or, where the agent was never sent it, as the connector fetched it for the message that replies to it.
+    const pointed = [...new Set(repliedTo)].map((subject) => {
+      const parent = context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`);
+      const fetched = parent ? [] : context.said.filter((message) => message.data.replies_to === subject).flatMap(quotedDocuments);
+      return { parent, links: parent ? ownDocuments(parent) : fetched, fetched };
+    });
+    const parents = pointed.map((each) => each.parent);
+    const named = pointed.flatMap((each) => each.links);
     const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
-    if (parents.some((message) => !message || documents(message).length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
+    if (pointed.some((each) => each.links.length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
     if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
     chosen = distinct;
+    quotedLink = pointed.flatMap((each) => each.fetched).find((each) => matches(each) && each.link)?.link;
     naming = parents.flatMap((each) => (each ? [each] : []));
-    for (const each of parents) context.relied?.("recent", context.recent.indexOf(each!));
+    for (const each of parents) if (each) context.relied?.("recent", context.recent.indexOf(each));
     if (context.said.length === 1) context.relied?.("said", 0);
   } else {
     // A reply to one of the agent's answers, linking nothing new for this document: only the one
@@ -205,6 +252,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
       const latest = linkingEarlier.at(-1)!;
       chosen = [...now, target];
       naming = [latest];
+      // Where that message only pointed at it (a reply to one the agent was never sent), the link as written there.
+      quotedLink = quotedDocuments(latest).find((each) => matches(each) && each.link)?.link;
       context.relied?.("recent", context.recent.indexOf(latest));
       // And the one message that asked for it now ("总结"), where there is exactly one: a reply to
       // that is about this request too. With several, which of them asked is not known.
@@ -213,9 +262,11 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   }
   // Which of the messages just written name this document: a reply to one of those is about it.
   context.said.forEach((message, index) => {
-    if (documents(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
+    if (ownDocuments(message).some((each) => each.kind === target.kind && each.token === target.token)) context.relied?.("said", index);
   });
-  if (!chosen.some(matches)) return { error: "only a document the person linked themselves can be read: in this request, or in their own messages here over the last day; ask them to send the link" };
+  // Where several people talk, the agent is sent only what mentions it: a link they posted without that never arrived.
+  const shared = context.scope.kind === "chat";
+  if (!chosen.some(matches)) return { error: `only a document the person linked themselves can be read: in this request, or in their own messages here over the last day; ask them to ${shared ? "reply to their message with the link and mention you, or to send the link again" : "send the link"}` };
 
   const redirect = redirectUri(env);
   // Which of the two settings is missing or malformed is said apart, so the operator can tell.
@@ -225,6 +276,26 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const app = await registry(env).feishuApp(who.app_id);
   if (!app || app.tenant !== context.scope.tenant || !who.tenant_key) return { error: "this conversation does not come through a Feishu app of this tenant" };
 
+  // Where several people talk, what is read is said in front of all of them. So only where the
+  // operator turned that on for this app, and only in a chat Feishu says, now, is the
+  // organisation's own with the bot in it. Asked on every call, a request carried on included.
+  // Otherwise the matter ends here in the system's own words: nothing is read, nobody is asked
+  // to authorise, and the model is not left to find another way.
+  let place: { turn: number; mode: string | undefined; name: string } | undefined;
+  if (shared) {
+    if (!app.group_documents) return { settled: { say: "chatUnknown" } };
+    const named: { name?: string } = {};
+    let facts: ChatFacts;
+    try {
+      facts = await chatFactsFor(env, app.app_id, context.scope.id, named);
+    } catch {
+      facts = { info: { status: 0, missing: [] }, member: { status: 0 } };
+    }
+    const is = chatIs(facts, who.tenant_key);
+    if (is !== "internal") return { settled: { say: is === "external" ? "externalChat" : "chatUnknown" } };
+    place = { turn: app.group_documents_gen ?? 0, mode: facts.info.chat_mode, name: named.name ?? "" };
+  }
+
   // Everything that does not depend on the grant is done before the grant is looked at, so that
   // nothing is waited for between looking and using what was found.
   const name = await grantName(who);
@@ -233,7 +304,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // As the person wrote it (their host) in the message that named it; the model's host only failing that.
   // The latest of those messages that links it, if several do.
   const theirs = [...naming].reverse().flatMap((message) => linksIn(message.text)).find((each) => each.kind === target.kind && each.token === target.token);
-  const canonical = theirs?.link ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
+  const canonical = theirs?.link ?? quotedLink ?? `${new URL(String(args.document).trim()).origin}/${target.kind}/${target.token}`;
   const grant = env.FEISHU_GRANTS.getByName(name);
   const { generation, credential, unreadable } = await grant.held();
   // The authorisation was taken away, or replaced, while this read was under way: what the old
@@ -249,10 +320,27 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // Not yet, then: the request waits for the person to authorise, and the Brain carries it on
   // when they have. What it waits for is named here; the invitation is the Brain's to send, and
   // its link is made only as it is sent.
+  // What a read here rests on, beyond the grant: asked again before anything read is passed on.
+  const under = place ? `chat|${name}|${app.app_id}|${place.turn}|${who.tenant_key}|${[...needed].sort().join(" ")}` : conditionOf(name, needed);
   const invite = async (refused?: { version: string; rotation: number }) => {
-    const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
+    if (!place) {
+      const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
+      if (invitation === "superseded") return superseded;
+      return { waiting: { on: "authorisation", subject: name, condition: conditionOf(name, needed), generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
+    }
+    // Where several people talk, the invitation is this question's alone: named by the message
+    // that asked, as Feishu named it. It waits on that very invitation being answered by the
+    // person, not on their being authorised some way or other, and on this still being turned on
+    // as it is now. The card is for their eyes only: where they asked if Feishu can show it
+    // there to one person (not in a topic chat), directly otherwise.
+    // Which question: the message of this request that names the document (the latest of them, or
+    // the latest of all where an earlier one named it), and the document. One card says one thing.
+    const asking = (linkingNow.at(-1) ?? context.said.at(-1))?.data.message_id;
+    if (typeof asking !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(asking)) return { error: "which message asked for this could not be told, so the person was not asked to authorise; ask them to send the link again" };
+    const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) }, { brain: scopeName(context.scope), key: `${asking}|${target.kind}:${target.token}`, label: canonical, place: place.name });
     if (invitation === "superseded") return superseded;
-    return { waiting: { on: "authorisation", subject: name, condition: conditionOf(name, needed), generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
+    const condition = `asked|${name}|${invitation.nonce}|${app.app_id}|${place.turn}|${[...needed].sort().join(" ")}`;
+    return { waiting: { on: "authorisation", subject: name, condition, generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical }, privately: place.mode === "topic" ? true : "here" } } satisfies Waiting;
   };
   // Not authorised at all, or for documents and not for wiki pages: ask for what this needs.
   // A token that is held but can no longer be read (the key changed, say) is reported as refused,
@@ -321,7 +409,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const end = await grant.finish(credential.version);
   if (end !== "ok") return superseded;
   // What was read, as Feishu resolved it: a wiki page can come to hold another document.
-  context.identified?.({ document: canonical }, `docx:${documentId}`, { condition: conditionOf(name, needed), generation });
+  context.identified?.({ document: canonical }, `docx:${documentId}`, { condition: under, generation });
   const text = String(raw.data?.content ?? "");
   return {
     text: text.slice(0, MAX_DOCUMENT_TEXT),
@@ -336,12 +424,43 @@ function conditionOf(grant: string, scope: string[]): string {
   return `${grant}:${[...scope].sort().join(" ")}`;
 }
 
-/** Whether what a read was waiting on holds now, asked of the grant itself. */
-export async function authorisationHolds(env: Env, condition: string, generation: number): Promise<Holds> {
+/**
+ * Whether what a read was waiting on, or was read under, holds now. Asked of the grant itself,
+ * and, where several people talk, of the app's setting and of Feishu about the chat.
+ */
+export async function authorisationHolds(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds> {
+  const scopesOf = (text: string) => (/^[a-z_:. ]{1,200}$/.test(text) && text.split(" ").every((each) => SCOPES.includes(each)) ? text.split(" ") : undefined);
+  // Still turned on for this app, the very time it was when this began: off, or off and on again, and it is over.
+  const turnedOn = async (appId: string, turn: string) => {
+    const app = await registry(env).feishuApp(appId);
+    return app !== null && app.tenant === scope.tenant && Boolean(app.group_documents) && String(app.group_documents_gen ?? 0) === turn ? app : undefined;
+  };
+  const part = condition.split("|");
+  // A question asked where several people talk, waiting for its own invitation to be answered.
+  if (part[0] === "asked" && part.length === 6) {
+    const needed = scopesOf(part[5]);
+    if (scope.kind !== "chat" || !needed || !/^[0-9a-f]{64}$/.test(part[1]) || !(await turnedOn(part[3], part[4]))) return { state: "gone" };
+    return env.FEISHU_GRANTS.getByName(part[1]).answered(part[2], needed, generation);
+  }
+  // Something read there: the grant still covers it, it is still turned on as it was, and the
+  // chat is still the organisation's own with the bot in it.
+  if (part[0] === "chat" && part.length === 6) {
+    const needed = scopesOf(part[5]);
+    const app = needed && /^[0-9a-f]{64}$/.test(part[1]) && scope.kind === "chat" ? await turnedOn(part[2], part[3]) : undefined;
+    if (!needed || !app) return { state: "gone" };
+    const held = await env.FEISHU_GRANTS.getByName(part[1]).covers(needed, generation);
+    if (held.state !== "holds") return held;
+    // Could not be asked just now: the caller puts it off and asks again; it is not taken for a no.
+    const facts = await chatFactsFor(env, app.app_id, scope.id);
+    // Not answered, told to come back later, or the app's own token turned away: not a no.
+    const unasked = (answer: { status: number; code?: number }) => answer.status === 0 || answer.status === 429 || answer.status >= 500 || answer.code === 99991663;
+    if (unasked(facts.info) || unasked(facts.member)) throw new Error("Feishu cannot be asked about the chat just now");
+    return chatIs(facts, part[4]) === "internal" ? held : { state: "gone" };
+  }
   const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);
-  const scope = found?.[2].split(" ") ?? [];
-  if (!found || scope.some((each) => !SCOPES.includes(each))) return { state: "gone" };
-  return env.FEISHU_GRANTS.getByName(found[1]).covers(scope, generation);
+  const needed = found ? scopesOf(found[2]) : undefined;
+  if (!found || !needed) return { state: "gone" };
+  return env.FEISHU_GRANTS.getByName(found[1]).covers(needed, generation);
 }
 
 /** The card for an invitation named by a Waiting's `interaction`, or nothing if it can no longer be used. */
@@ -368,12 +487,18 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   if (!state || !grantsKey(env)) return page("这个链接无法使用", "请回到飞书，重新向我发起请求。", 400);
   const grant = env.FEISHU_GRANTS.getByName(state[1]);
   const invitation = await grant.redeem(state[2]);
-  if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经失效", "链接只能使用一次，并且 10 分钟内有效。请回到飞书，重新向我发起请求。", 400);
+  if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经用过或已失效", "链接只能使用一次，并且 10 分钟内有效。如果你刚刚已经完成授权，请回到飞书等待结果；否则请重新向我发起请求。", 400);
   const { who } = invitation;
   const code = url.searchParams.get("code") ?? "";
-  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
+  // An invitation made for one question was claimed by this answer. However it ends short of
+  // the person's own token being kept, that invitation is over (a no-op for any other kind).
+  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) {
+    await grant.fail(state[2]);
+    return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
+  }
 
-  const refused = (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
+  const refused = async (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
+    await grant.fail(state[2]);
     // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
     // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
     // sent is logged.
@@ -411,6 +536,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
   if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
+    await grant.fail(state[2]);
     console.log(JSON.stringify({ feishu_authorisation_refused: "another_account", app: who.app_id }));
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }
@@ -426,7 +552,7 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,
     scope: granted.join(" "),
     ...(lasting ? { refresh: { token: issued.refresh_token as string, expires_at: Date.now() + lifetime(issued.refresh_token_expires_in) * 1_000, endpoint: app.oauth_v2 ? ("v2" as const) : ("v3" as const) } } : {}),
-  });
+  }, invitation.ask ? state[2] : undefined);
   if (!kept) return refused("superseded");
   // The grant tells the person's Brain, and keeps telling it until it is heard.
   // Said so that it is true for every invitation: one whose request is waiting is carried on; one

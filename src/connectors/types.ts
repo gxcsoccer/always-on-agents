@@ -82,14 +82,35 @@ export interface Waiting {
      * so. Where "directly" is, the connector's channel works out from where the request
      * verifiably came and who made it (`channel.direct`); the tool names no address. The
      * conversation the request was made in is told only how that went, once it is known.
+     *
+     * "here": for the person alone all the same, but where they asked if the channel can show
+     * something there to one person only (`channel.aside`); directly otherwise. It is never put
+     * where the others would see it.
      */
-    privately?: boolean;
+    privately?: boolean | "here";
   };
+}
+
+/**
+ * What a tool returns when the matter ends here: nothing was read, nothing waits, and nothing
+ * more is to be done about it in this run, by the model or by anything else. If something is to
+ * be said to the person, the system says it: `say` names one of its own fixed lines (the tool
+ * writes no words of its own here), and without it nothing is said.
+ */
+export interface Settled {
+  settled: { say?: string };
+}
+
+/** Whether a tool's answer is that and nothing else. Whether `say` names a line there is, is the Brain's to check. */
+export function isSettled(result: unknown): result is Settled {
+  if (typeof result !== "object" || result === null || Object.keys(result).some((key) => key !== "settled")) return false;
+  const s = (result as Settled).settled;
+  return typeof s === "object" && s !== null && !Array.isArray(s) && Object.keys(s).every((key) => key === "say") && (s.say === undefined || (typeof s.say === "string" && s.say !== ""));
 }
 
 export function isWaiting(result: unknown): result is Waiting {
   const w = (result as Waiting | null)?.waiting;
-  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean");
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean" || w.privately === "here");
 }
 
 /**
@@ -121,6 +142,12 @@ export interface ConnectorTool {
    * may still do in it.
    */
   effect: "read";
+  /**
+   * Whether the tool may also be used where several people talk (a group, say), for the one of
+   * them who asked. Without it the tool exists only in a person's private conversation. A tool
+   * that says so answers for what that takes: what it reads there is said in front of the others.
+   */
+  shared?: boolean;
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
@@ -265,6 +292,12 @@ export interface Channel {
    */
   direct?(origin: Record<string, string>, person: string): Target | undefined;
   /**
+   * An address in the conversation `from` points into at which only this one person sees what is
+   * sent, worked out from a verified origin, their id and that address. Undefined where the
+   * channel has no such thing.
+   */
+  aside?(origin: Record<string, string>, person: string, from: Target): Target | undefined;
+  /**
    * The message this one was written in reply to, where the Brain was never sent it (a group
    * sends the agent only what mentions it). Asked once, before the run that takes the message
    * up, with a limit on how long it may take; nothing depends on it. Its words are given only
@@ -275,9 +308,10 @@ export interface Channel {
   /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,
-   * and a second copy could no longer be told from the first.
+   * and a second copy could no longer be told from the first. It can depend on the address: 0
+   * for one where a repeat is never dropped, so an attempt whose outcome is unknown is the last.
    */
-  dedupeMs?: number;
+  dedupeMs?: number | ((target: Target) => number);
 }
 
 /**
@@ -404,4 +438,6 @@ export type Outcome =
 /** A message another was written in reply to: the person's own words where they could be read and are theirs; empty when there was one that is not shown. */
 export interface Quoted {
   text?: string;
+  /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
+  documents?: unknown[];
 }

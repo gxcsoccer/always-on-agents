@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { approvalCard, decrypt, normalize, normalizeCardAction, quotedBy, sentAt, verifySignature } from "../src/connectors/feishu";
+import { approvalCard, chatFacts, decrypt, normalize, normalizeCardAction, quotedBy, sentAt, verifySignature } from "../src/connectors/feishu";
 import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
@@ -288,5 +288,62 @@ describe("fetching the message a group message was written in reply to", () => {
   it("keeps an ordinary message on one line, as approvals are read from it", () => {
     const envelope = { schema: "2.0", header: { event_id: "ev1", event_type: "im.message.receive_v1", app_id: "cli_test", tenant_key: "t", token: "v" }, event: { sender: { sender_type: "user", tenant_key: "t", sender_id: { open_id: "ou_alice" } }, message: { message_id: "om_1", chat_id: "oc_chat", chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: "approve\nall  AB12" }) } } };
     expect(normalize(app, envelope)?.event.text).toBe("approve all AB12");
+  });
+});
+
+describe("which documents a fetched message links", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("goes by where a link leads, never by the words shown for it", async () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [{ tag: "text", text: "看 https://x.feishu.cn/docx/Written00000000001 " }, { tag: "a", text: "https://x.feishu.cn/docx/Shown0000000000001", href: "https://x.feishu.cn/docx/Linked000000000001" }],
+          [{ tag: "a", text: "点这里", href: "https://evil.example/docx/Other0000000000001" }],
+        ],
+      },
+    };
+    vi.stubGlobal("fetch", async () => Response.json({ code: 0, data: { items: [{ message_id: "om_p", chat_id: "oc_chat", msg_type: "post", sender: { sender_type: "user", id: "ou_alice", tenant_key: "t" }, body: { content: JSON.stringify(post) } }] } }));
+    const found = (await quotedBy("t-app", app, "oc_chat", "om_p", { open_id: "ou_alice", tenant_key: "t" })) as { documents?: { token: string }[] };
+    expect(found.documents?.map((each) => each.token)).toEqual(["Written00000000001", "Linked000000000001"]);
+  });
+});
+
+describe("asking Feishu what kind of chat this is", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const answers = (info: unknown, member: unknown, seen: string[] = []) =>
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      seen.push(`${init?.method ?? "GET"} ${url.pathname} ${new Headers(init?.headers).get("authorization")}`);
+      const [status, body] = (url.pathname.endsWith("/members/is_in_chat") ? member : info) as [number, unknown];
+      return typeof body === "string" ? new Response(body, { status }) : Response.json(body, { status });
+    });
+
+  it("reports the fields that say whose chat it is and whether the bot is in it, and nothing else Feishu said", async () => {
+    const seen: string[] = [];
+    answers([200, { code: 0, data: { name: "秘密项目", description: "不该出现", owner_id: "ou_owner", external: false, tenant_key: "t1", chat_mode: "group", chat_status: "normal" } }], [200, { code: 0, data: { is_in_chat: true } }], seen);
+    const facts = await chatFacts("t-app", "oc_1");
+    expect(facts).toEqual({
+      info: { status: 200, code: 0, external: false, tenant_key: "t1", chat_mode: "group", chat_status: "normal", missing: [] },
+      member: { status: 200, code: 0, is_in_chat: true },
+    });
+    expect(JSON.stringify(facts)).not.toMatch(/秘密|不该|ou_owner/);
+    expect(seen.sort()).toEqual(["GET /open-apis/im/v1/chats/oc_1 Bearer t-app", "GET /open-apis/im/v1/chats/oc_1/members/is_in_chat Bearer t-app"]);
+  });
+
+  it("says which fields were not there, and passes on a refusal as its status and code alone", async () => {
+    answers([200, { code: 0, data: { external: "no", chat_mode: "topic" } }], [400, { code: 232011, msg: "Operator and chat can NOT be in different tenants." }]);
+    expect(await chatFacts("t-app", "oc_1")).toEqual({
+      info: { status: 200, code: 0, chat_mode: "topic", missing: ["external", "tenant_key", "chat_status"] },
+      member: { status: 400, code: 232011 },
+    });
+  });
+
+  it("reports an answer that is not what Feishu sends as that, without throwing", async () => {
+    answers([502, "<html>bad gateway</html>"], [200, { code: 0, data: { is_in_chat: "yes" } }]);
+    expect(await chatFacts("t-app", "oc_1")).toEqual({ info: { status: 502, missing: ["external", "tenant_key", "chat_mode", "chat_status"] }, member: { status: 200, code: 0 } });
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("network down: secret detail");
+    });
+    expect(await chatFacts("t-app", "oc_1")).toEqual({ info: { status: 0, missing: ["external", "tenant_key", "chat_mode", "chat_status"] }, member: { status: 0 } });
   });
 });

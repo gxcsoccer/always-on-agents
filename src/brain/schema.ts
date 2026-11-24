@@ -287,6 +287,9 @@ export const MIGRATIONS: string[] = [
   // 27: whether a request's way in was put before the person directly, somewhere else than the
   // request was made. The conversation is then told how that went (see Requests.shown).
   `ALTER TABLE continuations ADD COLUMN direct INTEGER NOT NULL DEFAULT 0;`,
+  // 28: a run one of its tools has closed: "settled" (the tool ended the matter itself; nothing
+  // more is done in the run) or "waited" (a call of it has to wait; it can only reply and read again).
+  `ALTER TABLE runs ADD COLUMN closed TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

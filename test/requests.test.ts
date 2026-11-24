@@ -53,6 +53,8 @@ function bench(state: DurableObjectState) {
     notice: (which) => `notice:${which}`,
     // The person's own chat with the bot, as the connector would address it from a verified origin.
     direct: (connector, origin, person) => (settings.noDirect ? undefined : { connector, address: { app_id: origin.app_id, open_id: person } }),
+    // In the conversation the request was made in, for that person's eyes only, where the connector can.
+    aside: (connector, origin, person, from) => (settings.noAside ? undefined : { connector, address: { app_id: origin.app_id, chat_id: from.address.chat_id, visible_to: person } }),
   };
   const requests = new Requests(store, host);
   store.sql.exec("INSERT INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, ?, 1, 1)", SESSION, SESSION_KEY, TARGET);
@@ -394,6 +396,7 @@ describe("requests that wait, by themselves", () => {
       // As a deployment before this step has it.
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(kept("r_old").person).toBe("ou_7");
@@ -419,6 +422,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.meta(`asked_which:${SESSION}`)).toBeUndefined();
@@ -476,6 +480,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old", chose: choice }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
@@ -490,6 +495,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.rows("SELECT key FROM meta WHERE key LIKE 'asked_which:%'")).toEqual([]);
@@ -759,6 +765,168 @@ describe("keeping a request that has to wait", () => {
       expect(store.rows("SELECT idem, interaction FROM outbox")).toEqual([{ idem: "invite:grant_1.nonce", interaction: "grant_1.nonce" }]);
       expect(audited("request.waiting")).toHaveLength(1);
       expect(hints()).toHaveLength(1);
+    });
+  });
+
+  describe("a way in shown to the person alone, where they asked", () => {
+    const HERE = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", chat_id: "oc_1", visible_to: "ou_1" } });
+    const DIRECT = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", open_id: "ou_1" } });
+    const acting = { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" } };
+    const asking = (use: (all: ReturnType<typeof bench>, invite: () => Record<string, any>) => void | Promise<void>, set: (all: ReturnType<typeof bench>) => void = () => undefined) =>
+      within(async (all) => {
+        set(all);
+        const said = all.message("总结一下", {}, "r1");
+        all.requests.wait(all.run("r1"), { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, privately: "here" });
+        await use(all, () => all.sent("invite:grant_1.nonce"));
+      });
+
+    it("goes where the connector says that is, and nothing more is said once it is there", async () => {
+      await asking(({ requests, store, kept }, invite) => {
+        expect(invite().target).toBe(HERE);
+        expect(kept("call_1").direct).toBe(2);
+        requests.shown(invite() as never, "reached");
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+      });
+    });
+
+    it("goes to the person directly where the connector cannot show it there", async () => {
+      await asking(
+        ({ kept }, invite) => {
+          expect(invite().target).toBe(DIRECT);
+          expect(kept("call_1").direct).toBe(1);
+        },
+        ({ settings }) => (settings.noAside = "1"),
+      );
+    });
+
+    it("goes to the person directly instead, once, when it was certainly not shown there; how that goes is said as for any sent directly", async () => {
+      await asking(({ requests, store, kept, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        // The one that failed stays as it is; another is made, for the same way in, to them directly.
+        expect(invite()).toMatchObject({ target: HERE, status: "dead" });
+        const direct = () => sent("invite:grant_1.nonce:direct");
+        expect(direct()).toMatchObject({ target: DIRECT, interaction: "grant_1.nonce" });
+        expect(kept("call_1").direct).toBe(1);
+        expect(sent(told("grant_1.nonce", "call_1"))).toBeUndefined();
+        // Told again that the first failed (a repeat): nothing more is made.
+        requests.shown(invite() as never, "failed");
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(2);
+        // It reaches them there: the conversation is told so. Had it failed too, that is said, and it is not moved again.
+        requests.shown(direct() as never, "reached");
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:invitedElsewhere" });
+      });
+      await asking(({ requests, store, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        store.sql.exec("UPDATE outbox SET status = 'dead' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.shown(sent("invite:grant_1.nonce:direct") as never, "failed");
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(2);
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: "notice:inviteNotSent" });
+      });
+    });
+
+    it("is made up for at the next look when going to them directly could not be written down at once: one card, however often it is looked at", async () => {
+      await asking(({ requests, store, host, kept, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        const enqueue = host.enqueueMessage;
+        host.enqueueMessage = (idem, ...rest) => {
+          if (idem.endsWith(":direct")) throw new Error("the queue could not be written");
+          return enqueue(idem, ...rest);
+        };
+        expect(() => requests.shown(invite() as never, "failed")).not.toThrow();
+        expect(kept("call_1").direct).toBe(2);
+        expect(sent("invite:grant_1.nonce:direct")).toBeUndefined();
+        // Nothing is said yet where they asked: it is still going to them directly, and that is what will be said.
+        expect(sent(told("grant_1.nonce", "call_1"))).toBeUndefined();
+        // And it is looked at again soon, by itself, well before the request's time is up.
+        const next = requests.nextWakeAt(Date.now())!;
+        expect(next - Date.now()).toBeLessThanOrEqual(5_000);
+        expect(kept("call_1").until - next).toBeGreaterThan(60_000);
+        host.enqueueMessage = enqueue;
+        requests.deadlines(Date.now());
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL ORDER BY id")).toEqual([{ idem: "invite:grant_1.nonce" }, { idem: "invite:grant_1.nonce:direct" }]);
+        expect(kept("call_1").direct).toBe(1);
+        // Made up for: nothing more to look at before the request's own time.
+        expect(requests.nextWakeAt(Date.now())).toBe(kept("call_1").until);
+        // Shown, as far as anyone looking can tell, once that one has arrived; and where they asked is told that, in one line.
+        store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.shown(sent("invite:grant_1.nonce:direct") as never, "reached");
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ text: "notice:invitedElsewhere" });
+        expect(requests.waits().find((each) => each.id === "call_1")).toMatchObject({ shown: true });
+      });
+      // Not for one whose outcome is unknown, nor for a request that has ended.
+      await asking(({ requests, store }) => {
+        store.sql.exec("UPDATE outbox SET status = 'unverified', started = 1, uncertain = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+      });
+      await asking(({ requests, store }) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        requests.endRequest("call_1", "cancelled", "x");
+        requests.deadlines(Date.now());
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+      });
+    });
+
+    it("is not shown there a second time once it has gone to them directly: another request for the same way in is told how that one fared", async () => {
+      await asking(({ requests, store, run, message, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1, uncertain = 0 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = 'invite:grant_1.nonce:direct'");
+        requests.wait(run("r2"), { ...acting, events: { said: [message("再读一篇", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, request: { document: "another" }, privately: "here" });
+        expect(invite()).toMatchObject({ status: "dead" });
+        expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ text: "notice:invitedElsewhere" });
+      });
+    });
+
+    it("says so where the request was made when they cannot be reached directly either, or when it cannot be told whether it was shown", async () => {
+      await asking(
+        async ({ requests, store, sent }, invite) => {
+          store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+          requests.shown(invite() as never, "failed");
+          expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+          const line = sent(told("grant_1.nonce", "call_1"));
+          expect(line).toMatchObject({ target: TARGET, text: "notice:inviteNotShown" });
+          expect(await requests.gate(line as never)).toBe("send");
+        },
+        ({ settings }) => (settings.noDirect = "1"),
+      );
+      await asking(({ requests, store, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'unverified', started = 1, uncertain = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "unknown");
+        expect(invite()).toMatchObject({ target: HERE, status: "unverified" });
+        expect(store.rows("SELECT idem FROM outbox WHERE interaction IS NOT NULL")).toHaveLength(1);
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:inviteUnknownHere" });
+      });
+    });
+
+    it("is one request when the same messages ask for the same thing twice over: one answer will come of it", async () => {
+      await asking(({ requests, store, kept, hints }) => {
+        const before = hints().length;
+        const said = (JSON.parse(kept("call_1").events) as { said: number[] }).said;
+        const again = requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { ...acting, events: { said, recent: [] } }, "call_1b", "feishu_read_document", { ...waiting, privately: "here" });
+        expect(again).toMatchObject({ waiting: true, request: "call_1" });
+        // Kept, so that the second call has this for its answer if it is made again after an interruption.
+        expect(JSON.parse(store.meta("waited:call_1b")!)).toEqual({ request: "call_1", run: "r1" });
+        expect(store.rows("SELECT id FROM continuations")).toEqual([{ id: "call_1" }]);
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+        expect(hints().length).toBe(before);
+        // Something else asked for by the same messages is its own request.
+        requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { ...acting, events: { said, recent: [] } }, "call_other", "feishu_read_document", { ...waiting, request: { document: "another" }, privately: "here" });
+        expect(store.rows("SELECT id FROM continuations ORDER BY rowid")).toEqual([{ id: "call_1" }, { id: "call_other" }]);
+      });
+    });
+
+    it("is never put where everyone would see it: with no way to show it to the person alone, nothing waits", async () => {
+      await within((all) => {
+        all.settings.noAside = "1";
+        all.settings.noDirect = "1";
+        const said = all.message("总结一下", {}, "r1");
+        expect(() => all.requests.wait(all.run("r1"), { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, privately: "here" })).toThrow(/cannot be reached directly/);
+        expect(all.store.rows("SELECT 1 FROM outbox")).toEqual([]);
+      });
     });
   });
 
