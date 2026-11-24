@@ -450,6 +450,44 @@ describe("requests that wait, by themselves", () => {
     });
   });
 
+  it("keeps a choice made before the upgrade used up, when the request it chose is gone but who chose is known", async () => {
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), async (_instance: unknown, state: DurableObjectState) => {
+      const { store, requests, request, message, run } = bench(state);
+      store.sql.exec("UPDATE sessions SET session_key = ? WHERE id = ?", PRIVATE_KEY, SESSION);
+      const private_ = (text: string, runId: string | null = null) => {
+        const id = message(text, {}, runId);
+        store.sql.exec("UPDATE inbox SET session_key = ? WHERE id = ?", PRIVATE_KEY, id);
+        return id;
+      };
+      const asked = private_("read the second");
+      // The first was called off by the choice, and what it rested on is no longer on record.
+      request("r1", { status: "cancelled", events: JSON.stringify({ said: [99_999], recent: [] }) });
+      request("r2", { events: JSON.stringify({ said: [asked], recent: [] }) });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('which:old', ?, 'which?', 'sent', 0, 0, ?, ?)", TARGET, Date.now(), JSON.stringify({ subject: "feishu:message:om_which", holder: "" }));
+      run("run_pick");
+      const choice = private_("第一个", "run_pick");
+      store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old", chose: choice }));
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
+      expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
+      const running = store.rows<RunRow>("SELECT * FROM runs WHERE id = 'run_pick'")[0];
+      expect(() => requests.mayCancel(running, "r2", "call_2")).toThrow(/already been taken as choosing one request/);
+    });
+    // Where what is on record points at more than one person, nothing is guessed: the question is dropped.
+    await runInDurableObject(env.BRAIN.getByName(`acme:user:requests-${++scopes}`), (_instance: unknown, state: DurableObjectState) => {
+      const { store, request, message } = bench(state);
+      request("r1", { events: JSON.stringify({ said: [message("one", {}, null, "ou_1")], recent: [] }) });
+      request("r2", { events: JSON.stringify({ said: [message("two", {}, null, "ou_2")], recent: [] }) });
+      store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
+      store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
+      store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
+      migrate(state.storage);
+      expect(store.rows("SELECT key FROM meta WHERE key LIKE 'asked_which:%'")).toEqual([]);
+    });
+  });
+
   it("takes a request whose person was never recorded as anyone's only in a private conversation", async () => {
     await within(({ store, requests, request }) => {
       request("r_legacy");

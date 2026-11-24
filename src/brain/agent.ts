@@ -226,7 +226,8 @@ export class BrainAgent extends DurableObject<Env> {
     // ("done"). That is not taken from their words: the condition's owner is asked again.
     if (inserted && event.kind === "message") {
       // Their own requests, that is: what someone else says in a shared conversation is no reason to ask about them.
-      for (const waiting of this.#store.rows<Continuation>("SELECT c.* FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.status = 'waiting' AND s.session_key = ? AND (c.person IS NULL OR c.person = ?)", event.session_key, event.principal.id)) this.#requests.hint(waiting, `said:${event.source}:${event.source_id}`);
+      // One kept before its person was recorded counts as theirs only in a private conversation.
+      for (const waiting of this.#store.rows<Continuation>("SELECT c.* FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.status = 'waiting' AND s.session_key = ? AND (c.person = ? OR (? = 1 AND c.person IS NULL))", event.session_key, event.principal.id, isPrivateSession(event.session_key) ? 1 : 0)) this.#requests.hint(waiting, `said:${event.source}:${event.source_id}`);
     }
     // Also on a duplicate: the first delivery may have been stored without its wake-up being scheduled.
     await this.#wakeBy(Date.now() + BATCH_WINDOW_MS);

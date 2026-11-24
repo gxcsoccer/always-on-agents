@@ -1381,6 +1381,17 @@ describe("a request that waits and is carried on", () => {
     });
   const report = async (person: Person, event: string) => person.stub.conditionReported("feishu", await grantName(person.who), event);
 
+  it("does not carry a request on for anyone but the person it was kept for", async () => {
+    const ann = owner("DocAnn000000000000001");
+    const id = await asksFor(ann, "DocAnn000000000000001");
+    // The record says it is someone else's; what she wrote still reads as hers.
+    await rowsOf(ann.stub, "UPDATE continuations SET person = 'ou_someone_else' WHERE id = ?", id);
+    await authorises(ann);
+    expect(await ann.requests()).toMatchObject([{ id, status: "void" }]);
+    expect(feishu.reads).toEqual([]);
+    expect(await ann.audit("request.resumed")).toEqual([]);
+  });
+
   it("answers once after the person authorises, with nothing more said, and keeps the link out of everything the Brain holds", async () => {
     const amy = owner("DocAmy000000000000001");
     const id = await asksFor(amy, "DocAmy000000000000001");
