@@ -358,7 +358,7 @@ export class Requests implements Wakes {
     // The person's own words, that is: where others share the conversation, theirs say nothing about this request.
     const unheard = (of: Continuation): "pending" | "claimed" | undefined =>
       this.#s.rows<{ status: "pending" | "claimed" }>(
-        "SELECT status FROM inbox WHERE status IN ('pending', 'claimed') AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND (? IS NULL OR json_extract(principal, '$.id') = ?) ORDER BY status DESC LIMIT 1",
+        "SELECT status FROM inbox WHERE status IN ('pending', 'claimed') AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND (? IS NULL OR (json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') = ?)) ORDER BY status DESC LIMIT 1",
         of.session_id,
         of.person ?? null,
         of.person ?? null,
@@ -424,7 +424,7 @@ export class Requests implements Wakes {
   mayCancel(run: RunRow, requestId: string, by: string, ask = ""): { record: Continuation; choosing?: number } {
     const acting = this.continuationOf(run.id) ? undefined : this.#b.actingFor(run.id);
     if (!acting) throw new Error("a request can only be cancelled when the person themselves asks for that, in their own private conversation");
-    const done = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND session_id = ? AND status = 'cancelled' AND why = ?", requestId, run.session_id, calledOff(by))[0];
+    const done = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND session_id = ? AND status = 'cancelled' AND why = ? AND (person IS NULL OR person = ?)", requestId, run.session_id, calledOff(by), acting.person)[0];
     if (done) return { record: done };
     const events = this.basis(run.id);
     const repliedTo = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
@@ -445,7 +445,7 @@ export class Requests implements Wakes {
     // person, by its own receipt, and it has to stand alone: batched with another message, there
     // is no telling which of them chose.
     const delivered = question?.status === "sent" && question.receipt && question.sent_at != null ? question.sent_at : undefined;
-    const first = delivered === undefined ? undefined : this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND received_at >= ? AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND json_extract(principal, '$.id') = ? ORDER BY id LIMIT 1", delivered, run.session_id, acting.person)[0];
+    const first = delivered === undefined ? undefined : this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND received_at >= ? AND session_key = (SELECT session_key FROM sessions WHERE id = ?) AND source = ? AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') = ? ORDER BY id LIMIT 1", delivered, run.session_id, acting.connector, acting.person)[0];
     if (asked && asked.chose === undefined && (repliedTo.length === 0 || toQuestion) && first !== undefined && events.length === 1 && first.id === events[0].id && asked.ids.includes(requestId)) return { record: chosen, choosing: first.id };
     // A reply to that question which is not its one answer (it has been answered, or this is not
     // the first message since) decides nothing, however few requests are still open.
