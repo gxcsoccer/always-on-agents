@@ -257,7 +257,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // The bot's own is dropped: it only says the message is for the agent, which the event already
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
-    text = named(text, mentions, app.bot_open_id);
+    text = named(text, mentions, [app.bot_open_id]);
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -307,13 +307,13 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
 const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;
 
 /** The text of a message with its mention placeholders replaced, in one pass; the bot's own is dropped. */
-function named(text: string, mentions: any[], botOpenId: string | null): string {
+function named(text: string, mentions: any[], own: (string | null)[]): string {
   const replacements = new Map<string, string>();
   for (const mention of mentions) {
     if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
-    // An event carries the id as { open_id }; a message that was asked for, as the id itself.
+    // An event carries the id as { open_id }; a message that was asked for, as the id itself, and a bot's as its app id.
     const id = typeof mention.id === "string" ? mention.id : mention.id?.open_id;
-    replacements.set(mention.key, botOpenId && id === botOpenId ? " " : token(mention.name));
+    replacements.set(mention.key, typeof id === "string" && own.includes(id) ? " " : token(mention.name));
   }
   // A placeholder with no entry in the mention list is kept visible as a mention of someone
   // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
@@ -370,7 +370,7 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     if (found.deleted || typeof found.body?.content !== "string") return {};
     const content = JSON.parse(found.body.content);
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
-    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, app.bot_open_id) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
+    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Nothing could be made of it: not something read.
     return text === "" ? {} : { text: text.slice(0, MAX_QUOTED) };
   } catch {

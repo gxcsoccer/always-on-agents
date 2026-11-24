@@ -226,7 +226,7 @@ describe("fetching the message a group message was written in reply to", () => {
   });
 
   it("names the people mentioned in it, flattens a post, and cuts what is long", async () => {
-    feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2\nlook" }) }, mentions: [{ key: "@_user_1", id: "ou_bot", name: "Agent" }, { key: "@_user_2", id: "ou_carol", name: "Carol Approve" }] }));
+    feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2\nlook" }) }, mentions: [{ key: "@_user_1", id: "cli_test", id_type: "app_id", name: "Agent" }, { key: "@_user_2", id: "ou_carol", id_type: "open_id", name: "Carol Approve" }] }));
     expect(await look()).toEqual({ text: "and @CarolApprove look" });
     feishu(item({ msg_type: "post", body: { content: JSON.stringify({ title: "Plan", content: [[{ tag: "text", text: "see " }, { tag: "a", text: "the doc", href: "https://x.feishu.cn/docx/Doc2" }], [{ tag: "at", user_id: "ou_carol", user_name: "Carol" }, { tag: "img", image_key: "k" }]] }) } }));
     expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [img]");

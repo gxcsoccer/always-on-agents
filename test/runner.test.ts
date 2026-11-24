@@ -324,6 +324,11 @@ describe("the run loop, by itself", () => {
         store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");
         event("about the old one", { data: { replies_to: "feishu:message:om_old" } });
         expect(await next()).not.toContain("written as a reply");
+        // The same when it was filed under another conversation of this place (routed there by a code).
+        event("routed", { source_id: "om_routed", status: "done", session_key: "thread:t1" });
+        store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_routed'");
+        event("about the routed one", { data: { replies_to: "feishu:message:om_routed" } });
+        expect(await next()).not.toContain("written as a reply");
         // A question the system put (sent by no run), and a message filed as its answer.
         store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('ask1', ?, 'q', 'sent', 0, 0, 1, ?)", TARGET, JSON.stringify({ subject: "feishu:message:om_card", holder: "b" }));
         event("yes", { data: { replies_to: "feishu:message:om_card" } });

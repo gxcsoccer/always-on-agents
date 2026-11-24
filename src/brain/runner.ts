@@ -204,7 +204,10 @@ export class Runner {
       // that reached the agent (whoever wrote it, and whether or not its words are still kept),
       // not one the agent or the system sent, and not an answer to a question.
       if (event.kind !== "message" || principal.kind !== "human" || typeof subject !== "string" || data.quoted !== undefined || data.question !== undefined) continue;
-      if (this.#parentOf(event, subject) || this.#s.rows("SELECT 1 FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject).length > 0 || this.#repliedTo(event, sessionId, []) !== "") continue;
+      // On record anywhere in this place, by its identity alone: also where its words are gone, or it was filed under another conversation.
+      const prefix = `${event.source}:message:`;
+      if (subject.startsWith(prefix) && this.#s.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ? LIMIT 1", event.source, subject.slice(prefix.length)).length > 0) continue;
+      if (this.#s.rows("SELECT 1 FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject).length > 0 || this.#repliedTo(event, sessionId, []) !== "") continue;
       const key = JSON.stringify([event.source, principal.id, subject, data.origin ?? null]);
       const same = unknown.get(key);
       if (same) same.ids.push(event.id);
