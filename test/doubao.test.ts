@@ -217,6 +217,8 @@ const toolOutputs = (asked: any = modelCalls.at(-1)): any[] => {
   const input = asked.input as any[];
   return input.slice(input.map((each) => each.role).lastIndexOf("user") + 1).filter((each) => each.type === "function_call_output").map((each) => JSON.parse(each.output));
 };
+/** The workers a call to the model was offered, by name. */
+const workersOffered = (asked: any): string[] => asked.tools.find((t: any) => t.name === "hand_over")?.parameters.properties.worker.enum ?? [];
 const asks = (text: string, carry_on = false) => call("doubao_ask", { text, carry_on });
 const UNDER_WAY = "已经交出去处理了，需要一些时间。完成后我会把结果发给你。";
 /** Asks for something, authorises when invited, and is left with the work handed over. */
@@ -242,7 +244,7 @@ describe("handing work to Doubao Work", () => {
     const ann = someone();
     model.replies([say("好的")]);
     await ann.says("让豆包调研一下");
-    expect(modelCalls[0].tools.map((t: any) => t.name)).not.toContain("doubao_ask");
+    expect(workersOffered(modelCalls[0])).not.toContain("doubao");
 
     const set = await pair();
     expect(set.status).toBe(200);
@@ -250,7 +252,9 @@ describe("handing work to Doubao Work", () => {
     expect(await (await admin("GET", `doubao/apps/${CHAT_APP}`)).text()).not.toContain("work-secret");
     model.replies([say("好的")]);
     await ann.says("让豆包调研一下");
-    expect(modelCalls[1].tools.map((t: any) => t.name)).toContain("doubao_ask");
+    expect(workersOffered(modelCalls[1])).toContain("doubao");
+    // Under the one tool for handing work over, and not under a name of its own.
+    expect(modelCalls[1].tools.map((t: any) => t.name)).not.toContain("doubao_ask");
     // An unknown chat app cannot be paired; a person's id under one app is not who they are under another.
     expect((await admin("POST", "doubao/apps", { for: { connector: "feishu", app_id: "cli_unknown" }, app_id: WORK_APP, app_secret: "s" })).status).toBe(404);
     expect((await pair({ match: "open_id" })).status).toBe(400);
@@ -258,7 +262,7 @@ describe("handing work to Doubao Work", () => {
     expect((await admin("DELETE", `doubao/apps/${CHAT_APP}`)).status).toBe(200);
     model.replies([say("好的")]);
     await ann.says("让豆包调研一下");
-    expect(modelCalls[2].tools.map((t: any) => t.name)).not.toContain("doubao_ask");
+    expect(workersOffered(modelCalls[2])).not.toContain("doubao");
   });
 
   it("asks the person to authorise, hands the work over once as them, says so, and brings the reply back when it is done", async () => {
@@ -405,6 +409,178 @@ describe("handing work to Doubao Work", () => {
     model.replies([asks("再深入", true)], [say("")]);
     await cy.says("再深入");
     expect((await work()).map((each) => each.state)).toEqual(["done", "open"]);
+  });
+
+  it("is handed work through the one tool for all workers: something new, a follow-up by the id of the piece it follows, its standing and its end", async () => {
+    await pair();
+    const cy = someone();
+    const hand = (brief: string, continue_from: string | null = null, more: Record<string, unknown> = {}) => call("hand_over", { worker: "doubao", title: "调研", brief, continue_from, repository: null, replaces: null, ...more });
+    // What the model is told: the worker by name and what it is for, and the sandbox's own option as nobody else's.
+    model.replies([hand("调研 A")], [say("")]);
+    await cy.says("让豆包调研 A");
+    const tool = modelCalls[0].tools.find((t: any) => t.name === "hand_over");
+    expect(tool.parameters.properties.worker.enum).toEqual(["sandbox", "doubao"]);
+    expect(tool.description).toContain("doubao (does things as the person");
+    expect(tool.parameters.properties.repository.description).toContain('Only for the worker "sandbox"');
+    expect(modelCalls[0].tools.map((t: any) => t.name)).toEqual(expect.arrayContaining(["work_status", "cancel_work"]));
+    expect(modelCalls[0].tools.map((t: any) => t.name)).not.toEqual(expect.arrayContaining(["dispatch_task"]));
+    const first = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    expect(toolOutputs()).toEqual([{ waiting: true, request: first, note: expect.any(String) }]);
+    expect((await consent(linkOn(cy.cards()[0]), cy)).status).toBe(200);
+    await cy.settle();
+    const session = [...world.sessions.keys()][0];
+    expect(world.sessions.get(session)!.messages[0].items?.[0]?.text ?? JSON.stringify(world.writes[0].body)).toContain("调研 A");
+
+    // While it is under way it is listed as work, with its id and its worker, and not among the requests that wait.
+    model.replies([call("work_status", { work_id: first })], [say("")]);
+    await cy.says("怎么样了");
+    const told = modelCalls.at(-2).instructions as string;
+    expect(told).toContain(`- ${first} [doubao]`);
+    expect(told.split("Requests that are waiting")[1] ?? "").not.toContain(first);
+    // How it stands, and nothing of what it brought back.
+    expect(toolOutputs()).toEqual([{ work_id: first, worker: "doubao", state: expect.stringMatching(/^waiting_for_result/) }]);
+    expect(told).toContain("waiting_for_result");
+
+    doubaoReplies(session, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await cy.later();
+    // A follow-up, by the id of the piece it follows: into the same conversation, without the name.
+    const before = world.writes.length;
+    model.replies([hand("再深入一点", first)], [say("")]);
+    await cy.says("再深入一点");
+    expect((modelCalls.at(-2).instructions as string)).toContain(`- ${first} [doubao]`);
+    expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${session}/events`]);
+    const second = (await rowsOf(cy.stub, "SELECT id FROM continuations ORDER BY rowid"))[1].id;
+
+    // Stopped on the person's word: the request that carries it is called off.
+    model.replies([call("cancel_work", { work_id: second })], [call("send_message", { text: "不等了" })], [say("")]);
+    await cy.says("算了不用了");
+    // Handed over already: only the waiting for it stops here, and the model is told to say that.
+    expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ ok: true, cancelled: second, how: "no_longer_waited_for" });
+    expect((await rowsOf(cy.stub, "SELECT state FROM work ORDER BY created_at, rowid")).map((each) => each.state)).toEqual(["done", "cancelled"]);
+
+    // Named by the model with nothing of the person's to rest on: the agent has answered since, and they do not name Doubao.
+    model.replies([hand("补充成本", first)], [say("")]);
+    await cy.says("补充成本");
+    expect(JSON.stringify(toolOutputs())).toContain("cannot be told from the person's message");
+    // An option of another worker's, and a piece of work that is nobody's here.
+    model.replies([hand("调研 B", null, { repository: "https://github.com/acme/app" })], [call("work_status", { work_id: "nope" })], [say("")]);
+    await cy.says("让豆包调研 B");
+    expect(JSON.stringify(toolOutputs(modelCalls.at(-2)))).toContain('has no option repository');
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work nope here");
+    expect(world.writes).toHaveLength(before + 1);
+  });
+
+  it("lists and tells of work by what is kept of it on either side, stops what was not yet handed over as that, and takes the person's reply over the model's choice", async () => {
+    await pair();
+    const cy = someone();
+    const hand = (brief: string, continue_from: string | null = null, more: Record<string, unknown> = {}) => call("hand_over", { worker: "doubao", title: "调研", brief, continue_from, repository: null, replaces: null, ...more });
+    // Waiting for their authorisation: said as that, and stopping it stops the work itself (nothing was handed over).
+    model.replies([hand("调研 A")], [say("")]);
+    await cy.says("让豆包调研 A");
+    const first = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    // As a request kept before there was an index: its row is gone, and it is found all the same.
+    await rowsOf(cy.stub, "DELETE FROM work");
+    model.replies([call("work_status", { work_id: first })], [call("cancel_work", { work_id: first })], [call("send_message", { text: "好的" })], [say("")]);
+    await cy.says("怎么样了？算了不要了");
+    expect((modelCalls.at(-4).instructions as string)).toMatch(new RegExp(`- ${first} \\[doubao\\] .*waiting_for_authorisation`));
+    expect(toolOutputs(modelCalls.at(-3))[0]).toMatchObject({ work_id: first, state: expect.stringMatching(/^waiting_for_authorisation/) });
+    expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ ok: true, cancelled: first, how: "stopped" });
+
+    // Two pieces of work, both answered.
+    const a = await handsOver(cy, "调研 A");
+    doubaoReplies(a, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await cy.later();
+    model.replies([hand("调研 B")], [say("")]);
+    await cy.says("让豆包调研 B");
+    const b = [...world.sessions.keys()].at(-1)!;
+    doubaoReplies(b, "B 的结论。");
+    model.replies([call("send_message", { text: "B 的结论。" })], [say("")]);
+    await cy.later();
+    const ids = (await rowsOf(cy.stub, "SELECT id FROM work WHERE state = 'done' ORDER BY created_at, rowid")).map((each) => each.id);
+    expect(ids).toHaveLength(2);
+    // They reply to A's answer; the model names B. What they replied to says which: asked, and nothing sent.
+    const before = world.writes.length;
+    model.replies([hand("补充成本", ids[1])], [say("")]);
+    await cy.says("补充成本", undefined, cy.sentAs("A 的结论。"));
+    expect(JSON.stringify(toolOutputs())).toContain("replies to the answer of another piece of work");
+    expect(world.writes).toHaveLength(before);
+    // B's answer is the last they had. They name Doubao and mean A, and the model names A: it has nothing of theirs
+    // behind it, so it is not taken, and it is not sent to B in its place either. Two lately: they are asked.
+    model.replies([hand("把 A 展开讲一下", ids[0])], [say("")]);
+    await cy.says("让豆包把 A 展开讲一下");
+    expect(JSON.stringify(toolOutputs())).toContain("cannot be told which");
+    expect(world.writes).toHaveLength(before);
+    // They name Doubao and the model names A, with the agent having spoken since and B the last: the model's choice is not taken; two lately, so they are asked.
+    model.replies([call("send_message", { text: "好。" })], [say("")]);
+    await cy.says("谢谢");
+    model.replies([hand("补充成本", ids[0])], [say("")]);
+    await cy.says("让豆包把之前那个补充一下成本");
+    expect(JSON.stringify(toolOutputs())).toContain("cannot be told which");
+    expect(world.writes).toHaveLength(before);
+
+    // A piece that never had to wait and whose taking is not known: listed, and told of, by its row alone.
+    world.unreachable = 2;
+    model.replies([hand("调研 C")], [call("send_message", { text: "没能确认。" })], [say("")]);
+    await cy.says("让豆包调研 C");
+    const lost = (await rowsOf(cy.stub, "SELECT id FROM work WHERE state = 'unknown'"))[0].id;
+    model.replies([call("work_status", { work_id: lost })], [say("")]);
+    await cy.says("C 怎么样了");
+    expect((modelCalls.at(-2).instructions as string)).toContain(`- ${lost} [doubao]`);
+    expect(toolOutputs()).toEqual([{ work_id: lost, worker: "doubao", state: "unknown" }]);
+    // Their authorisation is taken away: what was done under it is no longer listed, nor told of. (What never waited was kept under none, and stays.)
+    expect((modelCalls.at(-2).instructions as string)).toContain(`- ${ids[0]} [doubao]`);
+    expect((await admin("DELETE", `doubao/grants/${CHAT_APP}/${ORG}/${cy.openId}`)).status).toBe(200);
+    model.replies([call("work_status", { work_id: ids[0] })], [say("")]);
+    await cy.says("A 那个呢");
+    expect((modelCalls.at(-2).instructions as string)).not.toContain(`- ${ids[0]} [doubao]`);
+    expect((modelCalls.at(-2).instructions as string)).not.toContain(`- ${ids[1]} [doubao]`);
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+    // Somebody else's run finds none of it.
+    const eve = someone();
+    model.replies([call("work_status", { work_id: lost })], [say("")]);
+    await eve.says("让豆包看看");
+    expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
+  });
+
+  it("says a piece Doubao turned away outright for want of authorisation was not handed over, and stops it as that", async () => {
+    await pair();
+    const cy = someone();
+    const first = await handsOver(cy, "调研 A");
+    doubaoReplies(first, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await cy.later();
+    // Their token is no longer taken. A second piece is turned away with it: nothing of it was handed over.
+    for (const token of world.tokens.values()) token.good = false;
+    const sessions = world.sessions.size;
+    model.replies([asks("调研 B")], [say("")]);
+    await cy.says("让豆包调研 B");
+    expect(world.sessions.size).toBe(sessions);
+    const id = (await rowsOf(cy.stub, "SELECT id FROM continuations ORDER BY rowid"))[1].id;
+    expect(await rowsOf(cy.stub, "SELECT handed FROM work WHERE id = ?", id)).toEqual([{ handed: 0 }]);
+    model.replies([call("work_status", { work_id: id })], [call("cancel_work", { work_id: id })], [call("send_message", { text: "好的" })], [say("")]);
+    await cy.says("怎么样了？算了");
+    expect(toolOutputs(modelCalls.at(-3))[0].state).toMatch(/^waiting_for_authorisation \(not handed over yet/);
+    expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "stopped" });
+  });
+
+  it("says that work already handed over may still be finished, when it is stopped while waiting for a new authorisation", async () => {
+    await pair();
+    const cy = someone();
+    await handsOver(cy, "调研 A");
+    const id = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    // Their token stops being taken: the work waits on a new authorisation, and was handed over all the same.
+    for (const token of world.tokens.values()) token.good = false;
+    await cy.later();
+    expect(cy.cards()).toHaveLength(2);
+    // That it was handed over is what its own record says, kept with the work: not that the person happened to be told so here.
+    await rowsOf(cy.stub, "DELETE FROM outbox WHERE idem LIKE 'underway:%'");
+    expect(await rowsOf(cy.stub, "SELECT handed FROM work")).toEqual([{ handed: 1 }]);
+    model.replies([call("work_status", { work_id: id })], [call("cancel_work", { work_id: id })], [call("send_message", { text: "不等了" })], [say("")]);
+    await cy.says("怎么样了？算了");
+    expect(toolOutputs(modelCalls.at(-3))[0].state).toMatch(/^waiting_for_authorisation \(it was handed over already/);
+    expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
   });
 
   it("asks for a token for this work only, whatever else the person has allowed the app before", async () => {

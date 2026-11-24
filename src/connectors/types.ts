@@ -113,6 +113,12 @@ export interface Waiting {
     until: number;
     /** Absent where there is nothing for the person to do: what is waited for happens by itself. */
     interaction?: string;
+    /**
+     * For a tool that hands work to a worker: set where the work has already been handed over, or
+     * may have been, and what is waited for is only the way to its result. Left out only where it
+     * is certain that nothing was handed over yet.
+     */
+    handed?: true;
     request: Record<string, unknown>;
     /**
      * The way in is for the person alone: it is put before them directly, not where the request

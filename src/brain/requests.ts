@@ -164,6 +164,11 @@ export class Requests implements Wakes {
     return rows.length === ids.length && rows.every((each) => each.text !== null) ? rows : [];
   }
 
+  /** One request by its id, whatever has become of it. */
+  record(id: string): Continuation | undefined {
+    return this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
+  }
+
   /** The person's own words that made a request, for telling requests apart. */
   askedFor(record: Continuation): string {
     // The messages it is tied to, where the tool named them: two requests made in one batch are
@@ -249,7 +254,8 @@ export class Requests implements Wakes {
         this.#s.audit("(system)", "request.waiting", { request: id, on: waiting.on });
       }
       // What a tool that hands work to a worker keeps waiting is a piece of work, under the request's own id.
-      this.#work(id, "open");
+      // Handed over where the tool says so, and wherever nothing is put before the person: what is waited for is then the worker's.
+      this.#work(id, "open", waiting.handed === true || !shows);
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       if (!shows) {
@@ -460,7 +466,7 @@ export class Requests implements Wakes {
       // The answer was about the request as it stood when asked. If that has changed, it is not used.
       if (!now || now.status !== "waiting" || now.condition !== before.condition || now.generation !== before.generation || now.until !== before.until) return drop();
       // Someone who was told that a thing was under way hears once that it is no longer waited for: whatever it was waiting on last.
-      const promised = () => this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
+      const promised = () => this.promised(id);
       const tell = (which: "underWayOver" | "underWayGone" | "underWayRefused") => void (promised() && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
@@ -520,11 +526,21 @@ export class Requests implements Wakes {
     return Date.now() - (record.claimed_at ?? 0) > HANDLING_LIMIT_MS ? "it was not finished in time" : undefined;
   }
 
+  /** Whether the person was ever told that what this request asked for is under way: it was handed over, whatever it waits on now. */
+  promised(id: string): boolean {
+    return this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
+  }
+
+  /** Makes sure a request that is a piece of work and is still under way has its row in the index of work (one kept before there was an index has none). */
+  indexed(id: string): void {
+    if (this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND status IN ('waiting', 'resuming', 'answering')", id).length > 0) this.#work(id, "open");
+  }
+
   /** A request kept for a tool that hands work to a worker is a piece of work, under the request's own id. */
-  #work(id: string, as: "open" | WorkEnd): void {
+  #work(id: string, as: "open" | WorkEnd, handed = false): void {
     const record = this.#s.rows<Continuation & { session_key: string | null }>("SELECT c.*, s.session_key FROM continuations c LEFT JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", id)[0];
     const worker = record && this.#b.handsTo(record.connector, record.tool);
-    if (worker) workIs(this.#s, { id, worker, sessionKey: record.session_key ?? "", person: record.person ?? null, under: { condition: record.condition, generation: record.generation } }, as);
+    if (worker) workIs(this.#s, { id, worker, sessionKey: record.session_key ?? "", person: record.person ?? null, under: { condition: record.condition, generation: record.generation }, handed }, as);
   }
 
   /** Ends a request, once. What ended it is kept; nothing ended is ever reopened. */

@@ -8,6 +8,7 @@
 import { type WorkEnd, workIs } from "./work";
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
+import type { Worker } from "../workers";
 import { chainLevels } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
@@ -37,7 +38,11 @@ export interface RunToolsHost {
   instructionEditors(runId: string): string[];
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
-  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft">;
+  /** Every worker this deployment lists. */
+  workers(): Worker[];
+  /** Whether a piece of work done in a person's name still stands under what it was done under. */
+  workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
+  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel">;
 }
@@ -125,10 +130,31 @@ export class RunTools {
     return source && source.tool === name ? { latest: { source: source.request, sent_at: last.sent_at } } : {};
   }
 
+  /**
+   * A piece of work the run may ask about or stop, by its id: a task, as tasks always were; or
+   * work done in a person's name, which is that person's alone and in the conversation it was
+   * handed over in. Told from what is kept of it on either side: a request kept before there
+   * was an index has its row made now; one that never waited has only its row.
+   */
+  async #work(run: RunRow, sessionKey: string, id: string): Promise<{ task: true } | { task: false; worker: string; state: string; standing: string; waits?: "authorisation" | "result"; handed: boolean }> {
+    if (this.#s.rows("SELECT 1 FROM tasks WHERE id = ?", id).length > 0) return { task: true };
+    const record = this.#b.requests.record(id);
+    if (record) this.#b.requests.indexed(id);
+    const row = this.#s.rows<{ worker: string; state: string; session_key: string; person: string | null; condition: string | null; generation: number | null; handed: number }>("SELECT worker, state, session_key, person, condition, generation, handed FROM work WHERE id = ?", id)[0];
+    // Nor one done under an authorisation since taken away: it is as if it were not there.
+    if (!row || row.session_key !== sessionKey || row.person === null || row.person !== this.#b.actingFor(run.id)?.person || !(await this.#b.workStands({ id, ...row }))) throw new Error(`there is no piece of work ${id} here`);
+    // What it waits for, where it waits: for the person (something was put before them), or for the worker.
+    const waits = row.state === "open" && record && record.status === "waiting" ? (record.interaction !== "" ? "authorisation" : "result") : undefined;
+    // Whether it was ever handed over, by the record: waiting for the person again does not undo that.
+    // (As whoever carries it out said when it was kept; or, for one kept before that was recorded, as the person was told.)
+    const handed = row.handed === 1 || waits === "result" || (record !== undefined && this.#b.requests.promised(id));
+    return { task: false, worker: row.worker, state: row.state, standing: standingOf(row.state, waits, handed), handed, ...(waits ? { waits } : {}) };
+  }
+
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
-    return {
+    const host: ToolHost = {
       connectorTool: async (callId, name, args) => {
         // Decided afresh at the moment of use, from what is stored: also after an interruption.
         const acting = this.#b.actingFor(run.id);
@@ -148,6 +174,10 @@ export class RunTools {
           const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", folded ?? callId)[0]?.interaction !== "";
           return { waiting: true, request: folded ?? callId, note: shown ? WAITING_NOTE : UNDER_WAY_NOTE };
         }
+        // A tool that carries a worker is that worker's way in, under whatever name it is called:
+        // something new goes through it only where the run has that worker. (What was already
+        // asked for is carried on above and below, whether or not the worker is still listed.)
+        if (found.hands_to && !carried && !workersIn(acting, this.#b.toolsOf, this.#b.workers()).some((each) => each.tool === name)) throw new Error(`there is no worker to hand this to here`);
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
         const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
@@ -316,6 +346,44 @@ export class RunTools {
         return { ok: true, cancelled: active };
       },
 
+      handOver: async (callId, name, title, brief, options, continueFrom, replaces) => {
+        // A call made before and made again is the piece of work it was, whatever the deployment lists now.
+        if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) {
+          const again = (await this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, typeof options.repository === "string" ? options.repository : null)) as { task_id: string; status: string };
+          return { work_id: again.task_id, status: again.status };
+        }
+        const kept = this.#b.requests.record(callId) ?? this.#b.requests.record((JSON.parse(this.#s.meta(`waited:${callId}`) ?? "null") as { request?: string } | null)?.request ?? "");
+        if (kept) return host.connectorTool(callId, kept.tool, { brief, continue_from: continueFrom, replaces });
+        const worker = workersIn(this.#b.actingFor(run.id), this.#b.toolsOf, this.#b.workers()).find((each) => each.name === name);
+        if (!worker) throw new Error(`there is no worker "${name}" to hand this to here`);
+        // Each worker has its own options and no other's.
+        const foreign = Object.entries(options).filter(([key, value]) => value != null && !(key in (worker.options ?? {})));
+        if (foreign.length > 0) throw new Error(`the worker "${name}" has no option ${foreign.map(([key]) => key).join(", ")}; leave it null`);
+        // Carried by a connector's tool: that tool is called for it, and what it cannot do yet waits as its request.
+        if (worker.tool) return host.connectorTool(callId, worker.tool, { brief, continue_from: continueFrom, replaces });
+        // Said before anything is started: a worker the Brain starts does not take a waiting request's place.
+        if (replaces !== null) throw new Error(`the worker "${name}" cannot take the place of a request that waits; if the person no longer wants that one, call it off first, then hand this over`);
+        if (continueFrom !== null) throw new Error(`the worker "${name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
+        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, typeof options.repository === "string" ? options.repository : null)) as { task_id: string; status: string };
+        return { work_id: started.task_id, status: started.status };
+      },
+      workStatus: async (workId) => {
+        const work = await this.#work(run, session.session_key, workId);
+        // Work done in a person's name: how it stands, and nothing of what it brought back.
+        return work.task ? this.#b.tasks.status(workId) : { work_id: workId, worker: work.worker, state: work.standing };
+      },
+      cancelWork: async (callId, workId) => {
+        const work = await this.#work(run, session.session_key, workId);
+        if (work.task) return this.#b.tasks.cancel(session.session_key, workId);
+        if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : "It had already ended; there was nothing to stop." };
+        // The request that carries it is called off, as any request of the person's is.
+        const off = (await host.cancelRequest(callId, workId, "")) as { cancelled?: string };
+        if (off.cancelled !== workId) return off;
+        // Whether the work itself stopped, or only the waiting for it here.
+        return !work.handed
+          ? { ok: true, cancelled: workId, how: "stopped", note: "It had not been handed over yet and will not be. Tell the person so." }
+          : { ok: true, cancelled: workId, how: "no_longer_waited_for", note: "Nothing of it will be brought back here. The worker may still finish it over there: tell the person that, not that it was stopped." };
+      },
       dispatchTask: async (callId, title, brief, repository) => {
         return this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, repository);
       },
@@ -323,12 +391,28 @@ export class RunTools {
       answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),
       cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
     };
+    return host;
   }
 }
 
 type Read = { connector: string; tool: string; args: string; identity: string };
 
 /** The connector's tools that may be used for this person where they are: all of them in private, and where several people talk only those that say so. */
+/**
+ * The workers a run can hand work to: those the Brain starts, and those carried by a connector's
+ * tool where the run has that tool (so one done in a person's name is there only for a person it
+ * is offered to).
+ */
+export function workersIn(acting: Parameters<typeof toolsIn>[0] | undefined, toolsOf: (connector: string) => ConnectorTool[], all: Worker[]): Worker[] {
+  const tools = acting ? toolsIn(acting, toolsOf).map((each) => each.name) : [];
+  return all.filter((each) => (each.tool ? tools.includes(each.tool) : each.start !== undefined));
+}
+
+/** How a piece of work done in a person's name stands, in words for the model: what it waits for while it is under way, or how it ended. */
+export function standingOf(state: string, waits?: "authorisation" | "result", handed = false): string {
+  return state !== "open" ? state : waits === "authorisation" ? (handed ? "waiting_for_authorisation (it was handed over already, or may have been; the person has to authorise again before it can go on; they were shown how)" : "waiting_for_authorisation (not handed over yet: the person has to authorise it first; they were shown how)") : waits === "result" ? "waiting_for_result (handed over; the worker is at it)" : "under way";
+}
+
 export function toolsIn(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {
   // An optional tool: only where every message the run acts on was marked, as it arrived, as one it is offered for.
   const offered = (name: string) => acting.said !== undefined && acting.said.length > 0 && acting.said.every((each) => Array.isArray(each.data.offered) && each.data.offered.includes(name));

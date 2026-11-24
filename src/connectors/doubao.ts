@@ -12,6 +12,7 @@
  * Feishu on its own hosts. It sends nothing back by itself: a reply is found by asking again.
  * See docs/design/doubao-work.zh-CN.md for what was measured against the real service.
  */
+import type { Worker } from "../workers/types";
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../env";
@@ -405,10 +406,12 @@ function standing(op: Op, result: unknown, gaveUp?: "expired" | "void"): "open" 
 
 async function ask(context: ToolContext, args: Record<string, unknown>, seen: Seen = {}): Promise<unknown> {
   const { env, origin } = context;
-  const text = String(args.text ?? "").trim();
+  // As a worker's tool it is called with `brief` and `continue_from`; a request kept before that, with what it was kept as.
+  const text = String(args.brief ?? args.text ?? "").trim();
+  const from = [args.continue_from, args.from].find((each): each is string => typeof each === "string" && each !== "");
   if (!text) return { error: "say what Doubao is to do" };
   if (text.length > MAX_TEXT) return { error: `that is too long to hand over: at most ${MAX_TEXT} characters` };
-  const carryOn = args.carry_on === true;
+  const carryOn = from !== undefined || args.carry_on === true;
   if (context.scope.kind !== "user") return { error: "this can only be done for one person, in their own conversation" };
   const redirect = redirectUri(env);
   if (!redirect || !grantsKey(env)) return { error: "handing work to Doubao is not set up on this deployment" };
@@ -420,13 +423,22 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   // something they said another time. (Or their reply to what Doubao made for them.)
   // Or, for a follow-up only: the last answer they had from the agent when they wrote was what Doubao made for them, not long ago.
   // (How recent is judged as it is first asked: a request carried on later is the same piece of work.)
-  const followed = carryOn && pointed === undefined && typeof context.latest?.source.op === "string" && (context.resuming !== undefined || Date.now() - context.latest.sent_at < CARRY_ON_WITHIN_MS) ? context.latest.source.op : undefined;
+  const last = typeof context.latest?.source.op === "string" && (context.resuming !== undefined || Date.now() - context.latest.sent_at < CARRY_ON_WITHIN_MS) ? context.latest.source.op : undefined;
+  // (Not where the model names a piece itself: if that is not the one, it is not swapped for another without a word.)
+  const followed = carryOn && from === undefined && pointed === undefined ? last : undefined;
   const named = context.said.some((each) => NAMED.test(each.text));
+  // A piece of work the model names to go on with is taken on the person's word only: the one they
+  // replied to, the one their last answer came from, or any of theirs where they name Doubao themselves.
+  // What they replied to says which, before anything the model names.
+  if (from !== undefined && pointed !== undefined && from !== pointed) return { error: "the person's message replies to the answer of another piece of work than the one named; nothing was sent. Ask them which they mean" };
+  // (Where they name Doubao and the model's choice has nothing of theirs behind it, the choice is not taken: it is the one recent piece of theirs, or they are asked.)
+  const chosen = from !== undefined && (from === pointed || from === last) ? from : undefined;
+  if (from !== undefined && chosen === undefined && !named) return { error: "it cannot be told from the person's message that they mean that piece of work: they did not name Doubao, reply to its answer, or write straight after it; nothing was sent. Answer it yourself, or ask them" };
   // Something new is handed over only on their word for it in this message: what they reply to, or what came before, can only say which piece of work to go on with.
   if (!carryOn && !named) return { error: "the person has not asked for Doubao in this message; nothing was sent. Something new is handed to Doubao only when they say so in the message itself" };
   // A reply they marked that does not lead to a piece of work is not guessed around.
   if (carryOn && pointed === undefined && context.said.some((each) => each.data.replies_to !== undefined)) return { error: "the person's message replies to something that is not a piece of work Doubao did for them, so it cannot be told what to carry on; nothing was sent. Answer it yourself, or ask them which piece of work they mean" };
-  if (!named && pointed === undefined && followed === undefined) return { error: "the person has not asked for Doubao in this message, and it does not follow on an answer Doubao made for them; nothing was sent. If they want this handed to Doubao, they can say so" };
+  if (!named && pointed === undefined && followed === undefined && chosen === undefined) return { error: "the person has not asked for Doubao in this message, and it does not follow on an answer Doubao made for them; nothing was sent. If they want this handed to Doubao, they can say so" };
   // Who they are on the other side, as the chat connector verified it with each of their messages.
   const ids = new Set(context.said.map((each) => each.data.union_id));
   const union = ids.size === 1 && typeof [...ids][0] === "string" && [...ids][0] !== "" ? ([...ids][0] as string) : undefined;
@@ -434,15 +446,15 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   const who: Who = { chat_app_id: app.chat_app_id, tenant_key: origin.tenant_key, open_id: context.person, ...(union ? { union_id: union } : {}) };
   const name = await grantName(who);
   const grant = env.DOUBAO_GRANTS.getByName(name);
-  const request = { text, carry_on: carryOn };
+  const request = { text, carry_on: carryOn, ...(chosen !== undefined ? { from: chosen } : {}) };
 
   const { generation, token, version } = await grant.held();
   if (context.resuming && generation !== context.resuming.generation) return CHANGED;
   // Kept as it is first asked for. The same call made again (carried on, or after an interruption) is the same piece of work.
-  const op = await grant.begin(who, context.callId, text, { carryOn, ...(carryOn && (pointed ?? followed) !== undefined ? { from: pointed ?? followed } : {}) }, app.version, generation);
-  if (op === "nothing_to_carry_on") return { error: "there is no recent piece of work with Doubao to carry on for this person; set `carry_on` to false to start a new one" };
-  if (op === "several") return { error: "the person has had more than one piece of work with Doubao lately, and it cannot be told which this follows; nothing was sent. Ask them which one: replying to the answer in question says it. Or start a new one with `carry_on` false" };
-  if (op === "not_found") return { error: "the piece of work this replies to can no longer be carried on (it is too old, or the authorisation changed since); nothing was sent. Start a new one with `carry_on` false" };
+  const op = await grant.begin(who, context.callId, text, { carryOn, ...(carryOn && (chosen ?? pointed ?? followed) !== undefined ? { from: chosen ?? pointed ?? followed } : {}) }, app.version, generation);
+  if (op === "nothing_to_carry_on") return { error: "there is no recent piece of work with Doubao to carry on for this person; hand it over as something new instead" };
+  if (op === "several") return { error: "the person has had more than one piece of work with Doubao lately, and it cannot be told which this follows; nothing was sent. Ask them which one: replying to the answer in question says it. Or hand it over as something new" };
+  if (op === "not_found") return { error: "the piece of work this replies to can no longer be carried on (it is too old, or the authorisation changed since); nothing was sent. Hand it over as something new" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
   seen.op = op;
   // Each step of it is kept where the record is, and what comes back is the record as it then stands.
@@ -501,7 +513,8 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   if (sent.status === 401) {
     await grant.refused(version);
     // Turned away for who is asking: nothing of it was taken. Still to be sent, once they have authorised again.
-    return again ? (await advance("lost"), { error: UNCERTAIN }) : authorise();
+    // (And said as that: turned away outright on the first try, it was not handed over.)
+    return again ? (await advance("lost"), { error: UNCERTAIN }) : authorise(false);
   }
   const mine = (Array.isArray(sent.data.messages) ? sent.data.messages : []).find((each: any) => each?.role === "user" && typeof each.id === "string");
   const session = op.fresh ? sent.data.id : op.session;
@@ -510,7 +523,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
     // And "taken" without saying what became of it is not a refusal.
     if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await advance("lost"), { error: UNCERTAIN };
     await advance("failed");
-    return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; wait for it to finish, or start a new one with `carry_on` false" : `Doubao did not take this (status ${sent.status}); nothing was started` };
+    return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; wait for it to finish, or hand it over as something new" : `Doubao did not take this (status ${sent.status}); nothing was started` };
   }
   await advance("submitted", { session, message: mine.id });
   return reply();
@@ -518,11 +531,12 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   function reply(): Waiting {
     return { waiting: { on: "reply", subject: name, condition, generation, until: (op as Op).deadline, request } };
   }
-  async function authorise(): Promise<unknown> {
+  /** `handed`: whether the work was handed over already, or may have been. Unless said, by how far its record has got. */
+  async function authorise(handed = (seen.op ?? (op as Op)).stage !== "asked"): Promise<unknown> {
     const invitation = await grant.invite(who, redirect!, app!, generation);
     if (invitation === "superseded") return (seen.gave_up = "void"), { error: "the person's authorisation changed just now; nothing was sent. They can ask again" };
     if (invitation === "full") return { error: "too many authorisations were begun and not finished in the last hour; nothing was sent. They can ask again later" };
-    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, request } } satisfies Waiting;
+    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, ...(handed ? { handed: true as const } : {}), request } } satisfies Waiting;
   }
 }
 
@@ -647,6 +661,15 @@ function page(title: string, body: string, status = 200): Response {
 }
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
+
+/** Doubao Work as a worker: carried by the tool above, so it is there for a person wherever that tool is. */
+export const doubaoWorker: Worker = {
+  name: "doubao",
+  description:
+    "Doubao Work (豆包工作): researches, writes documents and the like. It takes a while. Something new goes to it only when the person asks for Doubao by name in this message. What follows on something it made for them (more depth, a correction, the next part) can go on with it without the name: when they reply to that answer, or write straight after it. What they ask of you yourself (what you think, to answer here, another subject, anything they would not want written into that Doubao conversation) you answer yourself; if they say not to use Doubao, do not; if it cannot be told whether they mean you or Doubao and it matters where their words go, ask them once.",
+  acts_as: "person",
+  tool: doubaoAsk.name,
+};
 
 export const doubaoConnector: Connector = {
   name: "doubao",

@@ -1,3 +1,4 @@
+import type { Worker } from "../src/workers";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -45,6 +46,8 @@ function bench(state: DurableObjectState) {
     guards: [] as unknown[],
     over: undefined as string | undefined | Error,
     connectorTools: [] as ConnectorTool[],
+    /** The workers this deployment lists. */
+    workers: [] as Worker[],
   };
   /** What the model says, in order; an Error is thrown instead. */
   const model: (ModelResponse | Error)[] = [];
@@ -68,6 +71,8 @@ function bench(state: DurableObjectState) {
     outside,
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
+    workers: () => settings.workers,
+    workStands: async () => true,
     quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
     // As Feishu's does: a reply in a chat is written under the message it names.
     under: (target) => (target.address.message_id ? `${target.connector}:message:${target.address.message_id}` : undefined),
@@ -99,6 +104,9 @@ function bench(state: DurableObjectState) {
       resumed: () => undefined,
       cancellable: () => [],
       askedFor: () => "",
+      record: () => undefined,
+      indexed: () => undefined,
+      promised: () => false,
       resume: async (event: InboxRow) => (log.push(["resume", event.source_id]), undefined),
       // As the requests part has it: what the run noted it read, each thing once.
       readsOf: (runId: string) => [...new Map((JSON.parse(store.meta(`sources:${runId}`) ?? "[]") as { connector: string; tool: string; args: string; identity: string }[]).map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()],

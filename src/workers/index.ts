@@ -7,6 +7,11 @@ export type { Started, Work, Worker } from "./types";
 const byName = new Map(config.workers.map((each) => [each.name, each]));
 if (byName.size !== config.workers.length) throw new Error("two workers have the same name");
 
+/** Every worker this deployment lists. */
+export function workers(): Worker[] {
+  return config.workers;
+}
+
 /** The worker listed under this name, if this deployment has it. */
 export function workerNamed(name: string): Worker | undefined {
   return byName.get(name);

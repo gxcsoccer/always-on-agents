@@ -19,14 +19,16 @@ export interface Work {
   person: string | null;
   /** What it waits under, for work that waits on a condition of its worker's. */
   under?: { condition: string; generation: number };
+  /** It has been handed over, or may have been. Once so, it stays so. */
+  handed?: boolean;
 }
 
 /** How a piece of work stands now. Open again changes only what it waits under; an end is kept once. */
 export function workIs(store: BrainStore, work: Work, as: "open" | WorkEnd): void {
   const now = Date.now();
   store.sql.exec(
-    `INSERT INTO work (id, worker, session_key, person, state, condition, generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET state = excluded.state, condition = COALESCE(excluded.condition, work.condition), generation = COALESCE(excluded.generation, work.generation), updated_at = excluded.updated_at
+    `INSERT INTO work (id, worker, session_key, person, state, condition, generation, created_at, updated_at, handed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET handed = MAX(work.handed, excluded.handed), state = excluded.state, condition = COALESCE(excluded.condition, work.condition), generation = COALESCE(excluded.generation, work.generation), updated_at = excluded.updated_at
      WHERE work.state = 'open'`,
     work.id,
     work.worker,
@@ -37,5 +39,6 @@ export function workIs(store: BrainStore, work: Work, as: "open" | WorkEnd): voi
     work.under?.generation ?? null,
     now,
     now,
+    work.handed ? 1 : 0,
   );
 }

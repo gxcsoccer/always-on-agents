@@ -25,6 +25,10 @@ export interface ToolHost {
   setTimer(callId: string, delaySeconds: number, note: string, repeatEverySeconds: number | null): unknown;
   listTimers(): unknown;
   cancelTimer(id: string): unknown;
+  /** Hands a piece of work to one of the workers this run has. */
+  handOver(callId: string, worker: string, title: string, brief: string, options: Record<string, unknown>, continueFrom: string | null, replaces: string | null): Promise<unknown>;
+  workStatus(workId: string): Promise<unknown>;
+  cancelWork(callId: string, workId: string): Promise<unknown>;
   dispatchTask(callId: string, title: string, brief: string, repository: string | null): Promise<unknown>;
   taskStatus(taskId: string): Promise<unknown>;
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
@@ -101,27 +105,56 @@ export const TOOLS: ToolDefinition[] = [
   tool("list_timers", "List your active timers.", {}),
   tool("cancel_timer", "Cancel a timer.", { id: string }),
   tool(
-    "dispatch_task",
-    "Hand a piece of work to a coding agent that runs in its own sandbox: it can run shell commands, write code and use git. Use it for anything that takes more than a moment. You are told when it finishes, fails or needs approval; do not wait for it. The worker cannot open links that need a login (a company's documents, say): do not hand it one to fetch.",
-    {
-      title: { type: "string", description: "A few words, shown to people." },
-      brief: { type: "string", description: "Everything the worker needs. It knows nothing about this conversation. It cannot message anyone or post anywhere: say what you want back in its final answer." },
-      repository: { ...nullable("string"), description: "An https://github.com/... URL to clone first, or null." },
-    },
-  ),
-  tool("task_status", "Look up a task's current state and latest progress.", { task_id: string }),
-  tool(
     "answer_task",
     "Answer a task that is waiting for approval. Only pass on a decision a person just gave you in this conversation; you may not approve on your own.",
     { task_id: string, decision: { type: "string", enum: ["allow", "deny"] }, reason: string },
   ),
-  tool("cancel_task", "Stop a task and discard its sandbox.", { task_id: string }),
   tool(
     "cancel_request",
     "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If more than one request could be meant, the system asks the person which, itself; say nothing more about it then.",
     { request_id: string, ask: { type: "string", description: "One short sentence, in the person's language, asking which of their requests they mean. It is sent, followed by the list of those requests, only if more than one could be meant." } },
   ),
 ];
+
+/**
+ * The tools for handing work to workers, made from the workers a run has: none of their names or
+ * parameters is written here. `worker` is one of them by name; each worker's own options are
+ * parameters of `hand_over`, null for a worker they are not for. None where there is no worker.
+ */
+export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean }[], replaces: unknown): ToolDefinition[] {
+  // How work stands can be asked, and work stopped, also where nothing new can be handed over (a worker taken out of the deployment still has what it was given).
+  const standing = [
+    tool("work_status", "Look up how a piece of work you handed over stands.", { work_id: string }),
+    tool("cancel_work", "Stop a piece of work you handed over, or stop waiting for it. Only when the person says they no longer want it.", { work_id: string }),
+  ];
+  if (workers.length === 0) return standing;
+  const options: Record<string, unknown> = {};
+  for (const each of workers) {
+    for (const [key, schema] of Object.entries(each.options ?? {})) {
+      // One name, one meaning: two workers cannot both have an option of the same name.
+      if (key in options || ["worker", "title", "brief", "continue_from", "replaces"].includes(key)) throw new Error(`the option "${key}" of the worker "${each.name}" is already taken`);
+      const described = schema as { description?: string };
+      options[key] = { ...described, description: `Only for the worker "${each.name}"; null for any other. ${described.description ?? ""}`.trim() };
+    }
+  }
+  const listed = workers.map((each) => `- ${each.name}${each.acts_as === "person" ? " (does things as the person you are talking to, with their own account)" : ""}: ${each.description}`).join("\n");
+  const continues = workers.filter((each) => each.continues).map((each) => each.name);
+  return [
+    tool(
+      "hand_over",
+      `Hand a piece of work to a worker: something that takes more than a moment, or that a worker can do and you cannot. You are told when it is done, fails or needs something; do not wait for it. Choose the worker by what each can do:\n${listed}\nWork that goes on with an earlier piece (more depth, a correction, the next part) goes to the worker that did that piece, with its id in continue_from. A worker that does things as the person takes something new only when the person asks for that worker by name in this message; it is refused otherwise, and then you do it another way or ask them.`,
+      {
+        worker: { type: "string", enum: workers.map((each) => each.name) },
+        title: { type: "string", description: "A few words, shown to people." },
+        brief: { type: "string", description: "What to do. The worker knows nothing of this conversation. For a worker that does things as the person: the person's own request in their words, plus only what is needed from here to understand it; no requirements, scope or format they did not state. For any other: everything it needs, and what you want back in its final answer." },
+        continue_from: { type: ["string", "null"], description: `The id of an earlier piece of work (listed under "Work handed over") that this goes on with, or null for something new.${continues.length < workers.length ? ` Only ${continues.length ? continues.join(", ") : "no worker here"} can go on with an earlier piece.` : ""}` },
+        ...options,
+        ...(replaces ? { replaces } : {}),
+      },
+    ),
+    ...standing,
+  ];
+}
 
 /** Runs one tool call and returns the JSON string the model will see. Never throws. */
 export async function executeTool(host: ToolHost, call: ToolCall): Promise<string> {
@@ -168,6 +201,16 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
       return host.listTimers();
     case "cancel_timer":
       return host.cancelTimer(text(a.id, "id", 200));
+    case "hand_over": {
+      const { worker, title, brief, continue_from, replaces, ...options } = a;
+      return host.handOver(call.call_id, text(worker, "worker", 60), text(title, "title", 120), text(brief, "brief", 20_000), options, continue_from == null ? null : text(continue_from, "continue_from", 200), replaces == null ? null : text(replaces, "replaces", 200));
+    }
+    case "work_status":
+      return host.workStatus(text(a.work_id, "work_id", 200));
+    case "cancel_work":
+      return host.cancelWork(call.call_id, text(a.work_id, "work_id", 200));
+    // The names work was handed over under before there was one set of tools: still carried out,
+    // for a call made under them that is made again, and no longer offered.
     case "dispatch_task":
       return host.dispatchTask(call.call_id, text(a.title, "title", 120), text(a.brief, "brief", 20_000), a.repository == null ? null : text(a.repository, "repository", 300));
     case "task_status":
