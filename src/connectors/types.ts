@@ -244,6 +244,15 @@ export interface ToolContext {
    * points at nothing, so the reply is as any other message of the person's.
    */
   answering?: { source?: Record<string, unknown>; nothing?: true };
+  /**
+   * The agent's last answer in this conversation that had reached the person when they wrote
+   * what this run acts on, if it was written from one thing of this tool's that is theirs to
+   * point at: that thing as the tool's canonical call, and when the answer was sent. For telling
+   * what an unmarked follow-up ("and the third one?") follows. Absent when that answer was
+   * written from nothing read, from several things, or for someone else; an earlier answer is
+   * never looked past it. A reply the person marked as one (`answering`) comes first.
+   */
+  latest?: { source: Record<string, unknown>; sent_at: number };
   /** Names this call; the same on a repeat, and the same when a request that waited is carried on. */
   callId: string;
   /**

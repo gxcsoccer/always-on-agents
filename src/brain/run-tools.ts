@@ -93,6 +93,16 @@ export class RunTools {
     return { answering: one ? { source: one.request } : {} };
   }
 
+  /** What the agent's last answer here was written from, as of when the person wrote: see ToolContext.latest. */
+  #latest(run: RunRow, acting: Acting, name: string, kept = false): { latest?: { source: Record<string, unknown>; sent_at: number } } {
+    const basis = this.#b.requests.basis(run.id);
+    if (basis.length === 0) return {};
+    // The last one they could have seen when they wrote, whatever it was: not the last one of some kind.
+    const last = this.#s.rows<{ reads: string; person: string | null; sent_at: number }>("SELECT reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, Math.min(...basis.map((each) => each.received_at)))[0];
+    const source = last && eligibleSource(JSON.parse(last.reads) as Read[], acting, this.#b.toolsOf, last.person, kept);
+    return source && source.tool === name ? { latest: { source: source.request, sent_at: last.sent_at } } : {};
+  }
+
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
@@ -146,7 +156,7 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), ...this.#latest(run, acting, name, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
