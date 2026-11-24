@@ -5,6 +5,7 @@
  * whether it may still use a tool, what it has read from outside). See tools.ts for how the model
  * is told about them and how a call is dispatched.
  */
+import { type WorkEnd, workIs } from "./work";
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import { chainLevels } from "../events";
@@ -177,7 +178,9 @@ export class RunTools {
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
         try {
-          const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), ...this.#latest(run, acting, name, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const handsTo = found.hands_to;
+          const work = handsTo ? { work: (as: "open" | WorkEnd) => workIs(this.#s, { id: key, worker: handsTo, sessionKey: String(session.session_key), person: acting.person }, as) } : {};
+          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), ...this.#latest(run, acting, name, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;

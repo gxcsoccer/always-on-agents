@@ -18,6 +18,7 @@ import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools, eligibleSource, toolsIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
+import { workIs } from "./work";
 import { TOOLS, type ToolCall, describeTool, executeTool } from "./tools";
 
 const MAX_STEPS_PER_RUN = 16;
@@ -674,7 +675,8 @@ export class Runner {
         this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "the run was abandoned before this finished" }) });
       }
       // A task that never got past "dispatching" in this run will not be picked up by anything else.
-      this.#s.sql.exec("UPDATE tasks SET status = 'failed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", Date.now(), run.session_id);
+      const never = this.#s.rows<{ id: string; worker: string; session_key: string; requested_by: string | null }>("UPDATE tasks SET status = 'failed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) RETURNING id, worker, session_key, requested_by", Date.now(), run.session_id);
+      for (const each of never) workIs(this.#s, { id: each.id, worker: each.worker, sessionKey: each.session_key, person: each.requested_by }, "failed");
       // For a request that was being carried on, this takes the place of its answer: one or the other.
       const carried = this.#b.requests.continuationOf(runId);
       if (carried?.status === "resuming") this.#b.requests.draft(carried, run, this.#b.outbox.notice("failed", run.session_id));

@@ -633,6 +633,27 @@ describe("handing work to Doubao Work", () => {
     expect(toolOutputs(modelCalls.at(-2))[0].error).toContain("could not be confirmed");
     expect(hal.heard()).toEqual(["没能确认豆包是否收到。"]);
     expect(await (await hal.grant()).status()).toMatchObject({ work: { lost: 1 } });
+    // In the index of work: not known to have been taken, whatever the person was told and whether that reached them.
+    expect(await rowsOf(hal.stub, "SELECT state FROM work")).toEqual([{ state: "unknown" }]);
+  });
+
+  it("records what Doubao made of a piece of work, not that the person was told: a row also for one that never waited", async () => {
+    await pair();
+    const ivy = someone();
+    const session = await handsOver(ivy, "调研 A");
+    // Doubao says it failed. The person is told, and that reaches them: the work has still failed.
+    doubaoReplies(session, "", "failed");
+    model.replies([call("send_message", { text: "豆包没有做成。" })], [say("")]);
+    await ivy.later();
+    expect(ivy.heard().at(-1)).toBe("豆包没有做成。");
+    expect(await rowsOf(ivy.stub, "SELECT state FROM work")).toEqual([{ state: "failed" }]);
+
+    // With the authorisation standing, a new piece is taken by Doubao and its receipt is lost both times: it never waits, and is still a piece of work.
+    world.unreachable = 2;
+    model.replies([asks("调研 B")], [call("send_message", { text: "没能确认。" })], [say("")]);
+    await ivy.says("让豆包调研 B");
+    expect((await rowsOf(ivy.stub, "SELECT state FROM work ORDER BY created_at, rowid")).map((each) => each.state)).toEqual(["failed", "unknown"]);
+    expect(await rowsOf(ivy.stub, "SELECT 1 FROM continuations")).toHaveLength(1);
   });
 
   it("does not use an authorisation given under a pairing the operator has since changed", async () => {

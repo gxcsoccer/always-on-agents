@@ -9,7 +9,7 @@ import { type Target, isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
 import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
-import { workEnded, workOpened } from "./work";
+import { type WorkEnd, workIs } from "./work";
 import type { BrainStore, InboxRow, Row, RunRow, Wakes } from "./store";
 
 /**
@@ -249,11 +249,7 @@ export class Requests implements Wakes {
         this.#s.audit("(system)", "request.waiting", { request: id, on: waiting.on });
       }
       // What a tool that hands work to a worker keeps waiting is a piece of work, under the request's own id.
-      const worker = this.#b.handsTo(acting.connector, tool);
-      if (worker) {
-        const sessionKey = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", run.session_id)[0]?.session_key ?? "";
-        workOpened(this.#s, { id, worker, sessionKey, person: acting.person, under: { condition: waiting.condition, generation: waiting.generation } });
-      }
+      this.#work(id, "open");
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       if (!shows) {
@@ -524,12 +520,20 @@ export class Requests implements Wakes {
     return Date.now() - (record.claimed_at ?? 0) > HANDLING_LIMIT_MS ? "it was not finished in time" : undefined;
   }
 
+  /** A request kept for a tool that hands work to a worker is a piece of work, under the request's own id. */
+  #work(id: string, as: "open" | WorkEnd): void {
+    const record = this.#s.rows<Continuation & { session_key: string | null }>("SELECT c.*, s.session_key FROM continuations c LEFT JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", id)[0];
+    const worker = record && this.#b.handsTo(record.connector, record.tool);
+    if (worker) workIs(this.#s, { id, worker, sessionKey: record.session_key ?? "", person: record.person ?? null, under: { condition: record.condition, generation: record.generation } }, as);
+  }
+
   /** Ends a request, once. What ended it is kept; nothing ended is ever reopened. */
   endRequest(id: string, status: "done" | "failed" | "cancelled" | "expired" | "void" | "unverified", why: string): void {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
-    if (ended.length > 0) workEnded(this.#s, id, status === "unverified" ? "unknown" : status);
+    // If whoever carried it out has not said how it ended, it ended as the request did.
+    if (ended.length > 0) this.#work(id, status === "unverified" ? "unknown" : status);
     if (ended.length > 0 && shown) this.#wayInOver(shown);
   }
 

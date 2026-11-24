@@ -370,14 +370,31 @@ export const doubaoAsk: ConnectorTool = {
   optional: true,
   hands_to: "doubao",
   parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
-  run: ask,
+  // How the piece of work stands is said from its own record, however the call went.
+  run: async (context, args) => {
+    const seen: { grant?: { op(call: string): Promise<Op | undefined> } } = {};
+    const result = await ask(context, args, seen);
+    const op = await seen.grant?.op(context.callId).catch(() => undefined);
+    if (op) context.work?.(standing(op, result));
+    return result;
+  },
   // A piece of work handed over for the person is theirs to point at for as long as its record is kept: the call itself checks that.
   links: (_message, request) => typeof request.op === "string",
 };
 
 const UNCERTAIN = "it could not be confirmed whether Doubao took this; nothing more was sent, so that it is not done twice. The person can look in Doubao Work, or ask again";
 
-async function ask(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
+/** A piece of work as its record has it: what Doubao made of it where that is known, and not whether the person was told. */
+function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown" {
+  if (op.stage === "answered") return op.reply?.status === "completed" ? "done" : op.reply?.status === "cancelled" ? "cancelled" : "failed";
+  if (op.stage === "lost") return "unknown";
+  if (op.stage === "failed") return "failed";
+  // Still under way by its record. A call that ends in an error has given it up: never sent, or no longer waited for.
+  if (typeof result === "object" && result !== null && "error" in result) return op.stage === "asked" ? "failed" : Date.now() >= op.deadline ? "expired" : "void";
+  return "open";
+}
+
+async function ask(context: ToolContext, args: Record<string, unknown>, seen: { grant?: unknown } = {}): Promise<unknown> {
   const { env, origin } = context;
   const text = String(args.text ?? "").trim();
   if (!text) return { error: "say what Doubao is to do" };
@@ -408,6 +425,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   const who: Who = { chat_app_id: app.chat_app_id, tenant_key: origin.tenant_key, open_id: context.person, ...(union ? { union_id: union } : {}) };
   const name = await grantName(who);
   const grant = env.DOUBAO_GRANTS.getByName(name);
+  seen.grant = grant;
   const request = { text, carry_on: carryOn };
   const CHANGED = { error: "the person's authorisation, or how this is set up, changed while this was under way; nothing more was done. They can ask again" };
 

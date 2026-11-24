@@ -268,7 +268,7 @@ describe("tasks, by themselves", () => {
     });
 
     it("keeps one row for each task in the index of work, opened as it is written and ended once", async () => {
-      await within(async ({ tasks, store }) => {
+      await within(async ({ tasks, store, task }) => {
         const work = () => store.rows<Record<string, unknown>>("SELECT id, worker, session_key, person, state FROM work ORDER BY created_at, id");
         const one = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
         // The same call again is the same task, and the same row.
@@ -282,6 +282,10 @@ describe("tasks, by themselves", () => {
         const two = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", "t", "b", null)) as { task_id: string };
         await tasks.cancel(SESSION_KEY, two.task_id);
         expect(work().map((each) => each.state).sort()).toEqual(["cancelled", "done"]);
+        // A task taken before there was an index has no row; it gets one when it ends.
+        task("t_old", { status: "running" });
+        await tasks.cancel(SESSION_KEY, "t_old");
+        expect(store.rows("SELECT worker, session_key, state FROM work WHERE id = 't_old'")).toEqual([{ worker: "sandbox", session_key: SESSION_KEY, state: "cancelled" }]);
       });
     });
 

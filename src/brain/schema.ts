@@ -296,7 +296,8 @@ export const MIGRATIONS: string[] = [
   // 30: every piece of work handed to a worker, whichever worker: one row under the id the work
   // has where it is carried out (a task's id; the id of the request a connector's tool keeps).
   // An index beside what each worker keeps for itself, which stays where it is. Written, and not
-  // read by anything yet: see docs/design/workers.zh-CN.md, step 2.
+  // read by anything yet: see docs/design/workers.zh-CN.md, step 2. Tasks under way are given
+  // their row here; anything else under way gets one when something is next said of it.
   `CREATE TABLE IF NOT EXISTS work (
      id TEXT PRIMARY KEY,
      worker TEXT NOT NULL,
@@ -308,7 +309,9 @@ export const MIGRATIONS: string[] = [
      created_at INTEGER NOT NULL,
      updated_at INTEGER NOT NULL
    );
-   CREATE INDEX IF NOT EXISTS work_session ON work (session_key, created_at);`,
+   CREATE INDEX IF NOT EXISTS work_session ON work (session_key, created_at);
+   INSERT OR IGNORE INTO work (id, worker, session_key, person, state, created_at, updated_at)
+     SELECT id, worker, session_key, requested_by, 'open', created_at, updated_at FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input');`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
