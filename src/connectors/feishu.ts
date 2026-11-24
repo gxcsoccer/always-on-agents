@@ -22,7 +22,7 @@ import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -77,7 +77,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -323,6 +323,12 @@ function named(text: string, mentions: any[], own: (string | null)[]): string {
     .trim();
 }
 
+/** A person's own chat with the bot: through the app their message verifiably came through, by their id there. */
+export function directFeishu(origin: Record<string, string>, person: string): Target | undefined {
+  const ok = (each: unknown): each is string => typeof each === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each);
+  return ok(origin.app_id) && ok(person) ? { connector: "feishu", address: { app_id: origin.app_id, open_id: person } } : undefined;
+}
+
 /** How much of a quoted message is kept. */
 const MAX_QUOTED = 1_000;
 
@@ -425,8 +431,10 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 
 /** Sends as the bot. A direct chat gets a new message; a group gets a reply to the message that asked. */
 export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
-  const { app_id: appId, chat_id: chatId, message_id: messageId, thread } = target.address;
-  if (!appId || !chatId) throw new Error("bad Feishu address");
+  // A chat, or a person directly (their own chat with the bot, by their id): one or the other, never both.
+  const { app_id: appId, chat_id: chatId, open_id: openId, message_id: messageId, thread } = target.address;
+  if (!appId || (!chatId && !openId) || (openId && (chatId || messageId))) throw new Error("bad Feishu address");
+  const to = chatId ? { type: "chat_id", id: chatId } : { type: "open_id", id: openId };
   const token = await tenantAccessToken(env, appId);
   // Feishu drops a repeat of the same uuid within an hour, which makes a retry safe.
   const uuid = (await hex(message.idem)).slice(0, 40);
@@ -441,7 +449,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // attempt sends the very same thing.
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
   const current = message.encoding !== 0;
-  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: chatId, msg_type: msgType, content, uuid });
+  const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: to.id, msg_type: msgType, content, uuid });
   const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
@@ -453,13 +461,24 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify(body),
       })
-    : await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
+    : await fetch(`${API}/im/v1/messages?receive_id_type=${to.type}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify(body),
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
   const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
+  // Not now, which is not no: too many requests (it may say for how long), or the app's token
+  // lapsed before its time (forgotten, so the next attempt asks for a fresh one). Nothing was posted.
+  if (response.status === 429 || result.code === 99991400) {
+    const wait = Number(response.headers.get("retry-after") ?? response.headers.get("x-ogw-ratelimit-reset"));
+    // For as long as it says, never sooner; whether that is too long to wait for is the queue's to decide.
+    throw new DeliveryDeferred(said, Date.now() + (Number.isFinite(wait) && wait > 0 ? wait * 1_000 : 5_000));
+  }
+  if (result.code === 99991663) {
+    await forgetTenantAccessToken(env, appId, token);
+    throw new DeliveryDeferred(said, Date.now());
+  }
   // Feishu answered and said no: nothing was posted. A failure on its side leaves that open.
   if (response.status < 500 && typeof result.code === "number" && result.code !== 0) throw new DeliveryRejected(said);
   if (!response.ok || result.code !== 0) throw new Error(said);

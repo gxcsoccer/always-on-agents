@@ -92,6 +92,15 @@ export async function received(env: Env, name: string, scope: Scope, event: { so
   return show(env, scope, event).catch(() => undefined);
 }
 
+/** Where a person is reached directly through a connector, from a verified origin. Undefined where they cannot be. */
+export function direct(name: string, origin: Record<string, string>, person: string): Target | undefined {
+  try {
+    return byName.get(name)?.channel?.direct?.(origin, person);
+  } catch {
+    return undefined;
+  }
+}
+
 /** The message one was written in reply to, where the connector can fetch it. Never throws; undefined where it does not apply. */
 export async function quoted(env: Env, name: string, scope: Scope, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined> {
   const ask = byName.get(name)?.channel?.quoted;

@@ -27,6 +27,8 @@ function within<T>(use: (bench: ReturnType<typeof bench>) => T | Promise<T>): Pr
 function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const delivered: { target: Target; message: OutboundMessage }[] = [];
+  /** What the requests part was told about a way in: which message, and whether it reached the person. */
+  const shown: [string, string][] = [];
   const stamped: string[] = [];
   const ended: { id: string; status: string; why: string }[] = [];
   const closed: string[] = [];
@@ -49,6 +51,7 @@ function bench(state: DurableObjectState) {
       endRequest: (id, status, why) => void ended.push({ id, status, why }),
       sessionKeyOf: () => settings.sessionKey,
       readsOf: (runId) => settings.reads[runId] ?? [],
+      shown: (row, how) => void shown.push([row.idem as string, how]),
     },
   };
   const outbox = new Outbox(store, host);
@@ -65,7 +68,7 @@ function bench(state: DurableObjectState) {
   const said = (text: string) => void store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('feishu', ?, 'message', 'dm', '{}', ?, 'done', 1)", `om_${text}`, text);
   /** What was recorded as said to the person, in order. */
   const kept = () => store.rows<Record<string, any>>("SELECT * FROM said ORDER BY outbox_id").map(({ sent_at, ...rest }) => ({ ...rest, reads: JSON.parse(rest.reads) }));
-  return { store, host, outbox, delivered, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said, kept };
+  return { store, host, outbox, delivered, shown, stamped, ended, closed, outside, channel, gates, settings, run, row, set, sent, said, kept };
 }
 
 const fails = (err: Error) => () => {
@@ -174,6 +177,59 @@ describe("the outbox, by itself", () => {
         outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
         await outbox.flush();
         expect(delivered.map((each) => each.message)).toMatchObject([{ ask: { code: "A1" } }, { review: { summary: "fine" } }, { interaction: "int:1" }]);
+      });
+    });
+
+    it("tells the requests part how a way in fared: that it reached the person, or that it was given up", async () => {
+      await within(async ({ outbox, channel, set, shown, row }) => {
+        outbox.enqueue("plain", SESSION, null, "hello");
+        outbox.enqueue("i1", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
+        outbox.enqueue("i2", SESSION, null, "authorise", undefined, undefined, { interaction: "int:2" });
+        outbox.enqueue("i3", SESSION, null, "authorise", undefined, undefined, { interaction: "int:3" });
+        outbox.enqueue("after", SESSION, null, "next in line");
+        // A way in is not kept at the head of the queue: refused once, it is given up (it did not
+        // get there); with no answer, it is tried briefly and then given up (there is no telling).
+        channel.i2 = fails(new DeliveryRejected("no"));
+        channel.i3 = fails(new Error("timeout"));
+        await outbox.flush();
+        expect(row("i2")).toMatchObject({ status: "dead", attempts: 1 });
+        for (let tries = 0; tries < 3; tries++) {
+          set("i3", { next_at: 0 });
+          await outbox.flush();
+        }
+        expect(row("i3")).toMatchObject({ status: "unverified", attempts: 3 });
+        expect(row("after").status).toBe("sent");
+        expect(shown).toEqual([["i1", "reached"], ["i2", "failed"], ["i3", "unknown"]]);
+        // Told to come back later is not a refusal: it goes when it may.
+        let asked = 0;
+        channel.i4 = () => {
+          if (asked++ === 0) throw new DeliveryDeferred("limited", Date.now() + 1);
+          return { subject: "s:i4", holder: "" };
+        };
+        outbox.enqueue("i4", SESSION, null, "authorise", undefined, undefined, { interaction: "int:4" });
+        await outbox.flush();
+        expect(row("i4")).toMatchObject({ status: "pending", attempts: 1 });
+        set("i4", { next_at: 0 });
+        await outbox.flush();
+        expect(row("i4").status).toBe("sent");
+        expect(shown.at(-1)).toEqual(["i4", "reached"]);
+      });
+    });
+
+    it("does not keep the queue waiting behind a way in that is backing off once nobody waits on it", async () => {
+      await within(async ({ outbox, row, set, gates }) => {
+        outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1" });
+        outbox.enqueue("after", SESSION, null, "next in line");
+        // Told to come back in ten minutes; while someone still waits on it, that is kept, and what follows waits its turn.
+        set("i", { started: 1, attempts: 1, next_at: Date.now() + 600_000 });
+        await outbox.flush();
+        expect(row("i").status).toBe("pending");
+        expect(row("after").status).toBe("pending");
+        // The last one waiting on it has gone: it is set aside now, and the queue moves on.
+        gates.i = "void";
+        await outbox.flush();
+        expect(row("i").status).toBe("void");
+        expect(row("after").status).toBe("sent");
       });
     });
 

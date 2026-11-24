@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, canRevisit, deliver, quoted, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, canRevisit, deliver, direct, quoted, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -156,6 +156,7 @@ export class BrainAgent extends DurableObject<Env> {
       actingOn: (events, kept) => this.#runner.actingOn(events, kept),
       enqueueMessage: (...args) => this.#outbox.enqueue(...args),
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
+      direct,
     });
     this.#parts = [this.#timers, this.#requests, this.#outbox, this.#tasks, this.#marks];
     migrate(ctx.storage);

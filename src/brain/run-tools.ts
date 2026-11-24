@@ -110,6 +110,9 @@ export class RunTools {
         let waits = false;
         try {
           const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          // A tool that says it waits and does not say it whole has not answered: what it gave is
+          // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
+          if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return { error: "the tool's answer could not be used; nothing was read and nothing waits" };
           if (!isWaiting(result)) {
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.
@@ -123,7 +126,7 @@ export class RunTools {
           // Nothing was read. The answer the model gets is written here, not by the tool.
           waits = true;
           this.#b.outside.delete(callId);
-          return this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+          return this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
         } finally {
           // What this run has already written to send, and whatever it writes from here on.
           if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
