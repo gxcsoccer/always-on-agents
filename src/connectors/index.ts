@@ -8,8 +8,9 @@
 import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
-import type { Principal, Scope, Target } from "../events";
+import type { InboundEvent, Principal, Scope, Target } from "../events";
 import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Quoted, Receipt, Standing } from "./types";
+import { DeliveryVoid } from "./types";
 
 export type * from "./types";
 export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isSettled, isWaiting } from "./types";
@@ -23,7 +24,7 @@ for (const connector of config.connectors) {
   for (const tool of connector.tools ?? []) {
     if (toolNames.has(tool.name) || TOOLS.some((own) => own.name === tool.name)) throw new Error(`two tools are named "${tool.name}"`);
     toolNames.add(tool.name);
-    if (tool.effect !== "read") throw new Error(`tool "${tool.name}" must declare that it only reads`);
+    if (tool.effect !== "read" && tool.effect !== "act") throw new Error(`tool "${tool.name}" must declare what it does: read or act`);
     if (!tool.name.startsWith(`${connector.name.replace(/-/g, "_")}_`) || !/^[a-z][a-z0-9_]{2,63}$/.test(tool.name)) throw new Error(`tool "${tool.name}" must be named ${connector.name}_…`);
   }
   byName.set(connector.name, connector);
@@ -48,13 +49,42 @@ export function trusts(source: string): boolean {
 
 /** The tools a connector offers, if any. Whether they are offered in a given run is the Brain's decision. */
 export function toolsOf(name: string): ConnectorTool[] {
-  return byName.get(name)?.tools ?? [];
+  return [...(byName.get(name)?.tools ?? []), ...serving(name).flatMap((each) => each.tools ?? [])];
+}
+
+/** The connectors that plug into this one: their tools are for its people too. */
+function serving(name: string): Connector[] {
+  return connectors.filter((each) => each.name !== name && (each.serves ?? []).includes(name));
+}
+
+/** Which optional tools of the connectors plugged into an event's source are for whoever caused it. None where one of them cannot say. */
+export async function offeredFor(env: Env, event: InboundEvent): Promise<string[]> {
+  const names: string[] = [];
+  for (const each of serving(event.source)) {
+    const own = new Set((each.tools ?? []).filter((tool) => tool.optional).map((tool) => tool.name));
+    if (own.size === 0 || !each.offers) continue;
+    try {
+      names.push(...(await each.offers(env, event)).filter((name) => own.has(name)));
+    } catch {
+      // Not known: not offered.
+    }
+  }
+  return names;
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */
 export async function deliver(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
   const channel = byName.get(target.connector)?.channel;
   if (!channel) throw new Error(`no connector named "${target.connector}" delivers messages`);
+  // What is to be shown may be a plugged-in connector's to say: asked now, as it is sent.
+  // One that can no longer be used is not sent at all.
+  if (message.interaction) {
+    for (const each of serving(target.connector)) {
+      const invitation = await each.invitation?.(env, message.interaction);
+      if (invitation === null) throw new DeliveryVoid("the invitation can no longer be used");
+      if (invitation) return channel.deliver(env, scope, target, { ...message, invitation });
+    }
+  }
   return channel.deliver(env, scope, target, message);
 }
 
@@ -75,9 +105,16 @@ export async function standingOf(env: Env, name: string, scope: Scope, subject: 
 
 /** Whether a condition a connector's tool named holds now, asked of that connector. Throws if it cannot be asked. */
 export async function holds(env: Env, name: string, scope: Scope, condition: string, generation: number): Promise<Holds> {
+  // A connector that plugs into this one is asked first: it answers only for conditions of its own.
+  for (const each of serving(name)) {
+    const answer = await each.holds?.(env, scope, condition, generation);
+    if (answer) return answer;
+  }
   const ask = byName.get(name)?.holds;
   if (!ask) throw new Error(`connector "${name}" cannot say whether a condition holds`);
-  return ask(env, scope, condition, generation);
+  const answer = await ask(env, scope, condition, generation);
+  if (!answer) throw new Error(`no connector says whether that condition holds`);
+  return answer;
 }
 
 /** For how long this connector's system drops a repeated message, if it says. */

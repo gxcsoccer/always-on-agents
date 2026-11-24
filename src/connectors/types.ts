@@ -24,7 +24,7 @@
  * the deployment's secrets.
  */
 import type { Env } from "../env";
-import type { Principal, Scope, Target } from "../events";
+import type { InboundEvent, Principal, Scope, Target } from "../events";
 
 export interface Connector {
   /** Lowercase; also the first path segment of its routes and the `source` of its events. */
@@ -43,12 +43,46 @@ export interface Connector {
    * condition one of its tools named holds now, checked afresh against whatever the connector
    * itself keeps: never against what a caller says. `since` is when it began to hold, by the
    * connector's own record. "gone" means it can no longer come to hold as it was asked for.
-   * Throws if that cannot be found out right now.
+   * Throws if that cannot be found out right now. A connector that plugs into another (`serves`)
+   * is asked first, and answers nothing (undefined) for a condition that is not its own.
    */
-  holds?(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds>;
+  holds?(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds | undefined>;
+  /**
+   * The names of other connectors whose people this connector's tools are also for. A connector
+   * that plugs in like this need have no way in or out of its own: a person reaches the agent
+   * through the other connector, which says who they are, and this one adds something the agent
+   * can do for them. Its tools are offered wherever that connector's own would be.
+   */
+  serves?: string[];
+  /**
+   * What to put before a person for one of this connector's `Waiting.interaction`s, made at the
+   * moment of sending: words and one link, for whichever channel shows it. Null once it can no
+   * longer be used; undefined for an interaction that is not this connector's.
+   */
+  invitation?(env: Env, interaction: string): Promise<Invitation | null | undefined>;
+  /**
+   * For a connector that plugs into another: which of its `optional` tools are for the person
+   * who caused this event of that connector's, as the operator has set things up. Asked once,
+   * as the event arrives; what it answers is kept with the event (`data.offered`), and nothing
+   * a connector writes there itself is believed.
+   */
+  offers?(env: Env, event: InboundEvent): Promise<string[]>;
 }
 
-export type Holds = { state: "holds"; since: number } | { state: "not_yet" | "gone" };
+/**
+ * `again_in_ms`: with "not yet", how long until it is worth asking again, for something nobody
+ * will come and report (a reply being written elsewhere, say). Without it, it is asked again
+ * only when something is reported or the wait runs out.
+ */
+export type Holds = { state: "holds"; since: number } | { state: "not_yet"; again_in_ms?: number } | { state: "gone" };
+
+/** Something to put before a person so that they can bring a condition about: what it is, and the one place to go. */
+export interface Invitation {
+  title: string;
+  text: string;
+  action: { label: string; url: string };
+  note?: string;
+}
 
 /**
  * A tool's answer when it cannot act until something happens that is not the agent's to do (the
@@ -74,7 +108,8 @@ export interface Waiting {
     condition: string;
     generation: number;
     until: number;
-    interaction: string;
+    /** Absent where there is nothing for the person to do: what is waited for happens by itself. */
+    interaction?: string;
     request: Record<string, unknown>;
     /**
      * The way in is for the person alone: it is put before them directly, not where the request
@@ -110,7 +145,7 @@ export function isSettled(result: unknown): result is Settled {
 
 export function isWaiting(result: unknown): result is Waiting {
   const w = (result as Waiting | null)?.waiting;
-  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean" || w.privately === "here");
+  return typeof w === "object" && w !== null && [w.on, w.subject, w.condition].every((each) => typeof each === "string" && each !== "") && (w.interaction === undefined || (typeof w.interaction === "string" && w.interaction !== "")) && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean" || w.privately === "here");
 }
 
 /**
@@ -137,11 +172,14 @@ export interface ConnectorTool {
   name: string;
   description: string;
   /**
-   * What the tool does to the outside system. Only "read" exists: a tool that looks and changes
-   * nothing. Once a run has read outside text, reading again is the only thing a connector's tool
-   * may still do in it.
+   * What the tool does to the outside system. "read": it looks and changes nothing. "act": it
+   * does something there as the person (starts something, sends something). Once a run has read
+   * outside text, reading again is the only thing a connector's tool may still do in it: an
+   * "act" tool can no longer be used, so nothing that was read can have something done.
    */
-  effect: "read";
+  effect: "read" | "act";
+  /** Offered only where its connector said so for the very messages a run acts on (see `Connector.offers`): not there at all otherwise. */
+  optional?: true;
   /**
    * Whether the tool may also be used where several people talk (a group, say), for the one of
    * them who asked. Without it the tool exists only in a person's private conversation. A tool
@@ -401,6 +439,8 @@ export interface OutboundMessage {
    * reference sends `text`.
    */
   interaction?: string;
+  /** What a connector that plugs into this channel's connector says to show for that interaction, if it is one of its own. */
+  invitation?: Invitation;
 }
 
 export interface CodeReview {

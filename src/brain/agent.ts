@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { amend, aside, canRevisit, deliver, direct, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { amend, aside, canRevisit, deliver, direct, offeredFor, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -181,6 +181,11 @@ export class BrainAgent extends DurableObject<Env> {
     // Larger than the longest comment any connector passes on, so a reply is stored whole: what it
     // says about an open question is read from the stored text, and a cut-off refusal would be lost.
     if ((event.text?.length ?? 0) > 300_000) throw new Error("event text is too long");
+    // Which optional tools of plugged-in connectors are for whoever caused this: said by those
+    // connectors now, and by nobody else. Whatever the event's own connector wrote there is dropped.
+    if (event.data && "offered" in event.data) event = { ...event, data: Object.fromEntries(Object.entries(event.data).filter(([key]) => key !== "offered")) };
+    const offered = event.kind === "message" ? await offeredFor(this.env, event) : [];
+    if (offered.length > 0) event = { ...event, data: { ...event.data, offered } };
     // In a chat with threads, a reply that names an open question's code belongs with that
     // question, wherever in the chat it was typed. The connector says when this applies.
     // A message written in reply to one of the agent's questions answers that question.

@@ -20,6 +20,9 @@ export const HANDLING_LIMIT_MS = 60 * 60_000;
 export const WAITING_NOTE =
   "This cannot be done until the person does something that only they can do (authorise it, say). The system itself is showing them how, in this conversation; do not repeat or paraphrase that, and do not ask them to send their request again. The request is kept under the id given here and is carried on by itself once they have done it: its answer is sent to them then. There is nothing more for you to do about it in this run, and nothing to say about it.";
 
+export const UNDER_WAY_NOTE =
+  "This has been handed over and is being worked on elsewhere; it takes a while and nobody has to do anything meanwhile. The system itself has told the person so; do not repeat or paraphrase that. The request is kept under the id given here and is carried on by itself when the work is done: its result is sent to them then. There is nothing more for you to do about it in this run, and nothing to say about it.";
+
 /** A request that waits, or is being carried on: see the `continuations` table. */
 export interface Continuation {
   id: string;
@@ -173,7 +176,11 @@ export class Requests implements Wakes {
    * of them. One step: the record, and the message that shows the way in, exist together or not
    * at all, so nothing can be acted on before there is a request to carry on.
    */
-  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, waiting: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, asked: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+    // Where there is nothing for the person to do (what is waited for happens by itself),
+    // nothing is put before them: the request is kept, and asked about as any other.
+    const shows = asked.interaction !== undefined;
+    const waiting = { ...asked, interaction: asked.interaction ?? "" };
     // The same messages asking for the same thing through the same way in, a second time (the
     // model called the tool twice): that is the request already kept, and it is answered once.
     const twice = this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", id).length > 0
@@ -185,7 +192,7 @@ export class Requests implements Wakes {
       // Which request this call was answered with, kept: made again after an interruption it has
       // the same answer, whatever has become of that request since (see RunTools.connectorTool).
       this.#s.setMeta(`waited:${id}`, JSON.stringify({ request: twice.id, run: run.id }));
-      return { waiting: true, request: twice.id, note: WAITING_NOTE };
+      return { waiting: true, request: twice.id, note: shows ? WAITING_NOTE : UNDER_WAY_NOTE };
     }
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
@@ -193,8 +200,8 @@ export class Requests implements Wakes {
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // "here": in the conversation the request was made in, for their eyes only, where the
       // connector can; directly otherwise. Never where the others would see it.
-      const asked = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
-      const here = waiting.privately === "here" && asked ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(asked) as Target) : undefined;
+      const from = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
+      const here = waiting.privately === "here" && from ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(from) as Target) : undefined;
       // Where they are reached directly: used at once where it cannot be shown where they asked,
       // and kept beside the request for the one case that it could, and then certainly was not.
       const directly = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
@@ -235,6 +242,14 @@ export class Requests implements Wakes {
       }
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
+      if (!shows) {
+        // Said once for each thing it waits on, by the system: also when the request was carried
+        // on to get here, where what the run writes is the request's one answer and is not sent yet.
+        this.#b.enqueueMessage(`underway:${id}:${waiting.condition}`, now.session_id, null, this.#b.notice("underWay", now.session_id), undefined, undefined, { target: now.target });
+        // Asked about at once, and anew each time it comes to wait: on another thing, or on the
+        // same thing again after being carried on (told apart by when it was last taken up).
+        return void this.hint(now, `asked:${id}:${waiting.condition}:${existing?.claimed_at ?? 0}`);
+      }
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: aside ? JSON.stringify(aside) : now.target });
       // One set aside because nobody waited on it any more is wanted again, and so is one that
@@ -261,7 +276,7 @@ export class Requests implements Wakes {
       // The condition may already hold (the person used an earlier invitation a moment ago): ask.
       this.hint(now, `asked:${waiting.interaction}`);
     });
-    return { waiting: true, request: id, note: WAITING_NOTE };
+    return { waiting: true, request: id, note: shows ? WAITING_NOTE : UNDER_WAY_NOTE };
   }
 
   /**
@@ -432,12 +447,23 @@ export class Requests implements Wakes {
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // The answer was about the request as it stood when asked. If that has changed, it is not used.
       if (!now || now.status !== "waiting" || now.condition !== before.condition || now.generation !== before.generation || now.until !== before.until) return drop();
+      // Someone who was told that a thing was under way hears once that it is no longer waited for: whatever it was waiting on last.
+      const promised = () => this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
+      const tell = (which: "underWayOver" | "underWayGone") => void (promised() && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
+        tell("underWayGone");
         return drop();
       }
       if (answer.state !== "holds" || !(answer.since < now.until)) {
-        if (Date.now() >= now.until) this.endRequest(id, "expired", "it was not done in time");
+        if (Date.now() >= now.until) {
+          this.endRequest(id, "expired", "it was not done in time");
+          tell("underWayOver");
+        }
+        // Nobody will come and say when this holds: asked again when its owner says it is worth it, within bounds.
+        else if (answer.state === "not_yet" && typeof answer.again_in_ms === "number" && Number.isFinite(answer.again_in_ms)) {
+          this.#s.sql.exec("UPDATE continuations SET check_at = ? WHERE id = ? AND status = 'waiting'", Math.min(now.until, Date.now() + Math.min(600_000, Math.max(2_000, answer.again_in_ms))), id);
+        }
         return drop();
       }
       const runId = crypto.randomUUID();

@@ -3,12 +3,13 @@
  * and docs/connectors.md) and list it here.
  */
 import { consoleConnector } from "./connectors/console";
+import { doubaoConnector } from "./connectors/doubao";
 import { feishuConnector } from "./connectors/feishu";
 import { githubConnector } from "./connectors/github";
 import type { Connector } from "./connectors/types";
 
 const config: { connectors: Connector[]; trusted: string[] } = {
-  connectors: [consoleConnector, githubConnector, feishuConnector],
+  connectors: [consoleConnector, githubConnector, feishuConnector, doubaoConnector],
   /**
    * The connectors whose account of who said something is believed: only through these can a
    * person approve an action, be credited with a request, or change the agent's standing
