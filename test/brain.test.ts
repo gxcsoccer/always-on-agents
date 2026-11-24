@@ -1608,6 +1608,14 @@ describe("records and limits", () => {
       const task = (id: string, status: string, at: number) => sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', 'old', ?, ?, ?)", id, `op_${id}`, status, at, at);
       for (const id of ["w_task_old", "w_gone"]) work(id, longAgo);
       for (const id of ["w_task_new", "w_running"]) work(id, Date.now() - 1_000);
+      // Requests, as they ended: answered (which says nothing of the work), and called off (which does).
+      const request = (id: string, status: string, at: number) =>
+        sql.exec("INSERT INTO continuations (id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at, ended_at) VALUES (?, 's', '{}', 'c', 't', '{}', '{}', 'x', 'c', 1, '', ?, ?, ?, ?)", id, at, status, at, at);
+      for (const id of ["w_req_answered", "w_req_off"]) work(id, Date.now() - 2_000);
+      work("w_req_old", longAgo);
+      request("w_req_answered", "done", Date.now() - 1_000);
+      request("w_req_off", "cancelled", Date.now() - 1_000);
+      request("w_req_old", "expired", longAgo);
       task("w_task_old", "succeeded", longAgo);
       task("w_task_new", "failed", Date.now() - 1_000);
       task("w_running", "running", Date.now() - 1_000);
@@ -1623,7 +1631,7 @@ describe("records and limits", () => {
     expect(state.outbox.find((m: any) => m.text === "old message")).toBeUndefined();
     // Each open row was given the end of what it points at first; then what ended long ago went with it, and nothing open or recent.
     const kept = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT id, state FROM work WHERE id LIKE 'w_%' ORDER BY id").toArray());
-    expect(kept).toEqual([{ id: "w_running", state: "open" }, { id: "w_task_new", state: "failed" }]);
+    expect(kept).toEqual([{ id: "w_req_answered", state: "unknown" }, { id: "w_req_off", state: "cancelled" }, { id: "w_running", state: "open" }, { id: "w_task_new", state: "failed" }]);
     // The old pending event was handled rather than deleted. The old finished one lost its content
     // but kept its identity, so a replay of it is still recognised as a duplicate.
     expect(state.inbox).toMatchObject({ done: 4, pending: 0, dead: 0 });
