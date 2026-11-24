@@ -1,7 +1,7 @@
 import { handleFeishuWebhook } from "../src/connectors/feishu";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { call, installFakeModel, model, say, wake } from "./helpers";
 
@@ -194,6 +194,33 @@ describe("the Feishu webhook endpoint", () => {
     const mention = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
     expect(await (await deliver(appId, message(appId, "om_2", "@_user_1 hi", "group", [mention]))).json()).toMatchObject({ scope: `${t}:chat:oc_group` });
     expect(await (await deliver(appId, message(appId, "om_3", "lunch?", "group"))).json()).toEqual({ ignored: true });
+  });
+
+  it("fetches what a group message was written in reply to and files it with the message; in a direct chat nothing is fetched", async () => {
+    const { t, appId } = await app();
+    const asked: string[] = [];
+    let lapsed = 1;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = String(input instanceof Request ? input.url : input);
+      asked.push(url.replace("https://open.feishu.cn/open-apis", ""));
+      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: `t-${asked.length}`, expire: 7200 });
+      // The first token has lapsed early: a fresh one is got and the look-up made again.
+      if (lapsed-- > 0) return Response.json({ code: 99991663 }, { status: 400 });
+      return Response.json({ code: 0, data: { items: [{ msg_type: "text", chat_id: "oc_group", sender: { id: "ou_frank", sender_type: "user" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/D1" }) } }] } });
+    });
+    const mention = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
+    const reply = (id: string, chat: "p2p" | "group") => {
+      const body = message(appId, id, "@_user_1 look into it", chat, [mention]);
+      return { ...body, event: { ...body.event, message: { ...body.event.message, parent_id: "om_parent" } } };
+    };
+    expect(await (await deliver(appId, reply("om_r1", "group"))).json()).toMatchObject({ accepted: true });
+    expect(asked).toEqual(["/auth/v3/tenant_access_token/internal", "/im/v1/messages/om_parent", "/auth/v3/tenant_access_token/internal", "/im/v1/messages/om_parent"]);
+    const filed = async (scope: string) => runInDurableObject(brainFor(scope), (_: unknown, state: DurableObjectState) => state.storage.sql.exec<{ data: string }>("SELECT data FROM inbox WHERE kind = 'message'").toArray().map((each) => JSON.parse(each.data)));
+    expect((await filed(`${t}:chat:oc_group`))[0]).toMatchObject({ replies_to: "feishu:message:om_parent", quoted: { own: true, text: "the notes https://x.feishu.cn/docx/D1" } });
+    asked.length = 0;
+    expect(await (await deliver(appId, reply("om_r2", "p2p"))).json()).toMatchObject({ accepted: true });
+    expect(asked).toEqual([]);
+    expect((await filed(`${t}:user:ou_frank`))[0].quoted).toBeUndefined();
   });
 
   it("refuses unsigned, stale and plaintext events, and events for an app it does not know, all alike", async () => {

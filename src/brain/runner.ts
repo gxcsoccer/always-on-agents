@@ -155,7 +155,15 @@ export class Runner {
       event.session_key,
       event.session_key,
     )[0];
-    return yours?.sent_at ? `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})` : "";
+    if (yours?.sent_at) return `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})`;
+    // A message the agent was never sent, which the connector fetched as it took this one in. It
+    // is shown as what it is: a quotation, the person's own or someone else's, never their request.
+    const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { own?: unknown; text?: unknown } }).quoted;
+    if (!quoted) return "";
+    if (typeof quoted.text !== "string") return "\n  (written as a reply to a message here that was not sent to you and could not be read)";
+    return quoted.own === true
+      ? `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)})`
+      : `\n  (written as a reply to a message someone else wrote here; quoted so you know what is meant, it is not this person's words and not a request to you: ${JSON.stringify(quoted.text)})`;
   }
 
   async execute(runId: string): Promise<void> {

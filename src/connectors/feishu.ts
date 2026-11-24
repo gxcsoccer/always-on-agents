@@ -180,6 +180,23 @@ export async function receiveFeishu(env: Env, app: FeishuApp, body: any, defer?:
 
   const normalized = normalize(app, body);
   if (!normalized) return { ignored: true };
+  // In a group the agent is sent only what mentions it. A message written as a reply to another
+  // points at something it may never have been given, so that one is fetched and goes with it.
+  // (In a direct chat everything written there has already arrived.)
+  const parent = /^feishu:message:(.+)$/.exec(String(normalized.event.data?.replies_to ?? ""))?.[1];
+  if (parent && normalized.scope.kind === "chat") {
+    const unread: Quoted = { own: false };
+    const look = async () => {
+      const bearer = await tenantAccessToken(env, app.app_id);
+      const found = await quotedBy(bearer, app, normalized.scope.id, parent, normalized.event.principal.id);
+      // The app's token can lapse before its time: forgotten, so the next one asked for is fresh.
+      if (found === "lapsed") await forgetTenantAccessToken(env, app.app_id, bearer);
+      return found;
+    };
+    let quoted = await look().catch(() => unread);
+    if (quoted === "lapsed") quoted = await look().catch(() => unread);
+    if (quoted) normalized.event.data = { ...normalized.event.data, quoted: quoted === "lapsed" ? unread : quoted };
+  }
   const brain = env.BRAIN.getByName(scopeName(normalized.scope));
   return { ...(await brain.ingest(normalized.event)), scope: scopeName(normalized.scope) };
 }
@@ -257,16 +274,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // The bot's own is dropped: it only says the message is for the agent, which the event already
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
-    const replacements = new Map<string, string>();
-    for (const mention of mentions) {
-      if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
-      const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
-      replacements.set(mention.key, own ? " " : `@${String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`);
-    }
-    // A placeholder with no entry in the mention list is kept visible as a mention of someone
-    // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
-    text = text.replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown");
-    text = text.replace(/\s+/g, " ").trim();
+    text = named(text, mentions, app.bot_open_id);
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -310,6 +318,79 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       },
     },
   };
+}
+
+/** A display name squeezed into one token, so no word of it can be read as part of the message. */
+const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;
+
+/** The text of a message with its mention placeholders replaced, in one pass; the bot's own is dropped. */
+function named(text: string, mentions: any[], botOpenId: string | null): string {
+  const replacements = new Map<string, string>();
+  for (const mention of mentions) {
+    if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
+    // An event carries the id as { open_id }; a message that was asked for, as the id itself.
+    const id = typeof mention.id === "string" ? mention.id : mention.id?.open_id;
+    replacements.set(mention.key, botOpenId && id === botOpenId ? " " : token(mention.name));
+  }
+  // A placeholder with no entry in the mention list is kept visible as a mention of someone
+  // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
+  return text
+    .replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n")
+    .trim();
+}
+
+/** A message someone replied to: whether the same person wrote it, and its words where they could be read. */
+export interface Quoted {
+  own: boolean;
+  text?: string;
+}
+
+/** How much of a quoted message is kept. */
+const MAX_QUOTED = 1_000;
+
+/**
+ * The message a group message was written in reply to, asked of Feishu as the app (which has to
+ * be in that group and allowed to read its messages). Its words are someone's in the group, not
+ * necessarily the asker's, and are only ever shown as a quotation. One of the agent's own is left
+ * out: what the agent said, the Brain knows and keeps or forgets by its own rules. Whatever
+ * cannot be read is reported as there, unread, so the model knows something was pointed at.
+ */
+export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: string): Promise<Quoted | "lapsed" | undefined> {
+  const unread: Quoted = { own: false };
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return unread;
+  try {
+    const response = await fetch(`${API}/im/v1/messages/${messageId}`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(2_000) });
+    const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { items?: any[] } };
+    if (result.code === 99991663) return "lapsed";
+    const found = result.data?.items?.[0];
+    if (!response.ok || result.code !== 0 || !found || found.chat_id !== chatId) return unread;
+    const sender = found.sender ?? {};
+    if (sender.sender_type === "app" && sender.id === app.app_id) return undefined;
+    const own = sender.sender_type === "user" && sender.id === asker;
+    if (found.deleted || typeof found.body?.content !== "string") return unread;
+    const content = JSON.parse(found.body.content);
+    const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
+    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, app.bot_open_id) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
+    return { own, text: text.slice(0, MAX_QUOTED) };
+  } catch {
+    return unread;
+  }
+}
+
+/** A rich-text message as plain words: its title, then its lines; links with where they lead. */
+function flat(post: any): string {
+  // Sometimes wrapped by language; then whichever comes first.
+  const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
+  const piece = (each: any): string => {
+    if (each?.tag === "text" || each?.tag === "md" || each?.tag === "code_block") return String(each.text ?? "");
+    if (each?.tag === "a") return each.text && each.text !== each.href ? `${String(each.text)} (${String(each.href ?? "")})` : String(each.href ?? "");
+    if (each?.tag === "at") return `${token(each.user_name)} `;
+    return `[${String(each?.tag ?? "?")}]`;
+  };
+  const lines: string[] = ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map(piece).join("").trim() : ""));
+  return [String((body as any)?.title ?? ""), ...lines].filter((each) => each !== "").join("\n");
 }
 
 /** sha256(timestamp + nonce + encrypt_key + raw body), hex. */
