@@ -60,7 +60,7 @@ export interface RunnerHost {
   /** One call to the model. */
   respond(request: ModelRequest): Promise<ModelResponse>;
   /** The message one was written in reply to, asked of the connector it came through. Never throws. */
-  quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown> }): Promise<Quoted | undefined>;
+  quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
@@ -85,12 +85,33 @@ export class Runner {
    * over the oldest pending conversation. Claiming is one synchronous transaction, so two
    * invocations can never both claim the same events.
    */
-  #claim(): string | undefined {
+  /**
+   * The messages the next run would take up: those pending in the conversation of the oldest,
+   * in order. Bounded, so a burst in one conversation becomes several runs instead of one
+   * oversized one.
+   */
+  #batch(first: InboxRow): InboxRow[] {
+    const events: InboxRow[] = [];
+    let bytes = 0;
+    for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind != 'request.ready' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
+      bytes += (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
+      if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
+      // A message that replies to something other than what the ones before it reply to is about
+      // something else: it starts a run of its own, in order, so each is read under its own binding.
+      if (events.length > 0 && repliesTo(event) !== repliesTo(events.at(-1)!)) break;
+      events.push(event);
+    }
+    return events;
+  }
+
+  /** Starts a run over exactly these messages, those of them still pending. Anything that arrived since waits for the next. */
+  #claim(ids: number[]): string | undefined {
     return this.#s.transaction(() => {
       const active = this.activeRun();
       if (active) return active.retry_at && active.retry_at > Date.now() ? undefined : active.id;
 
-      const first = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
+      const events = ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE status = 'pending' AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids);
+      const first = events[0];
       if (!first) return undefined;
       const now = Date.now();
       const runId = crypto.randomUUID();
@@ -100,18 +121,7 @@ export class Runner {
         session = { id: crypto.randomUUID() };
         this.#s.sql.exec("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES (?, ?, ?, ?)", session.id, first.session_key, now, now);
       }
-      // Bounded, so a burst in one conversation becomes several runs instead of one oversized one.
-      const events: InboxRow[] = [];
-      let bytes = 0;
-      for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind != 'request.ready' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
-        bytes += (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
-        if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
-        // A message that replies to something other than what the ones before it reply to is about
-        // something else: it starts a run of its own, in order, so each is read under its own binding.
-        if (events.length > 0 && repliesTo(event) !== repliesTo(events.at(-1)!)) break;
-        events.push(event);
-        this.#s.sql.exec("UPDATE inbox SET status = 'claimed', run_id = ? WHERE id = ?", runId, event.id);
-      }
+      for (const event of events) this.#s.sql.exec("UPDATE inbox SET status = 'claimed', run_id = ? WHERE id = ?", runId, event.id);
 
       // Replies go where the most recent addressed event came from.
       const target = [...events].reverse().find((e) => e.reply_to)?.reply_to;
@@ -168,20 +178,30 @@ export class Runner {
   }
 
   /**
-   * Before a run takes messages up: for each that was written in reply to something the Brain
-   * has no record of, the connector is asked for it, once, and what it says is kept with the
-   * message. The message itself was stored and acknowledged long before; this only adds to what
-   * the model is shown, within a limit, and a run starts whatever comes of it.
+   * Before a run takes these messages up: for each that was written in reply to something the
+   * Brain has no record of, the connector is asked for it, once, and what it says is kept with
+   * the message. The messages were stored and acknowledged long before; this only adds to what
+   * the model is shown. All of them are asked about at once, within one limit for the lot; what
+   * has not answered by then is told to stop, and the run starts whatever came of it.
    */
-  async #quote(first: InboxRow): Promise<void> {
-    const sessionId = this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", first.session_key)[0]?.id ?? "";
-    for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind = 'message' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
+  async #quote(events: InboxRow[]): Promise<void> {
+    const sessionId = events[0] ? (this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", events[0].session_key)[0]?.id ?? "") : "";
+    const unknown = events.flatMap((event) => {
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
-      if (typeof data.replies_to !== "string" || data.quoted !== undefined || this.#repliedTo(event, sessionId, []) !== "") continue;
-      const late = new Promise<Quoted>((resolve) => setTimeout(() => resolve({}), QUOTED_WAIT_MS));
-      const found = await Promise.race([this.#b.quoted(event.source, { principal: JSON.parse(event.principal) as Principal, data }), late]).catch((): Quoted => ({}));
-      if (found) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text } : {}), event.id);
-    }
+      return event.kind === "message" && typeof data.replies_to === "string" && data.quoted === undefined && this.#repliedTo(event, sessionId, []) === "" ? [{ event, data }] : [];
+    });
+    if (unknown.length === 0) return;
+    const stop = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<Quoted>((resolve) => (timer = setTimeout(() => resolve({}), QUOTED_WAIT_MS)));
+    await Promise.all(
+      unknown.map(async ({ event, data }) => {
+        const found = await Promise.race([this.#b.quoted(event.source, { principal: JSON.parse(event.principal) as Principal, data, signal: stop.signal }), late]).catch((): Quoted => ({}));
+        if (found) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text } : {}), event.id);
+      }),
+    );
+    clearTimeout(timer);
+    stop.abort();
   }
 
   async execute(runId: string): Promise<void> {
@@ -652,8 +672,12 @@ export class Runner {
       const first = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
       if (!first) return undefined;
       if (first.kind !== "request.ready") {
-        await this.#quote(first);
-        return this.#claim();
+        // The very messages looked at are the ones taken up: what arrives meanwhile waits its turn.
+        const batch = this.#batch(first);
+        await this.#quote(batch);
+        const runId = this.#claim(batch.map((each) => each.id));
+        if (runId || this.activeRun()) return runId;
+        continue;
       }
       const runId = await this.#b.requests.resume(first);
       if (runId) return runId;

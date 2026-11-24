@@ -247,9 +247,9 @@ export interface Channel {
    * sends the agent only what mentions it). Asked once, before the run that takes the message
    * up, with a limit on how long it may take; nothing depends on it. Its words are given only
    * when the same person wrote it; otherwise only that there was one. Undefined where this does
-   * not apply.
+   * not apply. `signal` fires when the answer is no longer waited for.
    */
-  quoted?(env: Env, scope: Scope, event: { principal: Principal; data?: Record<string, unknown> }): Promise<Quoted | undefined>;
+  quoted?(env: Env, scope: Scope, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
   /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,

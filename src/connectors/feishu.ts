@@ -331,7 +331,7 @@ const MAX_QUOTED = 1_000;
  * record of that message: in a group the agent is sent only what mentions it. Nothing in a direct
  * chat, where everything written has already arrived.
  */
-export async function quotedFeishu(env: Env, scope: Scope, event: { principal: { id: string }; data?: Record<string, unknown> }): Promise<Quoted | undefined> {
+export async function quotedFeishu(env: Env, scope: Scope, event: { principal: { id: string }; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined> {
   const origin = event.data?.origin as { app_id?: unknown; tenant_key?: unknown } | undefined;
   const parent = /^feishu:message:(.+)$/.exec(String(event.data?.replies_to ?? ""))?.[1];
   if (scope.kind !== "chat" || !parent || typeof origin?.app_id !== "string" || typeof origin.tenant_key !== "string") return undefined;
@@ -339,11 +339,12 @@ export async function quotedFeishu(env: Env, scope: Scope, event: { principal: {
   if (!app || app.tenant !== scope.tenant) return {};
   const who = { open_id: event.principal.id, tenant_key: origin.tenant_key };
   const bearer = await tenantAccessToken(env, app.app_id);
-  const found = await quotedBy(bearer, app, scope.id, parent, who);
+  const found = await quotedBy(bearer, app, scope.id, parent, who, event.signal);
   if (found !== "lapsed") return found;
   // The app's token lapsed before its time: forgotten, and the message asked for once more.
   await forgetTenantAccessToken(env, app.app_id, bearer);
-  const again = await quotedBy(await tenantAccessToken(env, app.app_id), app, scope.id, parent, who);
+  if (event.signal?.aborted) return {};
+  const again = await quotedBy(await tenantAccessToken(env, app.app_id), app, scope.id, parent, who, event.signal);
   return again === "lapsed" ? {} : again;
 }
 
@@ -355,10 +356,10 @@ export async function quotedFeishu(env: Env, scope: Scope, event: { principal: {
  * people who address it, and what others wrote does not ride in on a reply. Whatever is not
  * given is still reported as there, so the model knows something was pointed at.
  */
-export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }): Promise<Quoted | "lapsed"> {
+export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }, signal?: AbortSignal): Promise<Quoted | "lapsed"> {
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return {};
   try {
-    const response = await fetch(`${API}/im/v1/messages/${messageId}`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(2_000) });
+    const response = await fetch(`${API}/im/v1/messages/${messageId}`, { headers: { authorization: `Bearer ${bearer}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000) });
     const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { items?: any[] } };
     if (result.code === 99991663) return "lapsed";
     // A forwarded bundle comes back as several messages: only the one asked for counts.

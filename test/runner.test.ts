@@ -68,7 +68,7 @@ function bench(state: DurableObjectState) {
     outside,
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
-    quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted() : settings.quoted),
+    quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
     registry: () =>
       ({
         recordUsage: async (tenant: string, tokens: number) => (log.push(["recordUsage", tenant, tokens]), { allowed: settings.allowed, used: 0, budget: 0, day: "2026-11-23" }),
@@ -256,6 +256,43 @@ describe("the run loop, by itself", () => {
         event("why?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
         const next = (await runner.next())!;
         expect(items(next)[0].content).toContain("\n  (written as a reply to the message you sent at 2026-11-23T08:00:00.000Z)");
+      });
+    });
+
+    it("asks only about the messages the next run takes, all at once and within one limit, and takes up exactly those", async () => {
+      await within(async ({ runner, store, event, items, settings, log }) => {
+        const asked = () => log.filter((each) => each[0] === "quoted").map((each) => each[2]);
+        // An ordinary message first: the replies queued behind it are another run's, and are not asked about now.
+        settings.quoted = () => new Promise(() => {});
+        event("hello");
+        for (let i = 0; i < 5; i++) event(`r${i}`, { data: { replies_to: `feishu:message:om_${i}` } });
+        const hello = (await runner.next())!;
+        expect(items(hello)[0].content).toContain("hello");
+        expect(asked()).toEqual([]);
+        store.sql.exec("UPDATE inbox SET status = 'done' WHERE status IN ('claimed', 'pending')");
+        store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+
+        // Two people reply to the same message: both are asked about together, under one limit.
+        const signals: AbortSignal[] = [];
+        let release!: (found: unknown) => void;
+        settings.quoted = (asking: { signal: AbortSignal }) => (signals.push(asking.signal), new Promise((resolve) => (release = resolve)));
+        vi.useFakeTimers();
+        event("a", { data: { replies_to: "feishu:message:om_p" } });
+        event("b", { data: { replies_to: "feishu:message:om_p" }, principal: { kind: "human", id: "ou_2", explicit: true } });
+        const taking = runner.next();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(asked()).toEqual(["feishu:message:om_p", "feishu:message:om_p"]);
+        // One that arrives while the connector is being asked is left for the next run.
+        event("c", { data: { replies_to: "feishu:message:om_p" } });
+        await vi.advanceTimersByTimeAsync(QUOTED_WAIT_MS);
+        const run = (await taking)!;
+        vi.useRealTimers();
+        // What no longer answers in time is told to stop.
+        expect(signals.every((each) => each.aborted)).toBe(true);
+        expect(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", run).map((each) => each.text)).toEqual(["a", "b"]);
+        expect(store.rows<{ status: string }>("SELECT status FROM inbox WHERE text = 'c'")[0].status).toBe("pending");
+        expect(items(run)[0].content).not.toContain("c\n");
+        void release;
       });
     });
 
