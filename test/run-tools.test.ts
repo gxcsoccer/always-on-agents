@@ -410,10 +410,27 @@ describe("a run's tools", () => {
           expect(await tools().connectorTool("c1", "feishu_read_document", { url: "u" })).toEqual({ settled: true, note: expect.stringMatching(/^The system has dealt with this/) });
           expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBe("settled");
           // Said by the system, not as something this run wrote.
-          expect(of("notify")).toEqual([["settled:r1", SESSION, null, "notice:externalChat"]]);
+          expect(of("enqueue")).toEqual([["settled:r1", SESSION, null, "notice:externalChat", undefined, undefined, undefined]]);
           expect(outside.has("c1")).toBe(false);
           expect(of("noteSource")).toEqual([]);
           expect(store.rows<{ private: number }>("SELECT private FROM outbox")[0].private).toBe(0);
+        });
+      });
+
+      it("is not closed with nothing said when the line could not be kept: the whole step is undone", async () => {
+        await within(async ({ tools, tool, host, store }) => {
+          tool.answer = async () => ({ settled: { say: "externalChat" } });
+          (host.outbox as any).enqueue = () => {
+            throw new Error("the queue could not be written");
+          };
+          await expect(tools().connectorTool("c1", "feishu_read_document", {})).rejects.toThrow("the queue could not be written");
+          expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBeNull();
+          // Only where there is nowhere to say it at all is it closed unsaid.
+          (host.outbox as any).enqueue = () => {
+            throw new Error("there is nowhere to send a message in this conversation");
+          };
+          expect(await tools().connectorTool("c2", "feishu_read_document", {})).toMatchObject({ settled: true });
+          expect(store.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = 'r1'")[0].closed).toBe("settled");
         });
       });
 

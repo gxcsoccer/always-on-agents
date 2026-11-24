@@ -88,6 +88,8 @@ export interface RequestsHost {
   notice(which: NoticeKey, sessionId: string): string;
   /** Where a person is reached directly through a connector, from a verified origin; undefined where they cannot be. */
   direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
+  /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
+  aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
 }
 
 /** The one person a run acts for, and their own messages it rests on. */
@@ -173,13 +175,19 @@ export class Requests implements Wakes {
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
       // says from where the request verifiably came and who made it. The tool names no address.
-      const aside = waiting.privately ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
-      if (waiting.privately && !aside) throw new Error("the person cannot be reached directly through this connector, so the way in was not sent and nothing waits");
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
+      // "here": in the conversation the request was made in, for their eyes only, where the
+      // connector can; directly otherwise. Never where the others would see it.
+      const asked = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
+      const here = waiting.privately === "here" && asked ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(asked) as Target) : undefined;
+      const aside = waiting.privately ? (here ?? this.#b.direct(acting.connector, acting.origin, acting.person)) : undefined;
+      if (waiting.privately && !aside) throw new Error("the person cannot be reached directly through this connector, so the way in was not sent and nothing waits");
+      // 1: put before them somewhere else than they asked. 2: where they asked, for them alone.
+      const where = here ? 2 : aside ? 1 : 0;
       if (existing && existing.status !== "resuming") throw new Error("that request has ended");
       if (existing) {
         // Carried on and told to wait once more: the same request, waiting on what it needs now.
-        this.#s.sql.exec("UPDATE continuations SET status = 'waiting', subject = ?, condition = ?, generation = ?, interaction = ?, until = ?, direct = ?, claimed_at = NULL, check_at = NULL WHERE id = ?", waiting.subject, waiting.condition, waiting.generation, waiting.interaction, waiting.until, aside ? 1 : 0, id);
+        this.#s.sql.exec("UPDATE continuations SET status = 'waiting', subject = ?, condition = ?, generation = ?, interaction = ?, until = ?, direct = ?, claimed_at = NULL, check_at = NULL WHERE id = ?", waiting.subject, waiting.condition, waiting.generation, waiting.interaction, waiting.until, where, id);
       } else {
         const basis = this.basis(run.id);
         // Its answer goes back where the person's own message came from, as that message said:
@@ -188,7 +196,7 @@ export class Requests implements Wakes {
         if (!target) throw new Error("there is nowhere to send a message in this conversation");
         this.#s.sql.exec(
           "INSERT INTO continuations (direct, person, id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
-          aside ? 1 : 0,
+          where,
           acting.person,
           id,
           run.session_id,
@@ -255,7 +263,7 @@ export class Requests implements Wakes {
    */
   shown(row: Row, how: "reached" | "failed" | "unknown"): void {
     if (typeof row.interaction !== "string") return;
-    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct = 1", row.interaction)) this.#tell(waiting, how);
+    for (const waiting of this.#s.rows<Continuation>("SELECT * FROM continuations WHERE interaction = ? AND status = 'waiting' AND direct IN (1, 2)", row.interaction)) this.#tell(waiting, how);
   }
 
   #tell(waiting: Continuation, how: "reached" | "failed" | "unknown"): void {
@@ -263,8 +271,11 @@ export class Requests implements Wakes {
     const on = JSON.parse(waiting.events) as { said: number[]; bound?: number[] };
     const said = on.said.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${on.said.map(() => "?").join(",")}) ORDER BY id`, ...on.said);
     if (!this.#anchor(said, on.bound ?? []).sure) return;
+    // Shown where they asked: it is in front of them, and there is nothing to add.
+    const here = waiting.direct === 2;
+    if (here && how === "reached") return;
     try {
-      const which = how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
+      const which = here ? (how === "failed" ? "inviteNotShown" : "inviteUnknownHere") : how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
       const text = this.#b.notice(which, waiting.session_id);
       this.#b.enqueueMessage(told(waiting), waiting.session_id, null, text, undefined, undefined, { target: waiting.target });
       // One line per request. While it has certainly not reached anyone, it says how things
@@ -415,7 +426,7 @@ export class Requests implements Wakes {
     if (row.interaction) return this.#s.rows("SELECT 1 FROM continuations WHERE interaction = ? AND status = 'waiting' AND until > ? LIMIT 1", row.interaction, Date.now()).length > 0 ? "send" : "void";
     // Word of how a way in fared is for a request that still waits on it, and for no other.
     const about = toldOf(String(row.idem));
-    if (about) return this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND interaction = ? AND status = 'waiting' AND direct = 1 AND until > ? LIMIT 1", about.request, about.interaction, Date.now()).length > 0 ? "send" : "void";
+    if (about) return this.#s.rows("SELECT 1 FROM continuations WHERE id = ? AND interaction = ? AND status = 'waiting' AND direct IN (1, 2) AND until > ? LIMIT 1", about.request, about.interaction, Date.now()).length > 0 ? "send" : "void";
     // Written after reading under a condition: not handed over once that is over. Asked last,
     // after everything else that is waited for, so nothing comes between its answer and the send.
     const guarded = async (): Promise<"send" | "void" | "unasked"> => {

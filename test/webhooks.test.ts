@@ -1,5 +1,6 @@
 import { DeliveryDeferred, DeliveryRejected } from "../src/connectors";
-import { deliverFeishu, handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
+import { deliverFeishu, feishuConnector, handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
+import { grantName, grantOf } from "../src/connectors/feishu-grant";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -239,6 +240,54 @@ describe("the Feishu webhook endpoint", () => {
     expect(await quotedFeishu(env as any, { tenant: t, kind: "user", id: "ou_frank" }, event)).toBeUndefined();
     expect(await quotedFeishu(env as any, { tenant: "another", kind: "chat", id: "oc_group" }, event)).toEqual({});
     expect(asked).toEqual([]);
+  });
+
+  it("shows a card to one person alone in a chat when the address names who may see it, and says exactly how that went", async () => {
+    const { t, appId } = await app();
+    const who = { app_id: appId, tenant_key: "org_x", open_id: "ou_frank" };
+    const grant = await grantOf(env as any, who);
+    const made = (await grant.invite(who, "https://agent.test/v1/feishu/oauth/callback", ["docx:document:readonly"], { generation: 1 }, { brain: `${t}:chat:oc_group`, key: "om_q" })) as { nonce: string };
+    const interaction = `${await grantName(who)}.${made.nonce}`;
+    const here = { connector: "feishu", address: { app_id: appId, chat_id: "oc_group", visible_to: "ou_frank" } };
+    const scope = { tenant: t, kind: "chat" as const, id: "oc_group" };
+    const message = { id: 1, idem: "invite:x", text: "需要你先授权", created_at: 0, interaction };
+    const asked: { url: string; body: any }[] = [];
+    let answer: () => Response = () => Response.json({ code: 0, data: { message_id: "om_card" } });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: "t-1", expire: 7200 });
+      asked.push({ url: url.replace("https://open.feishu.cn/open-apis", ""), body: JSON.parse(String(init?.body)) });
+      return answer();
+    });
+    expect(await deliverFeishu(env as any, scope, here, message)).toEqual({ subject: "feishu:message:om_card", holder: "" });
+    expect(asked).toHaveLength(1);
+    expect(asked[0].url).toBe("/ephemeral/v1/send");
+    expect(asked[0].body).toMatchObject({ chat_id: "oc_group", open_id: "ou_frank", msg_type: "interactive" });
+    // Nothing that would make Feishu drop a repeat goes along: there is no such thing here.
+    expect(asked[0].body.uuid).toBeUndefined();
+    expect(JSON.stringify(asked[0].body.card)).toContain("accounts.feishu.cn");
+    // Taken, even where Feishu does not say which message it became: a second one is never made for that.
+    answer = () => Response.json({ code: 0, data: {} });
+    expect(await deliverFeishu(env as any, scope, here, message)).toEqual({ subject: "feishu:message:", holder: "" });
+    // Told to come back later: nothing was shown. Refused: nothing was shown. Anything else: no telling.
+    answer = () => Response.json({ code: 99991400, msg: "too many" }, { status: 429 });
+    expect(await deliverFeishu(env as any, scope, here, message).catch((error) => error)).toBeInstanceOf(DeliveryDeferred);
+    answer = () => Response.json({ code: 230002, msg: "not in chat" }, { status: 400 });
+    expect(await deliverFeishu(env as any, scope, here, message).catch((error) => error)).toBeInstanceOf(DeliveryRejected);
+    answer = () => new Response("bad gateway", { status: 502 });
+    const unknown = await deliverFeishu(env as any, scope, here, message).catch((error) => error);
+    expect(unknown).toBeInstanceOf(Error);
+    expect(unknown instanceof DeliveryRejected || unknown instanceof DeliveryDeferred).toBe(false);
+    // Only a way in is shown like this: words for one person in front of the others are not something Feishu has.
+    await expect(deliverFeishu(env as any, scope, here, { id: 2, idem: "m", text: "hello", created_at: 0 })).rejects.toBeInstanceOf(DeliveryRejected);
+    // And never to someone directly and in a chat at once.
+    await expect(deliverFeishu(env as any, scope, { connector: "feishu", address: { app_id: appId, open_id: "ou_frank", visible_to: "ou_frank" } }, message)).rejects.toThrow("bad Feishu address");
+    // Where that is, from where a request verifiably came; and that a repeat is never dropped there.
+    expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: appId, chat_id: "oc_group", message_id: "om_q" } })).toEqual(here);
+    expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: "cli_other", chat_id: "oc_group" } })).toBeUndefined();
+    expect(feishuConnector.channel!.aside!({ app_id: appId, tenant_key: "org_x" }, "ou_frank", { connector: "feishu", address: { app_id: appId, open_id: "ou_frank" } })).toBeUndefined();
+    const window = feishuConnector.channel!.dedupeMs as (target: any) => number;
+    expect([window(here), window({ connector: "feishu", address: { app_id: appId, chat_id: "oc_group" } })]).toEqual([0, 3_600_000]);
   });
 
   it("sends to a person directly when the address names them, and to a chat when it names that", async () => {

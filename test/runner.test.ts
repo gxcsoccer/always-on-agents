@@ -1213,6 +1213,17 @@ describe("the run loop, by itself", () => {
         }, "chat:oc_1");
       });
 
+      it("finds what the person said there shortly before however much the others have said since", async () => {
+        await within(async (b) => {
+          b.settings.connectorTools = [SHARED];
+          const mine = asks(b, "the link", { status: "done", received_at: Date.now() - 60_000 });
+          for (let i = 0; i < 230; i++) asks(b, `chatter ${i}`, { status: "done", received_at: Date.now() - 50_000, principal: { kind: "human", id: `ou_other_${i % 7}`, explicit: true } });
+          asks(b, "summarise it");
+          const id = (await b.runner.next())!;
+          expect(b.runner.actingFor(id)?.recentIds).toEqual([mine]);
+        }, "chat:oc_1");
+      });
+
       it("is nobody unless the connector says so on every message, the person addressed the agent, and it is one person in one conversation", async () => {
         const cases: Record<string, unknown>[] = [
           { data: { origin: ORIGIN } },
@@ -1256,7 +1267,9 @@ describe("the run loop, by itself", () => {
           b.store.sql.exec("INSERT INTO items (session_id, seq, run_id, is_user, item, outside) VALUES ('s0', 99, 'old', 0, ?, 2)", JSON.stringify({ role: "assistant", content: "[note]" }));
           b.store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (1, 'old', 's0', 'the doc says three things', 1, '[]')");
           // Not marked by the connector: the run acts for nobody, and is not shown those words.
-          asks(b, "what about it?", { data: { origin: ORIGIN } });
+          b.store.sql.exec("UPDATE said SET receipt_subject = 'feishu:message:om_bot'");
+          // Not even when that very message is what they reply to.
+          asks(b, "what about it?", { data: { origin: ORIGIN, replies_to: "feishu:message:om_bot" } });
           await b.go();
           expect(JSON.stringify(b.asked[0].input)).not.toContain("three things");
           asks(b, "and now?");

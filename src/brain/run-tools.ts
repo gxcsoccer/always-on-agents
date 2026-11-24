@@ -134,11 +134,12 @@ export class RunTools {
               // A request being carried on is told where it was asked, not wherever the conversation points by now.
               if (say === undefined || !this.#b.outbox.isNotice(say)) return;
               const text = this.#b.outbox.notice(say, run.session_id);
-              if (!carried) return this.#b.outbox.notify(`settled:${run.id}`, run.session_id, null, text);
               try {
-                this.#b.outbox.enqueue(`settled:${run.id}`, run.session_id, null, text, undefined, undefined, { target: carried.target });
-              } catch {
-                // Nowhere to say it.
+                // A failure to keep the line undoes the whole step: the run is not closed with nothing said.
+                this.#b.outbox.enqueue(`settled:${run.id}`, run.session_id, null, text, undefined, undefined, carried ? { target: carried.target } : undefined);
+              } catch (err) {
+                // Only where there is nowhere to say it at all is it left unsaid.
+                if (!(err instanceof Error) || !err.message.startsWith("there is nowhere to send")) throw err;
               }
             });
             return { settled: true, note: say === undefined ? SETTLED_SILENT : SETTLED_NOTE };

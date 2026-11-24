@@ -582,7 +582,7 @@ export class Runner {
       recent = ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids);
       if (recent.length !== ids.length || !recent.every((each) => each.text !== null && own(each))) return undefined;
     } else {
-      recent = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND id < ? AND received_at >= ? ORDER BY id DESC LIMIT ?", conversation, source, first.id, first.received_at - RECENT_REQUEST_MS, MAX_RECENT_REQUESTS * 4)
+      recent = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND source = ? AND json_extract(principal, '$.id') = ? AND id < ? AND received_at >= ? ORDER BY id DESC LIMIT ?", conversation, source, person, first.id, first.received_at - RECENT_REQUEST_MS, MAX_RECENT_REQUESTS * 4)
         .filter(own)
         .slice(0, MAX_RECENT_REQUESTS)
         .reverse();
@@ -657,7 +657,7 @@ export class Runner {
     // The words people replied to, for every reply in the window, in one query.
     const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
     const quotedOf = new Map(
-      pointed.length === 0 ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+      pointed.length === 0 || !mayShow ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));

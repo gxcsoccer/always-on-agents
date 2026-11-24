@@ -53,6 +53,8 @@ function bench(state: DurableObjectState) {
     notice: (which) => `notice:${which}`,
     // The person's own chat with the bot, as the connector would address it from a verified origin.
     direct: (connector, origin, person) => (settings.noDirect ? undefined : { connector, address: { app_id: origin.app_id, open_id: person } }),
+    // In the conversation the request was made in, for that person's eyes only, where the connector can.
+    aside: (connector, origin, person, from) => (settings.noAside ? undefined : { connector, address: { app_id: origin.app_id, chat_id: from.address.chat_id, visible_to: person } }),
   };
   const requests = new Requests(store, host);
   store.sql.exec("INSERT INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, ?, 1, 1)", SESSION, SESSION_KEY, TARGET);
@@ -763,6 +765,65 @@ describe("keeping a request that has to wait", () => {
       expect(store.rows("SELECT idem, interaction FROM outbox")).toEqual([{ idem: "invite:grant_1.nonce", interaction: "grant_1.nonce" }]);
       expect(audited("request.waiting")).toHaveLength(1);
       expect(hints()).toHaveLength(1);
+    });
+  });
+
+  describe("a way in shown to the person alone, where they asked", () => {
+    const HERE = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", chat_id: "oc_1", visible_to: "ou_1" } });
+    const DIRECT = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", open_id: "ou_1" } });
+    const acting = { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" } };
+    const asking = (use: (all: ReturnType<typeof bench>, invite: () => Record<string, any>) => void | Promise<void>, set: (all: ReturnType<typeof bench>) => void = () => undefined) =>
+      within(async (all) => {
+        set(all);
+        const said = all.message("总结一下", {}, "r1");
+        all.requests.wait(all.run("r1"), { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, privately: "here" });
+        await use(all, () => all.sent("invite:grant_1.nonce"));
+      });
+
+    it("goes where the connector says that is, and nothing more is said once it is there", async () => {
+      await asking(({ requests, store, kept }, invite) => {
+        expect(invite().target).toBe(HERE);
+        expect(kept("call_1").direct).toBe(2);
+        requests.shown(invite() as never, "reached");
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(1);
+      });
+    });
+
+    it("goes to the person directly where the connector cannot show it there", async () => {
+      await asking(
+        ({ kept }, invite) => {
+          expect(invite().target).toBe(DIRECT);
+          expect(kept("call_1").direct).toBe(1);
+        },
+        ({ settings }) => (settings.noAside = "1"),
+      );
+    });
+
+    it("says so where the request was made when it was not shown, or when that cannot be told; it is not sent anywhere else", async () => {
+      await asking(async ({ requests, store, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "failed");
+        expect(invite()).toMatchObject({ target: HERE, status: "dead" });
+        const line = sent(told("grant_1.nonce", "call_1"));
+        expect(line).toMatchObject({ target: TARGET, text: "notice:inviteNotShown" });
+        expect(await requests.gate(line as never)).toBe("send");
+      });
+      await asking(({ requests, store, sent }, invite) => {
+        store.sql.exec("UPDATE outbox SET status = 'unverified', started = 1, uncertain = 1 WHERE idem = 'invite:grant_1.nonce'");
+        requests.shown(invite() as never, "unknown");
+        expect(invite()).toMatchObject({ target: HERE, status: "unverified" });
+        expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ target: TARGET, text: "notice:inviteUnknownHere" });
+      });
+    });
+
+    it("is never put where everyone would see it: with no way to show it to the person alone, nothing waits", async () => {
+      await within((all) => {
+        all.settings.noAside = "1";
+        all.settings.noDirect = "1";
+        const said = all.message("总结一下", {}, "r1");
+        expect(() => all.requests.wait(all.run("r1"), { ...acting, events: { said: [said], recent: [] } }, "call_1", "feishu_read_document", { ...waiting, privately: "here" })).toThrow(/cannot be reached directly/);
+        expect(all.store.rows("SELECT 1 FROM outbox")).toEqual([]);
+      });
     });
   });
 

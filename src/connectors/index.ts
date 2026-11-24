@@ -81,8 +81,9 @@ export async function holds(env: Env, name: string, scope: Scope, condition: str
 }
 
 /** For how long this connector's system drops a repeated message, if it says. */
-export function dedupeWindow(name: string): number | undefined {
-  return byName.get(name)?.channel?.dedupeMs;
+export function dedupeWindow(target: Target): number | undefined {
+  const window = byName.get(target.connector)?.channel?.dedupeMs;
+  return typeof window === "function" ? window(target) : window;
 }
 
 /** Shows a person that their message has arrived, where the connector can. Never throws; the mark it put on, only if the outside system confirmed it. */
@@ -96,6 +97,15 @@ export async function received(env: Env, name: string, scope: Scope, event: { so
 export function direct(name: string, origin: Record<string, string>, person: string): Target | undefined {
   try {
     return byName.get(name)?.channel?.direct?.(origin, person);
+  } catch {
+    return undefined;
+  }
+}
+
+/** An address in the same conversation at which only this person sees what is sent, where the connector has one. */
+export function aside(name: string, origin: Record<string, string>, person: string, from: Target): Target | undefined {
+  try {
+    return byName.get(name)?.channel?.aside?.(origin, person, from);
   } catch {
     return undefined;
   }

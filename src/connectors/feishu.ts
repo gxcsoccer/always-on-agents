@@ -115,7 +115,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -468,10 +468,24 @@ export async function decrypt(encryptKey: string, ciphertext: string): Promise<s
 }
 
 /** Sends as the bot. A direct chat gets a new message; a group gets a reply to the message that asked. */
+/**
+ * In the chat a request was made in, for the eyes of the one who made it: Feishu's card that only
+ * a named member of a chat sees. From the app the request verifiably came through, the chat its
+ * own message is in, and their id. Feishu drops no repeat of such a card (see `dedupeMs`).
+ */
+export function asideFeishu(origin: Record<string, string>, person: string, from: Target): Target | undefined {
+  const { app_id: appId, chat_id: chatId } = from.address;
+  if (from.connector !== "feishu" || !chatId || !appId || appId !== origin.app_id || !person) return undefined;
+  return { connector: "feishu", address: { app_id: appId, chat_id: chatId, visible_to: person } };
+}
+
 export async function deliverFeishu(env: Env, scope: Scope, target: Target, message: OutboundMessage): Promise<Receipt | void> {
   // A chat, or a person directly (their own chat with the bot, by their id): one or the other, never both.
-  const { app_id: appId, chat_id: chatId, open_id: openId, message_id: messageId, thread } = target.address;
-  if (!appId || (!chatId && !openId) || (openId && (chatId || messageId))) throw new Error("bad Feishu address");
+  // Or a chat and the one member of it who is to see this (`visible_to`).
+  const { app_id: appId, chat_id: chatId, open_id: openId, message_id: messageId, thread, visible_to: only } = target.address;
+  if (!appId || (!chatId && !openId) || (openId && (chatId || messageId)) || (only && (!chatId || openId))) throw new Error("bad Feishu address");
+  // Feishu shows one member of a chat a card, and nothing else: no words.
+  if (only && !message.interaction) throw new DeliveryRejected("only a card can be shown to one person in a chat");
   const to = chatId ? { type: "chat_id", id: chatId } : { type: "open_id", id: openId };
   const token = await tenantAccessToken(env, appId);
   // Feishu drops a repeat of the same uuid within an hour, which makes a retry safe.
@@ -493,7 +507,14 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
   const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text) : message.text }));
 
-  const response = messageId
+  const response = only
+    ? await fetch(`${API}/ephemeral/v1/send`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+        // No uuid: Feishu has none here, so this is sent at most once (the queue sees to that).
+        body: JSON.stringify({ chat_id: chatId, open_id: only, msg_type: "interactive", card }),
+      })
+    : messageId
     ? await fetch(`${API}/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
@@ -523,8 +544,9 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // Which message this is, so a reply to it can be told from a reply to anything else, and so a
   // question's card can be closed later. Accepted without saying which message it became is not
   // something to count as delivered.
-  if (!result.data?.message_id) throw new Error("Feishu accepted the message without naming it");
-  return { subject: `feishu:message:${result.data.message_id}`, holder: "" };
+  // (A card shown to one person was taken all the same: there is no finding it again, and no second one is made for that.)
+  if (!result.data?.message_id && !only) throw new Error("Feishu accepted the message without naming it");
+  return { subject: `feishu:message:${result.data?.message_id ?? ""}`, holder: "" };
 }
 
 /** Feishu's limit for a post, in bytes of the request, with a margin. */

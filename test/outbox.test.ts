@@ -234,6 +234,51 @@ describe("the outbox, by itself", () => {
       });
     });
 
+    describe("to an address that takes a message at most once", () => {
+      // Feishu says so of an address that names the one person who may see what is sent there.
+      const ONCE = JSON.stringify({ connector: "feishu", address: { app_id: "cli_1", chat_id: "oc_1", visible_to: "ou_1" } });
+
+      it("is not tried again after an attempt whose outcome is not known, and is recorded as that", async () => {
+        await within(async ({ outbox, row, channel, delivered, shown }) => {
+          outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1", target: ONCE });
+          outbox.enqueue("after", SESSION, null, "next in line");
+          channel.i = fails(new Error("connection lost"));
+          await outbox.flush();
+          await outbox.flush();
+          expect(delivered.filter((each) => each.message.idem === "i")).toHaveLength(1);
+          expect(row("i")).toMatchObject({ status: "unverified" });
+          expect(shown).toEqual([["i", "unknown"]]);
+          expect(row("after").status).toBe("sent");
+        });
+      });
+
+      it("is not sent at all when an earlier attempt was begun and never heard of, as after a restart", async () => {
+        await within(async ({ outbox, row, set, delivered, shown }) => {
+          outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1", target: ONCE });
+          set("i", { started: 1, uncertain: 1, first_attempt_at: Date.now() });
+          await outbox.flush();
+          expect(delivered).toEqual([]);
+          expect(row("i")).toMatchObject({ status: "unverified" });
+          expect(shown).toEqual([["i", "unknown"]]);
+        });
+      });
+
+      it("is tried again when it was told to come back later, and is given up as not sent when it is refused", async () => {
+        await within(async ({ outbox, row, set, channel, delivered, shown }) => {
+          outbox.enqueue("i", SESSION, null, "authorise", undefined, undefined, { interaction: "int:1", target: ONCE });
+          channel.i = fails(new DeliveryDeferred("busy", Date.now()));
+          await outbox.flush();
+          expect(row("i")).toMatchObject({ status: "pending", uncertain: 0 });
+          set("i", { next_at: 0 });
+          channel.i = fails(new DeliveryRejected("no"));
+          await outbox.flush();
+          expect(delivered).toHaveLength(2);
+          expect(row("i")).toMatchObject({ status: "dead" });
+          expect(shown).toEqual([["i", "failed"]]);
+        });
+      });
+    });
+
     it("takes the time a message was really posted from the receipt, when an earlier attempt had landed", async () => {
       await within(async ({ outbox, row, channel }) => {
         outbox.enqueue("m1", SESSION, null, "one");
@@ -704,6 +749,17 @@ describe("the outbox, by itself", () => {
         await outbox.flush();
         await outbox.flush();
         expect(kept().map((each) => each.text)).toEqual(["the document says three things"]);
+      });
+    });
+
+    it("keeps there the answer of a request that was carried on for the person who made it, although the run acts for nobody by then", async () => {
+      await within(async ({ outbox, run, settings, kept, store }) => {
+        settings.sessionKey = "chat";
+        run("r1");
+        store.sql.exec("INSERT INTO continuations (id, person, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, run_id, created_at) VALUES ('q1', 'ou_1', ?, '{}', 'feishu', 't', '{}', ?, 'g', 'c', 1, 'i', ?, 'answering', 'r1', 0)", SESSION, TARGET, Date.now() + 60_000);
+        outbox.enqueue("answer:q1", SESSION, "r1", "after you authorised: three things", undefined, undefined, { continuation: { id: "q1", target: TARGET } as Continuation, authored: true });
+        await outbox.flush();
+        expect(kept().map((each) => each.text)).toEqual(["after you authorised: three things"]);
       });
     });
 
