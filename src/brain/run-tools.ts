@@ -7,6 +7,7 @@
  */
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
+import { chainLevels } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, WAITING_NOTE } from "./requests";
@@ -62,16 +63,17 @@ export class RunTools {
     const delivered = (subject: unknown): subject is string => typeof subject === "string" && this.#s.rows("SELECT 1 FROM said WHERE session_id = ? AND receipt_subject = ? LIMIT 1", run.session_id, subject).length > 0;
     const naming = (source: string, subject: string, person: unknown): boolean => {
       const prefix = `${source}:message:`;
-      const row = subject.startsWith(prefix) ? this.#s.rows<{ data: string | null; principal: string }>("SELECT data, principal FROM inbox WHERE source = ? AND source_id = ? LIMIT 1", source, subject.slice(prefix.length))[0] : undefined;
+      // Only in this conversation, as everything else that follows the chain.
+      const row = subject.startsWith(prefix) ? this.#s.rows<{ data: string | null; principal: string }>("SELECT i.data, i.principal FROM inbox i WHERE i.source = ? AND i.source_id = ? AND i.session_key = (SELECT session_key FROM sessions WHERE id = ?) LIMIT 1", source, subject.slice(prefix.length), run.session_id)[0] : undefined;
       const documents = row && (JSON.parse(row.principal) as { id?: unknown }).id === person ? (JSON.parse(row.data ?? "{}") as { documents?: unknown }).documents : undefined;
       return Array.isArray(documents) && documents.length > 0;
     };
     const subjects = this.#b.requests
       .basis(run.id)
       .map((each) => {
-        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { documents?: unknown }; chain?: unknown };
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { documents?: unknown } };
         const person = (JSON.parse(each.principal ?? "{}") as { id?: unknown }).id;
-        const levels = [{ subject: data.replies_to, documents: data.quoted?.documents }, ...(Array.isArray(data.chain) ? (data.chain as { subject?: unknown; documents?: unknown }[]).filter(Boolean) : [])];
+        const levels: { subject?: unknown; documents?: unknown }[] = [{ subject: data.replies_to, documents: data.quoted?.documents }, ...chainLevels(data as Record<string, unknown>)];
         for (const level of levels) {
           if (delivered(level.subject)) return level.subject;
           if (typeof level.subject !== "string" || (Array.isArray(level.documents) && level.documents.length > 0) || naming(String(each.source ?? ""), level.subject, person)) break;

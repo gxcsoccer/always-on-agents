@@ -393,8 +393,14 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // Someone else's, or the app's own: nothing it says or links, only where it points, so that
     // what stands further up the chain of replies can still be found.
     if (sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return further;
-    if (typeof found.body?.content !== "string") return {};
-    const content = JSON.parse(found.body.content);
+    // Their own, with nothing that can be read in it: the chain still goes on from it.
+    if (typeof found.body?.content !== "string") return further;
+    let content: any;
+    try {
+      content = JSON.parse(found.body.content);
+    } catch {
+      return further;
+    }
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
@@ -403,7 +409,9 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const linked = found.msg_type === "text" ? linksIn(String(content.text ?? "")) : found.msg_type === "post" ? linkedIn(content) : [];
     const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
-    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...further };
+    // When it was written, as Feishu says (milliseconds): what it links is something they linked then, not now.
+    const at = Number(found.create_time);
+    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
   } catch {
     return {};
   }

@@ -16,7 +16,7 @@
  */
 import type { Env } from "../env";
 import { registry } from "../registry";
-import { type Scope, scopeName } from "../events";
+import { type Scope, chainLevels, scopeName } from "../events";
 import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFactsFor } from "./feishu-api";
 import { OFFLINE, SCOPES, type Who, grantName, grantsKey, lifetime, sameSet } from "./feishu-grant";
 import { type ConnectorTool, type Holds, type ToolContext, type Waiting, isWaiting } from "./types";
@@ -53,6 +53,20 @@ function documentsOf(message: { data: Record<string, unknown> }): DocumentRef[] 
   return [...ownDocuments(message), ...quotedDocuments(message)];
 }
 
+/** How far back a message of the person's own counts as something they linked lately (as the Brain's own look-back). */
+const LATELY_MS = 24 * 3_600_000;
+
+/**
+ * What a message counts as having linked lately, for a later message that does not stand in its
+ * chain of replies: what it links itself, and what the person's own message it replied to links
+ * if that one was written within the last day (the connector says when). A message that only
+ * pointed at something old does not make the old thing recent.
+ */
+function linkedLately(message: { data: Record<string, unknown> }): DocumentRef[] {
+  const at = (message.data.quoted as { at?: unknown } | undefined)?.at;
+  return [...ownDocuments(message), ...(typeof at === "number" && Date.now() - at <= LATELY_MS ? quotedDocuments(message) : [])];
+}
+
 const whole = <T extends DocumentRef>(each: T | undefined): each is T => Boolean(each) && (each!.kind === "docx" || each!.kind === "wiki") && typeof each!.token === "string" && /^[A-Za-z0-9]{10,64}$/.test(each!.token);
 
 /** The documents a message itself links. */
@@ -87,7 +101,7 @@ function fetchedDocuments(documents: unknown): (DocumentRef & { link?: string })
 function ledBackTo(context: ToolContext): (DocumentRef & { link?: string; message?: { text: string; data: Record<string, unknown> } })[] {
   const found: (DocumentRef & { link?: string; message?: { text: string; data: Record<string, unknown> } })[] = [];
   for (const message of context.said) {
-    const levels = Array.isArray(message.data.chain) ? (message.data.chain as { subject?: unknown; documents?: unknown }[]).filter(Boolean) : [];
+    const levels = chainLevels(message.data);
     found.push(...quotedDocuments(message), ...levels.flatMap((level) => fetchedDocuments(level.documents)));
     const subjects = [message.data.replies_to, ...levels.map((level) => level.subject)].filter((each): each is string => typeof each === "string");
     for (const earlier of context.recent) {
@@ -240,7 +254,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   const linkingNow = context.said.filter((message) => ownDocuments(message).some(matches));
   // The link the person wrote for this document in a message they replied to that had to be fetched.
   let quotedLink: string | undefined;
-  const linkingEarlier = context.recent.filter((message) => documents(message).some(matches));
+  const linkingEarlier = context.recent.filter((message) => linkedLately(message).some(matches));
   // What the chain of replies leads back to, of their own linking. Where it holds several
   // documents, which is meant is the model's to say from what it is shown: any of them can be read.
   const led = ledBackTo(context);

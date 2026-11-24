@@ -310,6 +310,12 @@ describe("which documents a fetched message links", () => {
     expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "app", id: "cli_test" } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    // Their own, with nothing in it that can be read: no words, but the chain goes on from it all the same.
+    expect(await fetched({ parent_id: "om_answer", body: { content: JSON.stringify({ text: "" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ parent_id: "om_answer", body: { content: "{not json" } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    expect(await fetched({ parent_id: "om_answer", body: {} })).toEqual({ replies_to: "feishu:message:om_answer" });
+    // When it was written goes along, as Feishu says it.
+    expect(await fetched({ create_time: "1795000000000" })).toEqual({ text: "说了啥？", at: 1795000000000 });
     // Not out of another chat, not once recalled, and not inside a topic.
     expect(await fetched({ parent_id: "om_answer", chat_id: "oc_other" })).toEqual({});
     expect(await fetched({ parent_id: "om_answer", deleted: true })).toEqual({});

@@ -447,6 +447,8 @@ export interface Quoted {
   text?: string;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
+  /** When that message was written, in milliseconds, where the outside system says. */
+  at?: number;
   /**
    * What that message was itself written in reply to, named as a message's `data.replies_to`
    * names it. Also given, alone, for a message that is not the person's own: nothing of what it

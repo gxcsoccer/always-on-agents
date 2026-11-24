@@ -10,7 +10,7 @@
  */
 import type { ConnectorTool, Quoted } from "../connectors";
 import type { Env } from "../env";
-import { type Principal, type Target, privateSessionKey } from "../events";
+import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
@@ -182,11 +182,22 @@ export class Runner {
    * message of the same person's in this conversation is quoted (their own words, as stored);
    * one of the agent's is only named by when it was sent, since what it said may not be kept.
    */
-  /** The one person who wrote every message this run was started by, if it was one person and nothing else started it. */
-  #writerOf(runId: string): string | undefined {
-    const writers = this.#s.rows<{ kind: string; principal: string }>("SELECT kind, principal FROM inbox WHERE run_id = ?", runId).map((each) => (each.kind === "message" ? (JSON.parse(each.principal) as Principal) : undefined));
-    const first = writers[0];
-    return first && first.kind === "human" && writers.every((each) => each?.kind === "human" && each.id === first.id) ? first.id : undefined;
+  /**
+   * The one person who wrote every message this run was started by, where it acts for nobody:
+   * all of them ordinary messages, through one connector the deployment trusts, with one and the
+   * same verified origin, by one human. Told apart by all of that, not by an id alone.
+   */
+  #writerOf(runId: string): { person: string; connector: string; origin: Record<string, string> } | undefined {
+    const events = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ?", runId);
+    const first = events[0];
+    const origin = first ? originOf(first) : undefined;
+    if (!first || !origin) return undefined;
+    const who = JSON.parse(first.principal) as Principal;
+    const same = (event: InboxRow) => {
+      const principal = JSON.parse(event.principal) as Principal;
+      return event.kind === "message" && event.source === first.source && this.#b.isDecider(principal, event.source) && principal.id === who.id && plain(event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {}) && JSON.stringify(originOf(event)) === JSON.stringify(origin);
+    };
+    return events.every(same) ? { person: who.id, connector: first.source, origin } : undefined;
   }
 
   /** What would be shown with this message because of what it leads back to, and how much each is: for measuring a run before it starts. */
@@ -201,7 +212,7 @@ export class Runner {
       ...replied.map((id) => ({ key: `said:${id}`, size: words(id) })),
       ...chain.map((each) => {
         if (each.kind === "said") return { key: `said:${each.id}`, size: words(each.id) };
-        if (each.kind === "inbox") return { key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + SHOWN_AROUND };
+        if (each.kind === "inbox") return { key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + MAX_LINKS_TEXT + SHOWN_AROUND };
         // Kept with the message itself, so already measured with it (sizeOf counts its data): only what is written around it.
         return { key: each.kind === "fetched" ? `fetched:${each.event}:${each.level}` : `${each.kind}:${event.id}`, size: SHOWN_AROUND };
       }),
@@ -259,12 +270,12 @@ export class Runner {
    * something stood there (someone else's, or nothing that can be shown).
    */
   #repliedFurther(event: InboxRow, sessionId: string, chain: Link[]): string {
-    const levels = (JSON.parse(event.data ?? "{}") as { chain?: unknown }).chain;
-    if (!Array.isArray(levels) || levels.length === 0) return "";
+    const levels = chainLevels(JSON.parse(event.data ?? "{}") as Record<string, unknown>);
+    if (levels.length === 0) return "";
     const by = (JSON.parse(event.principal) as Principal).id;
     const found: Link[] = [];
-    (levels as Level[]).forEach((level, index) => {
-      if ("cut" in level) return void found.push({ kind: "cut" });
+    levels.forEach((level, index) => {
+      if (level.cut || typeof level.subject !== "string") return void (level.cut && found.push({ kind: "cut" }));
       const words = this.#s.rows<{ outbox_id: number }>("SELECT outbox_id FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", level.subject, sessionId)[0];
       if (words) return void found.push({ kind: "said", id: words.outbox_id });
       const parent = this.#parentOf(event, level.subject);
@@ -311,7 +322,8 @@ export class Runner {
         if (!found) return;
         for (const id of ids) {
           if (found.quoted) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(found.quoted), id);
-          if (found.chain.length > 0 || found.partial) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.chain', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify([...found.chain, ...(found.partial ? [{ cut: true }] : [])]), id);
+          // Always written once the chain was followed, also when there is nothing above: so that it is not followed, or read the older way, again.
+          this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.chain', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify([...found.chain, ...(found.partial ? [{ cut: true }] : [])]), id);
         }
       }),
     );
@@ -360,7 +372,7 @@ export class Runner {
         // Where the connector has no such thing at all, nothing is kept, as before.
         if (found === undefined) break;
         const own = typeof found.text === "string";
-        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}) } : {};
+        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(typeof found.at === "number" ? { at: found.at } : {}) } : {};
         next = typeof found.replies_to === "string" ? found.replies_to : undefined;
         if (level === 1) quoted = { ...kept, ...(own && next ? { replies_to: next } : {}) };
         else chain.push({ subject, ...(own ? kept : { hidden: true }) });
@@ -383,21 +395,22 @@ export class Runner {
       const above = arrived.session_key === event.session_key ? (JSON.parse(arrived.data ?? "{}") as { replies_to?: unknown }).replies_to : undefined;
       return { ...(typeof above === "string" ? { next: above } : {}) };
     }
-    // The agent's own: what it was sent under, from the address it was really sent to. Only for
-    // an answer delivered in this conversation; anything else it sent (a notice, a card) ends the chain.
-    const sent = this.#s.rows<{ target: string; said: number | null }>(
-      "SELECT o.target, (SELECT 1 FROM said w JOIN sessions s ON s.id = w.session_id WHERE w.outbox_id = o.id AND s.session_key = ?) AS said FROM outbox o WHERE json_extract(o.receipt, '$.subject') = ? LIMIT 1",
-      event.session_key,
-      subject,
-    )[0];
-    if (!sent) return undefined;
-    let above: string | undefined;
-    try {
-      above = sent.said ? this.#b.under(JSON.parse(sent.target) as Target) : undefined;
-    } catch {
-      above = undefined;
+    // The agent's own answer, delivered in this conversation: known by what it said, whatever
+    // has become of the row it was sent by. What it was sent under comes from the address it was
+    // really sent to, if that row is still there; if not, the chain ends at the answer.
+    const answer = this.#s.rows<{ outbox_id: number }>("SELECT w.outbox_id FROM said w JOIN sessions s ON s.id = w.session_id WHERE w.receipt_subject = ? AND s.session_key = ? ORDER BY w.outbox_id DESC LIMIT 1", subject, event.session_key)[0];
+    if (answer) {
+      const target = this.#s.rows<{ target: string }>("SELECT target FROM outbox WHERE id = ?", answer.outbox_id)[0]?.target;
+      let above: string | undefined;
+      try {
+        above = target ? this.#b.under(JSON.parse(target) as Target) : undefined;
+      } catch {
+        above = undefined;
+      }
+      return { ...(above ? { next: above } : {}) };
     }
-    return { ...(above ? { next: above } : {}) };
+    // Anything else it sent here (a notice, a card): the chain ends there.
+    return this.#s.rows("SELECT 1 FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject).length > 0 ? {} : undefined;
   }
 
   async execute(runId: string): Promise<void> {
@@ -780,9 +793,8 @@ export class Runner {
       // they wrote it: their own, by the same test, in this conversation.
       // And every message further up the chain of replies (the same chain the model is shown).
       const pointed = events.flatMap((each) => {
-        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; chain?: unknown };
-        const further = Array.isArray(data.chain) ? (data.chain as Level[]).map((level) => ("subject" in level ? level.subject : undefined)) : [];
-        return [data.replies_to, ...further].filter((subject): subject is string => typeof subject === "string");
+        const data = JSON.parse(each.data ?? "{}") as Record<string, unknown>;
+        return [data.replies_to, ...chainLevels(data).map((level) => level.subject)].filter((subject): subject is string => typeof subject === "string");
       });
       if (pointed.length > 0) {
         const older = [...new Set(pointed)].flatMap((subject) => this.#parentOf(first, subject) ?? []).filter((each, index, all) => own(each) && each.text !== null && all.findIndex((other) => other.id === each.id) === index && !recent.some((seen) => seen.id === each.id));
@@ -872,7 +884,9 @@ export class Runner {
     // (Where the run acts for nobody there, the one person who wrote everything it was started
     // by: their own words, fetched for their own message, are theirs to be shown with it.)
     const scope = this.#s.scope();
-    const me = scope.kind === "chat" ? (acting?.person ?? (leads && runId ? this.#writerOf(runId) : undefined)) : scope.kind === "user" ? scope.id : undefined;
+    const writer = scope.kind === "chat" && !acting && leads && runId ? this.#writerOf(runId) : undefined;
+    const through = acting ? { connector: acting.connector, origin: acting.origin } : writer;
+    const me = scope.kind === "chat" ? (acting?.person ?? writer?.person) : scope.kind === "user" ? scope.id : undefined;
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[]; _pointed?: Pointed[]; _chain?: Link[] };
       if (row.is_user === 1) {
@@ -884,7 +898,7 @@ export class Runner {
         // through the same connector and origin where that is known: theirs then, and theirs now.
         const theirs = (id: number, by: string): InboxRow | undefined => {
           const kept = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ? AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", id, sessionId)[0];
-          const same = kept !== undefined && (!acting || (kept.source === acting.connector && JSON.stringify(originOf(kept)) === JSON.stringify(acting.origin)));
+          const same = kept !== undefined && (!through || (kept.source === through.connector && JSON.stringify(originOf(kept)) === JSON.stringify(through.origin)));
           return kept && same && by === me && (JSON.parse(kept.principal) as Principal).id === by ? kept : undefined;
         };
         const lead = (content: string, role: "user" | "assistant" = "user") => entries.push({ item: { role, content }, starts: entries.length === before });
@@ -894,14 +908,16 @@ export class Runner {
         for (const each of links) {
           if (each.kind === "inbox") {
             const kept = theirs(each.id, each.by);
-            lead(kept && kept.text !== null ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text.slice(0, MAX_POINTED_TEXT)}` : GONE);
+            lead(kept && kept.text !== null ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text.slice(0, MAX_POINTED_TEXT)}${linked(kept.text.length > MAX_POINTED_TEXT ? addressesIn(kept.text.slice(MAX_POINTED_TEXT - 300)) : [])}` : GONE);
           } else if (each.kind === "fetched") {
             // Their own words that had to be fetched, kept with the message that led to them.
             const kept = theirs(each.event, each.by);
-            const data = kept ? (JSON.parse(kept.data ?? "{}") as { quoted?: { text?: unknown }; chain?: Level[] }) : {};
-            const level = each.level === 1 ? data.quoted : data.chain?.[each.level - 2];
-            const text = level && "text" in level && typeof level.text === "string" ? level.text : undefined;
-            lead(text !== undefined ? `[An earlier message of theirs that this leads back to, which you were not sent:]\n${text.slice(0, MAX_FETCHED_TEXT)}` : GONE);
+            const data = kept ? (JSON.parse(kept.data ?? "{}") as Record<string, unknown>) : {};
+            const level = (each.level === 1 ? data.quoted : chainLevels(data)[each.level - 2]) as { text?: unknown; documents?: unknown } | undefined;
+            const text = typeof level?.text === "string" ? level.text : undefined;
+            // What it links, as the connector verified it: also where that lies beyond the words shown.
+            const links = Array.isArray(level?.documents) ? (level.documents as { link?: unknown }[]).flatMap((doc) => (typeof doc?.link === "string" ? [doc.link] : [])) : [];
+            lead(text !== undefined ? `[An earlier message of theirs that this leads back to, which you were not sent:]\n${text.slice(0, MAX_FETCHED_TEXT)}${linked(links.filter((link) => !text.slice(0, MAX_FETCHED_TEXT).includes(link)))}` : GONE);
           } else if (each.kind === "said") {
             const words = quotedOf.get(each.id);
             if (!words) continue;
@@ -911,7 +927,9 @@ export class Runner {
           } else lead(each.kind === "cut" ? "[The chain of replies goes further back than was followed.]" : "[A message here that this leads back to is not shown to you: someone else's, or one that could not be read.]");
         }
         const led = entries.length > before;
-        const quoted = [...new Set(item._replied ?? [])].flatMap((id) => quotedOf.get(id) ?? []);
+        // (One already shown as part of the chain is not shown a second time.)
+        const chained = new Set((item._chain ?? []).flatMap((each) => (each.kind === "said" ? [each.id] : [])));
+        const quoted = [...new Set(item._replied ?? [])].filter((id) => !chained.has(id)).flatMap((id) => quotedOf.get(id) ?? []);
         quoted.forEach((each, at) => {
           // What it was written from, by the tool's canonical call, where that is the one thing the
           // person can still point at: what they are asking about, even once that turn is out of sight.
@@ -1023,7 +1041,7 @@ function push(chain: Link[], link: Link, at = chain.length): boolean {
 }
 
 /** One message further up the chain of replies, as kept with the message that led to it: its name, and, where it had to be fetched, the person's own words and links, or that it is not theirs. A last entry `cut` says the chain goes on but was not followed. */
-type Level = { subject: string; text?: string; documents?: unknown[]; hidden?: true } | { cut: true };
+type Level = ChainLevel;
 /**
  * One thing a turn leads back to, to be shown before it: an answer of the agent's by its outbox
  * row; a message of the person's own on record by its row; one that was fetched, by the message
@@ -1034,10 +1052,27 @@ type Link = { kind: "said"; id: number } | { kind: "inbox"; id: number; by: stri
 type Pointed = { id: number; by: string };
 /** How much of such a message is shown. */
 const MAX_POINTED_TEXT = 500;
+/** Addresses written in a piece of text: for naming the links of a message whose words are cut short. */
+function addressesIn(text: string): string[] {
+  return [...new Set(text.match(/https?:\/\/[^\s<>"'）】]+/g) ?? [])].slice(0, MAX_LINKS_SHOWN).map((each) => each.slice(0, 300));
+}
+
+/** The line that names links beyond the words shown, or nothing. */
+function linked(links: string[]): string {
+  const some = [...new Set(links)].slice(0, MAX_LINKS_SHOWN);
+  let line = "";
+  for (const each of some) if (line.length + each.length + 1 <= MAX_LINKS_TEXT) line += ` ${each}`;
+  return line ? `\n(links in it:${line})` : "";
+}
+
+/** How many links of one message are named beside its words. */
+const MAX_LINKS_SHOWN = 10;
 /** How much of a fetched message is shown (the connector already keeps it short). */
 const MAX_FETCHED_TEXT = 1_000;
 /** Room for what is written around something shown with a turn: its label, and where it was written from. */
 const SHOWN_AROUND = 600;
+/** How much the line naming a message's links may take. */
+const MAX_LINKS_TEXT = 1_000;
 
 function sizeOf(event: InboxRow): number {
   return (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
