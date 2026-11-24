@@ -55,11 +55,13 @@ export class RunTools {
    * as it reached them, and if so the one thing every such answer was written from that the
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
-  #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown> } } {
+  #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
     const subjects = this.#b.requests.basis(run.id).map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
     if (subjects.length === 0) return {};
     const answers = this.#s.rows<{ reads: string }>("SELECT reads FROM said WHERE session_id = ? AND receipt_subject IN (SELECT value FROM json_each(?))", run.session_id, JSON.stringify(subjects));
     if (answers.length === 0) return {};
+    // Written from nothing read, every one of them: they point at nothing.
+    if (answers.every((each) => (JSON.parse(each.reads) as Read[]).length === 0)) return { answering: { nothing: true } };
     const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf));
     const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
     return { answering: one ? { source: one.request } : {} };

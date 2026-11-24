@@ -810,7 +810,11 @@ describe("reading a Feishu document as the person who asked", () => {
     expect((await rowsOf(sam.stub, "SELECT reads FROM said WHERE text = '三项（直接贴）'")).map((each: any) => JSON.parse(each.reads).map((read: any) => read.args))).toEqual([[JSON.stringify({ document: second })]]);
   });
 
-  it("does not read on the strength of a reply to an answer that rests on no one document still in reach, and reads a link pasted in the reply itself", async () => {
+  it("says in its description that links on Feishu's other document host are documents too", () => {
+    expect(readDocument.description).toContain("larkoffice.com");
+  });
+
+  it("does not read on the strength of a reply to an answer written from several documents; a reply to one that read nothing is an ordinary follow-up; and a link pasted in the reply itself is read", async () => {
     const tess = someone();
     for (const id of ["DocTessA0000000000001", "DocTessB0000000000001", "DocTessC0000000000001"]) feishu.docs.set(id, { readers: [tess.openId], text: `text of ${id}` });
     await authorised(tess, "DocTessA0000000000001");
@@ -823,12 +827,20 @@ describe("reading a Feishu document as the person who asked", () => {
     model.replies([readCall("DocTessA0000000000001"), readCall("DocTessB0000000000001")], [call("send_message", { text: "A 三项，B 两项" })], [say("")]);
     await tess.says("A 和 B 各几项");
     feishu.reads.length = 0;
-    for (const answer of ["凭印象：A 有三项", "A 三项，B 两项"]) {
-      model.replies([readCall("DocTessA0000000000001")], [call("send_message", { text: "需要链接" })], [say("")]);
-      await tess.says("第二项展开说说", undefined, sentText(answer));
-      expect(toolOutputs()[0].error).toMatch(/does not rest on one document/);
-    }
+    // The answer that read both: which of them a reply to it is about is not known, so neither is read.
+    model.replies([readCall("DocTessA0000000000001")], [call("send_message", { text: "需要链接" })], [say("")]);
+    await tess.says("第二项展开说说", undefined, sentText("A 三项，B 两项"));
+    expect(toolOutputs()[0].error).toMatch(/does not rest on one document/);
     expect(feishu.reads).toEqual([]);
+    // The answer that read nothing points at no document, so a reply to it is as any follow-up:
+    // what she linked herself here in the last day can be read, and nothing else.
+    model.replies([readCall("DocTessA0000000000001")], [call("send_message", { text: "A 的第二项是…" })], [say("")]);
+    await tess.says("第二项展开说说", undefined, sentText("凭印象：A 有三项"));
+    expect(toolOutputs()[0]).toEqual({ text: "text of DocTessA0000000000001" });
+    model.replies([readCall("DocTessC0000000000001")], [call("send_message", { text: "需要链接" })], [say("")]);
+    await tess.says("那 C 呢", undefined, sentText("凭印象：A 有三项"));
+    expect(toolOutputs()[0].error).toMatch(/only a document the person linked themselves/);
+    feishu.reads.length = 0;
     // A link pasted in the reply itself is hers to have read, whatever the answer rested on.
     model.replies([readCall("DocTessC0000000000001")], [call("send_message", { text: "C 也看了" })], [say("")]);
     await tess.says(`和 ${link("DocTessC0000000000001")} 对比下`, undefined, sentText("A 三项，B 两项"));
