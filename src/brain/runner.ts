@@ -261,9 +261,26 @@ export class Runner {
 
       // Tool calls without a recorded output: either the model just asked for them, or an earlier
       // attempt died mid-call. Either way, execute and record. Tools are idempotent per call id.
-      const dangling = danglingCalls(items);
+      const open = danglingCalls(items);
+      // A tool ended the matter itself: nothing more is done in this run, also when it is entered
+      // again after an interruption. Calls left open are closed unrun and the model is not asked.
+      if (run.closed === "settled") {
+        this.#s.transaction(() => {
+          for (const call of open) this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+        });
+        break;
+      }
+      // Calls that act for the person go first, whatever order the model gave them in: what they
+      // lead to (the run has read, has to wait, is settled) then decides about the others.
+      const acting = open.length > 1 ? this.actingFor(runId) : undefined;
+      const personal = new Set(acting ? this.#b.toolsOf(acting.connector).map((each) => each.name) : []);
+      const dangling = [...open.filter((each) => personal.has(each.name)), ...open.filter((each) => !personal.has(each.name))];
       if (dangling.length > 0) {
         for (const call of dangling) {
+          if (this.#stillActive(runId)?.closed === "settled") {
+            this.append(run.session_id, runId, { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "not carried out" }) });
+            continue;
+          }
           // Decided at the moment of use, a repeat after an interruption included.
           const output = this.mayUse(runId, call.name) ? await executeTool(this.#b.tools.for(run), call) : JSON.stringify({ error: READ_OUTSIDE });
           const outside = this.#b.outside.delete(call.call_id);
@@ -673,8 +690,11 @@ export class Runner {
   mayUse(runId: string, name: string): boolean {
     const carried = this.#b.requests.continuationOf(runId);
     // The one call made for it (checked again, by its id, where it is carried out) and its answer.
+    const closed = this.#s.rows<{ closed: string | null }>("SELECT closed FROM runs WHERE id = ?", runId)[0]?.closed;
+    if (closed === "settled") return false;
     if (carried) return name === "send_message" || (carried.status === "resuming" && name === carried.tool);
-    if (!this.sawOutside(runId)) return true;
+    // A run with a call that has to wait is held to the same as one that has read.
+    if (!this.sawOutside(runId) && closed !== "waited") return true;
     if (name === "send_message") return true;
     const acting = this.actingFor(runId);
     return acting !== undefined && this.#b.toolsOf(acting.connector).some((each) => each.name === name && each.effect === "read");

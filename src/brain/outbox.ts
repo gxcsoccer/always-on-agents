@@ -41,6 +41,8 @@ const NOTICES = {
   invitedElsewhere: { en: "I need you to authorise this before I can go on. I have sent you how in a direct message.", zh: "需要你先授权，我才能继续。授权卡片已私聊发你。" },
   inviteNotSent: { en: "I need you to authorise this before I can go on, but I could not reach you in a direct message. Message me directly and ask again.", zh: "需要你先授权，我才能继续，但授权卡片没能私聊发给你。请私聊我再问一次。" },
   inviteUnknown: { en: "I need you to authorise this before I can go on. I cannot tell whether what I sent you in a direct message arrived; please look there first.", zh: "需要你先授权，我才能继续。我无法确认授权卡片是否送达，请先看看和我的私聊。" },
+  externalChat: { en: "This chat includes people from outside the organisation, so I do not answer about documents here. Message me directly with the link.", zh: "这是外部群，文档内容不在这里回复，请私聊我发链接。" },
+  chatUnknown: { en: "I cannot confirm right now whether document contents may be answered in this chat. Please try again later, or message me directly.", zh: "现在无法确认这个群能不能回复文档内容，请稍后再试，或私聊我。" },
   tomorrow: { en: "I have reached today's usage limit here and will pick this up tomorrow.", zh: "我今天的用量已经用完，明天接着处理。" },
   failed: { en: "Something went wrong on my side and I could not finish handling that. Please try again.", zh: "我这边出了问题，没能处理完。请再试一次。" },
 } as const;
@@ -110,6 +112,11 @@ export class Outbox implements Wakes {
   notice(which: keyof typeof NOTICES, sessionId: string): string {
     const last = this.#s.rows<{ text: string | null }>("SELECT text FROM inbox WHERE kind = 'message' AND text IS NOT NULL AND session_key = (SELECT session_key FROM sessions WHERE id = ?) ORDER BY id DESC LIMIT 1", sessionId)[0]?.text ?? "";
     return NOTICES[which][/[\u4e00-\u9fff]/.test(last) ? "zh" : "en"];
+  }
+
+  /** Whether this names one of the system's fixed lines. */
+  isNotice(name: unknown): name is NoticeKey {
+    return typeof name === "string" && Object.hasOwn(NOTICES, name);
   }
 
   /** A message from the system rather than the model. Having nowhere to send it must never fail the caller. */

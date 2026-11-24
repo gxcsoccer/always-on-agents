@@ -5,7 +5,7 @@
  * whether it may still use a tool, what it has read from outside). See tools.ts for how the model
  * is told about them and how a call is dispatched.
  */
-import { type ConnectorTool, isWaiting } from "../connectors";
+import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
@@ -17,6 +17,8 @@ import { MAX_MESSAGE_TEXT, type ToolHost } from "./tools";
 const MAX_ACTIVE_TIMERS = 50;
 const MAX_MEMORY_FILES = 200;
 const MEMORY_PATH = /^[a-z0-9][a-z0-9_\-/]{0,150}\.md$/;
+export const SETTLED_NOTE = "The system has dealt with this itself and has told the person what they need to know. There is nothing more to do or say in this run.";
+const UNUSABLE = { error: "the tool's answer could not be used; nothing was read and nothing waits" };
 export const READ_OUTSIDE = "this run has read text from outside through a tool. From then on it can only reply to the person with send_message and read again; no other tool can be used in it. If the person wants something else done, they can ask for it in a new message";
 
 /** What a run's tools need from the Brain they are part of. */
@@ -33,7 +35,7 @@ export interface RunToolsHost {
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
   readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft">;
-  readonly outbox: Pick<Outbox, "enqueue">;
+  readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel">;
 }
 
@@ -78,7 +80,10 @@ export class RunTools {
         // A call that was told to wait has that for its answer, also when the run is replayed
         // after an interruption: the connector is not asked a second time, whatever has happened
         // since. Carrying the request on is another run's to do.
-        if (!carried && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) return { waiting: true, request: callId, note: WAITING_NOTE };
+        if (!carried && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0) {
+          this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
+          return { waiting: true, request: callId, note: WAITING_NOTE };
+        }
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
         const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
@@ -112,7 +117,23 @@ export class RunTools {
           const result = await found.run({ env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
-          if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return { error: "the tool's answer could not be used; nothing was read and nothing waits" };
+          if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
+          // The same for one that says the matter ends here: said whole, and naming a line the system has, or not at all.
+          if (typeof result === "object" && result !== null && "settled" in result) {
+            const say = isSettled(result) ? result.settled.say : null;
+            if (say === null || (say !== undefined && !this.#b.outbox.isNotice(say))) return UNUSABLE;
+            // Nothing was read. The run is closed and the line queued in one step, so a run that
+            // is interrupted here is either still open with nothing said, or closed with it said.
+            waits = true;
+            this.#b.outside.delete(callId);
+            this.#s.transaction(() => {
+              this.#s.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", run.id);
+              if (carried) this.#b.requests.endRequest(carried.id, "void", "the tool settled it");
+              // The system's line, not this run's: it is not held back with what the run wrote.
+              if (say !== undefined && this.#b.outbox.isNotice(say)) this.#b.outbox.notify(`settled:${run.id}`, run.session_id, null, this.#b.outbox.notice(say, run.session_id));
+            });
+            return { settled: true, note: SETTLED_NOTE };
+          }
           if (!isWaiting(result)) {
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.
@@ -126,6 +147,9 @@ export class RunTools {
           // Nothing was read. The answer the model gets is written here, not by the tool.
           waits = true;
           this.#b.outside.delete(callId);
+          // From here the run can only reply and read again, as after reading: what it could not
+          // read here it must not go and fetch some other way.
+          if (!carried) this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
           return this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
         } finally {
           // What this run has already written to send, and whatever it writes from here on.

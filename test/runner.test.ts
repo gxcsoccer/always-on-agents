@@ -681,6 +681,63 @@ describe("the run loop, by itself", () => {
     });
   });
 
+  describe("a run a tool has closed", () => {
+    it("does nothing more once a tool settled the matter: calls left open are closed unrun, and the model is not asked again", async () => {
+      await within(async ({ runner, event, store, model, results, items, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        results.memoryList = () => (store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id), { settled: true });
+        model.push(answer([calls("memory_list", "call_1"), calls("send_message", "call_2", { text: "hi" }), calls("dispatch_task", "call_3")]));
+        await runner.execute(id);
+        expect(of("tool").map(([name]) => name)).toEqual(["memoryList"]);
+        expect(asked).toHaveLength(1);
+        expect(run(id).status).toBe("done");
+        const outputs = items(id).filter((each) => each.type === "function_call_output").map((each) => [each.call_id, JSON.parse(each.output)]);
+        expect(outputs).toEqual([["call_1", { settled: true }], ["call_2", { error: "not carried out" }], ["call_3", { error: "not carried out" }]]);
+      });
+    });
+
+    it("does nothing either when entered again after an interruption", async () => {
+      await within(async ({ runner, event, store, items, of, asked, run }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        const session = store.rows<{ session_id: string }>("SELECT session_id FROM runs WHERE id = ?", id)[0].session_id;
+        runner.append(session, id, { type: "function_call", call_id: "c0", name: "feishu_read_document", arguments: "{}" });
+        store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id);
+        await runner.execute(id);
+        expect(of("tool")).toEqual([]);
+        expect(asked).toEqual([]);
+        expect(run(id).status).toBe("done");
+        expect(JSON.parse(items(id).at(-1)!.output)).toEqual({ error: "not carried out" });
+      });
+    });
+
+    it("can only reply and read again once a call of it had to wait", async () => {
+      await within(async ({ runner, event, store, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool, { name: "feishu_write", effect: "write", description: "", parameters: {} } as unknown as ConnectorTool];
+        event("hello");
+        const id = (await runner.next())!;
+        expect(runner.mayUse(id, "dispatch_task")).toBe(true);
+        store.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ?", id);
+        expect(["send_message", "feishu_read_document", "feishu_write", "dispatch_task", "memory_write"].map((name) => runner.mayUse(id, name))).toEqual([true, true, false, false, false]);
+        store.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", id);
+        expect(["send_message", "feishu_read_document", "dispatch_task"].map((name) => runner.mayUse(id, name))).toEqual([false, false, false]);
+      });
+    });
+
+    it("carries out first the calls that act for the person, whatever order the model gave them in", async () => {
+      await within(async ({ go, event, model, of, settings, items }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool];
+        event("hello");
+        model.push(answer([calls("list_timers", "call_1"), calls("feishu_read_document", "call_2"), calls("memory_list", "call_3")]), answer([says("ok")]));
+        const id = (await go())!;
+        expect(of("tool").map(([name]) => name)).toEqual(["connectorTool", "listTimers", "memoryList"]);
+        void items;
+        void id;
+      });
+    });
+  });
+
   describe("a run that stopped being the active one while it waited", () => {
     it("does not record what the model said once another run is active", async () => {
       await within(async ({ runner, event, host, store, items, run }) => {

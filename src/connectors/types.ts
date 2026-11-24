@@ -87,6 +87,23 @@ export interface Waiting {
   };
 }
 
+/**
+ * What a tool returns when the matter ends here: nothing was read, nothing waits, and nothing
+ * more is to be done about it in this run, by the model or by anything else. If something is to
+ * be said to the person, the system says it: `say` names one of its own fixed lines (the tool
+ * writes no words of its own here), and without it nothing is said.
+ */
+export interface Settled {
+  settled: { say?: string };
+}
+
+/** Whether a tool's answer is that and nothing else. Whether `say` names a line there is, is the Brain's to check. */
+export function isSettled(result: unknown): result is Settled {
+  if (typeof result !== "object" || result === null || Object.keys(result).some((key) => key !== "settled")) return false;
+  const s = (result as Settled).settled;
+  return typeof s === "object" && s !== null && !Array.isArray(s) && Object.keys(s).every((key) => key === "say") && (s.say === undefined || (typeof s.say === "string" && s.say !== ""));
+}
+
 export function isWaiting(result: unknown): result is Waiting {
   const w = (result as Waiting | null)?.waiting;
   return typeof w === "object" && w !== null && [w.on, w.subject, w.condition, w.interaction].every((each) => typeof each === "string" && each !== "") && Number.isFinite(w.generation) && Number.isFinite(w.until) && typeof w.request === "object" && w.request !== null && (w.privately === undefined || typeof w.privately === "boolean");

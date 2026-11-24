@@ -12,7 +12,7 @@ import type { Principal, Scope, Target } from "../events";
 import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Quoted, Receipt, Standing } from "./types";
 
 export type * from "./types";
-export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isWaiting } from "./types";
+export { DeliveryDeferred, DeliveryRejected, DeliveryVoid, isSettled, isWaiting } from "./types";
 
 const RESERVED = new Set(["admin", "worker", "timer", "system"]);
 const byName = new Map<string, Connector>();

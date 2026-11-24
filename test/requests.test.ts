@@ -394,6 +394,7 @@ describe("requests that wait, by themselves", () => {
       // As a deployment before this step has it.
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(kept("r_old").person).toBe("ou_7");
@@ -419,6 +420,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.meta(`asked_which:${SESSION}`)).toBeUndefined();
@@ -476,6 +478,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old", chose: choice }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(JSON.parse(store.meta(`asked_which:${SESSION}:ou_1`)!).chose).toBe(choice);
@@ -490,6 +493,7 @@ describe("requests that wait, by themselves", () => {
       store.setMeta(`asked_which:${SESSION}`, JSON.stringify({ ids: ["r1", "r2"], question: "which:old" }));
       store.sql.exec("ALTER TABLE continuations DROP COLUMN person");
       store.sql.exec("ALTER TABLE continuations DROP COLUMN direct");
+      store.sql.exec("ALTER TABLE runs DROP COLUMN closed");
       store.sql.exec("UPDATE meta SET value = '25' WHERE key = 'schema_version'");
       migrate(state.storage);
       expect(store.rows("SELECT key FROM meta WHERE key LIKE 'asked_which:%'")).toEqual([]);
