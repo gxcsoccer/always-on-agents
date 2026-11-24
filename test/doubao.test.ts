@@ -36,6 +36,14 @@ const world = {
   dropAnswers: 0,
   /** How many of the next writes get no answer and are not taken either. */
   unreachable: 0,
+  /** How many of the next writes Doubao takes and answers "ok" to, without saying what it made of them. */
+  bareAnswers: 0,
+  /** Runs while a write is being made, before Doubao takes it. */
+  duringWrite: undefined as undefined | (() => void),
+  /** How many messages Doubao lists at a time. */
+  pageSize: 100,
+  /** Every listing of messages asked of Doubao. */
+  listings: [] as string[],
   scope: SCOPE,
   issued: 0,
 };
@@ -50,6 +58,10 @@ function installWorld() {
   world.dropAnswers = 0;
   world.unreachable = 0;
   world.scope = SCOPE;
+  world.bareAnswers = 0;
+  world.duringWrite = undefined;
+  world.pageSize = 100;
+  world.listings.length = 0;
   const modelFetch = globalThis.fetch;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
@@ -84,10 +96,15 @@ function installWorld() {
     if (into?.[2] === "messages") {
       const session = world.sessions.get(into[1]);
       if (!session || session.owner !== user.union_id) return Response.json({ code: 3440004 }, { status: 404 });
-      return Response.json({ code: 0, data: { messages: [...session.messages].reverse() } });
+      world.listings.push(url.search);
+      const newestFirst = [...session.messages].reverse();
+      const from = Number(url.searchParams.get("page_token") ?? 0);
+      const more = from + world.pageSize < newestFirst.length;
+      return Response.json({ code: 0, data: { messages: newestFirst.slice(from, from + world.pageSize), has_more: more, ...(more ? { page_token: String(from + world.pageSize) } : {}) } });
     }
     // A write. The same key with the same words is answered as it was the first time; with other words it is refused.
     world.writes.push({ path: url.pathname, body, bearer });
+    world.duringWrite?.();
     if (world.unreachable > 0) return (world.unreachable--, Promise.reject(new Error("network")));
     const before = world.taken.get(body.uuid);
     if (before) return before.body === JSON.stringify(body) ? Response.json(before.answer) : Response.json({ code: 3440009, msg: "request conflict" }, { status: 409 });
@@ -100,14 +117,15 @@ function installWorld() {
     const answer = { code: 0, data: { ...(into ? {} : { id }), messages: [mine] } };
     world.taken.set(body.uuid, { body: JSON.stringify(body), answer });
     if (world.dropAnswers > 0) return (world.dropAnswers--, Promise.reject(new Error("network")));
+    if (world.bareAnswers > 0) return (world.bareAnswers--, Response.json({ code: 0, data: {} }));
     return Response.json(answer);
   });
 }
 
 /** Doubao's reply to the newest thing asked in a conversation. */
-function doubaoReplies(session: string, text: string, status = "completed", artifacts: any[] = []) {
+function doubaoReplies(session: string, text: string, status = "completed", artifacts: any[] = [], to = -1) {
   const messages = world.sessions.get(session)!.messages;
-  const asked = messages.filter((each) => each.role === "user").at(-1);
+  const asked = messages.filter((each) => each.role === "user").at(to);
   const at = messages.findIndex((each) => each.role === "assistant" && each.reply_id === asked.id);
   const reply = { id: `reply_${asked.id}`, session_id: session, role: "assistant", status, reply_id: asked.id, items: [{ type: "reasoning", text: "thinking" }, ...(text ? [{ type: "text", text }] : []), ...artifacts] };
   if (at >= 0) messages[at] = reply;
@@ -127,11 +145,11 @@ function someone() {
   const unionId = `on_w${people}`;
   const stub = (env as any).BRAIN.getByName(scopeName({ tenant: TENANT, kind: "user", id: openId })) as any;
   let n = 0;
-  const event = (text: string, union: string | undefined = unionId) =>
+  const event = (text: string, union: string | undefined = unionId, replyingTo?: string) =>
     normalize(APP, {
       schema: "2.0",
       header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP },
-      event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: openId, ...(union ? { union_id: union } : {}) } }, message: { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", message_type: "text", content: JSON.stringify({ text }) } },
+      event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: openId, ...(union ? { union_id: union } : {}) } }, message: { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", message_type: "text", content: JSON.stringify({ text }), ...(replyingTo ? { parent_id: replyingTo } : {}) } },
     })!.event;
   const quiet = async () => {
     const busy = () =>
@@ -148,8 +166,8 @@ function someone() {
     }
     throw new Error("the Brain did not come to rest");
   };
-  const says = async (text: string, union?: string) => {
-    await stub.ingest(event(text, union));
+  const says = async (text: string, union?: string, replyingTo?: string) => {
+    await stub.ingest(event(text, union, replyingTo));
     await quiet();
   };
   const grant = async () => (env as any).DOUBAO_GRANTS.getByName(await grantName({ chat_app_id: CHAT_APP, tenant_key: ORG, open_id: openId })) as any;
@@ -164,10 +182,12 @@ function someone() {
     await rowsOf(stub, "UPDATE continuations SET check_at = ? WHERE status = 'waiting' AND check_at IS NOT NULL", ++ticks);
     await quiet();
   };
+  /** The id the chat gave the bot's message that said exactly this. */
+  const sentAs = (text: string) => `om_sent_${world.sent.findIndex((each) => each.type === "text" && each.content.text === text) + 1}`;
   const heard = () => world.sent.filter((each) => each.to === `oc_${openId}` && each.type === "text").map((each) => String(each.content.text));
   const cards = () => world.sent.filter((each) => each.to === `oc_${openId}` && each.type === "interactive").map((each) => each.content);
   const requests = (): Promise<{ status: string; why: string | null; condition: string }[]> => rowsOf(stub, "SELECT status, why, condition FROM continuations ORDER BY rowid");
-  return { openId, unionId, stub, event, says, quiet, settle, later, heard, cards, requests, grant };
+  return { openId, unionId, stub, event, says, quiet, settle, later, heard, cards, requests, grant, sentAs };
 }
 
 type Person = ReturnType<typeof someone>;
@@ -315,6 +335,13 @@ describe("handing work to Doubao Work", () => {
     await eli.says("调研一下竞品");
     expect(toolOutputs()[0].error).toContain("has not asked for Doubao");
     expect(eli.cards()).toEqual([]);
+    // Having named it another time is not asking for it now.
+    model.replies([say("豆包工作是一个办公智能体。")]);
+    await eli.says("豆包是什么？");
+    model.replies([asks("调研一下竞品")], [say("我来查")]);
+    await eli.says("那调研一下竞品吧");
+    expect(toolOutputs()[0].error).toContain("has not asked for Doubao");
+    expect(eli.cards()).toEqual([]);
 
     // Their message came without the id they are matched by.
     const fay = someone();
@@ -382,6 +409,126 @@ describe("handing work to Doubao Work", () => {
     }
     expect((await jo.requests()).map((each) => each.status)).toEqual(["expired"]);
     expect(world.writes).toHaveLength(1);
+    // She was told it was under way; she is told, once, that it is no longer waited for.
+    await jo.quiet();
+    expect(jo.heard()).toEqual([UNDER_WAY, expect.stringContaining("没有在时限内完成")]);
+  });
+
+  it("does not try a second time once its deadline has passed, and says it cannot tell", async () => {
+    await pair();
+    const lu = someone();
+    model.replies([asks("调研一下向量数据库")], [say("")]);
+    await lu.says("让豆包调研一下向量数据库");
+    // The first try gets no answer, and by then its time is up.
+    world.unreachable = 1;
+    const real = Date.now;
+    let clock: any;
+    world.duringWrite = () => void (clock ??= vi.spyOn(Date, "now").mockImplementation(() => real() + 61 * 60_000));
+    model.replies([call("send_message", { text: "没能确认。" })], [say("")]);
+    try {
+      expect((await consent(linkOn(lu.cards()[0]), lu)).status).toBe(200);
+      await lu.settle();
+    } finally {
+      clock?.mockRestore();
+    }
+    expect(world.writes).toHaveLength(1);
+    expect(await (await lu.grant()).status()).toMatchObject({ work: { lost: 1 } });
+  });
+
+  it("takes an answer that does not say what was made of it as not knowing, never as not done", async () => {
+    await pair();
+    const mo = someone();
+    world.bareAnswers = 1;
+    model.replies([asks("调研一下向量数据库")], [say("")]);
+    await mo.says("让豆包调研一下向量数据库");
+    model.replies([call("send_message", { text: "没能确认豆包是否收到。" })], [say("")]);
+    expect((await consent(linkOn(mo.cards()[0]), mo)).status).toBe(200);
+    await mo.settle();
+    expect(toolOutputs(modelCalls.at(-2))[0].error).toContain("could not be confirmed");
+    expect(await (await mo.grant()).status()).toMatchObject({ work: { lost: 1 } });
+  });
+
+  it("carries on the piece of work whose answer the person replied to, and does not guess between several", async () => {
+    await pair();
+    const ned = someone();
+    const a = await handsOver(ned, "调研A");
+    doubaoReplies(a, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await ned.later();
+    model.replies([asks("调研B")], [say("")]);
+    await ned.says("让豆包调研B");
+    const b = [...world.sessions.keys()].at(-1)!;
+    expect(b).not.toBe(a);
+    doubaoReplies(b, "B 的结论。");
+    model.replies([call("send_message", { text: "B 的结论。" })], [say("")]);
+    await ned.later();
+
+    // Two lately, and nothing says which: nothing is sent, and the model is told to ask.
+    model.replies([asks("补充成本", true)], [say("你指哪一份？")]);
+    await ned.says("让豆包补充成本");
+    expect(toolOutputs()[0].error).toContain("cannot be told which");
+    expect(world.writes).toHaveLength(2);
+    // Replying to A's answer says it is A, without naming Doubao again.
+    model.replies([asks("补充成本", true)], [say("")]);
+    await ned.says("这份再补充成本", undefined, ned.sentAs("A 的结论。"));
+    expect(world.writes.map((each) => each.path).at(-1)).toBe(`/open-apis/agent/v1/sessions/${a}/events`);
+  });
+
+  it("no longer hands on what Doubao brought back once the pairing it was asked under has changed", async () => {
+    await pair();
+    const oz = someone();
+    const session = await handsOver(oz);
+    const asked = world.listings.length;
+    await pair();
+    doubaoReplies(session, "做完了。");
+    await oz.later();
+    expect((await oz.requests()).map((each) => each.status)).toEqual(["void"]);
+    await oz.quiet();
+    expect(oz.heard()).toEqual([UNDER_WAY, expect.stringContaining("不再等了")]);
+    // Doubao was not even asked: the old authorisation is not used under the new pairing.
+    expect(world.listings).toHaveLength(asked);
+  });
+
+  it("finds the reply further back than the first page of a long conversation", async () => {
+    await pair();
+    const pat = someone();
+    const session = await handsOver(pat);
+    doubaoReplies(session, "第一份。");
+    model.replies([call("send_message", { text: "第一份。" })], [say("")]);
+    await pat.later();
+    // A follow-up, and after it more talk in the same conversation (from Doubao Work itself, say).
+    model.replies([asks("再补充", true)], [say("")]);
+    await pat.says("让豆包再补充");
+    doubaoReplies(session, "补充好了。");
+    const messages = world.sessions.get(session)!.messages;
+    for (let i = 0; i < 5; i++) messages.push({ id: `later_${i}`, session_id: session, role: i % 2 ? "assistant" : "user", status: "completed", reply_id: `later_${i - 1}`, items: [{ type: "text", text: "别的" }] });
+    world.pageSize = 2;
+    model.replies([call("send_message", { text: "补充好了。" })], [say("")]);
+    await pat.later();
+    expect(pat.heard().at(-1)).toBe("补充好了。");
+    expect(world.listings.length).toBeGreaterThan(1);
+  });
+
+  it("keeps the key of a piece of work that has not ended, however many come after it", async () => {
+    const grant = (env as any).DOUBAO_GRANTS.getByName(await grantName({ chat_app_id: CHAT_APP, tenant_key: ORG, open_id: "ou_many" })) as any;
+    const who = { chat_app_id: CHAT_APP, tenant_key: ORG, open_id: "ou_many", union_id: "on_many" };
+    const first = await grant.begin(who, "call_first", "一", { carryOn: false }, "p1", 1);
+    await grant.advance("call_first", "submitting");
+    // Fifty more: the ones that ended make room, the one still being sent does not.
+    for (let i = 0; i < 49; i++) {
+      await grant.begin(who, `call_${i}`, "x", { carryOn: false }, "p1", 1);
+      await grant.advance(`call_${i}`, "submitting");
+      await grant.advance(`call_${i}`, "failed");
+    }
+    expect(await grant.begin(who, "call_more", "x", { carryOn: false }, "p1", 1)).toMatchObject({ stage: "asked" });
+    expect(await grant.begin(who, "call_first", "一", { carryOn: false }, "p1", 1)).toMatchObject({ uuid: first.uuid, stage: "submitting" });
+    // One that has ended stays as it ended.
+    expect(await grant.advance("call_48", "submitted")).toMatchObject({ stage: "failed" });
+    // With nothing ended to make room, a new one is refused.
+    const full = (env as any).DOUBAO_GRANTS.getByName(await grantName({ chat_app_id: CHAT_APP, tenant_key: ORG, open_id: "ou_full" })) as any;
+    const other = { ...who, open_id: "ou_full" };
+    for (let i = 0; i < 50; i++) await full.begin(other, `c${i}`, "x", { carryOn: false }, "p1", 1);
+    expect(await full.begin(other, "c50", "x", { carryOn: false }, "p1", 1)).toBe("full");
   });
 
   it("asks for authorisation again, and for the same reply, when the authorisation ends while Doubao is at work", async () => {

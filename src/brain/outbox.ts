@@ -38,6 +38,8 @@ const NOTICES = {
   which: { en: "More than one of your requests could be meant. Which one?", zh: "你指的可能不止一件事，是哪一件？" },
   unchecked: { en: "I did not send what I had written for you: I could not confirm that the authorisation for what I had read still stands. Please ask again.", zh: "我写好的内容没有发给你：我没能确认读取所依据的授权是否仍然有效。请再问一次。" },
   invite: { en: "I need you to authorise this before I can go on.", zh: "需要你先授权，我才能继续。" },
+  underWayOver: { en: "What I handed over earlier was not finished in time, so I have stopped waiting for it. It may still be going on over there; you can look at it there, or ask me again.", zh: "之前交出去处理的那件事没有在时限内完成，我不再等了。那边可能还在继续，你可以直接去那边看结果，或者再让我做一次。" },
+  underWayGone: { en: "I have stopped waiting for what I handed over earlier: the authorisation it rested on, or how this is set up, has changed. It may still be going on over there. Please ask again.", zh: "之前交出去处理的那件事我不再等了：它依据的授权或配置已经变了。那边可能还在继续。需要的话请再问一次。" },
   underWay: { en: "I have handed this over. It will take a while; I will send you the result when it is done.", zh: "已经交出去处理了，需要一些时间。完成后我会把结果发给你。" },
   invitedElsewhere: { en: "I need you to authorise this before I can go on. I have sent you how in a direct message.", zh: "需要你先授权，我才能继续。授权卡片已私聊发你。" },
   inviteNotSent: { en: "I need you to authorise this before I can go on, but I could not reach you in a direct message. Message me directly and ask again.", zh: "需要你先授权，我才能继续，但授权卡片没能私聊发给你。请私聊我再问一次。" },

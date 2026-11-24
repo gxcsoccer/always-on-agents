@@ -447,12 +447,18 @@ export class Requests implements Wakes {
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // The answer was about the request as it stood when asked. If that has changed, it is not used.
       if (!now || now.status !== "waiting" || now.condition !== before.condition || now.generation !== before.generation || now.until !== before.until) return drop();
+      // Someone told that a thing was under way, with nothing for them to do, hears once that it is no longer waited for.
+      const tell = (which: "underWayOver" | "underWayGone") => void (now.interaction === "" && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
+        tell("underWayGone");
         return drop();
       }
       if (answer.state !== "holds" || !(answer.since < now.until)) {
-        if (Date.now() >= now.until) this.endRequest(id, "expired", "it was not done in time");
+        if (Date.now() >= now.until) {
+          this.endRequest(id, "expired", "it was not done in time");
+          tell("underWayOver");
+        }
         // Nobody will come and say when this holds: asked again when its owner says it is worth it, within bounds.
         else if (answer.state === "not_yet" && typeof answer.again_in_ms === "number" && Number.isFinite(answer.again_in_ms)) {
           this.#s.sql.exec("UPDATE continuations SET check_at = ? WHERE id = ? AND status = 'waiting'", Math.min(now.until, Date.now() + Math.min(600_000, Math.max(2_000, answer.again_in_ms))), id);

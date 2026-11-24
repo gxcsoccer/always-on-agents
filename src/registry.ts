@@ -201,6 +201,11 @@ export class Registry extends DurableObject<Env> {
     return (this.ctx.storage.sql.exec("SELECT * FROM doubao_apps WHERE chat_app_id = ?", chatAppId).toArray()[0] as unknown as DoubaoApp | undefined) ?? null;
   }
 
+  /** Whether a chat app is paired at all: for those who need to know that and none of the rest. */
+  async doubaoPaired(chatAppId: string): Promise<boolean> {
+    return this.ctx.storage.sql.exec("SELECT 1 FROM doubao_apps WHERE chat_app_id = ?", chatAppId).toArray().length > 0;
+  }
+
   /**
    * Pairs a registered chat app with a Doubao app. Each setting is a new pairing with its own
    * version: an authorisation begun or given under an earlier one does not count under this one.
