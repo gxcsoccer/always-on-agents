@@ -267,6 +267,17 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
     text = named(text, mentions, [app.bot_open_id]);
+  } else if (message.message_type === "post") {
+    // Words with formatting, links or pictures among them: the words and links are read as they
+    // are for a message replied to; a picture is named as something that cannot be seen yet.
+    let content: unknown;
+    try {
+      content = JSON.parse(message.content);
+    } catch {
+      return undefined;
+    }
+    text = flat(content);
+    documents = linkedIn(content);
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -442,6 +453,7 @@ function flat(post: any): string {
     if (each?.tag === "text" || each?.tag === "md" || each?.tag === "code_block") return String(each.text ?? "");
     if (each?.tag === "a") return each.text && each.href && each.text !== each.href ? `${String(each.text)} (${String(each.href)})` : String(each.text || each.href || "");
     if (each?.tag === "at") return `${token(each.user_name)} `;
+    if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? "[a picture, which I cannot see yet]" : "[a video, which I cannot see yet]";
     return `[${String(each?.tag ?? "?")}]`;
   };
   const lines: string[] = ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map(piece).join("").trim() : ""));
