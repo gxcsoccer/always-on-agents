@@ -595,7 +595,8 @@ export class FeishuGrant extends DurableObject<Env> {
 function invitationCard(url: string, lasting: boolean, asked?: { label: string; place: string }): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   return {
-    config: { wide_screen_mode: true },
+    // So that it can be replaced once it is over.
+    config: { wide_screen_mode: true, update_multi: true },
     header: { template: "blue", title: plain("需要你的授权") },
     elements: [
       { tag: "div", text: plain("要读取你的飞书文档，需要你先授权。授权后我只能以你的身份读取文档，你打不开的文档我也读不到。") },
