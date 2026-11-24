@@ -105,6 +105,8 @@ export type Acting = { connector: string; person: string; origin: Record<string,
 export class Requests implements Wakes {
   readonly #s: BrainStore;
   readonly #b: RequestsHost;
+  /** Looks under way at whether a delivered invitation is over, by its outbox row. */
+  readonly #closing = new Map<number, Promise<void>>();
 
   constructor(store: BrainStore, host: RequestsHost) {
     this.#s = store;
@@ -526,17 +528,21 @@ export class Requests implements Wakes {
    * that others still wait on. Shown as over once: what it was first shown as stays.
    */
   #wayInOver(interaction: string, how: "used" | "over"): void {
-    if (this.#s.rows("SELECT 1 FROM continuations WHERE status = 'waiting' AND interaction = ? LIMIT 1", interaction).length > 0) return;
+    const waited = () => this.#s.rows("SELECT 1 FROM continuations WHERE status = 'waiting' AND interaction = ? LIMIT 1", interaction).length > 0;
+    if (waited()) return;
     for (const row of this.#s.rows<{ id: number; target: string; receipt: string }>("SELECT id, target, receipt FROM outbox WHERE idem IN (?, ?) AND receipt IS NOT NULL AND closed IS NULL", `invite:${interaction}`, `invite:${interaction}:direct`)) {
-      // Taken at once, so that a later ending does not show it as something else meanwhile; given back if it stays as it is.
-      this.#s.sql.exec("UPDATE outbox SET closed = ? WHERE id = ?", how, row.id);
-      const back = () => void this.#s.sql.exec("UPDATE outbox SET closed = NULL WHERE id = ? AND closed = ?", row.id, how);
-      this.#b.waitUntil(
-        this.#b
-          .closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, interaction, how)
-          .then((closed) => void (closed || back()))
-          .catch((err) => (back(), this.#s.log("invitation_not_closed", { error: String(err).slice(0, 300) }))),
-      );
+      // One look at a time for each card, each after the one before: a later reason to look (it
+      // has since been used, say) is not lost to an earlier look that is still out, and what a
+      // card is first shown as stays. Each looks at things as they stand when its turn comes.
+      const look = (this.#closing.get(row.id) ?? Promise.resolve())
+        .then(async () => {
+          if (waited() || this.#s.rows("SELECT 1 FROM outbox WHERE id = ? AND closed IS NULL", row.id).length === 0) return;
+          if (await this.#b.closeInvitation(JSON.parse(row.target) as Target, JSON.parse(row.receipt) as Receipt, interaction, how)) this.#s.sql.exec("UPDATE outbox SET closed = ? WHERE id = ? AND closed IS NULL", how, row.id);
+        })
+        .catch((err) => this.#s.log("invitation_not_closed", { error: String(err).slice(0, 300) }))
+        .finally(() => void (this.#closing.get(row.id) === look && this.#closing.delete(row.id)));
+      this.#closing.set(row.id, look);
+      this.#b.waitUntil(look);
     }
   }
 

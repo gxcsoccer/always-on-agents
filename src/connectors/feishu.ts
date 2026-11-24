@@ -647,7 +647,8 @@ export async function closeInvitationFeishu(env: Env, target: Target, receipt: R
   const appId = target.address.app_id;
   if (!messageId || !appId) return false;
   // One of this connector's own that still works stays: asked the same way as when it is sent.
-  if (await invitationFor(env, interaction).catch(() => undefined)) return false;
+  // (If that cannot be asked just now, it is not known to be over: this throws, and the card stays.)
+  if (await invitationFor(env, interaction)) return false;
   const plain = (content: string) => ({ tag: "plain_text", content });
   const [template, title, text] = how === "used" ? ["green", "已授权", "授权已完成，不需要再操作。"] : ["grey", "这次请求已结束", "这张卡片不用再点了。还需要的话，请在聊天里再跟我说一遍。"];
   const card = { config: { wide_screen_mode: true, update_multi: true }, header: { template, title: plain(title) }, elements: [{ tag: "div", text: plain(text) }] };
