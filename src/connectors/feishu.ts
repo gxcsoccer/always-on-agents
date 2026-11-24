@@ -22,7 +22,7 @@ import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -468,6 +468,16 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
       });
   const result = (await response.json().catch(() => ({}))) as { code?: number; msg?: string; data?: { message_id?: string } };
   const said = `Feishu returned ${response.status} code ${result.code}: ${String(result.msg).slice(0, 200)}`;
+  // Not now, which is not no: too many requests (it may say for how long), or the app's token
+  // lapsed before its time (forgotten, so the next attempt asks for a fresh one). Nothing was posted.
+  if (response.status === 429 || result.code === 99991400) {
+    const wait = Number(response.headers.get("retry-after") ?? response.headers.get("x-ogw-ratelimit-reset"));
+    throw new DeliveryDeferred(said, Date.now() + (Number.isFinite(wait) && wait > 0 ? Math.min(wait, 600) * 1_000 : 5_000));
+  }
+  if (result.code === 99991663) {
+    await forgetTenantAccessToken(env, appId, token);
+    throw new DeliveryDeferred(said, Date.now());
+  }
   // Feishu answered and said no: nothing was posted. A failure on its side leaves that open.
   if (response.status < 500 && typeof result.code === "number" && result.code !== 0) throw new DeliveryRejected(said);
   if (!response.ok || result.code !== 0) throw new Error(said);

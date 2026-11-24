@@ -200,7 +200,19 @@ describe("the outbox, by itself", () => {
         expect(row("i3")).toMatchObject({ status: "unverified", attempts: 3 });
         expect(row("after").status).toBe("sent");
         expect(shown).toEqual([["i1", "reached"], ["i2", "failed"], ["i3", "unknown"]]);
-        void set;
+        // Told to come back later is not a refusal: it goes when it may.
+        let asked = 0;
+        channel.i4 = () => {
+          if (asked++ === 0) throw new DeliveryDeferred("limited", Date.now() + 1);
+          return { subject: "s:i4", holder: "" };
+        };
+        outbox.enqueue("i4", SESSION, null, "authorise", undefined, undefined, { interaction: "int:4" });
+        await outbox.flush();
+        expect(row("i4")).toMatchObject({ status: "pending", attempts: 1 });
+        set("i4", { next_at: 0 });
+        await outbox.flush();
+        expect(row("i4").status).toBe("sent");
+        expect(shown.at(-1)).toEqual(["i4", "reached"]);
       });
     });
 

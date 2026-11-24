@@ -183,7 +183,7 @@ export class Requests implements Wakes {
         const basis = this.basis(run.id);
         // Its answer goes back where the person's own message came from, as that message said:
         // not to wherever the conversation, or the scope, happens to point later.
-        const target = [...basis].reverse().find((each) => each.reply_to)?.reply_to;
+        const target = this.#anchor(basis, acting.events.bound ?? []).target;
         if (!target) throw new Error("there is nowhere to send a message in this conversation");
         this.#s.sql.exec(
           "INSERT INTO continuations (direct, person, id, session_id, events, connector, tool, args, target, subject, condition, generation, interaction, until, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?)",
@@ -210,8 +210,10 @@ export class Requests implements Wakes {
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: aside ? JSON.stringify(aside) : now.target });
-      // One set aside before it was ever tried, because nobody waited on it any more, is wanted again.
-      this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'void' AND started = 0", Date.now(), `invite:${waiting.interaction}`);
+      // One set aside before it was ever tried, because nobody waited on it any more, is wanted
+      // again; and so is one that definitely did not get there, now that the person asks afresh.
+      // One that may have arrived is not sent a second time.
+      this.#s.sql.exec("UPDATE outbox SET status = 'pending', attempts = 0, next_at = ?, error = NULL WHERE idem = ? AND ((status = 'void' AND started = 0) OR status = 'dead')", Date.now(), `invite:${waiting.interaction}`);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
         const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
@@ -250,12 +252,30 @@ export class Requests implements Wakes {
   }
 
   #tell(waiting: Continuation, how: "reached" | "failed" | "unknown"): void {
+    // Put under the message that asked, where that can be told; under a guess, not at all.
+    const on = JSON.parse(waiting.events) as { said: number[]; bound?: number[] };
+    const said = on.said.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${on.said.map(() => "?").join(",")}) ORDER BY id`, ...on.said);
+    if (!this.#anchor(said, on.bound ?? []).sure) return;
     try {
       const which = how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
       this.#b.enqueueMessage(told(waiting), waiting.session_id, null, this.#b.notice(which, waiting.session_id), undefined, undefined, { target: waiting.target });
     } catch {
       // Nowhere to say it: nothing depends on it.
     }
+  }
+
+  /**
+   * Where what is said about a request goes: back to the message that asked for it. Where the
+   * tool tied the request to exactly one of the run's messages, that one. Otherwise wherever the
+   * run's messages are answered, which is one place unless they were asked in several (each
+   * message of a group is replied to where it stands); then the latest, as before, and it is not
+   * sure which was meant. Messages from earlier than this run are never where an answer goes.
+   */
+  #anchor(basis: InboxRow[], bound: number[]): { target: string | undefined; sure: boolean } {
+    const tied = basis.filter((each) => bound.includes(each.id) && each.reply_to);
+    if (tied.length === 1) return { target: tied[0].reply_to as string, sure: true };
+    const places = [...new Set(basis.flatMap((each) => (each.reply_to ? [each.reply_to as string] : [])))];
+    return { target: places.at(-1), sure: places.length === 1 };
   }
 
   /** A reason to ask a waiting request's condition again. Never more than that. */
@@ -609,13 +629,18 @@ function askedWhich(sessionId: string, person: string | null | undefined): strin
   return `asked_which:${sessionId}:${person ?? ""}`;
 }
 
-/** The name of the message that tells a request's conversation how its way in fared. */
+/** The name of the message that tells a request's conversation how its way in fared. Both parts are written out as data, so neither can be read as the other whatever it holds. */
 function told(waiting: Continuation): string {
-  return `invited:${waiting.interaction}:${waiting.id}`;
+  return `invited:${JSON.stringify([waiting.interaction, waiting.id])}`;
 }
 
-/** Which request and way in such a message is about, from its name. A request's id has no colon in it. */
+/** Which request and way in such a message is about, from its name. */
 function toldOf(idem: string): { interaction: string; request: string } | undefined {
-  const found = /^invited:(.+):([^:]+)$/.exec(idem);
-  return found ? { interaction: found[1], request: found[2] } : undefined;
+  if (!idem.startsWith("invited:")) return undefined;
+  try {
+    const [interaction, request] = JSON.parse(idem.slice("invited:".length)) as unknown[];
+    return typeof interaction === "string" && typeof request === "string" ? { interaction, request } : undefined;
+  } catch {
+    return undefined;
+  }
 }

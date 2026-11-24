@@ -1,3 +1,4 @@
+import { DeliveryDeferred, DeliveryRejected } from "../src/connectors";
 import { deliverFeishu, handleFeishuWebhook, quotedFeishu } from "../src/connectors/feishu";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
@@ -257,6 +258,24 @@ describe("the Feishu webhook endpoint", () => {
       ["/im/v1/messages?receive_id_type=open_id", "ou_frank"],
       ["/im/v1/messages?receive_id_type=chat_id", "oc_group"],
     ]);
+    // Not now (limited, or the app's token lapsed early) is not a refusal: nothing was posted, and it can go later.
+    const answers: [number, unknown, Record<string, string>?][] = [[429, { code: 99991400, msg: "too many" }, { "retry-after": "7" }], [400, { code: 99991663, msg: "token" }], [400, { code: 230002, msg: "not in chat" }]];
+    let tokens = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.endsWith("/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: `t-again-${++tokens}`, expire: 7200 });
+      const [status, body, headers] = answers.shift()!;
+      return Response.json(body, { status, headers });
+    });
+    const person = { connector: "feishu", address: { app_id: appId, open_id: "ou_frank" } };
+    const before = Date.now();
+    const limited = await deliverFeishu(env as any, scope, person, message).catch((error) => error);
+    expect(limited).toBeInstanceOf(DeliveryDeferred);
+    expect(limited.notBefore - before).toBeGreaterThanOrEqual(7_000);
+    expect(await deliverFeishu(env as any, scope, person, message).catch((error) => error)).toBeInstanceOf(DeliveryDeferred);
+    // The lapsed token was forgotten: the next attempt asks for a fresh one.
+    expect(await deliverFeishu(env as any, scope, person, message).catch((error) => error)).toBeInstanceOf(DeliveryRejected);
+    expect(tokens).toBe(1);
     // Neither named: nowhere to send.
     await expect(deliverFeishu(env as any, scope, { connector: "feishu", address: { app_id: appId } }, message)).rejects.toThrow("bad Feishu address");
   });
