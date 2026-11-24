@@ -94,7 +94,7 @@ export class Runner {
     const events: InboxRow[] = [];
     let bytes = 0;
     for (const event of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND session_key = ? AND kind != 'request.ready' ORDER BY id LIMIT ?", first.session_key, MAX_EVENTS_PER_RUN)) {
-      bytes += (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
+      bytes += sizeOf(event);
       if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
       // A message that replies to something other than what the ones before it reply to is about
       // something else: it starts a run of its own, in order, so each is read under its own binding.
@@ -110,7 +110,15 @@ export class Runner {
       const active = this.activeRun();
       if (active) return active.retry_at && active.retry_at > Date.now() ? undefined : active.id;
 
-      const events = ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE status = 'pending' AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids);
+      // Measured again as they now are: what was fetched for them counts too. Those that no
+      // longer fit stay pending, with what was fetched kept, for the next run.
+      const events: InboxRow[] = [];
+      let bytes = 0;
+      for (const event of ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE status = 'pending' AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids)) {
+        bytes += sizeOf(event);
+        if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
+        events.push(event);
+      }
       const first = events[0];
       if (!first) return undefined;
       const now = Date.now();
@@ -687,6 +695,11 @@ export class Runner {
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/** How much of a run's room a message takes. */
+function sizeOf(event: InboxRow): number {
+  return (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
 }
 
 /** What a message replies to, if anything. */

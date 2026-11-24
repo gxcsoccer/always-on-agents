@@ -296,6 +296,23 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("splits a burst by size the same whether what was fetched was already kept or is fetched now", async () => {
+      const quote = { text: "q".repeat(1_000) };
+      const taken = (fetched: boolean) =>
+        within(async ({ runner, store, event, settings }) => {
+          settings.quoted = quote;
+          for (let i = 0; i < 40; i++) event("x".repeat(2_600), { data: { replies_to: "feishu:message:om_p", ...(fetched ? {} : { quoted: quote }) } });
+          const run = (await runner.next())!;
+          const first = store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM inbox WHERE run_id = ?", run)[0].n;
+          // The rest wait, with what was fetched for them kept.
+          const kept = store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM inbox WHERE status = 'pending' AND json_extract(data, '$.quoted.text') IS NOT NULL")[0].n;
+          return { first, kept };
+        });
+      const before = await taken(false);
+      expect(before.first).toBeLessThan(40);
+      expect(await taken(true)).toEqual(before);
+    });
+
     it("does not quote what someone else wrote, nor anything from another conversation", async () => {
       await within(async ({ runner, event, items }) => {
         event("secret", { source_id: "om_other", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
