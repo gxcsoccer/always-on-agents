@@ -22,6 +22,8 @@ import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
 import { registry } from "../registry";
+import { workerNamed } from "../workers";
+import { sandboxWorker } from "../workers/sandbox/worker";
 import { migrate } from "./schema";
 import { BrainStore, type Row, type Wakes } from "./store";
 import { Outbox } from "./outbox";
@@ -79,6 +81,16 @@ export class BrainAgent extends DurableObject<Env> {
       standingOf: (source, subject) => standingOf(this.env, source, this.#store.scope(), subject),
     });
     this.#tasks = new Tasks(this.#store, this.#revisions, {
+      // Read each time, as everywhere else in this class: not the value at construction.
+      get env() {
+        return brain.env;
+      },
+      workerNamed,
+      workerOf: (name) => {
+        const worker = workerNamed(name) ?? (name === sandboxWorker.name ? sandboxWorker : undefined);
+        if (!worker) throw new Error(`no worker named "${name}" is known here`);
+        return worker;
+      },
       worker: (taskId) => this.env.TASKS.getByName(taskId),
       registry: () => registry(this.env),
       deciders: (runId) => this.#deciders(runId),

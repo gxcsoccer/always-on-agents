@@ -7,6 +7,7 @@ import type { Principal } from "../src/events";
 import { Revisions } from "../src/brain/revisions";
 import { BrainStore, type RunRow } from "../src/brain/store";
 import { Tasks, type TasksHost } from "../src/brain/tasks";
+import { sandboxWorker } from "../src/workers/sandbox/worker";
 
 /**
  * Tasks handed to workers, and the approval questions they raise, by themselves on a real Brain's
@@ -33,6 +34,8 @@ function bench(state: DurableObjectState) {
     revisable: new Set<string>(),
     /** What a source says one of its messages is now, by subject. */
     now: {} as Record<string, Standing>,
+    /** The workers this deployment lists, by name. */
+    workers: ["sandbox"],
   };
   /** The worker of every task: what it was told, and what it says back. */
   const worker = {
@@ -51,18 +54,24 @@ function bench(state: DurableObjectState) {
   const mayRevisit = (source: string) => settings.revisable.has(source);
   const standingOf = async (_source: string, subject: string) => settings.now[subject];
   const isDecider = (principal: Principal) => principal.kind === "human" && principal.explicit;
+  /** The sandbox of one task, as the Brain and the sandbox worker both reach it. */
+  const sandboxOf = (taskId: string) =>
+    ({
+      start: async (input: unknown) => (worker.started.push(input), worker.start(input)),
+      cancel: async () => (worker.cancelled.push(taskId), { ok: true }),
+      answer: async (...args: unknown[]) => (worker.answered.push(args), worker.answer(...args)),
+      decisionOn: async (questionId: string) => {
+        const fate = worker.fate[questionId];
+        if (fate instanceof Error) throw fate;
+        return fate ?? { state: "unknown" };
+      },
+    }) as never;
   const host: TasksHost & { amend: TasksHost["amend"] } = {
-    worker: (taskId) =>
-      ({
-        start: async (input: unknown) => (worker.started.push(input), worker.start(input)),
-        cancel: async () => (worker.cancelled.push(taskId), { ok: true }),
-        answer: async (...args: unknown[]) => (worker.answered.push(args), worker.answer(...args)),
-        decisionOn: async (questionId: string) => {
-          const fate = worker.fate[questionId];
-          if (fate instanceof Error) throw fate;
-          return fate ?? { state: "unknown" };
-        },
-      }) as never,
+    env: { TASKS: { getByName: sandboxOf } } as never,
+    // The deployment's workers, by name: the real sandbox worker, unless a test takes it out.
+    workerNamed: (name) => (settings.workers.includes(name) && name === sandboxWorker.name ? sandboxWorker : undefined),
+    workerOf: () => sandboxWorker,
+    worker: sandboxOf,
     registry: () =>
       ({
         acquireTaskSlot: async (tenant: string, taskId: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.acquire()),
@@ -255,6 +264,34 @@ describe("tasks, by themselves", () => {
         expect(JSON.parse(kept(id).result).error).toMatch(/^the sandbox could not be reached: Error: connection reset/);
         expect(worker.cancelled).toEqual([id]);
         expect(slots.released).toEqual([id]);
+      });
+    });
+
+    it("takes nothing new where the deployment lists no such worker, writes nothing for it, and still stops a task taken before", async () => {
+      await within(async ({ tasks, store, kept, settings, worker, slots }) => {
+        // Started while the worker was listed.
+        const before = (await tasks.dispatch(RUN, SESSION_KEY, "call_0", "t", "b", null)) as { task_id: string };
+        settings.workers = [];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("this deployment has no worker to hand this to");
+        expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(1);
+        expect(worker.started).toHaveLength(1);
+        expect(slots.acquired).toHaveLength(1);
+        // The earlier one is stopped as it was started.
+        await tasks.cancel(SESSION_KEY, before.task_id);
+        expect(worker.cancelled).toEqual([before.task_id]);
+        expect(kept(before.task_id)).toMatchObject({ status: "cancelled" });
+      });
+    });
+
+    it("carries a task through that was written before its worker was taken out of the deployment: one task, started once more under the same id", async () => {
+      await within(async ({ tasks, task, kept, settings, worker }) => {
+        // Written, slot perhaps taken, the worker perhaps already at it: only the Brain's "running" is missing.
+        task("t_before", { status: "dispatching" });
+        settings.workers = [];
+        const result = (await tasks.dispatch(RUN, SESSION_KEY, "op_t_before", "t", "b", null)) as { task_id: string; status: string };
+        expect(result).toEqual({ task_id: "t_before", status: "running" });
+        expect(worker.started).toMatchObject([{ id: "t_before" }]);
+        expect(kept("t_before")).toMatchObject({ status: "running" });
       });
     });
 

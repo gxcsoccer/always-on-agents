@@ -13,6 +13,7 @@ import type { Principal, Target, WorkerEventKind } from "../events";
 import type { registry } from "../registry";
 import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
+import type { Started, Worker } from "../workers";
 import type { Outbox } from "./outbox";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
@@ -25,8 +26,13 @@ const SETTLE_ATTEMPTS = 12;
 
 /** What tasks need from the Brain they are part of, and from the systems outside it. */
 export interface TasksHost {
-  /** The worker of one task. */
-  worker(taskId: string): Pick<ReturnType<Env["TASKS"]["getByName"]>, "start" | "cancel" | "answer" | "decisionOn">;
+  readonly env: Env;
+  /** The worker listed under a name in this deployment, if it is: only such a one is given something new. */
+  workerNamed(name: string): Worker | undefined;
+  /** The worker a task was written for, listed or not: what was taken is carried through and can be stopped. */
+  workerOf(name: string): Worker;
+  /** The sandbox of one task, for what is still its own: the questions it asks. */
+  worker(taskId: string): Pick<ReturnType<Env["TASKS"]["getByName"]>, "answer" | "decisionOn">;
   /** Where sandbox slots and the tenant's usage are kept. */
   registry(): Pick<ReturnType<typeof registry>, "acquireTaskSlot" | "releaseTaskSlot" | "recordUsage">;
   /** The people whose word counts in this run. */
@@ -47,6 +53,9 @@ export interface TasksHost {
   /** Counts tokens against this scope's daily budget, at once: the same count the Brain's own calls go to. */
   spend(tokens: number): void;
 }
+
+/** The worker tasks are written for. */
+const WORKER = "sandbox";
 
 export class Tasks implements Wakes {
   readonly #s: BrainStore;
@@ -77,6 +86,8 @@ export class Tasks implements Wakes {
     // and continues with the same task id, so a lost response can never start a second task.
     let task = this.#s.rows<Row>("SELECT * FROM tasks WHERE op_id = ?", callId)[0];
     if (!task) {
+      // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
+      if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
       if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input')")[0].n >= MAX_ACTIVE_TASKS) {
         throw new Error(`there are already ${MAX_ACTIVE_TASKS} tasks running here; wait for one to finish or cancel one`);
       }
@@ -110,6 +121,9 @@ export class Tasks implements Wakes {
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
     if (task.status !== "dispatching") return { task_id: task.id, status: task.status };
+    // One that was written is one that was taken: it is carried through by the worker it was
+    // written for, whether or not the deployment still lists that worker for new work.
+    const worker = this.#b.workerOf(String(task.worker));
 
     let slot: boolean;
     try {
@@ -125,21 +139,21 @@ export class Tasks implements Wakes {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
       throw new Error("too many sandboxes are running for this tenant right now; try again later");
     }
-    let started: { phase: string; error?: string };
+    let started: Started;
     try {
-      started = await this.#b.worker(task.id).start({ id: task.id, prompt: brief, repository: repository ?? undefined, brain: this.#s.scopeName() });
+      started = await worker.start(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() });
     } catch (err) {
       // Whether the worker heard us is unknown. Stop it if it did, and free the slot either way, so
       // a start that failed in transit does not hold one of this scope's task slots for good.
-      await this.#b.worker(task.id).cancel().catch(() => undefined);
+      await this.#stop(task).catch(() => undefined);
       this.#set(task.id, "failed", { result: JSON.stringify({ error: `the sandbox could not be reached: ${String(err).slice(0, 300)}` }) });
       await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
       throw new Error("the sandbox could not be started; try again");
     }
-    if (started.phase === "failed" || started.phase === "lost") {
-      this.#set(task.id, "failed", { result: JSON.stringify({ error: started.error ?? "the sandbox did not start" }) });
+    if (started.state === "refused") {
+      this.#set(task.id, "failed", { result: JSON.stringify({ error: started.error }) });
       await this.#b.registry().releaseTaskSlot(task.id);
-      throw new Error(`the sandbox did not start: ${started.error ?? "unknown error"}`);
+      throw new Error(`the sandbox did not start: ${started.error}`);
     }
     // Only move forward: the worker may already have reported while start() was returning.
     this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
@@ -334,13 +348,18 @@ export class Tasks implements Wakes {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     if (task.session_key !== sessionKey) throw new Error("that task belongs to a different conversation and has to be cancelled there");
     if (TERMINAL_TASK.has(task.status)) return { ok: true, task_id: taskId, status: task.status };
-    await this.#b.worker(taskId).cancel();
+    await this.#stop(task);
     // A question still open when the task is cancelled has nothing left to answer.
     const open = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
     if (this.#set(taskId, "cancelled", {}) && open) this.#setAside(open);
     this.#s.audit("(agent)", "task.cancelled", { task_id: taskId });
     await this.#b.registry().releaseTaskSlot(taskId);
     return { ok: true, task_id: taskId, status: "cancelled" };
+  }
+
+  /** Stops a task through the worker it was written for. */
+  async #stop(task: Row): Promise<void> {
+    await this.#b.workerOf(String(task.worker)).cancel?.(this.#b.env, String(task.id));
   }
 
   /** A terminal status is final: a late or repeated report cannot bring a task back. */
