@@ -117,6 +117,8 @@ In the Feishu developer console the app needs the bot capability, permission to 
 
 The reaction that shows a message has arrived needs the app permission `im:message` or `im:message.reactions:write_only`. Without it the reaction is missing and everything else works.
 
+In a group, only messages that mention the bot are sent to the agent. So a group message written as a reply may point at a message the agent never received. The message itself is stored and acknowledged first, as always. When the Brain is about to take it up and has no record of the message replied to, it asks the connector once, and the connector asks Feishu (at most 3 seconds, keeping at most 1,000 characters). The text is handed to the model only when the **same person** wrote that message (same group, same person, same organisation). What another member, a bot or someone from outside wrote is not handed on; the model is told only that the person replied to a message that is not shown to it. The same is said when the message cannot be fetched (no permission, recalled, timed out), and everything else works. This needs two app-identity permissions: a base permission to read messages (`im:message` or `im:message:readonly`) plus "read all messages in group chats" (`im:message.group_msg`); the bot also has to be in the group. Nothing is fetched in a direct chat: every message there has already been sent to the agent.
+
 ### Transport: long connection (recommended)
 
 The agent opens a WebSocket to Feishu and events arrive over it. In the developer console choose "receive through a long connection" for both events and callbacks, then publish a version.

@@ -6,7 +6,7 @@ import type { ConnectorTool } from "../src/connectors";
 import type { Env } from "../src/env";
 import { type Item, ModelError, type ModelResponse } from "../src/model/openai";
 import type { Continuation } from "../src/brain/requests";
-import { Runner, type RunnerHost } from "../src/brain/runner";
+import { QUOTED_WAIT_MS, Runner, type RunnerHost } from "../src/brain/runner";
 import { BrainStore, type InboxRow, type RunRow } from "../src/brain/store";
 import type { ToolHost } from "../src/brain/tools";
 
@@ -37,6 +37,8 @@ function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   const log: [string, ...unknown[]][] = [];
   const settings = {
+    /** What the connector says a replied-to message was: a value, or a function giving it. */
+    quoted: undefined as any,
     carried: undefined as Partial<Continuation> | undefined,
     allowed: true,
     mayNotDisclose: undefined as string | undefined | Error,
@@ -66,6 +68,7 @@ function bench(state: DurableObjectState) {
     outside,
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
+    quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
     registry: () =>
       ({
         recordUsage: async (tenant: string, tokens: number) => (log.push(["recordUsage", tenant, tokens]), { allowed: settings.allowed, used: 0, budget: 0, day: "2026-11-23" }),
@@ -135,6 +138,8 @@ function bench(state: DurableObjectState) {
   const tenant = store.scope().tenant;
   return { store, tenant, runner, host, settings, model, asked, results, outside, log, event, run, items, inbox, of, go };
 }
+
+afterEach(() => void vi.useRealTimers());
 
 describe("the run loop, by itself", () => {
   describe("claiming", () => {
@@ -256,6 +261,101 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("asks only about the messages the next run takes, all at once and within one limit, and takes up exactly those", async () => {
+      await within(async ({ runner, store, event, items, settings, log }) => {
+        const asked = () => log.filter((each) => each[0] === "quoted").map((each) => each[2]);
+        // An ordinary message first: the replies queued behind it are another run's, and are not asked about now.
+        settings.quoted = () => new Promise(() => {});
+        event("hello");
+        for (let i = 0; i < 5; i++) event(`r${i}`, { data: { replies_to: `feishu:message:om_${i}` } });
+        const hello = (await runner.next())!;
+        expect(items(hello)[0].content).toContain("hello");
+        expect(asked()).toEqual([]);
+        store.sql.exec("UPDATE inbox SET status = 'done' WHERE status IN ('claimed', 'pending')");
+        store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+
+        // Two people reply to the same message: both are asked about together, under one limit.
+        const signals: AbortSignal[] = [];
+        let release!: (found: unknown) => void;
+        settings.quoted = (asking: { signal: AbortSignal }) => (signals.push(asking.signal), new Promise((resolve) => (release = resolve)));
+        vi.useFakeTimers();
+        event("a", { data: { replies_to: "feishu:message:om_p" } });
+        event("b", { data: { replies_to: "feishu:message:om_p" }, principal: { kind: "human", id: "ou_2", explicit: true } });
+        // The same person again about the same message: asked about once for both.
+        event("a2", { data: { replies_to: "feishu:message:om_p" } });
+        const taking = runner.next();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(asked()).toEqual(["feishu:message:om_p", "feishu:message:om_p"]);
+        // One that arrives while the connector is being asked is left for the next run.
+        event("c", { data: { replies_to: "feishu:message:om_p" } });
+        await vi.advanceTimersByTimeAsync(QUOTED_WAIT_MS);
+        const run = (await taking)!;
+        vi.useRealTimers();
+        // What no longer answers in time is told to stop.
+        expect(signals.every((each) => each.aborted)).toBe(true);
+        expect(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", run).map((each) => each.text)).toEqual(["a", "b", "a2"]);
+        expect(store.rows<{ status: string }>("SELECT status FROM inbox WHERE text = 'c'")[0].status).toBe("pending");
+        expect(items(run)[0].content).not.toContain("c\n");
+        void release;
+      });
+    });
+
+    it("gives one answer to every message of the same person about the same message", async () => {
+      await within(async ({ runner, store, event, settings, log }) => {
+        settings.quoted = { text: "the notes" };
+        event("one", { data: { replies_to: "feishu:message:om_p" } });
+        event("two", { data: { replies_to: "feishu:message:om_p" } });
+        const run = (await runner.next())!;
+        expect(log.filter((each) => each[0] === "quoted")).toHaveLength(1);
+        expect(store.rows<{ data: string }>("SELECT data FROM inbox WHERE run_id = ?", run).map((each) => JSON.parse(each.data).quoted)).toEqual([{ text: "the notes" }, { text: "the notes" }]);
+      });
+    });
+
+    it("does not ask about a message that is on record, whoever wrote it and whatever is left of it, nor about an answer to a question", async () => {
+      await within(async ({ runner, store, event, items, settings, log }) => {
+        settings.quoted = { text: "fetched again" };
+        const next = async () => (store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'"), store.sql.exec("DELETE FROM meta WHERE key = 'active_run'"), items((await runner.next())!)[0].content as string);
+        // Someone else's message that reached the agent: already in the conversation.
+        event("from bob", { source_id: "om_bob", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
+        event("about that", { data: { replies_to: "feishu:message:om_bob" } });
+        expect(await next()).not.toContain("written as a reply");
+        // Their own, whose words are no longer kept: not brought back.
+        event("old", { source_id: "om_old", status: "done" });
+        store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");
+        event("about the old one", { data: { replies_to: "feishu:message:om_old" } });
+        expect(await next()).not.toContain("written as a reply");
+        // The same when it was filed under another conversation of this place (routed there by a code).
+        event("routed", { source_id: "om_routed", status: "done", session_key: "thread:t1" });
+        store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_routed'");
+        event("about the routed one", { data: { replies_to: "feishu:message:om_routed" } });
+        expect(await next()).not.toContain("written as a reply");
+        // A question the system put (sent by no run), and a message filed as its answer.
+        store.sql.exec("INSERT INTO outbox (idem, target, text, status, next_at, created_at, sent_at, receipt) VALUES ('ask1', ?, 'q', 'sent', 0, 0, 1, ?)", TARGET, JSON.stringify({ subject: "feishu:message:om_card", holder: "b" }));
+        event("yes", { data: { replies_to: "feishu:message:om_card" } });
+        expect(await next()).not.toContain("not shown to you");
+        event("yes", { data: { replies_to: "feishu:message:om_gone_card", question: "ask:1" } });
+        expect(await next()).not.toContain("not shown to you");
+        expect(log.filter((each) => each[0] === "quoted")).toEqual([]);
+      });
+    });
+
+    it("splits a burst by size the same whether what was fetched was already kept or is fetched now", async () => {
+      const quote = { text: "q".repeat(1_000) };
+      const taken = (fetched: boolean) =>
+        within(async ({ runner, store, event, settings }) => {
+          settings.quoted = quote;
+          for (let i = 0; i < 40; i++) event("x".repeat(2_600), { data: { replies_to: "feishu:message:om_p", ...(fetched ? {} : { quoted: quote }) } });
+          const run = (await runner.next())!;
+          const first = store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM inbox WHERE run_id = ?", run)[0].n;
+          // The rest wait, with what was fetched for them kept.
+          const kept = store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM inbox WHERE status = 'pending' AND json_extract(data, '$.quoted.text') IS NOT NULL")[0].n;
+          return { first, kept };
+        });
+      const before = await taken(false);
+      expect(before.first).toBeLessThan(40);
+      expect(await taken(true)).toEqual(before);
+    });
+
     it("does not quote what someone else wrote, nor anything from another conversation", async () => {
       await within(async ({ runner, event, items }) => {
         event("secret", { source_id: "om_other", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
@@ -264,6 +364,50 @@ describe("the run loop, by itself", () => {
         event("and?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_far" } });
         const id = (await runner.next())!;
         expect(items(id)[0].content).not.toContain("written as a reply");
+      });
+    });
+
+    it("asks the connector, once and before the run, for a replied-to message it has no record of, and shows what came back", async () => {
+      await within(async ({ runner, store, event, items, settings, log }) => {
+        const asked = () => log.filter((each) => each[0] === "quoted").map((each) => each[2]);
+        const again = () => store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+        // The person's own words.
+        settings.quoted = { text: "notes https://x/docx/D1" };
+        event("look into this", { data: { replies_to: "feishu:message:om_unseen" } });
+        const mine = (await runner.next())!;
+        expect(items(mine)[0].content).toContain('\n  (written as a reply to their own earlier message: "notes https://x/docx/D1")');
+        expect(asked()).toEqual(["feishu:message:om_unseen"]);
+        expect(JSON.parse(store.rows<{ data: string }>("SELECT data FROM inbox WHERE run_id = ?", mine)[0].data).quoted).toEqual({ text: "notes https://x/docx/D1" });
+        // Someone else's, or unreadable: only that there was one. Anything that is not text is not shown.
+        again();
+        settings.quoted = { text: 7, own: true };
+        event("and this", { data: { replies_to: "feishu:message:om_theirs" } });
+        expect(items((await runner.next())!)[0].content).toContain("\n  (written as a reply to a message here that is not shown to you: someone else's, or one that could not be read)");
+        // The connector fails, or takes too long: the same, and the run starts all the same.
+        again();
+        settings.quoted = () => Promise.reject(new Error("down"));
+        event("third", { data: { replies_to: "feishu:message:om_down" } });
+        expect(items((await runner.next())!)[0].content).toContain("is not shown to you");
+        again();
+        vi.useFakeTimers();
+        settings.quoted = () => new Promise(() => {});
+        event("fourth", { data: { replies_to: "feishu:message:om_slow" } });
+        const slow = runner.next();
+        await vi.advanceTimersByTimeAsync(QUOTED_WAIT_MS);
+        expect(items((await slow)!)[0].content).toContain("is not shown to you");
+        vi.useRealTimers();
+        // Where it does not apply, nothing is said; and nothing is asked about a message on record, or twice.
+        again();
+        settings.quoted = undefined;
+        event("fifth", { data: { replies_to: "feishu:message:om_none" } });
+        expect(items((await runner.next())!)[0].content).not.toContain("written as a reply");
+        again();
+        log.length = 0;
+        event("the link https://x", { source_id: "om_known", status: "done" });
+        event("sixth", { data: { replies_to: "feishu:message:om_known" } });
+        event("seventh", { data: { replies_to: "feishu:message:om_given", quoted: {} } });
+        expect(items((await runner.next())!)[0].content).toContain("their own earlier message");
+        expect(asked()).toEqual([]);
       });
     });
   });

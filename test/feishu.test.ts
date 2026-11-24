@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { approvalCard, decrypt, normalize, normalizeCardAction, sentAt, verifySignature } from "../src/connectors/feishu";
+import { approvalCard, decrypt, normalize, normalizeCardAction, quotedBy, sentAt, verifySignature } from "../src/connectors/feishu";
 import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
@@ -199,5 +199,94 @@ describe("turning a Feishu message into an event", () => {
 
   it("says so when a message is not text instead of dropping it", () => {
     expect(normalize(app, envelope({ chat_type: "p2p", message_type: "image", content: "{}" }))?.event.text).toContain("image");
+  });
+});
+
+describe("fetching the message a group message was written in reply to", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  /** Feishu answering the one look-up with this. */
+  const feishu = (answer: unknown, status = 200) => {
+    const asked: { url: string; bearer: string | null }[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input as RequestInfo, init);
+      asked.push({ url: request.url, bearer: request.headers.get("authorization") });
+      return Response.json(answer, { status });
+    });
+    return asked;
+  };
+  const one = (over: Record<string, unknown>) => ({ message_id: "om_parent", msg_type: "text", chat_id: "oc_chat", sender: { id: "ou_alice", id_type: "open_id", sender_type: "user", tenant_key: "t" }, body: { content: JSON.stringify({ text: "the notes https://x.feishu.cn/docx/Doc1" }) }, ...over });
+  const item = (over: Record<string, unknown>) => ({ code: 0, data: { items: [one(over)] } });
+  const alice = { open_id: "ou_alice", tenant_key: "t" };
+  const look = () => quotedBy("t-app", app, "oc_chat", "om_parent", alice);
+
+  it("asks Feishu for that one message as the app, and gives the asker's own words", async () => {
+    const asked = feishu(item({}));
+    expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1" });
+    expect(asked).toEqual([{ url: "https://open.feishu.cn/open-apis/im/v1/messages/om_parent?user_id_type=open_id", bearer: "Bearer t-app" }]);
+  });
+
+  it("names the people mentioned in it, flattens a post, and cuts what is long", async () => {
+    feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2\nlook" }) }, mentions: [{ key: "@_user_1", id: "cli_test", id_type: "app_id", name: "Agent" }, { key: "@_user_2", id: "ou_carol", id_type: "open_id", name: "Carol Approve" }] }));
+    expect(await look()).toEqual({ text: "and @CarolApprove look" });
+    feishu(item({ msg_type: "post", body: { content: JSON.stringify({ title: "Plan", content: [[{ tag: "text", text: "see " }, { tag: "a", text: "the doc", href: "https://x.feishu.cn/docx/Doc2" }], [{ tag: "at", user_id: "ou_carol", user_name: "Carol" }, { tag: "img", image_key: "k" }]] }) } }));
+    expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [img]");
+    feishu(item({ body: { content: JSON.stringify({ text: "x".repeat(5_000) }) } }));
+    expect((await look()).text).toHaveLength(1_000);
+    // A link with nowhere to lead is its words; a post with nothing in it is not something read.
+    feishu(item({ msg_type: "post", body: { content: JSON.stringify({ content: [[{ tag: "a", text: "bare" }]] }) } }));
+    expect((await look()).text).toBe("bare");
+    feishu(item({ msg_type: "post", body: { content: "{}" } }));
+    expect(await look()).toEqual({});
+    feishu(item({ msg_type: "post", body: { content: "null" } }));
+    expect(await look()).toEqual({});
+    feishu(item({ msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
+    expect((await look()).text).toBe("[a image message, which I cannot read yet]");
+  });
+
+  it("gives nobody else's words: another member's, a bot's, the agent's own, someone from another organisation, or another message of a forwarded bundle", async () => {
+    for (const sender of [
+      { id: "ou_bob", sender_type: "user", tenant_key: "t" },
+      { id: "cli_other", id_type: "app_id", sender_type: "app", tenant_key: "t" },
+      { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" },
+      { id: "ou_alice", sender_type: "user", tenant_key: "elsewhere" },
+      { id: "ou_alice", sender_type: "anonymous", tenant_key: "t" },
+    ]) {
+      feishu(item({ sender }));
+      expect(await look()).toEqual({});
+    }
+    // Only the message asked for counts, wherever it stands among those returned.
+    feishu({ code: 0, data: { items: [one({ message_id: "om_inner", body: { content: JSON.stringify({ text: "inner" }) } })] } });
+    expect(await look()).toEqual({});
+    feishu({ code: 0, data: { items: [one({ message_id: "om_inner", body: { content: JSON.stringify({ text: "inner" }) } }), one({})] } });
+    expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1" });
+  });
+
+  it("says only that there was one when it cannot be read: refused, gone, from another chat, malformed, or no answer", async () => {
+    feishu({ code: 230027, msg: "Lack of necessary permissions" }, 400);
+    expect(await look()).toEqual({});
+    feishu(item({ deleted: true, body: undefined }));
+    expect(await look()).toEqual({});
+    feishu(item({ chat_id: "oc_elsewhere" }));
+    expect(await look()).toEqual({});
+    feishu(item({ body: { content: "not json" } }));
+    expect(await look()).toEqual({});
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("no route");
+    });
+    expect(await look()).toEqual({});
+    // An id that is not one is not asked about.
+    const asked = feishu(item({}));
+    expect(await quotedBy("t-app", app, "oc_chat", "../x", alice)).toEqual({});
+    expect(asked).toEqual([]);
+  });
+
+  it("reports a lapsed app token as such, so the caller can get a fresh one", async () => {
+    feishu({ code: 99991663, msg: "invalid access token" }, 400);
+    expect(await look()).toBe("lapsed");
+  });
+
+  it("keeps an ordinary message on one line, as approvals are read from it", () => {
+    const envelope = { schema: "2.0", header: { event_id: "ev1", event_type: "im.message.receive_v1", app_id: "cli_test", tenant_key: "t", token: "v" }, event: { sender: { sender_type: "user", tenant_key: "t", sender_id: { open_id: "ou_alice" } }, message: { message_id: "om_1", chat_id: "oc_chat", chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: "approve\nall  AB12" }) } } };
+    expect(normalize(app, envelope)?.event.text).toBe("approve all AB12");
   });
 });

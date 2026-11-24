@@ -22,7 +22,7 @@ import { type FeishuApp, registry } from "../registry";
 import { API, hex, tenantAccessToken, forgetTenantAccessToken } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentsIn, handleOauthCallback, invitationFor, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Receipt } from "./types";
+import { type ApprovalQuestion, type Connector, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -77,7 +77,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, dedupeMs: 60 * 60_000 },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, dedupeMs: 60 * 60_000 },
   tools: [readDocument],
   holds: (env, _scope, condition, generation) => authorisationHolds(env, condition, generation),
 };
@@ -257,16 +257,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // The bot's own is dropped: it only says the message is for the agent, which the event already
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
-    const replacements = new Map<string, string>();
-    for (const mention of mentions) {
-      if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
-      const own = app.bot_open_id && mention.id?.open_id === app.bot_open_id;
-      replacements.set(mention.key, own ? " " : `@${String(mention.name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`);
-    }
-    // A placeholder with no entry in the mention list is kept visible as a mention of someone
-    // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
-    text = text.replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown");
-    text = text.replace(/\s+/g, " ").trim();
+    text = named(text, mentions, [app.bot_open_id]);
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -310,6 +301,95 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       },
     },
   };
+}
+
+/** A display name squeezed into one token, so no word of it can be read as part of the message. */
+const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;
+
+/** The text of a message with its mention placeholders replaced, in one pass; the bot's own is dropped. */
+function named(text: string, mentions: any[], own: (string | null)[]): string {
+  const replacements = new Map<string, string>();
+  for (const mention of mentions) {
+    if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
+    // An event carries the id as { open_id }; a message that was asked for, as the id itself, and a bot's as its app id.
+    const id = typeof mention.id === "string" ? mention.id : mention.id?.open_id;
+    replacements.set(mention.key, typeof id === "string" && own.includes(id) ? " " : token(mention.name));
+  }
+  // A placeholder with no entry in the mention list is kept visible as a mention of someone
+  // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
+  return text
+    .replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** How much of a quoted message is kept. */
+const MAX_QUOTED = 1_000;
+
+/**
+ * The message a group message was written in reply to, for the Brain, which asks when it has no
+ * record of that message: in a group the agent is sent only what mentions it. Nothing in a direct
+ * chat, where everything written has already arrived.
+ */
+export async function quotedFeishu(env: Env, scope: Scope, event: { principal: { id: string }; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined> {
+  const origin = event.data?.origin as { app_id?: unknown; tenant_key?: unknown } | undefined;
+  const parent = /^feishu:message:(.+)$/.exec(String(event.data?.replies_to ?? ""))?.[1];
+  if (scope.kind !== "chat" || !parent || typeof origin?.app_id !== "string" || typeof origin.tenant_key !== "string") return undefined;
+  const app = await registry(env).feishuApp(origin.app_id);
+  if (!app || app.tenant !== scope.tenant) return {};
+  const who = { open_id: event.principal.id, tenant_key: origin.tenant_key };
+  const bearer = await tenantAccessToken(env, app.app_id, event.signal);
+  const found = await quotedBy(bearer, app, scope.id, parent, who, event.signal);
+  if (found !== "lapsed") return found;
+  // The app's token lapsed before its time: forgotten, and the message asked for once more.
+  await forgetTenantAccessToken(env, app.app_id, bearer);
+  if (event.signal?.aborted) return {};
+  const again = await quotedBy(await tenantAccessToken(env, app.app_id, event.signal), app, scope.id, parent, who, event.signal);
+  return again === "lapsed" ? {} : again;
+}
+
+/**
+ * That one message, asked of Feishu as the app (which has to be in the group and allowed to read
+ * its messages). Its words are given only when it is beyond doubt the asker's own: the very
+ * message, in the same chat, written by that person of that organisation. Anyone else's (another
+ * member's, a bot's, someone from outside) is not handed on: the agent takes requests from the
+ * people who address it, and what others wrote does not ride in on a reply. Whatever is not
+ * given is still reported as there, so the model knows something was pointed at.
+ */
+export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }, signal?: AbortSignal): Promise<Quoted | "lapsed"> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return {};
+  try {
+    const response = await fetch(`${API}/im/v1/messages/${messageId}?user_id_type=open_id`, { headers: { authorization: `Bearer ${bearer}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000) });
+    const result = (await response.json().catch(() => ({}))) as { code?: number; data?: { items?: any[] } };
+    if (result.code === 99991663) return "lapsed";
+    // The sender's id is asked for as an open_id, which is what the asker is known by.
+    // A forwarded bundle comes back as several messages: only the one asked for counts.
+    const found = response.ok && result.code === 0 ? result.data?.items?.find((each) => each?.message_id === messageId) : undefined;
+    const sender = found?.sender ?? {};
+    if (!found || found.chat_id !== chatId || sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return {};
+    if (found.deleted || typeof found.body?.content !== "string") return {};
+    const content = JSON.parse(found.body.content);
+    const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
+    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
+    // Nothing could be made of it: not something read.
+    return text === "" ? {} : { text: text.slice(0, MAX_QUOTED) };
+  } catch {
+    return {};
+  }
+}
+
+/** A rich-text message as plain words: its title, then its lines; links with where they lead. */
+function flat(post: any): string {
+  // Sometimes wrapped by language; then whichever comes first.
+  const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
+  const piece = (each: any): string => {
+    if (each?.tag === "text" || each?.tag === "md" || each?.tag === "code_block") return String(each.text ?? "");
+    if (each?.tag === "a") return each.text && each.href && each.text !== each.href ? `${String(each.text)} (${String(each.href)})` : String(each.text || each.href || "");
+    if (each?.tag === "at") return `${token(each.user_name)} `;
+    return `[${String(each?.tag ?? "?")}]`;
+  };
+  const lines: string[] = ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map(piece).join("").trim() : ""));
+  return [String((body as any)?.title ?? ""), ...lines].filter((each) => each !== "").join("\n");
 }
 
 /** sha256(timestamp + nonce + encrypt_key + raw body), hex. */
