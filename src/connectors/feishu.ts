@@ -307,6 +307,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // an answer to that question, whatever its wording.
         // Not inside a topic: there every post points at the topic's first message, so a post
         // cannot be told from a reply to it, and an answer has to use the button or the code.
+        // When they wrote it, by Feishu's clock: it can reach here later than things that happened after.
+        ...(Number.isFinite(Number(message.create_time)) && Number(message.create_time) > 0 ? { written_at: Number(message.create_time) } : {}),
         ...(!message.thread_id && typeof (message.parent_id || message.root_id) === "string" ? { replies_to: `feishu:message:${message.parent_id || message.root_id}` } : {}),
       },
       reply_to: {
