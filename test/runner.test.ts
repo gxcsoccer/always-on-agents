@@ -1439,6 +1439,24 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("counts among what the person said the earlier message of their own that their fetched message was written in reply to, however long ago", async () => {
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        const old = event("the plan https://x/docx/D1", { source_id: "om_old", status: "done", received_at: Date.now() - 3 * 86_400_000 });
+        settings.quoted = { text: "这篇再看看", replies_to: "feishu:message:om_old" };
+        event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        expect(runner.actingFor((await runner.next())!)?.recentIds).toEqual([old]);
+      });
+      // Not where the fetched message names a document itself: that is what it points at.
+      await within(async ({ runner, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        event("the plan https://x/docx/D1", { source_id: "om_old", status: "done", received_at: Date.now() - 3 * 86_400_000 });
+        settings.quoted = { text: "改看 https://x/docx/D2", documents: [{ kind: "docx", token: "D2" }], replies_to: "feishu:message:om_old" };
+        event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        expect(runner.actingFor((await runner.next())!)?.recentIds).toEqual([]);
+      });
+    });
+
     it("is nobody outside a person's own scope, without connector tools, or for anything but their plain messages", async () => {
       const cases: [string, Record<string, unknown>][] = [
         ["a button press", { data: { direct: true, origin: ORIGIN, card: "x" } }],

@@ -668,7 +668,14 @@ export class Runner {
         .reverse();
       // A message the person replied to is part of what they are saying now, however long ago
       // they wrote it: their own, by the same test, in this conversation.
-      const pointed = events.map((each) => (JSON.parse(each.data ?? "{}") as { replies_to?: unknown }).replies_to).filter((each): each is string => typeof each === "string");
+      // Also one step further up: what their own fetched message was written in reply to, where
+      // that message names nothing itself (the same step the model is shown, and a read goes by).
+      const pointed = events.flatMap((each) => {
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; documents?: unknown; replies_to?: unknown } };
+        const names = Array.isArray(data.quoted?.documents) && data.quoted.documents.length > 0;
+        const further = typeof data.quoted?.text === "string" && !names ? data.quoted.replies_to : undefined;
+        return [data.replies_to, further].filter((subject): subject is string => typeof subject === "string");
+      });
       if (pointed.length > 0) {
         const older = [...new Set(pointed)].flatMap((subject) => this.#parentOf(first, subject) ?? []).filter((each, index, all) => own(each) && each.text !== null && all.findIndex((other) => other.id === each.id) === index && !recent.some((seen) => seen.id === each.id));
         recent = [...older, ...recent].sort((a, b) => a.id - b.id);
