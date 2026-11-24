@@ -373,9 +373,9 @@ export const doubaoAsk: ConnectorTool = {
   // How the piece of work stands is said from its own record, however the call went.
   run: async (context, args) => {
     // The record of the piece of work as this call last had it from where it is kept: never read a second time for this.
-    const seen: { op?: Op } = {};
+    const seen: Seen = {};
     const result = await ask(context, args, seen);
-    if (seen.op) context.work?.(standing(seen.op, result));
+    if (seen.op) context.work?.(standing(seen.op, result, seen.gave_up));
     return result;
   },
   // A piece of work handed over for the person is theirs to point at for as long as its record is kept: the call itself checks that.
@@ -384,12 +384,17 @@ export const doubaoAsk: ConnectorTool = {
 
 const UNCERTAIN = "it could not be confirmed whether Doubao took this; nothing more was sent, so that it is not done twice. The person can look in Doubao Work, or ask again";
 
+/** What a call learnt of its piece of work: its record as last had, and why the call gave it up where it said so. */
+type Seen = { op?: Op; gave_up?: "expired" | "void" };
+
 const CHANGED = { error: "the person's authorisation, or how this is set up, changed while this was under way; nothing more was done. They can ask again" };
 
 /** A piece of work as its record has it: what Doubao made of it where that is known, and not whether the person was told. */
-function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown" {
+function standing(op: Op, result: unknown, gaveUp?: "expired" | "void"): "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown" {
   if (op.stage === "answered") return op.reply?.status === "completed" ? "done" : op.reply?.status === "cancelled" ? "cancelled" : "failed";
   if (op.stage === "lost") return "unknown";
+  // Given up for a reason of its own, as the call said: its time ran out, or what it was asked under no longer stands. (Also where it was never sent for that reason.)
+  if (gaveUp) return gaveUp;
   if (op.stage === "failed") return "failed";
   // Still under way by its record. A call that ends in an error has given it up: never sent, or no longer waited for.
   // What it was asked under no longer stands; its time ran out; or, never sent, it was refused.
@@ -398,7 +403,7 @@ function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancel
   return "open";
 }
 
-async function ask(context: ToolContext, args: Record<string, unknown>, seen: { op?: Op } = {}): Promise<unknown> {
+async function ask(context: ToolContext, args: Record<string, unknown>, seen: Seen = {}): Promise<unknown> {
   const { env, origin } = context;
   const text = String(args.text ?? "").trim();
   if (!text) return { error: "say what Doubao is to do" };
@@ -458,7 +463,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
 
   // One limit for the whole of it, whatever it has waited on: nothing is sent, or asked for, past it.
   const late = () => Date.now() >= op.deadline;
-  if (late()) return { error: op.stage === "asked" ? "this was not done in time; nothing was sent. The person can ask again" : "Doubao did not finish this in time. What it makes of it can still be seen in Doubao Work" };
+  if (late()) return (seen.gave_up = "expired"), { error: op.stage === "asked" ? "this was not done in time; nothing was sent. The person can ask again" : "Doubao did not finish this in time. What it makes of it can still be seen in Doubao Work" };
   if (!token || !version) return authorise();
   if (op.stage === "submitted") return reply();
 
@@ -488,7 +493,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   const again = maybeTaken;
   if (!sent) {
     // Never sent at all (what it rested on changed, or its time ran out, before the first try): said as that.
-    if (!maybeTaken) return await advance("failed"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
+    if (!maybeTaken) return await advance("failed"), (seen.gave_up = late() ? "expired" : "void"), late() ? { error: "this was not done in time; nothing was sent. The person can ask again" } : CHANGED;
     // Tried, and not known to have failed.
     await advance("lost");
     return { error: UNCERTAIN };
@@ -515,7 +520,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   }
   async function authorise(): Promise<unknown> {
     const invitation = await grant.invite(who, redirect!, app!, generation);
-    if (invitation === "superseded") return { error: "the person's authorisation changed just now; nothing was sent. They can ask again" };
+    if (invitation === "superseded") return (seen.gave_up = "void"), { error: "the person's authorisation changed just now; nothing was sent. They can ask again" };
     if (invitation === "full") return { error: "too many authorisations were begun and not finished in the last hour; nothing was sent. They can ask again later" };
     return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, request } } satisfies Waiting;
   }
