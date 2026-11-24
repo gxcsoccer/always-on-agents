@@ -453,6 +453,8 @@ export class Requests implements Wakes {
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
         tell("underWayGone");
+        // The way in they were shown did not work: said once for that way in, however many requests waited on it.
+        if (answer.refused && now.interaction && !promised()) this.#b.enqueueMessage(`refused:${now.interaction}`, now.session_id, null, this.#b.notice("notAuthorised", now.session_id), undefined, undefined, { target: now.target });
         return drop();
       }
       if (answer.state !== "holds" || !(answer.since < now.until)) {

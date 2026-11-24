@@ -74,6 +74,8 @@ interface Stored {
   pending: { nonce: string; verifier: string; redirect: string; expires_at: number; app_id: string; pairing: string }[];
   grant?: { sealed: string; version: string; expires_at: number; since: number; pairing: string };
   owed?: { event: string; attempts: number };
+  /** Invitations that were taken out and came to nothing: a request waiting on one of them is over. */
+  refused?: string[];
   ops: Record<string, Op>;
 }
 
@@ -143,9 +145,24 @@ export class DoubaoGrant extends DurableObject<Env> {
     return true;
   }
 
-  /** Whether the person's authorisation stands now, in this generation and under the pairing in force, and since when. */
-  async covers(generation: number): Promise<Holds> {
+  /** An invitation that was taken out came to nothing: whoever waits on it is owed word, and is not taken up by a later one. */
+  async refuse(nonce: string): Promise<void> {
     const stored = await this.#load();
+    if (!stored) return;
+    stored.refused = [...(stored.refused ?? []).filter((each) => each !== nonce), nonce].slice(-20);
+    stored.owed = { event: `refused:${nonce}`, attempts: 0 };
+    void this.ctx.storage.put("grant", stored);
+    void this.ctx.storage.setAlarm(Date.now());
+  }
+
+  /**
+   * Whether the person's authorisation stands now, in this generation and under the pairing in
+   * force, and since when: for a request shown one invitation. If that invitation came to nothing
+   * the request is over, whatever was authorised since through another.
+   */
+  async covers(generation: number, nonce?: string): Promise<Holds> {
+    const stored = await this.#load();
+    if (nonce !== undefined && stored?.refused?.includes(nonce)) return { state: "gone", refused: true };
     if ((stored?.generation ?? 1) !== generation) return { state: "gone" };
     if (!stored?.grant || !usable(stored.grant)) return { state: "not_yet" };
     const app = await registry(this.env).doubaoApp(stored.who.chat_app_id);
@@ -326,7 +343,7 @@ const NAMED = /豆包|doubao/i;
 export const doubaoAsk: ConnectorTool = {
   name: "doubao_ask",
   description:
-    "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it only when the person themselves plainly asks, in this message, for Doubao to do something (research, write a document, and the like); never on your own initiative. If they only mention Doubao, say not to use it, or it is unclear whether they want this handed over now, do not call it: ask them first. `text` is what to ask Doubao, written out in full: it knows nothing of this conversation. `carry_on`: false for something new; true for a follow-up to a piece of work Doubao already did for this person (the one whose answer they replied to, or the only recent one; where it cannot be told which, you are told to ask them). Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
+    "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it only when the person themselves plainly asks, in this message, for Doubao to do something (research, write a document, and the like); never on your own initiative. If they only mention Doubao, say not to use it, or it is unclear whether they want this handed over now, do not call it: ask them first. `text` is what to ask Doubao: the person's own request, in their words where those are enough. Doubao knows nothing of this conversation, so add what it needs from here to understand the request (what a \"this\" or \"that\" refers to, say), and nothing else: no requirements, scope, format or guesses at what they mean that they did not state. `carry_on`: false for something new; true for a follow-up to a piece of work Doubao already did for this person (the one whose answer they replied to, or the only recent one; where it cannot be told which, you are told to ask them). Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
   effect: "act",
   optional: true,
   parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
@@ -442,7 +459,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   async function authorise(): Promise<unknown> {
     const invitation = await grant.invite(who, redirect!, app!, generation);
     if (invitation === "superseded") return { error: "the person's authorisation changed just now; nothing was sent. They can ask again" };
-    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, request } } satisfies Waiting;
+    return { waiting: { on: "authorisation", subject: name, condition: `doubao|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, (op as Op).deadline), interaction: `doubao.${name}.${invitation.nonce}`, request } } satisfies Waiting;
   }
 }
 
@@ -459,7 +476,7 @@ async function holds(env: Env, scope: Scope, condition: string, generation: numb
   if (part[0] !== "doubao") return undefined;
   if (scope.kind !== "user" || !/^[0-9a-f]{64}$/.test(part[2] ?? "")) return { state: "gone" };
   const grant = env.DOUBAO_GRANTS.getByName(part[2]);
-  if (part[1] === "auth" && part.length === 3) return grant.covers(generation);
+  if (part[1] === "auth" && (part.length === 3 || part.length === 4)) return grant.covers(generation, part[3]);
   if (part[1] !== "reply" || part.length !== 4) return { state: "gone" };
   const op = await grant.op(part[3]);
   if (!op || (op.stage !== "submitted" && op.stage !== "answered")) return { state: "gone" };
@@ -525,9 +542,10 @@ async function callback(request: Request, env: Env): Promise<Response> {
   if (!invitation || (await grantName(invitation.who)) !== state[1]) return page("这个链接已经用过或已失效", "链接只能使用一次，并且 10 分钟内有效。请回到聊天里，重新向我发起请求。", 400);
   const { who } = invitation;
   const code = url.searchParams.get("code") ?? "";
-  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return page("没有授权", "你没有完成授权，我不会以你的身份使用豆包工作。需要时可以回到聊天里重新发起请求。");
-  const refused = (why: string) => {
+  if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) return (await grant.refuse(state[2]), page("没有授权", "你没有完成授权，我不会以你的身份使用豆包工作。需要时可以回到聊天里重新发起请求。"));
+  const refused = async (why: string) => {
     console.log(JSON.stringify({ doubao_authorisation_refused: why }));
+    await grant.refuse(state[2]);
     return page("授权没有成功", "请回到聊天里，重新向我发起请求。如果一直不成功，请联系管理员。", 400);
   };
   const app = await registry(env).doubaoApp(who.chat_app_id);
@@ -547,6 +565,7 @@ async function callback(request: Request, env: Env): Promise<Response> {
   const theirs = app.match === "open_id" ? info.data?.open_id === who.open_id : typeof who.union_id === "string" && who.union_id !== "" && info.data?.union_id === who.union_id;
   if (!theirs || !who.tenant_key || info.data?.tenant_key !== who.tenant_key) {
     console.log(JSON.stringify({ doubao_authorisation_refused: "another_account" }));
+    await grant.refuse(state[2]);
     return page("授权的账号不对", "完成授权的账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }
   if (!(await grant.install(invitation.generation, invitation.pairing, { access_token: issued.access_token, expires_at: Date.now() + lifetime(issued.expires_in) * 1_000 }))) return refused("superseded");

@@ -318,6 +318,58 @@ describe("handing work to Doubao Work", () => {
     expect(await (await dee.grant()).status()).toMatchObject({ authorised: true });
   });
 
+  it("ends the wait when the authorisation does not go through, says so once, and does the work once when asked again", async () => {
+    await pair();
+    const dee = someone();
+    const NOT_DONE = "授权没有完成，你要我做的事还没有做。还需要的话，请再跟我说一遍。";
+    // The token comes back reaching further than was asked: not kept.
+    world.scope = `${SCOPE} doubao:session:read`;
+    world.narrows = false;
+    model.replies([asks("写周报")], [say("")]);
+    await dee.says("让豆包写周报");
+    const first = linkOn(dee.cards()[0]);
+    expect((await consent(first, dee)).status).toBe(400);
+    await dee.settle();
+    expect(await dee.requests()).toMatchObject([{ status: "void" }]);
+    expect(dee.heard().filter((each) => each === NOT_DONE)).toHaveLength(1);
+    // The same link once more changes nothing and says nothing more.
+    expect((await consent(first, dee)).status).toBe(400);
+    await dee.quiet();
+    expect(dee.heard().filter((each) => each === NOT_DONE)).toHaveLength(1);
+
+    // Asked again in the same words: a new way in, and the work is handed over once.
+    world.narrows = true;
+    model.replies([asks("写周报")], [say("")]);
+    await dee.says("让豆包写周报");
+    expect(dee.cards()).toHaveLength(2);
+    expect((await consent(linkOn(dee.cards()[1]), dee)).status).toBe(200);
+    await dee.settle();
+    expect(world.writes).toHaveLength(1);
+    expect((await dee.requests()).map((each) => each.status)).toEqual(["void", "waiting"]);
+  });
+
+  it("does not take up a request whose own way in failed, even after another one worked", async () => {
+    await pair();
+    const dee = someone();
+    world.narrows = false;
+    world.scope = `${SCOPE} doubao:session:read`;
+    model.replies([asks("写周报")], [say("")]);
+    await dee.says("让豆包写周报");
+    const failed = (await dee.requests())[0].condition;
+    expect((await consent(linkOn(dee.cards()[0]), dee)).status).toBe(400);
+    // Before the Brain has heard of that, they authorise through another way in.
+    world.narrows = true;
+    const grant = await dee.grant();
+    const held = await grant.held();
+    const again = await grant.invite({ chat_app_id: CHAT_APP, tenant_key: ORG, open_id: dee.openId, union_id: dee.unionId }, "https://agent.test/v1/doubao/oauth/callback", await (env as any).REGISTRY.getByName("global").doubaoApp(CHAT_APP), held.generation);
+    const card = await grant.card(failed.split("|")[2], again.nonce);
+    expect((await consent(new URL(card.action.url), dee)).status).toBe(200);
+    expect(await doubaoConnector.holds!(env as any, { tenant: TENANT, kind: "user", id: dee.openId }, failed, held.generation)).toEqual({ state: "gone", refused: true });
+    await dee.settle();
+    expect(await dee.requests()).toMatchObject([{ status: "void" }]);
+    expect(world.writes).toEqual([]);
+  });
+
   it("keeps nothing when another account completes the authorisation, or when more is granted than was asked", async () => {
     await pair();
     const dee = someone();
