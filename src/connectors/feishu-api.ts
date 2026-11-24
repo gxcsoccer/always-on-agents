@@ -77,7 +77,7 @@ export interface ChatFacts {
  * these fields are taken from the answers, each only if it is of the kind Feishu documents; the
  * chat's name, owner and everything else are left behind. A call that could not be made is status 0.
  */
-export async function chatFacts(bearer: string, chatId: string, signal?: AbortSignal): Promise<ChatFacts> {
+export async function chatFacts(bearer: string, chatId: string, signal?: AbortSignal, named?: { name?: string }): Promise<ChatFacts> {
   const ask = async (path: string): Promise<{ status: number; code?: number; data: Record<string, unknown> }> => {
     try {
       const response = await fetch(`${API}/im/v1/chats/${encodeURIComponent(chatId)}${path}`, { headers: { authorization: `Bearer ${bearer}` }, ...(signal ? { signal } : {}) });
@@ -89,6 +89,8 @@ export async function chatFacts(bearer: string, chatId: string, signal?: AbortSi
     }
   };
   const [info, member] = await Promise.all([ask(""), ask("/members/is_in_chat")]);
+  // The chat's name is no part of the facts: handed only to a caller that asks for it, to show the person who asked there.
+  if (named && typeof info.data.name === "string") named.name = info.data.name.slice(0, 60);
   const text = (name: string) => (typeof info.data[name] === "string" && info.data[name] !== "" ? { [name]: String(info.data[name]).slice(0, 100) } : {});
   const read = { ...(typeof info.data.external === "boolean" ? { external: info.data.external } : {}), ...text("tenant_key"), ...text("chat_mode"), ...text("chat_status") };
   return {

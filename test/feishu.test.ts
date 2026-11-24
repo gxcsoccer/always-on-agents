@@ -291,6 +291,23 @@ describe("fetching the message a group message was written in reply to", () => {
   });
 });
 
+describe("which documents a fetched message links", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("goes by where a link leads, never by the words shown for it", async () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [{ tag: "text", text: "看 https://x.feishu.cn/docx/Written00000000001 " }, { tag: "a", text: "https://x.feishu.cn/docx/Shown0000000000001", href: "https://x.feishu.cn/docx/Linked000000000001" }],
+          [{ tag: "a", text: "点这里", href: "https://evil.example/docx/Other0000000000001" }],
+        ],
+      },
+    };
+    vi.stubGlobal("fetch", async () => Response.json({ code: 0, data: { items: [{ message_id: "om_p", chat_id: "oc_chat", msg_type: "post", sender: { sender_type: "user", id: "ou_alice", tenant_key: "t" }, body: { content: JSON.stringify(post) } }] } }));
+    const found = (await quotedBy("t-app", app, "oc_chat", "om_p", { open_id: "ou_alice", tenant_key: "t" })) as { documents?: { token: string }[] };
+    expect(found.documents?.map((each) => each.token)).toEqual(["Written00000000001", "Linked000000000001"]);
+  });
+});
+
 describe("asking Feishu what kind of chat this is", () => {
   afterEach(() => vi.unstubAllGlobals());
   const answers = (info: unknown, member: unknown, seen: string[] = []) =>

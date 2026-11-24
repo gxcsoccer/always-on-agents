@@ -252,13 +252,19 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // organisation's own with the bot in it. Asked on every call, a request carried on included.
   // Otherwise the matter ends here in the system's own words: nothing is read, nobody is asked
   // to authorise, and the model is not left to find another way.
-  let place: { turn: number; mode: string | undefined } | undefined;
+  let place: { turn: number; mode: string | undefined; name: string } | undefined;
   if (shared) {
     if (!app.group_documents) return { settled: { say: "chatUnknown" } };
-    const facts = await chatFacts(await tenantAccessToken(env, app.app_id), context.scope.id).catch((): ChatFacts => ({ info: { status: 0, missing: [] }, member: { status: 0 } }));
+    const named: { name?: string } = {};
+    let facts: ChatFacts;
+    try {
+      facts = await chatFacts(await tenantAccessToken(env, app.app_id), context.scope.id, undefined, named);
+    } catch {
+      facts = { info: { status: 0, missing: [] }, member: { status: 0 } };
+    }
     const is = chatIs(facts, who.tenant_key);
     if (is !== "internal") return { settled: { say: is === "external" ? "externalChat" : "chatUnknown" } };
-    place = { turn: app.group_documents_gen ?? 0, mode: facts.info.chat_mode };
+    place = { turn: app.group_documents_gen ?? 0, mode: facts.info.chat_mode, name: named.name ?? "" };
   }
 
   // Everything that does not depend on the grant is done before the grant is looked at, so that
@@ -298,9 +304,11 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     // person, not on their being authorised some way or other, and on this still being turned on
     // as it is now. The card is for their eyes only: where they asked if Feishu can show it
     // there to one person (not in a topic chat), directly otherwise.
-    const asking = context.said.at(-1)?.data.message_id;
+    // Which question: the message of this request that names the document (the latest of them, or
+    // the latest of all where an earlier one named it), and the document. One card says one thing.
+    const asking = (linkingNow.at(-1) ?? context.said.at(-1))?.data.message_id;
     if (typeof asking !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(asking)) return { error: "which message asked for this could not be told, so the person was not asked to authorise; ask them to send the link again" };
-    const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) }, { brain: scopeName(context.scope), key: asking, label: canonical });
+    const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) }, { brain: scopeName(context.scope), key: `${asking}|${target.kind}:${target.token}`, label: canonical, place: place.name });
     if (invitation === "superseded") return superseded;
     const condition = `asked|${name}|${invitation.nonce}|${app.app_id}|${place.turn}|${[...needed].sort().join(" ")}`;
     return { waiting: { on: "authorisation", subject: name, condition, generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical }, privately: place.mode === "topic" ? true : "here" } } satisfies Waiting;
@@ -415,7 +423,9 @@ export async function authorisationHolds(env: Env, scope: Scope, condition: stri
     if (held.state !== "holds") return held;
     // Could not be asked just now: the caller puts it off and asks again; it is not taken for a no.
     const facts = await chatFacts(await tenantAccessToken(env, app.app_id), scope.id);
-    if (facts.info.status === 0 || facts.info.status >= 500 || facts.member.status === 0 || facts.member.status >= 500) throw new Error("Feishu cannot be asked about the chat just now");
+    // Not answered, or told to come back later: not a no.
+    const unasked = (status: number) => status === 0 || status === 429 || status >= 500;
+    if (unasked(facts.info.status) || unasked(facts.member.status)) throw new Error("Feishu cannot be asked about the chat just now");
     return chatIs(facts, part[4]) === "internal" ? held : { state: "gone" };
   }
   const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);

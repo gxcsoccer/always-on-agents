@@ -62,6 +62,8 @@ export interface Ask {
   key: string;
   /** What was asked about, as verified where it was asked (a document's link, say): shown on the card, so it can be told which question it is for. */
   label?: string;
+  /** The name of where it was asked, as the outside system gives it: shown on the card, so it can be told where the answer will go. */
+  place?: string;
 }
 
 /** What became of an invitation made for one question. */
@@ -201,7 +203,7 @@ export class FeishuGrant extends DurableObject<Env> {
     if (!stored || !pending || pending.expires_at <= Date.now() || pending.redeeming !== undefined) return null;
     const state = `${await grantName(stored.who)}.${pending.nonce}`;
     const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: stored.who.app_id, response_type: "code", redirect_uri: pending.redirect, scope: pending.scope.join(" "), state, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
-    return invitationCard(url, pending.scope.includes(OFFLINE), pending.ask ? (pending.ask.label ?? "") : undefined);
+    return invitationCard(url, pending.scope.includes(OFFLINE), pending.ask ? { label: pending.ask.label ?? "", place: pending.ask.place ?? "" } : undefined);
   }
 
   /**
@@ -590,7 +592,7 @@ export class FeishuGrant extends DurableObject<Env> {
   }
 }
 
-function invitationCard(url: string, lasting: boolean, asked?: string): unknown {
+function invitationCard(url: string, lasting: boolean, asked?: { label: string; place: string }): unknown {
   const plain = (content: string) => ({ tag: "plain_text", content });
   return {
     config: { wide_screen_mode: true },
@@ -598,7 +600,7 @@ function invitationCard(url: string, lasting: boolean, asked?: string): unknown 
     elements: [
       { tag: "div", text: plain("要读取你的飞书文档，需要你先授权。授权后我只能以你的身份读取文档，你打不开的文档我也读不到。") },
       // For a question asked where several people talk: which one, and where the answer will go. Only the person asked sees this card.
-      ...(asked !== undefined ? [{ tag: "div", text: plain(`这张卡片只有你看得到，是为你刚才在群里问的${asked ? `这篇文档（${asked.slice(0, 200)}）` : "文档"}发的。授权后我会在群里你那条消息下面接着回答。`) }] : []),
+      ...(asked !== undefined ? [{ tag: "div", text: plain(`这张卡片只有你看得到，是为你刚才在群${asked.place ? `「${asked.place}」` : ""}里问的${asked.label ? `这篇文档（${asked.label.slice(0, 200)}）` : "文档"}发的。授权后我会在群里你那条消息下面接着回答。`) }] : []),
       { tag: "action", actions: [{ tag: "button", text: plain("去授权"), type: "primary", url }] },
       // Said before it is given: this authorisation renews itself, and how to end it.
       ...(lasting ? [{ tag: "div", text: plain("这次授权会长期有效：到期后我会自动续期，不再每次请你授权，直到被解除或满一年。需要解除时，可以在飞书的授权管理里取消，或联系管理员。") }] : []),

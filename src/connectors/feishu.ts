@@ -389,7 +389,8 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
     const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
-    const linked = [...documentsIn(text), ...(found.msg_type === "post" ? hrefsOf(content).flatMap((href) => documentOf(href) ?? []) : [])];
+    // In words the person typed, an address counts; a link counts for where it leads, never for what it shows.
+    const linked = found.msg_type === "post" ? linkedIn(content) : documentsIn(text);
     const documents = linked.filter((each, index) => linked.findIndex((other) => other.kind === each.kind && other.token === each.token) === index).slice(0, 20);
     // Nothing could be made of it: not something read.
     return text === "" ? {} : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}) };
@@ -398,10 +399,14 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
   }
 }
 
-/** Where the links of a rich-text message lead. */
-function hrefsOf(post: any): string[] {
+/** The documents a rich-text message links: addresses written in its plain words, and where its links lead. */
+function linkedIn(post: any): DocumentRef[] {
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
-  return ((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap((each: any) => (each?.tag === "a" && typeof each.href === "string" ? [each.href] : [])) : []));
+  const piece = (each: any): DocumentRef[] => {
+    if (each?.tag === "a") return typeof each.href === "string" ? [documentOf(each.href)].flatMap((found) => found ?? []) : [];
+    return each?.tag === "text" || each?.tag === "md" ? documentsIn(String(each.text ?? "")) : [];
+  };
+  return ((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap(piece) : []));
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */

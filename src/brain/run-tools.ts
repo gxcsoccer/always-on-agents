@@ -125,8 +125,7 @@ export class RunTools {
             if (say === null || (say !== undefined && !this.#b.outbox.isNotice(say))) return UNUSABLE;
             // Nothing was read. The run is closed and the line queued in one step, so a run that
             // is interrupted here is either still open with nothing said, or closed with it said.
-            waits = true;
-            this.#b.outside.delete(callId);
+            // (Only once that step has been kept is the call no longer counted as one that read.)
             this.#s.transaction(() => {
               this.#s.sql.exec("UPDATE runs SET closed = 'settled' WHERE id = ?", run.id);
               if (carried) this.#b.requests.endRequest(carried.id, "void", "the tool settled it");
@@ -142,6 +141,8 @@ export class RunTools {
                 if (!(err instanceof Error) || !err.message.startsWith("there is nowhere to send")) throw err;
               }
             });
+            waits = true;
+            this.#b.outside.delete(callId);
             return { settled: true, note: say === undefined ? SETTLED_SILENT : SETTLED_NOTE };
           }
           if (!isWaiting(result)) {

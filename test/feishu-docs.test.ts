@@ -146,6 +146,7 @@ function installFakeFeishu() {
     const aboutChat = url.host === "open.feishu.cn" ? /\/im\/v1\/chats\/([^/]+)(\/members\/is_in_chat)?$/.exec(url.pathname) : undefined;
     if (aboutChat) {
       const chat = chats.get(aboutChat[1]);
+      if (chat?.limited) return Response.json({ code: 99991400, msg: "too many" }, { status: 429 });
       if (!chat || chat.fails) return Response.json({ code: 99991400, msg: "busy" }, { status: 500 });
       return aboutChat[2] ? Response.json({ code: 0, data: { is_in_chat: chat.botIn !== false } }) : Response.json({ code: 0, data: { name: "a chat's name", external: chat.external, tenant_key: chat.org ?? ORG, chat_mode: chat.mode ?? "group", chat_status: "normal" } });
     }
@@ -275,7 +276,7 @@ const rowsOf = (stub: any, query: string, ...args: unknown[]): Promise<any[]> =>
 /** Messages the bot was never sent, which Feishu hands over when asked for one by its id. */
 const quotable = new Map<string, { chat_id: string; open_id: string; text: string }>();
 /** The chats Feishu knows of in these tests, and what it says of each. */
-const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean }>();
+const chats = new Map<string, { external: boolean; org?: string; botIn?: boolean; mode?: string; fails?: boolean; limited?: boolean }>();
 
 /** A person writing to the bot in a chat several people share, through an app whose operator turned reading there on. */
 function inGroup(chatId: string, person: ReturnType<typeof someone>) {
@@ -2849,6 +2850,43 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(here.heard()).toEqual(["读好了：Bea 的笔记。"]);
     expect((await here.requests()).map((each) => each.status)).toEqual(["done"]);
     expect(model.remaining()).toBe(0);
+  });
+
+  it("makes one invitation for each document asked about, each card saying which, and answers only the one whose card was used", async () => {
+    const hal = someone();
+    feishu.docs.set("DocGroupHal0000000001", { readers: [hal.openId], text: "First." });
+    feishu.docs.set("DocGroupHal0000000002", { readers: [hal.openId], text: "Second." });
+    const here = inGroup(chat(), hal);
+    model.replies([readCall("DocGroupHal0000000001"), readCall("DocGroupHal0000000002")], [say("")]);
+    await here.says(`对比 ${link("DocGroupHal0000000001")} 和 ${link("DocGroupHal0000000002")}`);
+    const cards = here.shown();
+    expect(cards).toHaveLength(2);
+    expect(cards.map((each) => [JSON.stringify(each.content).includes("DocGroupHal0000000001"), JSON.stringify(each.content).includes("DocGroupHal0000000002")])).toEqual([[true, false], [false, true]]);
+    expect(new Set(cards.map((each) => linkOn(each.content).searchParams.get("state"))).size).toBe(2);
+    // The card says where the answer will go, by the chat's name as Feishu gives it.
+    expect(JSON.stringify(cards[0].content)).toContain("a chat's name");
+    // The second card is used: the second document is read and answered; the first still waits.
+    carriesOn("第二篇读好了");
+    expect((await consent(linkOn(cards[1].content), hal)).status).toBe(200);
+    await here.settle();
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupHal0000000002/raw_content"]);
+    expect((await here.requests()).map((each) => each.status).sort()).toEqual(["done", "waiting"]);
+    // The same question taken up again gets the same invitation, not a new one.
+    const grant = await hal.grant();
+    expect((await runInDurableObject(grant, (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"))).pending).toHaveLength(1);
+  });
+
+  it("is put off, not ended, when Feishu cannot be asked about the chat just then", async () => {
+    const ivy = someone();
+    await authorised(ivy, "DocGroupIvy0000000001").catch(() => undefined);
+    const id = chat();
+    const scope = { tenant: TENANT, kind: "chat" as const, id };
+    const turnNow = (await (env as any).REGISTRY.getByName("global").feishuApp(APP_ID)).group_documents_gen;
+    const read = `chat|${await grantName(ivy.who)}|${APP_ID}|${turnNow}|${ORG}|docx:document:readonly`;
+    chats.set(id, { external: false, limited: true });
+    await expect(authorisationHolds(env as any, scope, read, 1)).rejects.toThrow();
+    chats.set(id, { external: false });
+    expect((await authorisationHolds(env as any, scope, read, 1)).state).toBe("holds");
   });
 
   it("is not carried on because they authorised some other way: only the card made for that question does it", async () => {
