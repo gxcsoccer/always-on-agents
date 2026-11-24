@@ -193,6 +193,15 @@ describe("the run loop, by itself", () => {
           event("approve AB12", { ...group, data: { origin: ORIGIN, card: true } });
           event("", { ...group, source: "timer", kind: "timer", principal: { kind: "system", id: "timer" } });
           event("a4", group);
+          // Two people pressing buttons, one after the other: each press is taken up alone.
+          event("approve CD34", { ...group, data: { origin: ORIGIN, card: true } });
+          event("deny CD34", { ...group, principal: bob, data: { origin: ORIGIN, card: true } });
+          // Words that name an open question, then an ordinary request, from one person.
+          event("deny EF56", { ...group, data: { origin: ORIGIN, about_question: true } });
+          event("a5", group);
+          // Words not addressed to the agent, then words that are, from one person.
+          event("aside", { ...group, principal: { kind: "human", id: PERSON, explicit: false } });
+          event("a6", group);
           const runs: string[][] = [];
           for (let id = await runner.next(); id; id = await runner.next()) {
             runs.push(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text));
@@ -201,9 +210,9 @@ describe("the run loop, by itself", () => {
           }
           return runs;
         }, "chat:oc_1");
-      expect(await taken([read])).toEqual([["a1", "a2"], ["b1"], ["a3"], ["approve AB12"], [""], ["a4"]]);
+      expect(await taken([read])).toEqual([["a1", "a2"], ["b1"], ["a3"], ["approve AB12"], [""], ["a4"], ["approve CD34"], ["deny CD34"], ["deny EF56"], ["a5"], ["aside"], ["a6"]]);
       // Where no tool acts for a person, a conversation's messages are taken together as before.
-      expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4"]]);
+      expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4", "approve CD34", "deny CD34", "deny EF56", "a5", "aside", "a6"]]);
     });
 
     it("takes a burst as several runs, by count and by size", async () => {

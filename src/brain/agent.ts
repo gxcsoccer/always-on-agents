@@ -194,6 +194,10 @@ export class BrainAgent extends DurableObject<Env> {
           .filter(({ code, ask }) => (pressed ? ask === pressed : code && quotes(event.text ?? "", code)))
           .map(({ session_key }) => session_key),
       );
+      // Typed words that name an open question are marked as such, so that they are taken up
+      // apart from the person's ordinary requests. Only that: they are not thereby an answer to
+      // the question, which is still judged from what they say.
+      if (!pressed && sessions.size > 0) event = { ...event, data: { ...event.data, about_question: true } };
       // Its answer goes where the question was asked, not to wherever the reply came from. Where it
       // did come from is kept: what the same person says there next still bears on it.
       // Not into or out of someone's private conversation: what is said there stays there, and what
