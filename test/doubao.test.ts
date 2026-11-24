@@ -353,6 +353,32 @@ describe("handing work to Doubao Work", () => {
     expect(world.writes).toHaveLength(then);
   });
 
+  it("does not guess around a reply the person marked, and starts nothing new on the strength of a reply", async () => {
+    await pair();
+    const cy = someone();
+    model.replies([call("send_message", { text: "我自己的看法。" })], [say("")]);
+    await cy.says("你怎么看向量数据库");
+    const session = await handsOver(cy, "调研 A");
+    doubaoReplies(session, "A 的结论。");
+    model.replies([call("send_message", { text: "A 的结论。" })], [say("")]);
+    await cy.later();
+    const before = world.writes.length;
+
+    // The last answer was Doubao's, but they reply to the agent's own earlier one.
+    model.replies([asks("再解释一下", true)], [say("")]);
+    await cy.says("再解释一下", undefined, cy.sentAs("我自己的看法。"));
+    expect(JSON.stringify(toolOutputs())).toContain("replies to something that is not a piece of work");
+    // Replying to Doubao's answer says which to go on with, and no more: it does not start something new.
+    model.replies([asks("调研 C")], [say("")]);
+    await cy.says("调研 C", undefined, cy.sentAs("A 的结论。"));
+    expect(JSON.stringify(toolOutputs())).toContain("Something new is handed to Doubao only when they say so");
+    expect(world.writes).toHaveLength(before);
+    // And going on with what they replied to still works.
+    model.replies([asks("补充成本", true)], [say("")]);
+    await cy.says("补充成本", undefined, cy.sentAs("A 的结论。"));
+    expect(world.writes.slice(before).map((each) => each.path)).toEqual([`/open-apis/agent/v1/sessions/${session}/events`]);
+  });
+
   it("asks for a token for this work only, whatever else the person has allowed the app before", async () => {
     await pair();
     const dee = someone();

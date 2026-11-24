@@ -392,8 +392,14 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   // Their own word for it, in what they just wrote: not what the model was led to ask for, nor
   // something they said another time. (Or their reply to what Doubao made for them.)
   // Or, for a follow-up only: the last answer they had from the agent when they wrote was what Doubao made for them, not long ago.
-  const followed = carryOn && pointed === undefined && typeof context.latest?.source.op === "string" && Date.now() - context.latest.sent_at < CARRY_ON_WITHIN_MS ? context.latest.source.op : undefined;
-  if (!context.said.some((each) => NAMED.test(each.text)) && pointed === undefined && followed === undefined) return { error: "the person has not asked for Doubao in this message, and it does not follow on an answer Doubao made for them; nothing was sent. If they want this handed to Doubao, they can say so" };
+  // (How recent is judged as it is first asked: a request carried on later is the same piece of work.)
+  const followed = carryOn && pointed === undefined && typeof context.latest?.source.op === "string" && (context.resuming !== undefined || Date.now() - context.latest.sent_at < CARRY_ON_WITHIN_MS) ? context.latest.source.op : undefined;
+  const named = context.said.some((each) => NAMED.test(each.text));
+  // Something new is handed over only on their word for it in this message: what they reply to, or what came before, can only say which piece of work to go on with.
+  if (!carryOn && !named) return { error: "the person has not asked for Doubao in this message; nothing was sent. Something new is handed to Doubao only when they say so in the message itself" };
+  // A reply they marked that does not lead to a piece of work is not guessed around.
+  if (carryOn && pointed === undefined && context.said.some((each) => each.data.replies_to !== undefined)) return { error: "the person's message replies to something that is not a piece of work Doubao did for them, so it cannot be told what to carry on; nothing was sent. Answer it yourself, or ask them which piece of work they mean" };
+  if (!named && pointed === undefined && followed === undefined) return { error: "the person has not asked for Doubao in this message, and it does not follow on an answer Doubao made for them; nothing was sent. If they want this handed to Doubao, they can say so" };
   // Who they are on the other side, as the chat connector verified it with each of their messages.
   const ids = new Set(context.said.map((each) => each.data.union_id));
   const union = ids.size === 1 && typeof [...ids][0] === "string" && [...ids][0] !== "" ? ([...ids][0] as string) : undefined;

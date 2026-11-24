@@ -93,13 +93,25 @@ export class RunTools {
     return { answering: one ? { source: one.request } : {} };
   }
 
-  /** What the agent's last answer here was written from, as of when the person wrote: see ToolContext.latest. */
+  /**
+   * What the agent's last answer here was written from, as of when the person wrote: see
+   * ToolContext.latest. Each message the run acts on is taken at the time it was written (as its
+   * connector gives it, where it does; it can arrive after things that happened later). None if
+   * any of them is marked as a reply to something, or if they do not all follow the same answer.
+   */
   #latest(run: RunRow, acting: Acting, name: string, kept = false): { latest?: { source: Record<string, unknown>; sent_at: number } } {
     const basis = this.#b.requests.basis(run.id);
     if (basis.length === 0) return {};
-    // The last one they could have seen when they wrote, whatever it was: not the last one of some kind.
-    const last = this.#s.rows<{ reads: string; person: string | null; sent_at: number }>("SELECT reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, Math.min(...basis.map((each) => each.received_at)))[0];
-    const source = last && eligibleSource(JSON.parse(last.reads) as Read[], acting, this.#b.toolsOf, last.person, kept);
+    const lasts = basis.map((each) => {
+      const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; written_at?: unknown };
+      if (data.replies_to !== undefined) return undefined;
+      const written = typeof data.written_at === "number" && data.written_at > 0 ? Math.min(data.written_at, each.received_at) : each.received_at;
+      // The last one they could have seen when they wrote, whatever it was: not the last one of some kind.
+      return this.#s.rows<{ outbox_id: number; reads: string; person: string | null; sent_at: number }>("SELECT outbox_id, reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, written)[0];
+    });
+    const last = lasts[0];
+    if (!last || lasts.some((each) => each?.outbox_id !== last.outbox_id)) return {};
+    const source = eligibleSource(JSON.parse(last.reads) as Read[], acting, this.#b.toolsOf, last.person, kept);
     return source && source.tool === name ? { latest: { source: source.request, sent_at: last.sent_at } } : {};
   }
 
