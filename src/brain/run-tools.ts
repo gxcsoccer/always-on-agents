@@ -56,18 +56,27 @@ export class RunTools {
    * person can still point at (see eligibleSource); none when there is no such single thing.
    */
   #answering(run: RunRow, acting: Acting): { answering?: { source?: Record<string, unknown>; nothing?: true } } {
-    // What each message points at: the message it replies to; or, where that is the person's own
-    // message the connector had to fetch, and that one was written in reply to an answer of the
-    // agent's, that answer (one step further up, as the model is shown it).
+    // Which answer of the agent's each message points at: the message it replies to, or the
+    // nearest one further up the chain of replies it stands in, as long as nothing of the
+    // person's own in between names a document itself (what they link comes first).
     const delivered = (subject: unknown): subject is string => typeof subject === "string" && this.#s.rows("SELECT 1 FROM said WHERE session_id = ? AND receipt_subject = ? LIMIT 1", run.session_id, subject).length > 0;
+    const naming = (source: string, subject: string, person: unknown): boolean => {
+      const prefix = `${source}:message:`;
+      const row = subject.startsWith(prefix) ? this.#s.rows<{ data: string | null; principal: string }>("SELECT data, principal FROM inbox WHERE source = ? AND source_id = ? LIMIT 1", source, subject.slice(prefix.length))[0] : undefined;
+      const documents = row && (JSON.parse(row.principal) as { id?: unknown }).id === person ? (JSON.parse(row.data ?? "{}") as { documents?: unknown }).documents : undefined;
+      return Array.isArray(documents) && documents.length > 0;
+    };
     const subjects = this.#b.requests
       .basis(run.id)
       .map((each) => {
-        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; replies_to?: unknown; documents?: unknown } };
-        // Not where the fetched message names something itself: what it links comes first.
-        const names = Array.isArray(data.quoted?.documents) && data.quoted.documents.length > 0;
-        const further = typeof data.quoted?.text === "string" && !names ? data.quoted.replies_to : undefined;
-        return !delivered(data.replies_to) && delivered(further) ? further : data.replies_to;
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { documents?: unknown }; chain?: unknown };
+        const person = (JSON.parse(each.principal ?? "{}") as { id?: unknown }).id;
+        const levels = [{ subject: data.replies_to, documents: data.quoted?.documents }, ...(Array.isArray(data.chain) ? (data.chain as { subject?: unknown; documents?: unknown }[]).filter(Boolean) : [])];
+        for (const level of levels) {
+          if (delivered(level.subject)) return level.subject;
+          if (typeof level.subject !== "string" || (Array.isArray(level.documents) && level.documents.length > 0) || naming(String(each.source ?? ""), level.subject, person)) break;
+        }
+        return data.replies_to;
       })
       .filter((each): each is string => typeof each === "string");
     if (subjects.length === 0) return {};

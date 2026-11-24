@@ -224,7 +224,7 @@ describe("the Feishu webhook endpoint", () => {
     // The Brain asks through the connector as it takes the message up, and the model is shown what came back.
     model.replies([say("ok")]);
     await wake(brainFor(`${t}:chat:oc_group`));
-    expect(JSON.stringify(modelCalls.at(-1).input)).toContain("written as a reply to their own earlier message: \\\"the notes https://x.feishu.cn/docx/D1\\\"");
+    expect(JSON.stringify(modelCalls.at(-1).input)).toContain("[An earlier message of theirs that this leads back to, which you were not sent:]\\nthe notes https://x.feishu.cn/docx/D1");
     expect(asked.filter((each) => each.startsWith("/im/v1/messages/om_parent"))).toHaveLength(1);
     asked.length = 0;
     lapsed = 1;

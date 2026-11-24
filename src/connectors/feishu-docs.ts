@@ -66,11 +66,37 @@ function ownDocuments(message: { data: Record<string, unknown> }): DocumentRef[]
  * link as written there, where the connector kept it. Not this message's own: what it points at.
  */
 function quotedDocuments(message: { data: Record<string, unknown> }): (DocumentRef & { link?: string })[] {
-  const quoted = (message.data.quoted as { documents?: unknown } | undefined)?.documents;
-  return (Array.isArray(quoted) ? (quoted as (DocumentRef & { link?: unknown })[]) : []).filter((each) => whole(each)).map((each) => {
+  return fetchedDocuments((message.data.quoted as { documents?: unknown } | undefined)?.documents);
+}
+
+/** Documents as the connector recorded them for a message it fetched: each whole, with its link only where that names the same document. */
+function fetchedDocuments(documents: unknown): (DocumentRef & { link?: string })[] {
+  return (Array.isArray(documents) ? (documents as (DocumentRef & { link?: unknown })[]) : []).filter((each) => whole(each)).map((each) => {
     const named = typeof each.link === "string" ? documentOf(each.link) : undefined;
     return { kind: each.kind, token: each.token, ...(named && named.kind === each.kind && named.token === each.token ? { link: each.link as string } : {}) };
   });
+}
+
+/**
+ * The documents the chain of replies these messages stand in leads back to, of the person's own
+ * linking: in the message replied to and in everything further up that the Brain followed.
+ * Their own words the connector fetched (kept with the message), and their own earlier messages
+ * on record here (`recent` holds only theirs). Nothing of anyone else's, and nothing an answer
+ * of the agent's says. Good for this request alone: it is read off the request's own messages.
+ */
+function ledBackTo(context: ToolContext): (DocumentRef & { link?: string; message?: { text: string; data: Record<string, unknown> } })[] {
+  const found: (DocumentRef & { link?: string; message?: { text: string; data: Record<string, unknown> } })[] = [];
+  for (const message of context.said) {
+    const levels = Array.isArray(message.data.chain) ? (message.data.chain as { subject?: unknown; documents?: unknown }[]).filter(Boolean) : [];
+    found.push(...quotedDocuments(message), ...levels.flatMap((level) => fetchedDocuments(level.documents)));
+    const subjects = [message.data.replies_to, ...levels.map((level) => level.subject)].filter((each): each is string => typeof each === "string");
+    for (const earlier of context.recent) {
+      if (typeof earlier.data.message_id !== "string" || !subjects.includes(`feishu:message:${earlier.data.message_id}`)) continue;
+      const written = linksIn(earlier.text);
+      for (const each of ownDocuments(earlier)) found.push({ ...each, link: written.find((link) => link.kind === each.kind && link.token === each.token)?.link, message: earlier });
+    }
+  }
+  return found.filter((each, index) => found.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
 }
 
 /**
@@ -215,31 +241,26 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   // The link the person wrote for this document in a message they replied to that had to be fetched.
   let quotedLink: string | undefined;
   const linkingEarlier = context.recent.filter((message) => documents(message).some(matches));
-  if (now.length === 0 && repliedTo.length > 0 && !context.answering) {
-    // Every message they replied to has to be one of their own, on record, and together they
-    // have to name one document. Anything less does not say which document is meant, and what
-    // they linked last is not read in its place. They point at it afresh each time.
-    // On record here; or, where the agent was never sent it, as the connector fetched it for the message that replies to it.
-    const pointed = [...new Set(repliedTo)].map((subject) => {
-      const parent = context.recent.find((message) => typeof message.data.message_id === "string" && subject === `feishu:message:${message.data.message_id}`);
-      const replying = parent ? [] : context.said.filter((message) => message.data.replies_to === subject);
-      const fetched = replying.flatMap(quotedDocuments);
-      // One step further up, where the fetched message links nothing itself: the person's own
-      // earlier message it was written in reply to, if that is on record here.
-      const above = fetched.length > 0 ? [] : [...new Set(replying.map((message) => (message.data.quoted as { replies_to?: unknown } | undefined)?.replies_to).filter((each): each is string => typeof each === "string"))];
-      const earlier = above.length === 1 ? context.recent.find((message) => typeof message.data.message_id === "string" && above[0] === `feishu:message:${message.data.message_id}`) : undefined;
-      return { parent: parent ?? earlier, links: parent ? ownDocuments(parent) : earlier ? ownDocuments(earlier) : fetched, fetched };
-    });
-    const parents = pointed.map((each) => each.parent);
-    const named = pointed.flatMap((each) => each.links);
-    const distinct = named.filter((each, index) => named.findIndex((other) => other.kind === each.kind && other.token === each.token) === index);
-    if (pointed.some((each) => each.links.length === 0)) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
-    if (distinct.length !== 1) return { error: "the message the person replied to links several documents and this request does not say which; ask them which one they mean" };
-    chosen = distinct;
-    quotedLink = pointed.flatMap((each) => each.fetched).find((each) => matches(each) && each.link)?.link;
-    naming = parents.flatMap((each) => (each ? [each] : []));
-    for (const each of parents) if (each) context.relied?.("recent", context.recent.indexOf(each));
+  // What the chain of replies leads back to, of their own linking. Where it holds several
+  // documents, which is meant is the model's to say from what it is shown: any of them can be read.
+  const led = ledBackTo(context);
+  const hit = led.find(matches);
+  const fromChain = () => {
+    chosen = [...now, target];
+    quotedLink = hit!.link;
+    naming = hit!.message ? [hit!.message] : [];
+    if (hit!.message) context.relied?.("recent", context.recent.indexOf(hit!.message));
     if (context.said.length === 1) context.relied?.("said", 0);
+  };
+  if (now.length === 0 && repliedTo.length > 0 && !context.answering) {
+    // A reply to something that is not an answer of the agent's, linking nothing itself: it is
+    // about what the chain leads back to, and about nothing else they happen to have linked.
+    if (led.length === 0) return { error: "the person wrote this as a reply to a message that does not link a document (or that is no longer on record), so it is not known which document they mean; ask them to send the link" };
+    if (!hit) return { error: "the messages this one was written in reply to link other documents, not that one; read one of those, or ask the person which they mean" };
+    fromChain();
+  } else if (hit && linkingNow.length === 0) {
+    // Also where it replies to an answer of the agent's: what the person linked up the chain is theirs to have read.
+    fromChain();
   } else {
     // A reply to one of the agent's answers, linking nothing new for this document: only the one
     // thing that answer was written from and the person can still point at, if there is one.

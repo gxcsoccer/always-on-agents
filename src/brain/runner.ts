@@ -10,7 +10,7 @@
  */
 import type { ConnectorTool, Quoted } from "../connectors";
 import type { Env } from "../env";
-import { type Principal, privateSessionKey } from "../events";
+import { type Principal, type Target, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import type { Outbox } from "./outbox";
@@ -30,6 +30,8 @@ const MAX_TRANSCRIPT_ITEMS = 80;
 const MAX_EVENTS_PER_RUN = 40;
 /** How long a connector is given to fetch what a message was written in reply to. */
 export const QUOTED_WAIT_MS = 3_000;
+/** How far up the chain of replies a message stands in is followed. */
+export const MAX_CHAIN = 5;
 const MAX_EVENT_BYTES_PER_RUN = 120_000;
 const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
@@ -61,6 +63,8 @@ export interface RunnerHost {
   respond(request: ModelRequest): Promise<ModelResponse>;
   /** The message one was written in reply to, asked of the connector it came through. Never throws. */
   quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
+  /** The message something sent to this address is written under, where the connector says. */
+  under(target: Target): string | undefined;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
   readonly tools: Pick<RunTools, "for">;
@@ -163,9 +167,11 @@ export class Runner {
       // A reply to one of the agent's own delivered messages points at those words (see #transcript); it does not hold them.
       // Likewise an earlier message of the person's own that one of these leads back to: named, not copied.
       const replied: number[] = [];
-      const pointed: Pointed[] = [];
-      const content = events.map((each) => renderEvent(each) + this.#repliedTo(each, session.id, replied, pointed)).join("\n");
-      this.append(session.id, runId, { role: "user", content, ...(replied.length > 0 ? { _replied: replied } : {}), ...(pointed.length > 0 ? { _pointed: pointed } : {}) } as Item);
+      // And what stands further up the chain of replies: named, never copied, and shown from
+      // where it is kept each time the transcript is put together (oldest first, each thing once).
+      const chain: Link[] = [];
+      const content = events.map((each) => renderEvent(each) + this.#repliedTo(each, session.id, replied, chain)).join("\n");
+      this.append(session.id, runId, { role: "user", content, ...(replied.length > 0 ? { _replied: replied } : {}), ...(chain.length > 0 ? { _chain: chain } : {}) } as Item);
       this.#s.setMeta("active_run", runId);
       return runId;
     });
@@ -176,15 +182,30 @@ export class Runner {
    * message of the same person's in this conversation is quoted (their own words, as stored);
    * one of the agent's is only named by when it was sent, since what it said may not be kept.
    */
+  /** The one person who wrote every message this run was started by, if it was one person and nothing else started it. */
+  #writerOf(runId: string): string | undefined {
+    const writers = this.#s.rows<{ kind: string; principal: string }>("SELECT kind, principal FROM inbox WHERE run_id = ?", runId).map((each) => (each.kind === "message" ? (JSON.parse(each.principal) as Principal) : undefined));
+    const first = writers[0];
+    return first && first.kind === "human" && writers.every((each) => each?.kind === "human" && each.id === first.id) ? first.id : undefined;
+  }
+
   /** What would be shown with this message because of what it leads back to, and how much each is: for measuring a run before it starts. */
   #shownWith(event: InboxRow): { key: string; size: number }[] {
     const sessionId = this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", event.session_key)[0]?.id ?? "";
     const replied: number[] = [];
-    const pointed: Pointed[] = [];
-    this.#repliedTo(event, sessionId, replied, pointed);
+    const chain: Link[] = [];
+    this.#repliedTo(event, sessionId, replied, chain);
     // In the units the messages themselves are measured in (sizeOf), with room for what is written around each when it is shown.
-    const said = replied.map((id) => ({ key: `said:${id}`, size: (this.#s.rows<{ text: string }>("SELECT text FROM said WHERE outbox_id = ?", id)[0]?.text.length ?? 0) + SHOWN_AROUND }));
-    return [...said, ...pointed.map((each) => ({ key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + SHOWN_AROUND }))];
+    const words = (id: number) => (this.#s.rows<{ text: string }>("SELECT text FROM said WHERE outbox_id = ?", id)[0]?.text.length ?? 0) + SHOWN_AROUND;
+    return [
+      ...replied.map((id) => ({ key: `said:${id}`, size: words(id) })),
+      ...chain.map((each) => {
+        if (each.kind === "said") return { key: `said:${each.id}`, size: words(each.id) };
+        if (each.kind === "inbox") return { key: `inbox:${each.id}`, size: MAX_POINTED_TEXT + SHOWN_AROUND };
+        // Kept with the message itself, so already measured with it (sizeOf counts its data): only what is written around it.
+        return { key: each.kind === "fetched" ? `fetched:${each.event}:${each.level}` : `${each.kind}:${event.id}`, size: SHOWN_AROUND };
+      }),
+    ];
   }
 
   /** The stored message another was written in reply to: the very one, earlier, in the same conversation and through the same connector. */
@@ -194,9 +215,14 @@ export class Runner {
     return this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE source = ? AND source_id = ? AND kind = 'message' AND session_key = ? AND id < ?", event.source, subject.slice(prefix.length), event.session_key, event.id)[0];
   }
 
-  #repliedTo(event: InboxRow, sessionId: string, replied: number[], pointed: Pointed[] = []): string {
+  #repliedTo(event: InboxRow, sessionId: string, replied: number[], chain: Link[] = []): string {
     const subject = event.kind === "message" && event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
     if (typeof subject !== "string") return "";
+    return this.#repliedDirectly(event, sessionId, subject, replied, chain) + this.#repliedFurther(event, sessionId, chain);
+  }
+
+  /** What the message it replies to itself is, for the model. */
+  #repliedDirectly(event: InboxRow, sessionId: string, subject: string, replied: number[], chain: Link[]): string {
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
     if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `\n  (written as a reply to their own earlier message: ${JSON.stringify(parent.text.slice(0, 500))})`;
@@ -217,35 +243,41 @@ export class Runner {
     if (yours?.sent_at) return `\n  (written as a reply to the message you sent at ${new Date(yours.sent_at).toISOString()})`;
     // A message the agent was never sent, which the connector was asked for before this run
     // (see #quote): the person's own words, or only that there was one.
-    const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { text?: unknown; replies_to?: unknown } }).quoted;
+    const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { text?: unknown } }).quoted;
     if (!quoted) return "";
     if (typeof quoted.text !== "string") return "\n  (written as a reply to a message here that is not shown to you: someone else's, or one that could not be read)";
-    return `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)}${this.#further(event, sessionId, quoted.replies_to, replied, pointed)})`;
+    // Their own words, kept with this message and shown from there: not copied into the turn,
+    // which everyone who talks here is later shown.
+    push(chain, { kind: "fetched", event: event.id, level: 1, by: (JSON.parse(event.principal) as Principal).id });
+    return "\n  (written as a reply to an earlier message of their own that you were not sent, shown just before this)";
   }
 
   /**
-   * One step further up: what the person's own message, the one this event replies to and the
-   * connector had to fetch, was itself written in reply to. Only from the Brain's own records, in
-   * this conversation: an answer of the agent's as it reached them (shown as the agent's own when
-   * the transcript is put together), or an earlier message of the same person's. Anything else up
-   * there is not said.
+   * What stands further up the chain of replies, beyond the message replied to: each named for
+   * showing before the turn, oldest first. An answer of the agent's delivered here; a message of
+   * the same person's on record here; their own words the connector fetched; or only that
+   * something stood there (someone else's, or nothing that can be shown).
    */
-  #further(event: InboxRow, sessionId: string, subject: unknown, replied: number[], pointed: Pointed[]): string {
-    if (typeof subject !== "string") return "";
-    const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
-    if (words) {
-      if (!replied.includes(words.outbox_id)) replied.push(words.outbox_id);
-      return `, which they wrote as a reply to the message you sent at ${new Date(words.sent_at).toISOString()}`;
-    }
-    // Their own, on record here: named by its row, and shown from there when the transcript is
-    // put together (see #transcript). Its words are not copied into this turn, which could outlast them.
-    const parent = this.#parentOf(event, subject);
-    const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
-    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) {
-      if (!pointed.some((each) => each.id === parent.id)) pointed.push({ id: parent.id, by: who(parent).id });
-      return ", which they wrote as a reply to an earlier message of their own, shown just before this";
-    }
-    return "";
+  #repliedFurther(event: InboxRow, sessionId: string, chain: Link[]): string {
+    const levels = (JSON.parse(event.data ?? "{}") as { chain?: unknown }).chain;
+    if (!Array.isArray(levels) || levels.length === 0) return "";
+    const by = (JSON.parse(event.principal) as Principal).id;
+    const found: Link[] = [];
+    (levels as Level[]).forEach((level, index) => {
+      if ("cut" in level) return void found.push({ kind: "cut" });
+      const words = this.#s.rows<{ outbox_id: number }>("SELECT outbox_id FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", level.subject, sessionId)[0];
+      if (words) return void found.push({ kind: "said", id: words.outbox_id });
+      const parent = this.#parentOf(event, level.subject);
+      const who = parent ? (JSON.parse(parent.principal) as Principal) : undefined;
+      if (parent && parent.text !== null && who?.kind === "human" && who.id === by) return void found.push({ kind: "inbox", id: parent.id, by });
+      if (typeof level.text === "string") return void found.push({ kind: "fetched", event: event.id, level: index + 2, by });
+      found.push({ kind: "hidden" });
+    });
+    // Oldest first; and before the message replied to itself, where that is shown this way too.
+    const direct = chain.findIndex((each) => each.kind === "fetched" && each.event === event.id && each.level === 1);
+    let at = direct >= 0 ? direct : chain.length;
+    for (const each of found.reverse()) if (push(chain, each, at)) at++;
+    return "\n  (that stands in a chain of replies: what it leads back to is shown just before this, oldest first)";
   }
 
   /**
@@ -256,38 +288,116 @@ export class Runner {
    * has not answered by then is told to stop, and the run starts whatever came of it.
    */
   async #quote(events: InboxRow[]): Promise<void> {
-    const sessionId = events[0] ? (this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", events[0].session_key)[0]?.id ?? "") : "";
-    // Asked about once for each person and message replied to, however many messages say so.
-    const unknown = new Map<string, { asking: { principal: Principal; data: Record<string, unknown> }; source: string; ids: number[] }>();
+    // Followed once for each person and message replied to, however many messages say so.
+    const asked = new Map<string, { event: InboxRow; ids: number[] }>();
     for (const event of events) {
       const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
       const principal = JSON.parse(event.principal) as Principal;
-      const subject = data.replies_to;
-      // Only a person's ordinary message, about a message there is no record of at all: not one
-      // that reached the agent (whoever wrote it, and whether or not its words are still kept),
-      // not one the agent or the system sent, and not an answer to a question.
-      if (event.kind !== "message" || principal.kind !== "human" || typeof subject !== "string" || data.quoted !== undefined || data.question !== undefined) continue;
-      // On record anywhere in this place, by its identity alone: also where its words are gone, or it was filed under another conversation.
-      const prefix = `${event.source}:message:`;
-      if (subject.startsWith(prefix) && this.#s.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ? LIMIT 1", event.source, subject.slice(prefix.length)).length > 0) continue;
-      if (this.#s.rows("SELECT 1 FROM outbox WHERE json_extract(receipt, '$.subject') = ? LIMIT 1", subject).length > 0 || this.#repliedTo(event, sessionId, []) !== "") continue;
-      const key = JSON.stringify([event.source, principal.id, subject, data.origin ?? null]);
-      const same = unknown.get(key);
+      // Only a person's ordinary message written as a reply, and only once: not an answer to a question.
+      if (event.kind !== "message" || principal.kind !== "human" || typeof data.replies_to !== "string" || data.quoted !== undefined || data.chain !== undefined || data.question !== undefined) continue;
+      const key = JSON.stringify([event.source, principal.id, data.replies_to, data.origin ?? null]);
+      const same = asked.get(key);
       if (same) same.ids.push(event.id);
-      else unknown.set(key, { asking: { principal, data }, source: event.source, ids: [event.id] });
+      else asked.set(key, { event, ids: [event.id] });
     }
-    if (unknown.size === 0) return;
+    if (asked.size === 0) return;
     const stop = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<Quoted>((resolve) => (timer = setTimeout(() => resolve({}), QUOTED_WAIT_MS)));
+    // One limit for all of it. What has not come back by then is left out, and said to be.
+    const late = new Promise<"late">((resolve) => (timer = setTimeout(() => resolve("late"), QUOTED_WAIT_MS)));
     await Promise.all(
-      [...unknown.values()].map(async ({ asking, source, ids }) => {
-        const found = await Promise.race([this.#b.quoted(source, { ...asking, signal: stop.signal }), late]).catch((): Quoted => ({}));
-        if (found) for (const id of ids) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(typeof found.text === "string" ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(typeof found.replies_to === "string" ? { replies_to: found.replies_to } : {}) } : {}), id);
+      [...asked.values()].map(async ({ event, ids }) => {
+        const found = await this.#walk(event, stop.signal, late).catch(() => undefined);
+        if (!found) return;
+        for (const id of ids) {
+          if (found.quoted) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.quoted', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify(found.quoted), id);
+          if (found.chain.length > 0 || found.partial) this.#s.sql.exec("UPDATE inbox SET data = json_set(data, '$.chain', json(?)) WHERE id = ? AND status = 'pending'", JSON.stringify([...found.chain, ...(found.partial ? [{ cut: true }] : [])]), id);
+        }
       }),
     );
     clearTimeout(timer);
     stop.abort();
+  }
+
+  /**
+   * The chain of replies a message stands in, from the message it replies to upwards: at most
+   * MAX_CHAIN messages. Each is looked for in the Brain's own records first (a message that
+   * reached it here, an answer of its own as it was delivered here); only one there is no record
+   * of is asked of the connector, which gives the person's own words or, for anyone else's,
+   * nothing but where it points. What is on record is kept as a name only; what was fetched is
+   * kept with the message that led to it. Ends where a message replies to nothing, where the
+   * same message comes round again, or where time runs out (`partial`).
+   */
+  async #walk(event: InboxRow, signal: AbortSignal, late: Promise<"late">): Promise<{ quoted?: Record<string, unknown>; chain: Level[]; partial: boolean }> {
+    const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
+    const principal = JSON.parse(event.principal) as Principal;
+    const chain: Level[] = [];
+    let quoted: Record<string, unknown> | undefined;
+    const seen = new Set<string>();
+    let subject: string | undefined = data.replies_to as string;
+    let partial = false;
+    for (let level = 1; subject !== undefined; level++) {
+      // Round in a circle, or not the name of a message that came through this connector: it ends here.
+      if (seen.has(subject) || !subject.startsWith(`${event.source}:message:`)) break;
+      if (level > MAX_CHAIN) {
+        partial = true;
+        break;
+      }
+      seen.add(subject);
+      const here = this.#onRecord(event, subject);
+      let next: string | undefined;
+      if (here) {
+        next = here.next;
+        if (level > 1) chain.push({ subject });
+      } else {
+        const found: Quoted | "late" | undefined = await Promise.race([this.#b.quoted(event.source, { principal, data: { ...data, replies_to: subject }, signal }), late]).catch((): Quoted => ({}));
+        if (found === "late") {
+          // Not back in time: for the message replied to itself, as one that could not be read.
+          if (level === 1) quoted = {};
+          else partial = true;
+          break;
+        }
+        // Where the connector has no such thing at all, nothing is kept, as before.
+        if (found === undefined) break;
+        const own = typeof found.text === "string";
+        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}) } : {};
+        next = typeof found.replies_to === "string" ? found.replies_to : undefined;
+        if (level === 1) quoted = { ...kept, ...(own && next ? { replies_to: next } : {}) };
+        else chain.push({ subject, ...(own ? kept : { hidden: true }) });
+      }
+      subject = next;
+    }
+    return { ...(quoted ? { quoted } : {}), chain, partial };
+  }
+
+  /**
+   * A message on the Brain's own record in this conversation, by its name, and what it was
+   * itself written in reply to: one that reached the agent here (whoever wrote it), or one the
+   * agent sent here. Undefined where there is no record of it.
+   */
+  #onRecord(event: InboxRow, subject: string): { next?: string } | undefined {
+    const prefix = `${event.source}:message:`;
+    const arrived = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE source = ? AND source_id = ? LIMIT 1", event.source, subject.slice(prefix.length))[0];
+    if (arrived) {
+      // Followed further only within this conversation: a message filed under another is where this ends.
+      const above = arrived.session_key === event.session_key ? (JSON.parse(arrived.data ?? "{}") as { replies_to?: unknown }).replies_to : undefined;
+      return { ...(typeof above === "string" ? { next: above } : {}) };
+    }
+    // The agent's own: what it was sent under, from the address it was really sent to. Only for
+    // an answer delivered in this conversation; anything else it sent (a notice, a card) ends the chain.
+    const sent = this.#s.rows<{ target: string; said: number | null }>(
+      "SELECT o.target, (SELECT 1 FROM said w JOIN sessions s ON s.id = w.session_id WHERE w.outbox_id = o.id AND s.session_key = ?) AS said FROM outbox o WHERE json_extract(o.receipt, '$.subject') = ? LIMIT 1",
+      event.session_key,
+      subject,
+    )[0];
+    if (!sent) return undefined;
+    let above: string | undefined;
+    try {
+      above = sent.said ? this.#b.under(JSON.parse(sent.target) as Target) : undefined;
+    } catch {
+      above = undefined;
+    }
+    return { ...(above ? { next: above } : {}) };
   }
 
   async execute(runId: string): Promise<void> {
@@ -668,13 +778,11 @@ export class Runner {
         .reverse();
       // A message the person replied to is part of what they are saying now, however long ago
       // they wrote it: their own, by the same test, in this conversation.
-      // Also one step further up: what their own fetched message was written in reply to, where
-      // that message names nothing itself (the same step the model is shown, and a read goes by).
+      // And every message further up the chain of replies (the same chain the model is shown).
       const pointed = events.flatMap((each) => {
-        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; quoted?: { text?: unknown; documents?: unknown; replies_to?: unknown } };
-        const names = Array.isArray(data.quoted?.documents) && data.quoted.documents.length > 0;
-        const further = typeof data.quoted?.text === "string" && !names ? data.quoted.replies_to : undefined;
-        return [data.replies_to, further].filter((subject): subject is string => typeof subject === "string");
+        const data = JSON.parse(each.data ?? "{}") as { replies_to?: unknown; chain?: unknown };
+        const further = Array.isArray(data.chain) ? (data.chain as Level[]).map((level) => ("subject" in level ? level.subject : undefined)) : [];
+        return [data.replies_to, ...further].filter((subject): subject is string => typeof subject === "string");
       });
       if (pointed.length > 0) {
         const older = [...new Set(pointed)].flatMap((subject) => this.#parentOf(first, subject) ?? []).filter((each, index, all) => own(each) && each.text !== null && all.findIndex((other) => other.id === each.id) === index && !recent.some((seen) => seen.id === each.id));
@@ -742,7 +850,11 @@ export class Runner {
       wordsOf.set(each.run_id, [...(wordsOf.get(each.run_id) ?? []), { role: "assistant", content: each.text }]);
     }
     // The words people replied to, for every reply in the window, in one query.
-    const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
+    const pointed = rows.flatMap((row) => {
+      if (row.is_user !== 1) return [];
+      const item = JSON.parse(row.item) as { _replied?: number[]; _chain?: Link[] };
+      return [...(item._replied ?? []), ...(item._chain ?? []).flatMap((each) => (each.kind === "said" ? [each.id] : []))];
+    });
     const quotedOf = new Map(
       pointed.length === 0 || !mayShow ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string; person: string | null }>("SELECT outbox_id, text, sent_at, reads, person FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
@@ -753,25 +865,50 @@ export class Runner {
     const entries: { item: Item; starts: boolean }[] = [];
     // Who the run acts for, worked out once and only if some answer is quoted: what they can still
     // point at decides what an answer is shown as written from.
-    const leads = rows.some((row) => row.is_user === 1 && row.item.includes('"_pointed"'));
+    const leads = rows.some((row) => row.is_user === 1 && (row.item.includes('"_pointed"') || row.item.includes('"_chain"')));
     const acting = (quotedOf.size > 0 || leads) && runId ? this.actingFor(runId) : undefined;
     // Whose earlier words may be led back to in this run: the person it acts for, where several
     // people talk; in a person's own scope, theirs.
+    // (Where the run acts for nobody there, the one person who wrote everything it was started
+    // by: their own words, fetched for their own message, are theirs to be shown with it.)
     const scope = this.#s.scope();
-    const me = scope.kind === "chat" ? acting?.person : scope.kind === "user" ? scope.id : undefined;
+    const me = scope.kind === "chat" ? (acting?.person ?? (leads && runId ? this.#writerOf(runId) : undefined)) : scope.kind === "user" ? scope.id : undefined;
     rows.forEach((row, index) => {
-      const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[]; _pointed?: Pointed[] };
+      const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[]; _pointed?: Pointed[]; _chain?: Link[] };
       if (row.is_user === 1) {
         // An earlier message of the person's own that this turn leads back to: its words as they
         // are kept now, in this conversation, by the same person; or only that there was one.
         // (A turn begins at the first thing shown for it, so the window is never cut between them.)
         const before = entries.length;
-        for (const each of mayShow ? (item._pointed ?? []) : []) {
-          const kept = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ? AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", each.id, sessionId)[0];
-          // Theirs then, and theirs now: the same person this run is for, through the same connector and origin where that is known.
+        // A message kept here, if it is this conversation's and this run is for the one who wrote it,
+        // through the same connector and origin where that is known: theirs then, and theirs now.
+        const theirs = (id: number, by: string): InboxRow | undefined => {
+          const kept = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ? AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", id, sessionId)[0];
           const same = kept !== undefined && (!acting || (kept.source === acting.connector && JSON.stringify(originOf(kept)) === JSON.stringify(acting.origin)));
-          const theirs = kept && kept.text !== null && same && each.by === me && (JSON.parse(kept.principal) as Principal).id === each.by;
-          entries.push({ item: { role: "user", content: theirs ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text!.slice(0, MAX_POINTED_TEXT)}` : "[An earlier message of theirs that this leads back to is no longer kept.]" }, starts: entries.length === before });
+          return kept && same && by === me && (JSON.parse(kept.principal) as Principal).id === by ? kept : undefined;
+        };
+        const lead = (content: string, role: "user" | "assistant" = "user") => entries.push({ item: { role, content }, starts: entries.length === before });
+        const GONE = "[An earlier message of theirs that this leads back to is no longer kept.]";
+        // (An item written before the whole chain was followed names one such message this way.)
+        const links: Link[] = [...(item._pointed ?? []).map((each): Link => ({ kind: "inbox", ...each })), ...(item._chain ?? [])];
+        for (const each of links) {
+          if (each.kind === "inbox") {
+            const kept = theirs(each.id, each.by);
+            lead(kept && kept.text !== null ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text.slice(0, MAX_POINTED_TEXT)}` : GONE);
+          } else if (each.kind === "fetched") {
+            // Their own words that had to be fetched, kept with the message that led to them.
+            const kept = theirs(each.event, each.by);
+            const data = kept ? (JSON.parse(kept.data ?? "{}") as { quoted?: { text?: unknown }; chain?: Level[] }) : {};
+            const level = each.level === 1 ? data.quoted : data.chain?.[each.level - 2];
+            const text = level && "text" in level && typeof level.text === "string" ? level.text : undefined;
+            lead(text !== undefined ? `[An earlier message of theirs that this leads back to, which you were not sent:]\n${text.slice(0, MAX_FETCHED_TEXT)}` : GONE);
+          } else if (each.kind === "said") {
+            const words = quotedOf.get(each.id);
+            if (!words) continue;
+            const source = eligibleSource(JSON.parse(words.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, words.person);
+            const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
+            lead(`[A message of yours further up the chain of replies, sent at ${new Date(words.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${words.text}`, "assistant");
+          } else lead(each.kind === "cut" ? "[The chain of replies goes further back than was followed.]" : "[A message here that this leads back to is not shown to you: someone else's, or one that could not be read.]");
         }
         const led = entries.length > before;
         const quoted = [...new Set(item._replied ?? [])].flatMap((id) => quotedOf.get(id) ?? []);
@@ -877,10 +1014,28 @@ function today(): string {
 }
 
 /** How much of a run's room a message takes. */
+/** Adds something to show before a turn, unless it is there already: each thing once. Says whether it was added. */
+function push(chain: Link[], link: Link, at = chain.length): boolean {
+  const key = (each: Link) => (each.kind === "said" || each.kind === "inbox" ? `${each.kind}:${each.id}` : each.kind === "fetched" ? `fetched:${each.event}:${each.level}` : undefined);
+  if (key(link) !== undefined && chain.some((each) => key(each) === key(link))) return false;
+  chain.splice(at, 0, link);
+  return true;
+}
+
+/** One message further up the chain of replies, as kept with the message that led to it: its name, and, where it had to be fetched, the person's own words and links, or that it is not theirs. A last entry `cut` says the chain goes on but was not followed. */
+type Level = { subject: string; text?: string; documents?: unknown[]; hidden?: true } | { cut: true };
+/**
+ * One thing a turn leads back to, to be shown before it: an answer of the agent's by its outbox
+ * row; a message of the person's own on record by its row; one that was fetched, by the message
+ * it is kept with and how far up it stood; or one that is not shown.
+ */
+type Link = { kind: "said"; id: number } | { kind: "inbox"; id: number; by: string } | { kind: "fetched"; event: number; level: number; by: string } | { kind: "hidden" } | { kind: "cut" };
 /** An earlier message of the person's own that a turn leads back to: its row, and whose it was when that was established. */
 type Pointed = { id: number; by: string };
 /** How much of such a message is shown. */
 const MAX_POINTED_TEXT = 500;
+/** How much of a fetched message is shown (the connector already keeps it short). */
+const MAX_FETCHED_TEXT = 1_000;
 /** Room for what is written around something shown with a turn: its label, and where it was written from. */
 const SHOWN_AROUND = 600;
 
