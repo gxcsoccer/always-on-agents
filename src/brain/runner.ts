@@ -133,9 +133,14 @@ export class Runner {
       // longer fit stay pending, with what was fetched kept, for the next run.
       const events: InboxRow[] = [];
       let bytes = 0;
+      // What is shown with a message because of what it leads back to (an answer of the agent's,
+      // an earlier message of the person's) counts too: each such thing once for the run.
+      const counted = new Set<string>();
       for (const event of ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE status = 'pending' AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids)) {
-        bytes += sizeOf(event);
+        const shown = this.#shownWith(event).filter((each) => !counted.has(each.key));
+        bytes += sizeOf(event) + shown.reduce((sum, each) => sum + each.size, 0);
         if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
+        for (const each of shown) counted.add(each.key);
         events.push(event);
       }
       const first = events[0];
@@ -156,9 +161,11 @@ export class Runner {
 
       this.#s.sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES (?, ?, 'running', ?)", runId, session.id, now);
       // A reply to one of the agent's own delivered messages points at those words (see #transcript); it does not hold them.
+      // Likewise an earlier message of the person's own that one of these leads back to: named, not copied.
       const replied: number[] = [];
-      const content = events.map((each) => renderEvent(each) + this.#repliedTo(each, session.id, replied)).join("\n");
-      this.append(session.id, runId, { role: "user", content, ...(replied.length > 0 ? { _replied: replied } : {}) } as Item);
+      const pointed: Pointed[] = [];
+      const content = events.map((each) => renderEvent(each) + this.#repliedTo(each, session.id, replied, pointed)).join("\n");
+      this.append(session.id, runId, { role: "user", content, ...(replied.length > 0 ? { _replied: replied } : {}), ...(pointed.length > 0 ? { _pointed: pointed } : {}) } as Item);
       this.#s.setMeta("active_run", runId);
       return runId;
     });
@@ -169,6 +176,16 @@ export class Runner {
    * message of the same person's in this conversation is quoted (their own words, as stored);
    * one of the agent's is only named by when it was sent, since what it said may not be kept.
    */
+  /** What would be shown with this message because of what it leads back to, and how much each is: for measuring a run before it starts. */
+  #shownWith(event: InboxRow): { key: string; size: number }[] {
+    const sessionId = this.#s.rows<{ id: string }>("SELECT id FROM sessions WHERE session_key = ?", event.session_key)[0]?.id ?? "";
+    const replied: number[] = [];
+    const pointed: Pointed[] = [];
+    this.#repliedTo(event, sessionId, replied, pointed);
+    const said = replied.map((id) => ({ key: `said:${id}`, size: this.#s.rows<{ n: number }>("SELECT LENGTH(text) AS n FROM said WHERE outbox_id = ?", id)[0]?.n ?? 0 }));
+    return [...said, ...pointed.map((each) => ({ key: `inbox:${each.id}`, size: MAX_POINTED_TEXT }))];
+  }
+
   /** The stored message another was written in reply to: the very one, earlier, in the same conversation and through the same connector. */
   #parentOf(event: InboxRow, subject: string): InboxRow | undefined {
     const prefix = `${event.source}:message:`;
@@ -176,7 +193,7 @@ export class Runner {
     return this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE source = ? AND source_id = ? AND kind = 'message' AND session_key = ? AND id < ?", event.source, subject.slice(prefix.length), event.session_key, event.id)[0];
   }
 
-  #repliedTo(event: InboxRow, sessionId: string, replied: number[]): string {
+  #repliedTo(event: InboxRow, sessionId: string, replied: number[], pointed: Pointed[] = []): string {
     const subject = event.kind === "message" && event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
     if (typeof subject !== "string") return "";
     const parent = this.#parentOf(event, subject);
@@ -202,7 +219,7 @@ export class Runner {
     const quoted = (JSON.parse(event.data ?? "{}") as { quoted?: { text?: unknown; replies_to?: unknown } }).quoted;
     if (!quoted) return "";
     if (typeof quoted.text !== "string") return "\n  (written as a reply to a message here that is not shown to you: someone else's, or one that could not be read)";
-    return `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)}${this.#further(event, sessionId, quoted.replies_to, replied)})`;
+    return `\n  (written as a reply to their own earlier message: ${JSON.stringify(quoted.text)}${this.#further(event, sessionId, quoted.replies_to, replied, pointed)})`;
   }
 
   /**
@@ -212,18 +229,21 @@ export class Runner {
    * the transcript is put together), or an earlier message of the same person's. Anything else up
    * there is not said.
    */
-  #further(event: InboxRow, sessionId: string, subject: unknown, replied: number[]): string {
+  #further(event: InboxRow, sessionId: string, subject: unknown, replied: number[], pointed: Pointed[]): string {
     if (typeof subject !== "string") return "";
     const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
     if (words) {
       if (!replied.includes(words.outbox_id)) replied.push(words.outbox_id);
       return `, which they wrote as a reply to the message you sent at ${new Date(words.sent_at).toISOString()}`;
     }
-    // Their own, on record here: pointed at by when it arrived. Its words are not copied into
-    // this turn, which could outlast them; they are in the conversation for as long as they are kept.
+    // Their own, on record here: named by its row, and shown from there when the transcript is
+    // put together (see #transcript). Its words are not copied into this turn, which could outlast them.
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
-    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `, which they wrote as a reply to their own message of ${new Date(parent.received_at).toISOString()}`;
+    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) {
+      if (!pointed.some((each) => each.id === parent.id)) pointed.push({ id: parent.id, by: who(parent).id });
+      return ", which they wrote as a reply to an earlier message of their own, shown just before this";
+    }
     return "";
   }
 
@@ -727,17 +747,27 @@ export class Runner {
     // point at decides what an answer is shown as written from.
     const acting = quotedOf.size > 0 && runId ? this.actingFor(runId) : undefined;
     rows.forEach((row, index) => {
-      const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
+      const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[]; _pointed?: Pointed[] };
       if (row.is_user === 1) {
+        // An earlier message of the person's own that this turn leads back to: its words as they
+        // are kept now, in this conversation, by the same person; or only that there was one.
+        // (A turn begins at the first thing shown for it, so the window is never cut between them.)
+        const before = entries.length;
+        for (const each of mayShow ? (item._pointed ?? []) : []) {
+          const kept = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ? AND kind = 'message' AND session_key = (SELECT session_key FROM sessions WHERE id = ?)", each.id, sessionId)[0];
+          const theirs = kept && kept.text !== null && (JSON.parse(kept.principal) as Principal).id === each.by;
+          entries.push({ item: { role: "user", content: theirs ? `[An earlier message of theirs that this leads back to, written at ${new Date(kept.received_at).toISOString()}:]\n${kept.text!.slice(0, MAX_POINTED_TEXT)}` : "[An earlier message of theirs that this leads back to is no longer kept.]" }, starts: entries.length === before });
+        }
+        const led = entries.length > before;
         const quoted = [...new Set(item._replied ?? [])].flatMap((id) => quotedOf.get(id) ?? []);
         quoted.forEach((each, at) => {
           // What it was written from, by the tool's canonical call, where that is the one thing the
           // person can still point at: what they are asking about, even once that turn is out of sight.
           const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, each.person);
           const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
-          entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
+          entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 && !led });
         });
-        entries.push({ item: shown(item), starts: quoted.length === 0 });
+        entries.push({ item: shown(item), starts: quoted.length === 0 && !led });
       } else entries.push({ item: shown(item), starts: false });
       if (row.run_id && lastOf.get(row.run_id) === index) for (const words of wordsOf.get(row.run_id) ?? []) entries.push({ item: words, starts: false });
     });
@@ -832,6 +862,11 @@ function today(): string {
 }
 
 /** How much of a run's room a message takes. */
+/** An earlier message of the person's own that a turn leads back to: its row, and whose it was when that was established. */
+type Pointed = { id: number; by: string };
+/** How much of such a message is shown. */
+const MAX_POINTED_TEXT = 500;
+
 function sizeOf(event: InboxRow): number {
   return (event.text?.length ?? 0) + (event.data?.length ?? 0) + 300;
 }
