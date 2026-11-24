@@ -850,6 +850,23 @@ describe("keeping a request that has to wait", () => {
       requests.wait(run("r2"), { ...acting, events: { said: [message("再问一次", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
       expect(invite()).toMatchObject({ status: "pending", next_at: later });
     });
+    // The way in failed, and word of that is still on its way when it is tried afresh and arrives: nobody is then told it did not.
+    await asking(({ requests, store, run, message, sent }, invite) => {
+      store.sql.exec("UPDATE outbox SET status = 'dead', attempts = 1, started = 1 WHERE idem = 'invite:grant_1.nonce'");
+      requests.shown(invite() as never, "failed");
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "pending", text: "notice:inviteNotSent" });
+      requests.wait(run("r2"), { ...acting, events: { said: [message("再问一次", {}, "r2")], recent: [] } }, "call_2", "feishu_read_document", { ...waiting, privately: true });
+      // Being tried again: what was to be said of the first try is no longer true, and is not said.
+      expect(sent(told("grant_1.nonce", "call_1")).status).toBe("void");
+      store.sql.exec("UPDATE outbox SET status = 'sent', sent_at = 1 WHERE idem = 'invite:grant_1.nonce'");
+      requests.shown(invite() as never, "reached");
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
+      expect(sent(told("grant_1.nonce", "call_2"))).toMatchObject({ status: "pending", text: "notice:invitedElsewhere" });
+      // A line that has gone out, or may have, is not said again in other words.
+      store.sql.exec("UPDATE outbox SET status = 'sent' WHERE idem = ?", told("grant_1.nonce", "call_1"));
+      requests.shown(invite() as never, "failed");
+      expect(sent(told("grant_1.nonce", "call_1"))).toMatchObject({ status: "sent", text: "notice:invitedElsewhere" });
+    });
     // A request's id may hold any character: which request a line is about is not read off punctuation.
     await within(async ({ requests, run, message, sent }) => {
       const active = run("r1");

@@ -214,7 +214,10 @@ export class Requests implements Wakes {
       // was given up, now that the person asks afresh: as long as it is certain that it never
       // arrived. One that may have (kept as unverified) is not sent a second time. A time it
       // was told not to be sent before still holds.
-      this.#s.sql.exec("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0", Date.now(), `invite:${waiting.interaction}`);
+      const again = this.#s.rows("UPDATE outbox SET status = 'pending', attempts = 0, next_at = MAX(next_at, ?), error = NULL WHERE idem = ? AND status IN ('void', 'dead') AND uncertain = 0 RETURNING id", Date.now(), `invite:${waiting.interaction}`).length > 0;
+      // It is being tried again: word of how the earlier try went, where it has certainly not
+      // reached anyone yet, is no longer true and is not said. What comes of this try is said instead.
+      if (again) this.#s.sql.exec("UPDATE outbox SET status = 'void' WHERE idem LIKE 'invited:%' AND status = 'pending' AND uncertain = 0 AND json_valid(substr(idem, 9)) AND json_extract(substr(idem, 9), '$[0]') = ?", waiting.interaction);
       // The way in may be one already sent for an earlier request: how that went is known, and is said now.
       if (aside) {
         const sent = this.#s.rows<{ status: string }>("SELECT status FROM outbox WHERE idem = ?", `invite:${waiting.interaction}`)[0]?.status;
@@ -259,7 +262,11 @@ export class Requests implements Wakes {
     if (!this.#anchor(said, on.bound ?? []).sure) return;
     try {
       const which = how === "reached" ? "invitedElsewhere" : how === "failed" ? "inviteNotSent" : "inviteUnknown";
-      this.#b.enqueueMessage(told(waiting), waiting.session_id, null, this.#b.notice(which, waiting.session_id), undefined, undefined, { target: waiting.target });
+      const text = this.#b.notice(which, waiting.session_id);
+      this.#b.enqueueMessage(told(waiting), waiting.session_id, null, text, undefined, undefined, { target: waiting.target });
+      // One line per request. While it has certainly not reached anyone, it says how things
+      // stand now; once it has gone out, or may have, it is not said again in other words.
+      this.#s.sql.exec("UPDATE outbox SET status = 'pending', text = ?, next_at = MAX(next_at, ?) WHERE idem = ? AND status IN ('pending', 'void') AND uncertain = 0", text, Date.now(), told(waiting));
     } catch {
       // Nowhere to say it: nothing depends on it.
     }
