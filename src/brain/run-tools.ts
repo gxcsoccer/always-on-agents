@@ -179,7 +179,11 @@ export class RunTools {
         let waits = false;
         try {
           const handsTo = found.hands_to;
-          const work = handsTo ? { work: (as: "open" | WorkEnd) => workIs(this.#s, { id: key, worker: handsTo, sessionKey: String(session.session_key), person: acting.person }, as) } : {};
+          // How the tool says the piece of work stands: kept once it is known what became of the
+          // call. One that waits is recorded with the request it is kept as (or not at all, where
+          // it turns out to be a request already kept, or cannot be kept).
+          let standing: "open" | WorkEnd | undefined;
+          const work = handsTo ? { work: (as: "open" | WorkEnd) => void (standing = as) } : {};
           const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), ...this.#latest(run, acting, name, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
@@ -211,6 +215,7 @@ export class RunTools {
             return { settled: true, note: say === undefined ? SETTLED_SILENT : SETTLED_NOTE };
           }
           if (!isWaiting(result)) {
+            if (handsTo && standing) workIs(this.#s, { id: key, worker: handsTo, sessionKey: String(session.session_key), person: acting.person }, standing);
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
             // What was read, for a later follow-up; a refusal or an error is not something read.
             // Only what the tool itself identified: its canonical call and the thing as resolved.

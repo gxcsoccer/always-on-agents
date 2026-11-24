@@ -637,6 +637,19 @@ describe("handing work to Doubao Work", () => {
     expect(await rowsOf(hal.stub, "SELECT state FROM work")).toEqual([{ state: "unknown" }]);
   });
 
+  it("keeps one row where the same thing is handed over twice in one go, and none for a call that came to nothing", async () => {
+    await pair();
+    const kay = someone();
+    model.replies([asks("写周报"), asks("写周报")], [say("")]);
+    await kay.says("让豆包写周报");
+    expect(await rowsOf(kay.stub, "SELECT 1 FROM continuations")).toHaveLength(1);
+    expect(await rowsOf(kay.stub, "SELECT state FROM work")).toEqual([{ state: "open" }]);
+    // Not named, so nothing is handed over: nothing is recorded.
+    model.replies([asks("写月报")], [say("")]);
+    await kay.says("写月报");
+    expect(await rowsOf(kay.stub, "SELECT state FROM work")).toEqual([{ state: "open" }]);
+  });
+
   it("records what Doubao made of a piece of work, not that the person was told: a row also for one that never waited", async () => {
     await pair();
     const ivy = someone();

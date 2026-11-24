@@ -384,13 +384,17 @@ export const doubaoAsk: ConnectorTool = {
 
 const UNCERTAIN = "it could not be confirmed whether Doubao took this; nothing more was sent, so that it is not done twice. The person can look in Doubao Work, or ask again";
 
+const CHANGED = { error: "the person's authorisation, or how this is set up, changed while this was under way; nothing more was done. They can ask again" };
+
 /** A piece of work as its record has it: what Doubao made of it where that is known, and not whether the person was told. */
 function standing(op: Op, result: unknown): "open" | "done" | "failed" | "cancelled" | "expired" | "void" | "unknown" {
   if (op.stage === "answered") return op.reply?.status === "completed" ? "done" : op.reply?.status === "cancelled" ? "cancelled" : "failed";
   if (op.stage === "lost") return "unknown";
   if (op.stage === "failed") return "failed";
   // Still under way by its record. A call that ends in an error has given it up: never sent, or no longer waited for.
-  if (typeof result === "object" && result !== null && "error" in result) return op.stage === "asked" ? "failed" : Date.now() >= op.deadline ? "expired" : "void";
+  // What it was asked under no longer stands; its time ran out; or, never sent, it was refused.
+  if (result === CHANGED) return "void";
+  if (typeof result === "object" && result !== null && "error" in result) return Date.now() >= op.deadline ? "expired" : op.stage === "asked" ? "failed" : "void";
   return "open";
 }
 
@@ -426,7 +430,6 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: { 
   const name = await grantName(who);
   const grant = env.DOUBAO_GRANTS.getByName(name);
   const request = { text, carry_on: carryOn };
-  const CHANGED = { error: "the person's authorisation, or how this is set up, changed while this was under way; nothing more was done. They can ask again" };
 
   const { generation, token, version } = await grant.held();
   if (context.resuming && generation !== context.resuming.generation) return CHANGED;
