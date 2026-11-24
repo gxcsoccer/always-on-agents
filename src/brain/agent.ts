@@ -172,6 +172,7 @@ export class BrainAgent extends DurableObject<Env> {
       notice: (which, sessionId) => this.#outbox.notice(which, sessionId),
       direct,
       aside,
+      handsTo: (connector, tool) => toolsOf(connector).find((each) => each.name === tool)?.hands_to,
       closeInvitation: (target, receipt, interaction, how) => closeInvitation(this.env, target, receipt, interaction, how),
       waitUntil: (promise) => this.ctx.waitUntil(promise),
     });

@@ -9,6 +9,7 @@ import { type Target, isPrivateSession } from "../events";
 import type { Item } from "../model/openai";
 import type { Said } from "./runner";
 import type { NoticeKey } from "./outbox";
+import { workEnded, workOpened } from "./work";
 import type { BrainStore, InboxRow, Row, RunRow, Wakes } from "./store";
 
 /**
@@ -93,6 +94,8 @@ export interface RequestsHost {
   direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
   /** An address in the conversation `from` points into at which only this person sees what is sent, if the connector has one. */
   aside(connector: string, origin: Record<string, string>, person: string, from: Target): Target | undefined;
+  /** The worker a connector's tool hands work to, if it is such a tool. */
+  handsTo(connector: string, tool: string): string | undefined;
   /** Shows a delivered invitation as over where it was shown. Never holds anything up. */
   closeInvitation(target: Target, receipt: Receipt, interaction: string, how: "used" | "over"): Promise<boolean>;
   waitUntil(promise: Promise<unknown>): void;
@@ -244,6 +247,12 @@ export class Requests implements Wakes {
           Date.now(),
         );
         this.#s.audit("(system)", "request.waiting", { request: id, on: waiting.on });
+      }
+      // What a tool that hands work to a worker keeps waiting is a piece of work, under the request's own id.
+      const worker = this.#b.handsTo(acting.connector, tool);
+      if (worker) {
+        const sessionKey = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", run.session_id)[0]?.session_key ?? "";
+        workOpened(this.#s, { id, worker, sessionKey, person: acting.person, under: { condition: waiting.condition, generation: waiting.generation } });
       }
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
@@ -520,6 +529,7 @@ export class Requests implements Wakes {
     const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", id)[0]?.interaction;
     const ended = this.#s.rows("UPDATE continuations SET status = ?, ended_at = ?, why = ? WHERE id = ? AND status IN ('waiting', 'resuming', 'answering') RETURNING id", status, Date.now(), why, id);
     if (ended.length > 0) this.#s.audit("(system)", "request.ended", { request: id, as: status, why });
+    if (ended.length > 0) workEnded(this.#s, id, status === "unverified" ? "unknown" : status);
     if (ended.length > 0 && shown) this.#wayInOver(shown);
   }
 

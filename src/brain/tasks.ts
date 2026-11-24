@@ -15,6 +15,7 @@ import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
 import { type QuestionFate, clipResult } from "../workers/sandbox/result";
 import type { Started, Worker } from "../workers";
 import type { Outbox } from "./outbox";
+import { type WorkEnd, workEnded, workOpened } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
 import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
@@ -117,6 +118,7 @@ export class Tasks implements Wakes {
         JSON.stringify({ task_id: id }),
         now,
       );
+      workOpened(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy });
       this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, repository });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
@@ -375,6 +377,7 @@ export class Tasks implements Wakes {
       Date.now(),
       taskId,
     );
+    if (TERMINAL_TASK.has(status)) workEnded(this.#s, taskId, ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown");
     // The watchdog has nothing left to watch.
     if (TERMINAL_TASK.has(status)) this.#s.sql.exec("UPDATE timers SET status = 'done' WHERE id = ? AND status = 'active'", `watch_${taskId}`);
     return true;

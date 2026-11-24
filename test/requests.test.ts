@@ -55,6 +55,8 @@ function bench(state: DurableObjectState) {
     direct: (connector, origin, person) => (settings.noDirect ? undefined : { connector, address: { app_id: origin.app_id, open_id: person } }),
     // In the conversation the request was made in, for that person's eyes only, where the connector can.
     aside: (connector, origin, person, from) => (settings.noAside ? undefined : { connector, address: { app_id: origin.app_id, chat_id: from.address.chat_id, visible_to: person } }),
+    // Whether the tool hands its work to a worker: by its name here.
+    handsTo: (_connector, tool) => (tool.startsWith("hand_") ? "elsewhere" : undefined),
   };
   const requests = new Requests(store, host);
   store.sql.exec("INSERT INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, ?, 1, 1)", SESSION, SESSION_KEY, TARGET);

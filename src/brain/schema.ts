@@ -293,6 +293,22 @@ export const MIGRATIONS: string[] = [
   // 29: whom an answer was written for: the person the run that wrote it acted for, or whose
   // request it carried on. What it was written from counts, later, only for that same person.
   `ALTER TABLE said ADD COLUMN person TEXT;`,
+  // 30: every piece of work handed to a worker, whichever worker: one row under the id the work
+  // has where it is carried out (a task's id; the id of the request a connector's tool keeps).
+  // An index beside what each worker keeps for itself, which stays where it is. Written, and not
+  // read by anything yet: see docs/design/workers.zh-CN.md, step 2.
+  `CREATE TABLE IF NOT EXISTS work (
+     id TEXT PRIMARY KEY,
+     worker TEXT NOT NULL,
+     session_key TEXT NOT NULL,
+     person TEXT,
+     state TEXT NOT NULL,                     -- open | done | failed | cancelled | expired | void | unknown
+     condition TEXT,
+     generation INTEGER,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   CREATE INDEX IF NOT EXISTS work_session ON work (session_key, created_at);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

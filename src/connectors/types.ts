@@ -184,6 +184,11 @@ export interface ConnectorTool {
   /** Offered only where its connector said so for the very messages a run acts on (see `Connector.offers`): not there at all otherwise. */
   optional?: true;
   /**
+   * Set on a tool that hands a piece of work to a worker: the worker's name. A request such a
+   * tool keeps waiting is then recorded as a piece of work, under the request's id.
+   */
+  hands_to?: string;
+  /**
    * Whether the tool may also be used where several people talk (a group, say), for the one of
    * them who asked. Without it the tool exists only in a person's private conversation. A tool
    * that says so answers for what that takes: what it reads there is said in front of the others.
