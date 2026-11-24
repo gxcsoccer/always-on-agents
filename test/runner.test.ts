@@ -72,6 +72,7 @@ function bench(state: DurableObjectState) {
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
     workers: () => settings.workers,
+    guidance: () => "",
     workStands: async () => true,
     quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
     // As Feishu's does: a reply in a chat is written under the message it names.

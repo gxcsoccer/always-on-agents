@@ -10,6 +10,8 @@
   "compatibility_date": "2026-11-01",
   // Files resolves native Linux errno names through node:os.
   "compatibility_flags": ["nodejs_compat"],
+  // Markdown shipped with the Worker (the guidance on which worker a piece of work goes to) is read as text.
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "vars": {
     // Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host only.
     "OPENAI_BASE_URL": "https://api.openai.com/v1",

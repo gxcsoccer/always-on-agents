@@ -61,6 +61,8 @@ export interface RunnerHost {
   toolsOf(connector: string): ConnectorTool[];
   /** Every worker this deployment lists. */
   workers(): Worker[];
+  /** The deployment's guidance on which worker a piece of work goes to. */
+  guidance(): string;
   /** Whether a piece of work done in a person's name still stands under what it was done under: see BrainAgent. */
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   /** Where the tenant's usage is kept. */
@@ -1033,6 +1035,8 @@ export class Runner {
       now: Date.now(),
       instructions: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'instructions.md'")[0]?.content,
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
+      // Only where this very call to the model is given the tool to hand work over with: by the same word that decides its tools.
+      guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
         ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status })),
         ...theirs.map((each) => {

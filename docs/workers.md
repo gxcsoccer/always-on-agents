@@ -39,6 +39,10 @@ The run's instructions list the work handed over, each with its id and worker: w
 
 A run has a worker the Brain starts wherever it is listed, and a worker carried by a tool wherever the run has that tool (so the connector's `offers` decides for whom).
 
+## Which worker for what
+
+Each worker says what it is in its own `description`. How to choose between the workers of a deployment is said once, in words, in `src/workers.md`: it is put before the model as it is written, under "Where to hand work", wherever a run has a worker to hand work to. It is advice for the model's judgement and is not parsed or matched. It is the deployment's to write (change it and deploy); nobody in a conversation can change it.
+
 ## A worker carried by a connector's tool
 
 A worker that does things in a person's name needs what a connector's tool already has: the person's authorisation, a request that waits and is carried on, a result that is checked against that authorisation before it goes anywhere. So such a worker names the tool that carries it (`tool`), and the tool names the worker (`hands_to`). The tool is no longer offered to the model under its own name; `hand_over` to the worker calls it with `{ brief, continue_from }`, and everything in [connectors.md](connectors.md) about tools holds for it.

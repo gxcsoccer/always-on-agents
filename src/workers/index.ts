@@ -12,6 +12,11 @@ export function workers(): Worker[] {
   return config.workers;
 }
 
+/** The deployment's guidance on which worker a piece of work goes to, in words. */
+export function guidance(): string {
+  return config.guidance.trim();
+}
+
 /** The worker listed under this name, if this deployment has it. */
 export function workerNamed(name: string): Worker | undefined {
   return byName.get(name);
