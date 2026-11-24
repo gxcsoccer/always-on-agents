@@ -27,13 +27,12 @@ const SETTLE_ATTEMPTS = 12;
 /** What tasks need from the Brain they are part of, and from the systems outside it. */
 export interface TasksHost {
   readonly env: Env;
-  /** The worker listed under a name in this deployment, if it is. New work is started, and work stopped, through it. */
+  /** The worker listed under a name in this deployment, if it is: only such a one is given something new. */
   workerNamed(name: string): Worker | undefined;
-  /**
-   * The sandbox of one task, for what is still its own: the questions it asks, and stopping a
-   * task whose worker is no longer listed.
-   */
-  worker(taskId: string): Pick<ReturnType<Env["TASKS"]["getByName"]>, "cancel" | "answer" | "decisionOn">;
+  /** The worker a task was written for, listed or not: what was taken is carried through and can be stopped. */
+  workerOf(name: string): Worker;
+  /** The sandbox of one task, for what is still its own: the questions it asks. */
+  worker(taskId: string): Pick<ReturnType<Env["TASKS"]["getByName"]>, "answer" | "decisionOn">;
   /** Where sandbox slots and the tenant's usage are kept. */
   registry(): Pick<ReturnType<typeof registry>, "acquireTaskSlot" | "releaseTaskSlot" | "recordUsage">;
   /** The people whose word counts in this run. */
@@ -54,6 +53,9 @@ export interface TasksHost {
   /** Counts tokens against this scope's daily budget, at once: the same count the Brain's own calls go to. */
   spend(tokens: number): void;
 }
+
+/** The worker tasks are written for. */
+const WORKER = "sandbox";
 
 export class Tasks implements Wakes {
   readonly #s: BrainStore;
@@ -84,6 +86,8 @@ export class Tasks implements Wakes {
     // and continues with the same task id, so a lost response can never start a second task.
     let task = this.#s.rows<Row>("SELECT * FROM tasks WHERE op_id = ?", callId)[0];
     if (!task) {
+      // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
+      if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
       if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input')")[0].n >= MAX_ACTIVE_TASKS) {
         throw new Error(`there are already ${MAX_ACTIVE_TASKS} tasks running here; wait for one to finish or cancel one`);
       }
@@ -117,11 +121,9 @@ export class Tasks implements Wakes {
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
     if (task.status !== "dispatching") return { task_id: task.id, status: task.status };
-    const worker = this.#b.workerNamed(String(task.worker));
-    if (!worker) {
-      this.#set(task.id, "failed", { result: JSON.stringify({ error: "this deployment has no worker to give it to" }) });
-      throw new Error("there is no worker to hand this to on this deployment");
-    }
+    // One that was written is one that was taken: it is carried through by the worker it was
+    // written for, whether or not the deployment still lists that worker for new work.
+    const worker = this.#b.workerOf(String(task.worker));
 
     let slot: boolean;
     try {
@@ -355,14 +357,12 @@ export class Tasks implements Wakes {
     return { ok: true, task_id: taskId, status: "cancelled" };
   }
 
-  /** A terminal status is final: a late or repeated report cannot bring a task back. */
-  /** Stops a task through its worker; one whose worker is no longer listed, as it was started. */
+  /** Stops a task through the worker it was written for. */
   async #stop(task: Row): Promise<void> {
-    const worker = this.#b.workerNamed(String(task.worker));
-    if (worker?.cancel) await worker.cancel(this.#b.env, String(task.id));
-    else await this.#b.worker(String(task.id)).cancel();
+    await this.#b.workerOf(String(task.worker)).cancel?.(this.#b.env, String(task.id));
   }
 
+  /** A terminal status is final: a late or repeated report cannot bring a task back. */
   #set(taskId: string, status: string, fields: { pending?: string | null; result?: string; last_progress?: string }): boolean {
     const current = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
     if (!current || TERMINAL_TASK.has(current.status)) return false;

@@ -70,6 +70,7 @@ function bench(state: DurableObjectState) {
     env: { TASKS: { getByName: sandboxOf } } as never,
     // The deployment's workers, by name: the real sandbox worker, unless a test takes it out.
     workerNamed: (name) => (settings.workers.includes(name) && name === sandboxWorker.name ? sandboxWorker : undefined),
+    workerOf: () => sandboxWorker,
     worker: sandboxOf,
     registry: () =>
       ({
@@ -266,18 +267,31 @@ describe("tasks, by themselves", () => {
       });
     });
 
-    it("starts nothing where the deployment lists no such worker, and still stops a task that one started before it was taken out", async () => {
-      await within(async ({ tasks, kept, settings, worker, slots }) => {
+    it("takes nothing new where the deployment lists no such worker, writes nothing for it, and still stops a task taken before", async () => {
+      await within(async ({ tasks, store, kept, settings, worker, slots }) => {
         // Started while the worker was listed.
         const before = (await tasks.dispatch(RUN, SESSION_KEY, "call_0", "t", "b", null)) as { task_id: string };
         settings.workers = [];
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("there is no worker to hand this to");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("this deployment has no worker to hand this to");
+        expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(1);
         expect(worker.started).toHaveLength(1);
         expect(slots.acquired).toHaveLength(1);
         // The earlier one is stopped as it was started.
         await tasks.cancel(SESSION_KEY, before.task_id);
         expect(worker.cancelled).toEqual([before.task_id]);
         expect(kept(before.task_id)).toMatchObject({ status: "cancelled" });
+      });
+    });
+
+    it("carries a task through that was written before its worker was taken out of the deployment: one task, started once more under the same id", async () => {
+      await within(async ({ tasks, task, kept, settings, worker }) => {
+        // Written, slot perhaps taken, the worker perhaps already at it: only the Brain's "running" is missing.
+        task("t_before", { status: "dispatching" });
+        settings.workers = [];
+        const result = (await tasks.dispatch(RUN, SESSION_KEY, "op_t_before", "t", "b", null)) as { task_id: string; status: string };
+        expect(result).toEqual({ task_id: "t_before", status: "running" });
+        expect(worker.started).toMatchObject([{ id: "t_before" }]);
+        expect(kept("t_before")).toMatchObject({ status: "running" });
       });
     });
 

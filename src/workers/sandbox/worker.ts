@@ -9,7 +9,7 @@ export const sandboxWorker: Worker = {
   async start(env, work) {
     const repository = typeof work.options.repository === "string" ? work.options.repository : undefined;
     const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository, brain: work.brain });
-    return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "the sandbox did not start" } : { state: "started" };
+    return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "unknown error" } : { state: "started" };
   },
   async cancel(env, id) {
     await env.TASKS.getByName(id).cancel();
