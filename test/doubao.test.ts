@@ -44,7 +44,10 @@ const world = {
   pageSize: 100,
   /** Every listing of messages asked of Doubao. */
   listings: [] as string[],
+  /** Everything the person has allowed the Doubao app, here or elsewhere. */
   scope: SCOPE,
+  /** Whether a token is issued for only what the exchange asks for, as Doubao does. */
+  narrows: true,
   issued: 0,
 };
 
@@ -58,6 +61,7 @@ function installWorld() {
   world.dropAnswers = 0;
   world.unreachable = 0;
   world.scope = SCOPE;
+  world.narrows = true;
   world.bareAnswers = 0;
   world.duringWrite = undefined;
   world.pageSize = 100;
@@ -86,7 +90,7 @@ function installWorld() {
       if (!consent || consent.redirect !== body.redirect_uri || (await challengeOf(String(body.code_verifier))) !== consent.challenge) return Response.json({ code: 20003 }, { status: 400 });
       const token = `d-${++world.issued}`;
       world.tokens.set(token, { ...consent, good: true });
-      return Response.json({ code: 0, access_token: token, expires_in: 7200, token_type: "Bearer", scope: world.scope });
+      return Response.json({ code: 0, access_token: token, expires_in: 7200, token_type: "Bearer", scope: world.narrows && typeof body.scope === "string" ? body.scope.split(" ").filter((each: string) => world.scope.split(" ").includes(each)).join(" ") : world.scope });
     }
     const user = world.tokens.get(bearer);
     if (url.host === "accounts.doubao.com" && url.pathname === "/open-apis/authen/v1/user_info") return user?.good ? Response.json({ code: 0, data: { open_id: user.open_id, union_id: user.union_id, tenant_key: user.tenant_key } }) : Response.json({ code: 99991668 }, { status: 401 });
@@ -304,6 +308,16 @@ describe("handing work to Doubao Work", () => {
     expect(cy.heard().at(-1)).toBe("成本对比如下。");
   });
 
+  it("asks for a token for this work only, whatever else the person has allowed the app before", async () => {
+    await pair();
+    const dee = someone();
+    world.scope = `${SCOPE} doubao:session:read doubao:session:delete`;
+    model.replies([asks("写周报")], [say("")]);
+    await dee.says("让豆包写周报");
+    expect((await consent(linkOn(dee.cards()[0]), dee)).status).toBe(200);
+    expect(await (await dee.grant()).status()).toMatchObject({ authorised: true });
+  });
+
   it("keeps nothing when another account completes the authorisation, or when more is granted than was asked", async () => {
     await pair();
     const dee = someone();
@@ -314,14 +328,16 @@ describe("handing work to Doubao Work", () => {
     expect(await (await dee.grant()).status()).toMatchObject({ authorised: false });
     expect(world.writes).toEqual([]);
 
-    // Asked again: a new way in. This time Doubao grants more than was asked for.
+    // Asked again: a new way in. This time the token reaches further than was asked for.
     model.replies([asks("写周报")], [say("")]);
     await dee.says("让豆包写周报");
     world.scope = `${SCOPE} doubao:session:read`;
+    world.narrows = false;
     expect((await consent(linkOn(dee.cards().at(-1)), dee)).status).toBe(400);
     expect(await (await dee.grant()).status()).toMatchObject({ authorised: false });
     // And the right account in another organisation is not her either.
     world.scope = SCOPE;
+    world.narrows = true;
     model.replies([asks("写周报")], [say("")]);
     await dee.says("让豆包写周报");
     expect((await consent(linkOn(dee.cards().at(-1)), { unionId: dee.unionId, org: "org_other" })).status).toBe(403);

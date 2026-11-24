@@ -532,7 +532,8 @@ async function callback(request: Request, env: Env): Promise<Response> {
   };
   const app = await registry(env).doubaoApp(who.chat_app_id);
   if (!app || app.app_id !== invitation.app_id || app.version !== invitation.pairing) return refused("not_set_up");
-  const exchange = await fetch(`${ACCOUNTS}/oauth/v3/token`, { method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier }) });
+  // The token is asked for these and nothing else, whatever else the person has allowed the app before.
+  const exchange = await fetch(`${ACCOUNTS}/oauth/v3/token`, { method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: SCOPES.join(" ") }) });
   const issued = (((await exchange.json().catch(() => null)) as unknown) ?? {}) as { code?: number; access_token?: string; expires_in?: number; scope?: string };
   if (!exchange.ok || issued.code !== 0 || typeof issued.access_token !== "string" || !issued.access_token || !lifetime(issued.expires_in)) return refused("exchange_failed");
   // For what was asked and nothing more (Doubao adds knowing who the token is for by itself).
