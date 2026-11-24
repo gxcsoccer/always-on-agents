@@ -6,7 +6,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { grantName } from "../src/connectors/doubao";
+import { doubaoConnector, grantName } from "../src/connectors/doubao";
 import { challengeOf } from "../src/connectors/feishu-grant";
 import { normalize } from "../src/connectors/feishu";
 import { scopeName } from "../src/events";
@@ -39,7 +39,7 @@ const world = {
   /** How many of the next writes Doubao takes and answers "ok" to, without saying what it made of them. */
   bareAnswers: 0,
   /** Runs while a write is being made, before Doubao takes it. */
-  duringWrite: undefined as undefined | (() => void),
+  duringWrite: undefined as undefined | (() => unknown),
   /** How many messages Doubao lists at a time. */
   pageSize: 100,
   /** Every listing of messages asked of Doubao. */
@@ -104,7 +104,7 @@ function installWorld() {
     }
     // A write. The same key with the same words is answered as it was the first time; with other words it is refused.
     world.writes.push({ path: url.pathname, body, bearer });
-    world.duringWrite?.();
+    await world.duringWrite?.();
     if (world.unreachable > 0) return (world.unreachable--, Promise.reject(new Error("network")));
     const before = world.taken.get(body.uuid);
     if (before) return before.body === JSON.stringify(body) ? Response.json(before.answer) : Response.json({ code: 3440009, msg: "request conflict" }, { status: 409 });
@@ -489,6 +489,76 @@ describe("handing work to Doubao Work", () => {
     expect(world.listings).toHaveLength(asked);
   });
 
+  it("goes on looking from where it stopped in a conversation longer than one look covers", async () => {
+    await pair();
+    const quin = someone();
+    const session = await handsOver(quin);
+    doubaoReplies(session, "找到了。");
+    const messages = world.sessions.get(session)!.messages;
+    for (let i = 0; i < 14; i++) messages.push({ id: `later_${i}`, session_id: session, role: i % 2 ? "assistant" : "user", status: "completed", reply_id: `later_${i - 1}`, items: [{ type: "text", text: "别的" }] });
+    world.pageSize = 2;
+    world.listings.length = 0;
+    await quin.later();
+    // Five pages, and not there yet.
+    expect(world.listings.map((each) => new URLSearchParams(each).get("page_token"))).toEqual([null, "2", "4", "6", "8"]);
+    model.replies([call("send_message", { text: "找到了。" })], [say("")]);
+    await quin.later();
+    expect(world.listings.slice(5).map((each) => new URLSearchParams(each).get("page_token"))[0]).toBe("10");
+    expect(quin.heard().at(-1)).toBe("找到了。");
+  });
+
+  it("tells the person that waiting ended also when the last thing it waited on was their authorising again", async () => {
+    await pair();
+    const rae = someone();
+    await handsOver(rae);
+    for (const token of world.tokens.values()) token.good = false;
+    await rae.later();
+    expect(rae.cards()).toHaveLength(2);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61 * 60_000);
+    try {
+      await rae.quiet();
+    } finally {
+      clock.mockRestore();
+    }
+    await rae.quiet();
+    expect((await rae.requests()).map((each) => each.status)).toEqual(["expired"]);
+    expect(rae.heard()).toEqual([UNDER_WAY, expect.stringContaining("没有在时限内完成")]);
+  });
+
+  it("still gives what Doubao brought back after the person's token has run out by itself, and not after it was taken away", async () => {
+    await pair();
+    const sam = someone();
+    const session = await handsOver(sam);
+    doubaoReplies(session, "好了。");
+    model.replies([call("send_message", { text: "好了。" })], [say("")]);
+    await sam.later();
+    const condition = (await rowsOf(sam.stub, "SELECT condition FROM continuations"))[0].condition as string;
+    const scope = { tenant: TENANT, kind: "user" as const, id: sam.openId };
+    for (const token of world.tokens.values()) token.good = false;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3 * 60 * 60_000);
+    try {
+      expect(await doubaoConnector.holds!(env as any, scope, condition, 1)).toMatchObject({ state: "holds" });
+    } finally {
+      clock.mockRestore();
+    }
+    expect((await admin("DELETE", `doubao/grants/${CHAT_APP}/${ORG}/${sam.openId}`)).status).toBe(200);
+    expect(await doubaoConnector.holds!(env as any, scope, condition, 1)).toEqual({ state: "gone" });
+  });
+
+  it("does not send a second time with an authorisation that was taken away between the tries", async () => {
+    await pair();
+    const tess = someone();
+    model.replies([asks("调研一下向量数据库")], [say("")]);
+    await tess.says("让豆包调研一下向量数据库");
+    world.unreachable = 1;
+    // Taken away while the first try is on its way, which then brings no answer.
+    world.duringWrite = () => admin("DELETE", `doubao/grants/${CHAT_APP}/${ORG}/${tess.openId}`);
+    model.replies([call("send_message", { text: "没能确认。" })], [say("")]);
+    expect((await consent(linkOn(tess.cards()[0]), tess)).status).toBe(200);
+    await tess.settle();
+    expect(world.writes).toHaveLength(1);
+  });
+
   it("finds the reply further back than the first page of a long conversation", async () => {
     await pair();
     const pat = someone();
@@ -514,21 +584,27 @@ describe("handing work to Doubao Work", () => {
     const who = { chat_app_id: CHAT_APP, tenant_key: ORG, open_id: "ou_many", union_id: "on_many" };
     const first = await grant.begin(who, "call_first", "一", { carryOn: false }, "p1", 1);
     await grant.advance("call_first", "submitting");
-    // Fifty more: the ones that ended make room, the one still being sent does not.
     for (let i = 0; i < 49; i++) {
       await grant.begin(who, `call_${i}`, "x", { carryOn: false }, "p1", 1);
       await grant.advance(`call_${i}`, "submitting");
       await grant.advance(`call_${i}`, "failed");
     }
-    expect(await grant.begin(who, "call_more", "x", { carryOn: false }, "p1", 1)).toMatchObject({ stage: "asked" });
-    expect(await grant.begin(who, "call_first", "一", { carryOn: false }, "p1", 1)).toMatchObject({ uuid: first.uuid, stage: "submitting" });
     // One that has ended stays as it ended.
-    expect(await grant.advance("call_48", "submitted")).toMatchObject({ stage: "failed" });
-    // With nothing ended to make room, a new one is refused.
-    const full = (env as any).DOUBAO_GRANTS.getByName(await grantName({ chat_app_id: CHAT_APP, tenant_key: ORG, open_id: "ou_full" })) as any;
-    const other = { ...who, open_id: "ou_full" };
-    for (let i = 0; i < 50; i++) await full.begin(other, `c${i}`, "x", { carryOn: false }, "p1", 1);
-    expect(await full.begin(other, "c50", "x", { carryOn: false }, "p1", 1)).toBe("full");
+    expect(await grant.advance("call_0", "submitted")).toMatchObject({ stage: "failed" });
+    // No room is made while any of these calls could still be made again, ended or not: a new one is refused.
+    expect(await grant.begin(who, "call_more", "x", { carryOn: false }, "p1", 1)).toBe("full");
+    // Nor just past the deadline: the same call made again is the same piece of work, with the same key and the same deadline.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61 * 60_000);
+    try {
+      expect(await grant.begin(who, "call_more", "x", { carryOn: false }, "p1", 1)).toBe("full");
+      expect(await grant.begin(who, "call_first", "一", { carryOn: false }, "p1", 1)).toEqual({ ...first, stage: "submitting" });
+      expect(await grant.begin(who, "call_0", "x", { carryOn: false }, "p1", 1)).toMatchObject({ stage: "failed" });
+      // Long after, when nothing can ask about them again, they make room.
+      clock.mockReturnValue(Date.now() + 4 * 60 * 60_000);
+      expect(await grant.begin(who, "call_more", "x", { carryOn: false }, "p1", 1)).toMatchObject({ stage: "asked" });
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("asks for authorisation again, and for the same reply, when the authorisation ends while Doubao is at work", async () => {

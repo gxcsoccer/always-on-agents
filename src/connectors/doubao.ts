@@ -62,6 +62,8 @@ interface Op {
   /** The pairing and the generation of the person's authorisation it was asked under: it is carried on under no other. */
   pairing: string;
   generation: number;
+  /** How far back the look for its reply has got, where the conversation is longer than one look covers. */
+  cursor?: string;
   reply?: { status: string; text: string; artifacts: { name: string; kind: string; link?: string }[]; truncated?: boolean };
 }
 const STAGES = ["asked", "submitting", "submitted", "answered", "lost", "failed"] as const;
@@ -79,6 +81,8 @@ const ENDED: Op["stage"][] = ["answered", "lost", "failed"];
 /** Which stage may follow which. Nothing follows one that has ended. */
 const NEXT: Record<Op["stage"], Op["stage"][]> = { asked: ["submitting"], submitting: ["submitted", "lost", "failed"], submitted: ["answered"], answered: [], lost: [], failed: [] };
 const MAX_OPS = 50;
+/** How long after its deadline a piece of work is still kept: longer than a request can be carried on after it. */
+const KEPT_AFTER_MS = 2 * 60 * 60_000;
 const CARRY_ON_WITHIN_MS = 24 * 60 * 60_000;
 
 const same = (a: Who, b: Who) => a.chat_app_id === b.chat_app_id && a.tenant_key === b.tenant_key && a.open_id === b.open_id;
@@ -205,8 +209,8 @@ export class DoubaoGrant extends DurableObject<Env> {
    * whose answer they replied to), or, pointing at none, of the only one they had here in the
    * last day. Several, and it is not guessed.
    *
-   * A piece of work that has not ended is never dropped to make room: its key is what keeps it
-   * from being done twice. With no room left, a new one is refused.
+   * A piece of work is never dropped to make room while the call that made it could still be
+   * made again. With no room left, a new one is refused.
    */
   async begin(who: Who, call: string, text: string, to: { carryOn: boolean; from?: string }, pairing: string, generation: number): Promise<Op | "nothing_to_carry_on" | "several" | "not_found" | "full"> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [], ops: {} };
@@ -224,7 +228,10 @@ export class DoubaoGrant extends DurableObject<Env> {
       if (lately.length !== 1) return lately.length === 0 ? "nothing_to_carry_on" : "several";
       session = lately[0];
     }
-    const over = (each: Op) => ENDED.includes(each.stage) || now >= each.deadline;
+    // Only once nothing can ask about it again: the request it belongs to ends at its deadline at
+    // the latest, and may be carried on for a while after. Until then its key and its outcome are
+    // what keep the same call from being done a second time, whatever stage it is at.
+    const over = (each: Op) => now >= each.deadline + KEPT_AFTER_MS;
     const kept = Object.entries(stored.ops).sort(([, a], [, b]) => a.created_at - b.created_at);
     while (kept.length >= MAX_OPS) {
       const oldest = kept.findIndex(([, each]) => over(each));
@@ -247,6 +254,16 @@ export class DoubaoGrant extends DurableObject<Env> {
     stored.ops[call] = now;
     void this.ctx.storage.put("grant", stored);
     return now;
+  }
+
+  /** Notes how far back the look for a reply has got (nothing: start from the newest again). */
+  async looked(call: string, cursor?: string): Promise<void> {
+    const stored = await this.#load();
+    const op = stored?.ops[call];
+    if (!stored || !op || op.cursor === cursor) return;
+    if (cursor === undefined) delete op.cursor;
+    else op.cursor = cursor;
+    void this.ctx.storage.put("grant", stored);
   }
 
   /** Tells the person's Brain that their authorisation has changed, until it has heard. */
@@ -309,7 +326,7 @@ const NAMED = /豆包|doubao/i;
 export const doubaoAsk: ConnectorTool = {
   name: "doubao_ask",
   description:
-    "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it only when the person themselves plainly asks for Doubao to do something (research, write a document, and the like); never on your own initiative. `text` is what to ask Doubao, written out in full: it knows nothing of this conversation. `carry_on`: false for something new; true for a follow-up to a piece of work Doubao already did for this person (the one whose answer they replied to, or the only recent one; where it cannot be told which, you are told to ask them). Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
+    "Hand a piece of work to Doubao Work (豆包工作), as the person you are talking to and with their own account there. Use it only when the person themselves plainly asks, in this message, for Doubao to do something (research, write a document, and the like); never on your own initiative. If they only mention Doubao, say not to use it, or it is unclear whether they want this handed over now, do not call it: ask them first. `text` is what to ask Doubao, written out in full: it knows nothing of this conversation. `carry_on`: false for something new; true for a follow-up to a piece of work Doubao already did for this person (the one whose answer they replied to, or the only recent one; where it cannot be told which, you are told to ask them). Doubao takes a while: the system tells the person it has been handed over, and its result is brought back when it is done. Calling a request off stops the waiting here; it does not stop Doubao.",
   effect: "act",
   optional: true,
   parameters: { text: { type: "string" }, carry_on: { type: "boolean" } },
@@ -380,8 +397,11 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
   let again = op.stage === "submitting";
   let sent: Awaited<ReturnType<typeof asPerson>> | undefined;
   for (let tries = 0; tries < 2 && !sent; tries++) {
-    // Not past its time, on any try.
+    // Not past its time, on any try. And only while everything it was asked under still stands,
+    // asked now: the same authorisation, the same pairing, the very token.
     if (late()) break;
+    const still = tries === 0 ? undefined : await grant.held();
+    if (still && (still.generation !== op.generation || still.pairing !== op.pairing || still.version !== version)) break;
     try {
       const got = await send();
       if (got.status >= 500 || got.status === 429) again = true;
@@ -391,6 +411,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>): Promise
     }
   }
   if (!sent) {
+    // Tried, and not known to have failed: it may have been taken.
     await grant.advance(context.callId, "lost");
     return { error: UNCERTAIN };
   }
@@ -441,6 +462,8 @@ async function holds(env: Env, scope: Scope, condition: string, generation: numb
   // Only under what it was asked under, asked now: an authorisation taken away, or another pairing, ends it, also once it is answered.
   const held = await grant.held();
   if (held.generation !== generation || op.generation !== generation || held.pairing !== op.pairing) return { state: "gone" };
+  // What it brought back is kept here and is the person's own: it stays theirs to be given
+  // after their token has run out by itself. (Taken away, or another pairing: not, as above.)
   if (op.stage === "answered") return { state: "holds", since: op.created_at };
   // Past its time: said without asking Doubao, so that it ends also when Doubao cannot be reached.
   if (Date.now() >= op.deadline) return { state: "not_yet" };
@@ -449,9 +472,13 @@ async function holds(env: Env, scope: Scope, condition: string, generation: numb
   if (!held.token || !held.version) return { state: "holds", since: Date.now() };
   // The reply to that very message: found by what it answers, and done only when it says so
   // itself. Newest first, a page at a time, as far back as the message it answers and no further.
+  // A look covers five pages. In a conversation longer than that the next look goes on from
+  // where this one stopped, until the message it answers has been passed; then from the newest again.
   let reply: any;
-  let page: string | undefined;
+  let page = op.cursor;
+  let resume: string | undefined;
   for (let pages = 0; pages < 5 && !reply; pages++) {
+    if (Date.now() >= op.deadline) return { state: "not_yet" };
     const listed = await asPerson(held.token, "GET", `/sessions/${encodeURIComponent(op.session!)}/messages?order=desc${page ? `&page_token=${encodeURIComponent(page)}` : ""}`);
     if (listed.status === 401) {
       await grant.refused(held.version);
@@ -460,9 +487,13 @@ async function holds(env: Env, scope: Scope, condition: string, generation: numb
     if (listed.status !== 200 || listed.code !== 0) throw new Error("Doubao cannot be asked just now");
     const messages: any[] = Array.isArray(listed.data.messages) ? listed.data.messages : [];
     reply = messages.find((each) => each?.role === "assistant" && each.reply_id === op.message);
-    page = listed.data.has_more === true && typeof listed.data.page_token === "string" && listed.data.page_token !== "" ? listed.data.page_token : undefined;
-    if (!page || messages.some((each) => each?.id === op.message)) break;
+    const next = listed.data.has_more === true && typeof listed.data.page_token === "string" && listed.data.page_token !== "" ? listed.data.page_token : undefined;
+    // Found, though perhaps not done: looked at again on this same page. Passed the message it answers, or the end: from the newest again.
+    resume = reply ? page : !next || messages.some((each) => each?.id === op.message) ? undefined : next;
+    if (reply || resume === undefined) break;
+    page = next;
   }
+  await grant.looked(part[3], resume);
   const age = Date.now() - op.created_at;
   if (!reply || !["completed", "failed", "cancelled"].includes(reply.status)) return { state: "not_yet", again_in_ms: age < 30_000 ? 5_000 : age < 300_000 ? 15_000 : 60_000 };
   const items: any[] = Array.isArray(reply.items) ? reply.items : [];

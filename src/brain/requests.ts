@@ -447,8 +447,9 @@ export class Requests implements Wakes {
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // The answer was about the request as it stood when asked. If that has changed, it is not used.
       if (!now || now.status !== "waiting" || now.condition !== before.condition || now.generation !== before.generation || now.until !== before.until) return drop();
-      // Someone told that a thing was under way, with nothing for them to do, hears once that it is no longer waited for.
-      const tell = (which: "underWayOver" | "underWayGone") => void (now.interaction === "" && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
+      // Someone who was told that a thing was under way hears once that it is no longer waited for: whatever it was waiting on last.
+      const promised = () => this.#s.rows("SELECT 1 FROM outbox WHERE idem >= ? AND idem < ? LIMIT 1", `underway:${id}:`, `underway:${id};`).length > 0;
+      const tell = (which: "underWayOver" | "underWayGone") => void (promised() && this.#b.enqueueMessage(`over:${id}`, now.session_id, null, this.#b.notice(which, now.session_id), undefined, undefined, { target: now.target }));
       if (answer.state === "gone") {
         this.endRequest(id, "void", "what it waited for was taken away");
         tell("underWayGone");
