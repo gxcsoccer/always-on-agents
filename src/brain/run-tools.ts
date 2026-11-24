@@ -97,7 +97,8 @@ export class RunTools {
    * What the agent's last answer here was written from, as of when the person wrote: see
    * ToolContext.latest. Each message the run acts on is taken at the time it was written (as its
    * connector gives it, where it does; it can arrive after things that happened later). None if
-   * any of them is marked as a reply to something, or if they do not all follow the same answer.
+   * any of them is marked as a reply to something, if an answer went out between a message's
+   * writing and its arriving, or if they do not all follow the same answer.
    */
   #latest(run: RunRow, acting: Acting, name: string, kept = false): { latest?: { source: Record<string, unknown>; sent_at: number } } {
     const basis = this.#b.requests.basis(run.id);
@@ -107,7 +108,12 @@ export class RunTools {
       if (data.replies_to !== undefined) return undefined;
       const written = typeof data.written_at === "number" && data.written_at > 0 ? Math.min(data.written_at, each.received_at) : each.received_at;
       // The last one they could have seen when they wrote, whatever it was: not the last one of some kind.
-      return this.#s.rows<{ outbox_id: number; reads: string; person: string | null; sent_at: number }>("SELECT outbox_id, reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, written)[0];
+      const at = (time: number) => this.#s.rows<{ outbox_id: number; reads: string; person: string | null; sent_at: number }>("SELECT outbox_id, reads, person, sent_at FROM said WHERE session_id = ? AND sent_at <= ? ORDER BY sent_at DESC, outbox_id DESC LIMIT 1", run.session_id, time)[0];
+      // The two clocks (theirs for when it was written, ours for when an answer was confirmed sent)
+      // are not one: if an answer went out between the writing and the arriving, which one they
+      // had before them cannot be told, and none is taken.
+      const [then, arrived] = [at(written), at(each.received_at)];
+      return then?.outbox_id === arrived?.outbox_id ? then : undefined;
     });
     const last = lasts[0];
     if (!last || lasts.some((each) => each?.outbox_id !== last.outbox_id)) return {};
