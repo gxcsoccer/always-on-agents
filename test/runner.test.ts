@@ -920,11 +920,24 @@ describe("the run loop, by itself", () => {
       });
       // Or to an earlier message of their own that is on record.
       await within(async (b) => {
-        b.event("the plan https://x/docx/D1", { source_id: "om_first", status: "done" });
+        // Pointed at by when it was written, not copied: its words are where they always were, for as long as they are kept.
+        b.event("the plan https://x/docx/D1", { source_id: "om_first", status: "done", received_at: Date.UTC(2026, 10, 23, 7) });
         b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_first" };
         b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
         await b.go();
-        expect(String(b.asked[0].input.at(-1)!.content)).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to their own still earlier message: "the plan https://x/docx/D1")');
+        const said = String(b.asked[0].input.at(-1)!.content);
+        expect(said).toContain('(written as a reply to their own earlier message: "说了啥？", which they wrote as a reply to their own message of 2026-11-23T07:00:00.000Z)');
+        expect(said).not.toContain("the plan");
+      });
+      // Two messages taken up together that lead to the same answer: its words are shown once.
+      await within(async (b) => {
+        earlier(b, "r0", "summarise A");
+        delivered(b, "r0", "A has three items", { subject: "feishu:message:om_bot", sentAt: Date.UTC(2026, 10, 23, 8) });
+        b.settings.quoted = { text: "说了啥？", replies_to: "feishu:message:om_bot" };
+        b.event("", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        b.event("?", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        await b.go();
+        expect(JSON.stringify(b.asked[0].input).split("[The message of yours they are replying to").length - 1).toBe(1);
       });
       // Anything else up there (someone else's, nothing on record, something that is not a message's name): not said.
       for (const further of ["feishu:message:om_nowhere", 7, "other:message:x"]) {

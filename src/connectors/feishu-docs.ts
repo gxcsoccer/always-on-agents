@@ -226,7 +226,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
       const fetched = replying.flatMap(quotedDocuments);
       // One step further up, where the fetched message links nothing itself: the person's own
       // earlier message it was written in reply to, if that is on record here.
-      const above = fetched.length > 0 ? [] : replying.map((message) => (message.data.quoted as { replies_to?: unknown } | undefined)?.replies_to).filter((each): each is string => typeof each === "string");
+      const above = fetched.length > 0 ? [] : [...new Set(replying.map((message) => (message.data.quoted as { replies_to?: unknown } | undefined)?.replies_to).filter((each): each is string => typeof each === "string"))];
       const earlier = above.length === 1 ? context.recent.find((message) => typeof message.data.message_id === "string" && above[0] === `feishu:message:${message.data.message_id}`) : undefined;
       return { parent: parent ?? earlier, links: parent ? ownDocuments(parent) : earlier ? ownDocuments(earlier) : fetched, fetched };
     });

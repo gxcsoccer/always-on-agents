@@ -3005,6 +3005,51 @@ describe("reading a document for the one who asked, where several people talk", 
     expect(feishu.reads).toEqual([]);
   });
 
+  it("goes by the link in the message replied to before anything further up: a newer document named there is the one read", async () => {
+    const ola = someone();
+    feishu.docs.set("DocGroupOla0000000001", { readers: [ola.openId], text: "The old version." });
+    feishu.docs.set("DocGroupOla0000000002", { readers: [ola.openId], text: "The new version." });
+    await authorised(ola, "DocGroupOla0000000001");
+    const id = chat();
+    const here = inGroup(id, ola);
+    model.replies([readCall("DocGroupOla0000000001")], [call("send_message", { text: "旧版三步。" })], [say("")]);
+    await here.says(`总结一下 ${link("DocGroupOla0000000001")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "旧版三步。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    quotable.set("om_newer_ola", { chat_id: id, open_id: ola.openId, text: `改看新版 ${link("DocGroupOla0000000002")}`, parent: answer });
+    model.replies([readCall("DocGroupOla0000000002")], [call("send_message", { text: "新版四步。" })], [say("")]);
+    await here.says("", "om_newer_ola");
+    expect(feishu.reads.map((each) => each.path)).toEqual(["/open-apis/docx/v1/documents/DocGroupOla0000000002/raw_content"]);
+  });
+
+  it("shows an answer written for someone else there as what was said, and reads nothing again on its strength for another person", async () => {
+    const pia = someone();
+    const quin = someone();
+    feishu.docs.set("DocGroupPia0000000001", { readers: [pia.openId, quin.openId], text: "Shared by both." });
+    await authorised(pia, "DocGroupPia0000000001");
+    await authorised(quin, "DocGroupPia0000000001");
+    const id = chat();
+    const hers = inGroup(id, pia);
+    const his = inGroup(id, quin);
+    // Both linked it there; the answer was written for her.
+    model.replies([say("")]);
+    await his.says(`存一下 ${link("DocGroupPia0000000001")}`);
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "给 Pia 的总结。" })], [say("")]);
+    await hers.says(`总结一下 ${link("DocGroupPia0000000001")}`);
+    const answer = `om_sent_${feishu.sent.filter((each) => each.type === "text" && each.content.text === "给 Pia 的总结。").at(-1)!.uuid}`;
+    feishu.reads.length = 0;
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "请贴链接" })], [say("")]);
+    await his.says("第二点展开", answer);
+    expect(JSON.stringify(modelCalls.at(-2)!.input)).toContain("给 Pia 的总结。");
+    expect(JSON.stringify(modelCalls.at(-2)!.input)).not.toContain("written from");
+    expect(toolOutputs()[0].error).toMatch(/does not rest on one document/);
+    expect(feishu.reads).toEqual([]);
+    // She can: it was written for her.
+    model.replies([readCall("DocGroupPia0000000001")], [call("send_message", { text: "第二点是…" })], [say("")]);
+    await hers.says("第二点展开", answer);
+    expect(feishu.reads).toHaveLength(1);
+  });
+
   it("asks which is meant when the earlier message they reply to links several documents, and reads none of them", async () => {
     const jo = someone();
     feishu.docs.set("DocGroupJo00000000001", { readers: [jo.openId], text: "One." });

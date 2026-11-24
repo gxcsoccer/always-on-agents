@@ -216,12 +216,14 @@ export class Runner {
     if (typeof subject !== "string") return "";
     const words = this.#s.rows<{ outbox_id: number; sent_at: number }>("SELECT outbox_id, sent_at FROM said WHERE receipt_subject = ? AND session_id = ? ORDER BY outbox_id DESC LIMIT 1", subject, sessionId)[0];
     if (words) {
-      replied.push(words.outbox_id);
+      if (!replied.includes(words.outbox_id)) replied.push(words.outbox_id);
       return `, which they wrote as a reply to the message you sent at ${new Date(words.sent_at).toISOString()}`;
     }
+    // Their own, on record here: pointed at by when it arrived. Its words are not copied into
+    // this turn, which could outlast them; they are in the conversation for as long as they are kept.
     const parent = this.#parentOf(event, subject);
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
-    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `, which they wrote as a reply to their own still earlier message: ${JSON.stringify(parent.text.slice(0, 500))}`;
+    if (parent && parent.text !== null && who(parent).kind === "human" && who(event).kind === "human" && who(parent).id === who(event).id) return `, which they wrote as a reply to their own message of ${new Date(parent.received_at).toISOString()}`;
     return "";
   }
 
@@ -714,7 +716,7 @@ export class Runner {
     // The words people replied to, for every reply in the window, in one query.
     const pointed = rows.flatMap((row) => (row.is_user === 1 ? ((JSON.parse(row.item) as { _replied?: unknown })._replied as number[] | undefined) ?? [] : []));
     const quotedOf = new Map(
-      pointed.length === 0 || !mayShow ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string }>("SELECT outbox_id, text, sent_at, reads FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
+      pointed.length === 0 || !mayShow ? [] : this.#s.rows<{ outbox_id: number; text: string; sent_at: number; reads: string; person: string | null }>("SELECT outbox_id, text, sent_at, reads, person FROM said WHERE session_id = ? AND outbox_id IN (SELECT value FROM json_each(?))", sessionId, JSON.stringify(pointed)).map((each) => [each.outbox_id, each] as const),
     );
     const lastOf = new Map<string, number>();
     rows.forEach((each, index) => each.run_id && lastOf.set(each.run_id, index));
@@ -727,11 +729,11 @@ export class Runner {
     rows.forEach((row, index) => {
       const item = JSON.parse(row.item) as Record<string, unknown> & { _replied?: number[] };
       if (row.is_user === 1) {
-        const quoted = (item._replied ?? []).flatMap((id) => quotedOf.get(id) ?? []);
+        const quoted = [...new Set(item._replied ?? [])].flatMap((id) => quotedOf.get(id) ?? []);
         quoted.forEach((each, at) => {
           // What it was written from, by the tool's canonical call, where that is the one thing the
           // person can still point at: what they are asking about, even once that turn is out of sight.
-          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf);
+          const source = eligibleSource(JSON.parse(each.reads) as { connector: string; tool: string; args: string; identity: string }[], acting, this.#b.toolsOf, each.person);
           const from = source ? linksOf([{ args: JSON.stringify(source.request) }]) : [];
           entries.push({ item: { role: "assistant", content: `[The message of yours they are replying to, sent at ${new Date(each.sent_at).toISOString()}${from.length > 0 ? `, written from ${from.join(", ")}` : ""}:]\n${each.text}` }, starts: at === 0 });
         });

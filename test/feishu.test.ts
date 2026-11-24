@@ -303,6 +303,9 @@ describe("which documents a fetched message links", () => {
     expect(await fetched({})).toEqual({ text: "说了啥？" });
     expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1" })).toEqual({ text: "说了啥？" });
     expect(await fetched({ parent_id: "not an id!" })).toEqual({ text: "说了啥？" });
+    // Only the message it replies to itself: where it started is not that.
+    expect(await fetched({ root_id: "om_root" })).toEqual({ text: "说了啥？" });
+    expect(await fetched({ parent_id: "om_answer", root_id: "om_root" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
     // Not for someone else's message: nothing of it is passed on, where it points included.
     expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
   });

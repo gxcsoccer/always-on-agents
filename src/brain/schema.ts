@@ -290,6 +290,9 @@ export const MIGRATIONS: string[] = [
   // 28: a run one of its tools has closed: "settled" (the tool ended the matter itself; nothing
   // more is done in the run) or "waited" (a call of it has to wait; it can only reply and read again).
   `ALTER TABLE runs ADD COLUMN closed TEXT;`,
+  // 29: whom an answer was written for: the person the run that wrote it acted for, or whose
+  // request it carried on. What it was written from counts, later, only for that same person.
+  `ALTER TABLE said ADD COLUMN person TEXT;`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
