@@ -195,7 +195,7 @@ export function linksIn(text: string): (DocumentRef & { link: string })[] {
 async function read(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
   const { env, origin } = context;
   const target = documentOf(String(args.document ?? "").trim());
-  if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…)" };
+  if (!target) return { error: "that is not a link to a Feishu document (https://….feishu.cn/docx/… or …/wiki/…, or the same on ….larkoffice.com)" };
   // The document is the person's choice: one they linked themselves, in this request or in their
   // own messages here over the last day (which of those is the model's to say). A reply to one of
   // their own messages names what it is about exactly; a reply to one of the agent's answers can
