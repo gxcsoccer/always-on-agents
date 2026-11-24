@@ -7,6 +7,18 @@ import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "./env";
 
+/** Which Doubao app a chat app's people are served with, and how a person is known to be the same on both sides. */
+export interface DoubaoApp {
+  chat_connector: string;
+  chat_app_id: string;
+  tenant: string;
+  app_id: string;
+  app_secret: string;
+  match: "union_id" | "open_id";
+  /** Names this pairing: changes whenever it is set again. */
+  version: string;
+}
+
 export interface FeishuApp {
   app_id: string;
   tenant: string;
@@ -65,6 +77,10 @@ export class Registry extends DurableObject<Env> {
       );
       CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS chat_repos (tenant TEXT NOT NULL, chat TEXT NOT NULL, repo TEXT NOT NULL, PRIMARY KEY (tenant, chat));
+      CREATE TABLE IF NOT EXISTS doubao_apps (
+        chat_app_id TEXT PRIMARY KEY, chat_connector TEXT NOT NULL, tenant TEXT NOT NULL, app_id TEXT NOT NULL, app_secret TEXT NOT NULL,
+        match TEXT NOT NULL, version TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS feishu_apps (
         app_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, app_secret TEXT NOT NULL, encrypt_key TEXT, verification_token TEXT,
         bot_open_id TEXT, token TEXT, token_expires_at INTEGER
@@ -178,6 +194,26 @@ export class Registry extends DurableObject<Env> {
   async feishuApp(appId: string): Promise<FeishuApp | null> {
     const row = this.ctx.storage.sql.exec("SELECT * FROM feishu_apps WHERE app_id = ?", appId).toArray()[0] as unknown as FeishuApp | undefined;
     return row ? { ...row } : null;
+  }
+
+  /** Which Doubao app the people of one chat app are served with, if the operator set one. */
+  async doubaoApp(chatAppId: string): Promise<DoubaoApp | null> {
+    return (this.ctx.storage.sql.exec("SELECT * FROM doubao_apps WHERE chat_app_id = ?", chatAppId).toArray()[0] as unknown as DoubaoApp | undefined) ?? null;
+  }
+
+  /**
+   * Pairs a registered chat app with a Doubao app. Each setting is a new pairing with its own
+   * version: an authorisation begun or given under an earlier one does not count under this one.
+   */
+  async setDoubaoApp(pair: Pick<DoubaoApp, "chat_connector" | "chat_app_id" | "app_id" | "app_secret" | "match">): Promise<DoubaoApp | null> {
+    const chat = await this.feishuApp(pair.chat_app_id);
+    if (!chat) return null;
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO doubao_apps (chat_app_id, chat_connector, tenant, app_id, app_secret, match, version) VALUES (?, ?, ?, ?, ?, ?, ?)", pair.chat_app_id, pair.chat_connector, chat.tenant, pair.app_id, pair.app_secret, pair.match, crypto.randomUUID());
+    return this.doubaoApp(pair.chat_app_id);
+  }
+
+  async removeDoubaoApp(chatAppId: string): Promise<boolean> {
+    return this.ctx.storage.sql.exec("DELETE FROM doubao_apps WHERE chat_app_id = ? RETURNING chat_app_id", chatAppId).toArray().length > 0;
   }
 
   /**

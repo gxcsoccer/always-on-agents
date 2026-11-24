@@ -24,7 +24,7 @@
  * the deployment's secrets.
  */
 import type { Env } from "../env";
-import type { Principal, Scope, Target } from "../events";
+import type { InboundEvent, Principal, Scope, Target } from "../events";
 
 export interface Connector {
   /** Lowercase; also the first path segment of its routes and the `source` of its events. */
@@ -60,6 +60,13 @@ export interface Connector {
    * longer be used; undefined for an interaction that is not this connector's.
    */
   invitation?(env: Env, interaction: string): Promise<Invitation | null | undefined>;
+  /**
+   * For a connector that plugs into another: which of its `optional` tools are for the person
+   * who caused this event of that connector's, as the operator has set things up. Asked once,
+   * as the event arrives; what it answers is kept with the event (`data.offered`), and nothing
+   * a connector writes there itself is believed.
+   */
+  offers?(env: Env, event: InboundEvent): Promise<string[]>;
 }
 
 /**
@@ -171,6 +178,8 @@ export interface ConnectorTool {
    * "act" tool can no longer be used, so nothing that was read can have something done.
    */
   effect: "read" | "act";
+  /** Offered only where its connector said so for the very messages a run acts on (see `Connector.offers`): not there at all otherwise. */
+  optional?: true;
   /**
    * Whether the tool may also be used where several people talk (a group, say), for the one of
    * them who asked. Without it the tool exists only in a person's private conversation. A tool

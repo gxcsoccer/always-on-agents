@@ -10,7 +10,7 @@ import type { Env } from "../env";
 import { chainLevels } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
-import { type Acting, HANDLING_LIMIT_MS, type Requests, WAITING_NOTE } from "./requests";
+import { type Acting, HANDLING_LIMIT_MS, type Requests, UNDER_WAY_NOTE, WAITING_NOTE } from "./requests";
 import type { BrainStore, Row, RunRow } from "./store";
 import type { Tasks } from "./tasks";
 import { MAX_MESSAGE_TEXT, type ToolHost } from "./tools";
@@ -113,7 +113,8 @@ export class RunTools {
         const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${callId}`) ?? "null") as { request: string } | null)?.request;
         if (!carried && (folded !== undefined || this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0)) {
           this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
-          return { waiting: true, request: folded ?? callId, note: WAITING_NOTE };
+          const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", folded ?? callId)[0]?.interaction !== "";
+          return { waiting: true, request: folded ?? callId, note: shown ? WAITING_NOTE : UNDER_WAY_NOTE };
         }
         const key = carried ? carried.id : callId;
         const { replaces, ...asked } = args;
@@ -289,8 +290,10 @@ export class RunTools {
 type Read = { connector: string; tool: string; args: string; identity: string };
 
 /** The connector's tools that may be used for this person where they are: all of them in private, and where several people talk only those that say so. */
-export function toolsIn(acting: Pick<Acting, "connector" | "shared">, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {
-  return toolsOf(acting.connector).filter((each) => !acting.shared || each.shared === true);
+export function toolsIn(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {
+  // An optional tool: only where every message the run acts on was marked, as it arrived, as one it is offered for.
+  const offered = (name: string) => acting.said !== undefined && acting.said.length > 0 && acting.said.every((each) => Array.isArray(each.data.offered) && each.data.offered.includes(name));
+  return toolsOf(acting.connector).filter((each) => (!acting.shared || each.shared === true) && (!each.optional || offered(each.name)));
 }
 
 /**

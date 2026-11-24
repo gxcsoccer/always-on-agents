@@ -290,6 +290,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // Which app received it and which organisation the sender belongs to, both as Feishu
         // stated them in the verified event.
         origin: { app_id: app.app_id, tenant_key: String(sender.tenant_key) },
+        // Who the sender is across the apps of one developer, as Feishu stated it in the same
+        // verified event. Beside the origin, not in it: it does not say where a message came from.
+        ...(typeof sender.sender_id?.union_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(sender.sender_id.union_id) ? { union_id: sender.sender_id.union_id } : {}),
         // An ordinary message written to the agent in a direct chat.
         // Or one written where several people talk, through an app whose operator lets a
         // person's own tools be used for them there.

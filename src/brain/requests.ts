@@ -20,6 +20,9 @@ export const HANDLING_LIMIT_MS = 60 * 60_000;
 export const WAITING_NOTE =
   "This cannot be done until the person does something that only they can do (authorise it, say). The system itself is showing them how, in this conversation; do not repeat or paraphrase that, and do not ask them to send their request again. The request is kept under the id given here and is carried on by itself once they have done it: its answer is sent to them then. There is nothing more for you to do about it in this run, and nothing to say about it.";
 
+export const UNDER_WAY_NOTE =
+  "This has been handed over and is being worked on elsewhere; it takes a while and nobody has to do anything meanwhile. The system itself has told the person so; do not repeat or paraphrase that. The request is kept under the id given here and is carried on by itself when the work is done: its result is sent to them then. There is nothing more for you to do about it in this run, and nothing to say about it.";
+
 /** A request that waits, or is being carried on: see the `continuations` table. */
 export interface Continuation {
   id: string;
@@ -189,7 +192,7 @@ export class Requests implements Wakes {
       // Which request this call was answered with, kept: made again after an interruption it has
       // the same answer, whatever has become of that request since (see RunTools.connectorTool).
       this.#s.setMeta(`waited:${id}`, JSON.stringify({ request: twice.id, run: run.id }));
-      return { waiting: true, request: twice.id, note: WAITING_NOTE };
+      return { waiting: true, request: twice.id, note: shows ? WAITING_NOTE : UNDER_WAY_NOTE };
     }
     this.#s.transaction(() => {
       // A way in meant for the person alone goes to them directly: where that is, the connector
@@ -239,7 +242,14 @@ export class Requests implements Wakes {
       }
       if (replacing) this.cancel(replacing.record, replacing.by, replacing.choosing);
       const now = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
-      if (!shows) return void this.hint(now, `asked:${id}`);
+      if (!shows) {
+        // Said once for each thing it waits on, by the system: also when the request was carried
+        // on to get here, where what the run writes is the request's one answer and is not sent yet.
+        this.#b.enqueueMessage(`underway:${id}:${waiting.condition}`, now.session_id, null, this.#b.notice("underWay", now.session_id), undefined, undefined, { target: now.target });
+        // Asked about at once, and anew each time it comes to wait: on another thing, or on the
+        // same thing again after being carried on (told apart by when it was last taken up).
+        return void this.hint(now, `asked:${id}:${waiting.condition}:${existing?.claimed_at ?? 0}`);
+      }
       // One message per way in, whoever is waiting on it: two requests can share an invitation.
       this.#b.enqueueMessage(`invite:${waiting.interaction}`, now.session_id, null, this.#b.notice("invite", now.session_id), undefined, undefined, { interaction: waiting.interaction, target: aside ? JSON.stringify(aside) : now.target });
       // One set aside because nobody waited on it any more is wanted again, and so is one that
@@ -266,7 +276,7 @@ export class Requests implements Wakes {
       // The condition may already hold (the person used an earlier invitation a moment ago): ask.
       this.hint(now, `asked:${waiting.interaction}`);
     });
-    return { waiting: true, request: id, note: WAITING_NOTE };
+    return { waiting: true, request: id, note: shows ? WAITING_NOTE : UNDER_WAY_NOTE };
   }
 
   /**

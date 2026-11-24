@@ -8,7 +8,7 @@
 import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
-import type { Principal, Scope, Target } from "../events";
+import type { InboundEvent, Principal, Scope, Target } from "../events";
 import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Quoted, Receipt, Standing } from "./types";
 import { DeliveryVoid } from "./types";
 
@@ -55,6 +55,21 @@ export function toolsOf(name: string): ConnectorTool[] {
 /** The connectors that plug into this one: their tools are for its people too. */
 function serving(name: string): Connector[] {
   return connectors.filter((each) => each.name !== name && (each.serves ?? []).includes(name));
+}
+
+/** Which optional tools of the connectors plugged into an event's source are for whoever caused it. None where one of them cannot say. */
+export async function offeredFor(env: Env, event: InboundEvent): Promise<string[]> {
+  const names: string[] = [];
+  for (const each of serving(event.source)) {
+    const own = new Set((each.tools ?? []).filter((tool) => tool.optional).map((tool) => tool.name));
+    if (own.size === 0 || !each.offers) continue;
+    try {
+      names.push(...(await each.offers(env, event)).filter((name) => own.has(name)));
+    } catch {
+      // Not known: not offered.
+    }
+  }
+  return names;
 }
 
 /** Sends one message. Throwing means "not delivered, try again later". */

@@ -227,6 +227,24 @@ What the agent writes itself goes out as a Feishu post with one Markdown element
 
 The card's fixed text is currently Chinese only.
 
+## Doubao Work
+
+Lets a person hand a piece of work to Doubao Work's agent from their direct chat ("让豆包调研一下…"), as themselves, and brings its reply back. It is a connector that plugs into the Feishu one: it has no way in or out of its own and adds one tool, `doubao_ask`, for people who write through a chat app the operator has paired. Until an app is paired the tool does not exist for anyone. Design and what was measured against the service: [docs/design/doubao-work.zh-CN.md](design/doubao-work.zh-CN.md).
+
+Doubao Work speaks for a user only, with Feishu's authorisation protocol on its own hosts. The app whose credentials are used needs the user permissions `doubao:session:write`, `doubao:session.event:write` and `doubao:session.message:read`, and `$PUBLIC_ORIGIN/v1/doubao/oauth/callback` among its redirect URLs. It need not be the chat app: a person is matched by `tenant_key` and `union_id`, which are the same across the apps of one developer.
+
+```sh
+# Pair a registered chat app with the app used towards Doubao. The secret is never given back.
+curl -X POST $ORIGIN/v1/admin/doubao/apps -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"for":{"connector":"feishu","app_id":"<chat app>"},"app_id":"<app>","app_secret":"<secret>"}'
+# Is it paired? DELETE unpairs: the tool is gone, and what was authorised under the pairing is no longer used.
+curl $ORIGIN/v1/admin/doubao/apps/<chat app> -H "authorization: Bearer $ADMIN_TOKEN"
+# One person's authorisation and how their pieces of work stand (counts only). DELETE takes the authorisation away.
+curl $ORIGIN/v1/admin/doubao/grants/<chat app>/<tenant_key>/<open_id> -H "authorization: Bearer $ADMIN_TOKEN"
+```
+
+What a person sees: the first time, a card asking them to authorise (about two hours; then again). Then one line that the work was handed over, and the answer when Doubao is done, within an hour. A follow-up ("让豆包再补充…") goes into the same Doubao conversation. Calling it off stops the waiting; it does not stop Doubao.
+
 ## Writing a connector
 
 A connector is one object that implements `Connector` (`src/connectors/types.ts`), listed in `src/agent.config.ts`. Routes, admin requests, scheduled work, delivery and the re-reading of messages all reach it through that object, not by its name. Two things still name a system elsewhere: a connector's Durable Object class is exported from `src/index.ts`, and a task can only be given a GitHub repository to work on. The three connectors in this repository are written this way and are the examples to copy.
@@ -271,7 +289,7 @@ Each part is optional and independent. A connector that only reports events (a C
 
 ### Tools
 
-A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect: "read", parameters, run(context, args) }`, named `<connector name>_…`. Only tools that read exist so far. `context.person` is who the call is for; the tool must act as that person and nobody else. `context.said` is that person's messages that started the run, each with its text and the `data` the connector attached, so a tool can hold a call to what they themselves asked for; `context.recent` is the same for what they wrote there shortly before. A tool sends nothing itself. One that cannot act yet because the person has not authorised it answers with a `Waiting`, and what the person is shown goes out through the Brain like everything else said to them; see [A tool that has to wait](#a-tool-that-has-to-wait).
+A connector can give the agent tools: things it can do in the outside system on one person's behalf, such as reading a document as that person. A tool is `{ name, description, effect, parameters, run(context, args) }`, named `<connector name>_…`. `effect` is `"read"` (it looks and changes nothing) or `"act"` (it does something there as the person); once a run has read outside text, only tools that read can still be used in it. `context.person` is who the call is for; the tool must act as that person and nobody else. `context.said` is that person's messages that started the run, each with its text and the `data` the connector attached, so a tool can hold a call to what they themselves asked for; `context.recent` is the same for what they wrote there shortly before. A tool sends nothing itself. One that cannot act yet because the person has not authorised it answers with a `Waiting`, and what the person is shown goes out through the Brain like everything else said to them; see [A tool that has to wait](#a-tool-that-has-to-wait).
 
 The core decides when a connector's tools exist at all, and for whom:
 
@@ -282,6 +300,16 @@ The core decides when a connector's tools exist at all, and for whom:
 - **Nothing is routed across a private conversation.** A reply elsewhere that names an open question's code is normally taken to that question. Not into or out of a private conversation.
 - **Every call is audited** (`tool.used`, with the person and the tool, not the arguments).
 - A call may be repeated after an interruption, so a tool must be safe to run twice.
+
+### A connector that plugs into another
+
+A connector need not have a way in or out. One that lists other connectors in `serves` adds its tools for the people who arrive through those: they are offered wherever that connector's own tools would be, and run with the same context. Three things make that work without the other connector knowing of it:
+
+- `offers(env, event)`: asked as each of that connector's messages arrives, it names which of its `optional` tools are for whoever wrote it (by the operator's set-up, say). The answer is kept with the message; an optional tool is offered only in a run whose messages all carry it.
+- `holds(...)` is asked before the other connector's, and answers nothing for a condition that is not its own.
+- `invitation(env, interaction)` gives what to show for one of its `Waiting.interaction`s as words and one link; the channel that delivers it decides how that looks.
+
+A tool may also wait on something nobody has to do (a reply being written elsewhere): a `Waiting` without `interaction`. The system then tells the person in one fixed line that it is under way, and asks `holds` again whenever its "not yet" says to (`again_in_ms`).
 
 ### Where several people talk, and a tool that settles the matter itself
 

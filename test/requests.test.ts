@@ -934,18 +934,19 @@ describe("keeping a request that has to wait", () => {
     });
   });
 
-  it("keeps a request that waits on something nobody has to do: nothing is put before the person, and it is asked about at once", async () => {
+  it("keeps a request that waits on something nobody has to do: the person is told it is under way, shown nothing to act on, and it is asked about at once", async () => {
     await within(({ requests, store, run, message, kept, hints }) => {
       const said = message("交给豆包", {}, "r1");
       const { interaction: _none, ...plain } = waiting;
       expect(requests.wait(run("r1"), { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" }, events: { said: [said], recent: [] } }, "call_1", "doubao_ask", plain as never)).toMatchObject({ waiting: true, request: "call_1" });
       expect(kept("call_1")).toMatchObject({ status: "waiting", interaction: "" });
-      expect(store.rows("SELECT 1 FROM outbox")).toEqual([]);
+      // Only the system's own line that it is under way: no way in, nothing to act on.
+      expect(store.rows("SELECT idem, interaction FROM outbox")).toEqual([{ idem: `underway:call_1:${plain.condition}`, interaction: null }]);
       expect(hints()).toHaveLength(1);
       // Asked for again by the same messages: still one request, and still nothing sent.
       requests.wait(store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0], { connector: "feishu", person: "ou_1", origin: { app_id: "cli_1", tenant_key: "org_1" }, events: { said: [said], recent: [] } }, "call_1b", "doubao_ask", plain as never);
       expect(store.rows("SELECT id FROM continuations")).toEqual([{ id: "call_1" }]);
-      expect(store.rows("SELECT 1 FROM outbox")).toEqual([]);
+      expect(store.rows("SELECT 1 FROM outbox")).toHaveLength(1);
     });
   });
 

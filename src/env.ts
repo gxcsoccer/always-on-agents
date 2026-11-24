@@ -1,5 +1,6 @@
 import type { BrainAgent } from "./brain/agent";
 import type { Registry } from "./registry";
+import type { DoubaoGrant } from "./connectors/doubao";
 import type { FeishuGrant } from "./connectors/feishu-grant";
 import type { FeishuLink } from "./connectors/feishu-link";
 import type { TaskSandbox } from "./workers/sandbox/task";
@@ -10,6 +11,7 @@ export interface Env {
   REGISTRY: DurableObjectNamespace<Registry>;
   FEISHU_LINKS: DurableObjectNamespace<FeishuLink>;
   FEISHU_GRANTS: DurableObjectNamespace<FeishuGrant>;
+  DOUBAO_GRANTS: DurableObjectNamespace<DoubaoGrant>;
   CHECKPOINTS: R2Bucket;
 
   /** Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host. */

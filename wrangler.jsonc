@@ -27,7 +27,8 @@
       { "name": "TASKS", "class_name": "TaskSandbox" },
       { "name": "REGISTRY", "class_name": "Registry" },
       { "name": "FEISHU_LINKS", "class_name": "FeishuLink" },
-      { "name": "FEISHU_GRANTS", "class_name": "FeishuGrant" }
+      { "name": "FEISHU_GRANTS", "class_name": "FeishuGrant" },
+      { "name": "DOUBAO_GRANTS", "class_name": "DoubaoGrant" }
     ]
   },
   "containers": [
@@ -44,7 +45,8 @@
     "TaskSandbox": { "type": "durable-object", "storage": "sqlite" },
     "Registry": { "type": "durable-object", "storage": "sqlite" },
     "FeishuLink": { "type": "durable-object", "storage": "sqlite" },
-    "FeishuGrant": { "type": "durable-object", "storage": "sqlite" }
+    "FeishuGrant": { "type": "durable-object", "storage": "sqlite" },
+    "DoubaoGrant": { "type": "durable-object", "storage": "sqlite" }
   },
   // The backstop for Feishu long connections; see `scheduled` in src/index.ts.
   "triggers": { "crons": ["* * * * *"] },

@@ -644,7 +644,7 @@ export async function challengeOf(verifier: string): Promise<string> {
   return base64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
 }
 
-function random(bytes: number): string {
+export function random(bytes: number): string {
   return base64url(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
@@ -652,7 +652,7 @@ function base64url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function seal(key: CryptoKey, plain: string, bound: string): Promise<string> {
+export async function seal(key: CryptoKey, plain: string, bound: string): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(bound) }, key, new TextEncoder().encode(plain)));
   const out = new Uint8Array(iv.length + sealed.length);
@@ -663,7 +663,7 @@ async function seal(key: CryptoKey, plain: string, bound: string): Promise<strin
   return btoa(binary);
 }
 
-async function open(key: CryptoKey, sealed: string, bound: string): Promise<string> {
+export async function open(key: CryptoKey, sealed: string, bound: string): Promise<string> {
   const data = Uint8Array.from(atob(sealed), (c) => c.charCodeAt(0));
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.subarray(0, 12), additionalData: new TextEncoder().encode(bound) }, key, data.subarray(12));
   return new TextDecoder().decode(plain);
