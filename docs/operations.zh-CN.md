@@ -171,15 +171,30 @@ Worker 输出结构化日志（每行一个 JSON 对象），`wrangler.jsonc` �
 
 ## 各项上限
 
-这些是代码里的常量，不是配置项。
+前四项按租户可改，下表是没改过时的默认值；其余是代码里的常量。
+
+```bash
+# 查看某个租户现在的限额和默认值
+curl -H "authorization: Bearer $ADMIN_KEY" https://<你的域名>/v1/admin/tenants/<租户>/limits
+# 改其中几项：没写到的保持不变，写 null 的回到默认值
+curl -X PUT -H "authorization: Bearer $ADMIN_KEY" -H "content-type: application/json" \
+  -d '{"scope_daily_tokens": 5000000, "scope_active_tasks": null}' \
+  https://<你的域名>/v1/admin/tenants/<租户>/limits
+```
+
+四项的名字：`scope_daily_tokens`（每个作用域每天的 token）、`tenant_daily_tokens`（租户每天的 token）、`scope_active_tasks`（每个作用域同时进行的任务）、`tenant_sandboxes`（租户同时运行的沙箱）。都是不小于 0 的整数；`tenant_daily_tokens` 要么是 0，要么不小于 20000（每次调用模型前会先预留这么多，比它小就一次也调不了）。返回里的 `overrides` 是这个租户显式设过的项，`most` 是每项允许的最大值。租户不存在返回 404，写法不对返回 400。
+
+设为 0 的含义：`scope_daily_tokens` 为 0 时，该作用域里 agent 自己不再调用模型；已经在跑的沙箱任务会做完，它们的用量在结束时计入。`tenant_daily_tokens` 为 0 时，整个租户的 agent 和沙箱都不能再开始新的模型调用。两个并发上限为 0 时只是不再接新任务，已有的照常收尾。
+
+改动从该作用域下一次调用模型时起生效（在那之前已经发出的工具调用仍按旧值）；已经因为当天额度用完而暂停的作用域，要到次日（UTC）才会继续，调高额度不会把它提前叫醒。
 
 | 项目 | 上限 |
 |---|---|
-| 每个作用域每天的 token | 2,000,000 |
-| 每个租户每天的 token | 20,000,000 |
+| 每个作用域每天的 token | 2,000,000（可改） |
+| 每个租户每天的 token | 20,000,000（可改） |
 | 每次 run 的模型步数 | 16 |
 | 一次 run 认领的事件数 | 40 |
-| 同时运行的沙箱任务 | 每个作用域 3 个，每个租户 5 个 |
+| 同时运行的沙箱任务 | 每个作用域 3 个，每个租户 5 个（都可改） |
 | 沙箱任务：启动 / 空闲 / 总时长 | 5 分钟 / 15 分钟 / 2 小时 |
 | 沙箱任务：模型调用次数 | 400 |
 | 沙箱任务：容器丢失后的恢复次数 | 2 |

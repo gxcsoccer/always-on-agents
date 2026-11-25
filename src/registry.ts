@@ -6,6 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "./env";
+import { type Limits, changed, limitsFrom, overridesFrom } from "./limits";
 
 /** Which Doubao app a chat app's people are served with, and how a person is known to be the same on both sides. */
 export interface DoubaoApp {
@@ -57,10 +58,6 @@ export interface Tenant {
   created_at: number;
 }
 
-/** What one tenant may spend on models per UTC day, across all of its scopes and sandboxes. */
-const TENANT_DAILY_TOKEN_BUDGET = 20_000_000;
-/** How many sandbox containers one tenant may run at once. */
-const MAX_TASKS_PER_TENANT = 5;
 /** A slot nobody released is reclaimed after this long. */
 const SLOT_TTL_MS = 3 * 60 * 60 * 1_000;
 
@@ -70,6 +67,7 @@ export class Registry extends DurableObject<Env> {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS api_keys (hash TEXT PRIMARY KEY, tenant TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS tenant_limits (tenant TEXT PRIMARY KEY, limits TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS github_installations (installation_id TEXT PRIMARY KEY, tenant TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS identities (
         tenant TEXT NOT NULL, provider TEXT NOT NULL, external_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -301,7 +299,48 @@ export class Registry extends DurableObject<Env> {
    * Records model tokens a tenant used and says whether it may keep spending today. All tenants
    * share one provider key, so this is what stops one tenant from using up everyone's allowance.
    */
-  async recordUsage(tenant: string, tokens: number): Promise<{ allowed: boolean; used: number; budget: number; day: string }> {
+  /** What a tenant may use: its own figures where the operator set them, the defaults elsewhere. */
+  async limits(tenant: string): Promise<{ limits: Limits; overrides: Partial<Limits> } | null> {
+    if (this.ctx.storage.sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) return null;
+    return { limits: this.#limits(tenant), overrides: overridesFrom(this.#kept(tenant)) };
+  }
+
+  /** Sets some of a tenant's limits (null: back to the default) and says what holds then. See `changed`. */
+  async setLimits(tenant: string, change: unknown): Promise<{ limits: Limits; overrides: Partial<Limits> } | { error: string; missing?: true }> {
+    const sql = this.ctx.storage.sql;
+    if (sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) return { error: "no such tenant", missing: true };
+    // Read apart from the check below: failing to read what is kept is something going wrong here, not a mistake in what was asked.
+    const kept = this.#kept(tenant);
+    let next: Partial<Limits>;
+    try {
+      next = changed(kept, change);
+    } catch (err) {
+      // What was asked for is not a change that can be made: said as that, apart from anything going wrong here.
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+    if (Object.keys(next).length === 0) sql.exec("DELETE FROM tenant_limits WHERE tenant = ?", tenant);
+    else sql.exec("INSERT INTO tenant_limits (tenant, limits, updated_at) VALUES (?, ?, ?) ON CONFLICT(tenant) DO UPDATE SET limits = excluded.limits, updated_at = excluded.updated_at", tenant, JSON.stringify(next), Date.now());
+    return { limits: this.#limits(tenant), overrides: next };
+  }
+
+  #kept(tenant: string): unknown {
+    const kept = this.ctx.storage.sql.exec<{ limits: string }>("SELECT limits FROM tenant_limits WHERE tenant = ?", tenant).toArray()[0]?.limits;
+    try {
+      return kept ? JSON.parse(kept) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #limits(tenant: string): Limits {
+    return limitsFrom(this.#kept(tenant));
+  }
+
+  /**
+   * Counts tokens against the tenant's day and says whether it is still within what it may
+   * spend; with it, the tenant's limits as they stand, for the scope that asked to go by.
+   */
+  async recordUsage(tenant: string, tokens: number): Promise<{ allowed: boolean; used: number; budget: number; day: string; limits: Limits }> {
     const day = new Date().toISOString().slice(0, 10);
     const sql = this.ctx.storage.sql;
     const add = Number.isFinite(tokens) && tokens > 0 ? Math.min(Math.floor(tokens), 1_000_000_000) : 0;
@@ -311,7 +350,10 @@ export class Registry extends DurableObject<Env> {
     }
     const used = sql.exec<{ tokens: number }>("SELECT tokens FROM tenant_usage WHERE tenant = ? AND day = ?", tenant, day).toArray()[0]?.tokens ?? 0;
     // Allowed if the total, including what was just added, is still within the budget.
-    return { allowed: used <= TENANT_DAILY_TOKEN_BUDGET, used, budget: TENANT_DAILY_TOKEN_BUDGET, day };
+    const limits = this.#limits(tenant);
+    // A reservation is taken if the day, with it, is still within the limit. Asked with nothing to
+    // add ("may another call begin?"), a day that is used up says no: also one whose limit is nothing.
+    return { allowed: add > 0 ? used <= limits.tenant_daily_tokens : used < limits.tenant_daily_tokens, used, budget: limits.tenant_daily_tokens, day, limits };
   }
 
   /** Corrects a reservation to what was actually used. May be negative; the total never goes below zero. */
@@ -333,7 +375,7 @@ export class Registry extends DurableObject<Env> {
     sql.exec("DELETE FROM task_slots WHERE taken_at < ?", Date.now() - SLOT_TTL_MS);
     if (sql.exec("SELECT 1 FROM task_slots WHERE task_id = ?", taskId).toArray().length > 0) return true;
     const used = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM task_slots WHERE tenant = ?", tenant).one().n;
-    if (used >= MAX_TASKS_PER_TENANT) return false;
+    if (used >= this.#limits(tenant).tenant_sandboxes) return false;
     sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at) VALUES (?, ?, ?)", taskId, tenant, Date.now());
     return true;
   }

@@ -15,6 +15,7 @@ import type { Worker } from "../workers";
 import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
+import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
@@ -40,9 +41,8 @@ const MAX_EVENT_BYTES_PER_RUN = 120_000;
 const MAX_PICTURES_SHOWN = 4;
 /** How long before a message the same person's pictures here still count as going with it. */
 const PICTURES_RECENT_MS = 10 * 60_000;
-const DAILY_TOKEN_BUDGET = 2_000_000;
-/** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
-const MODEL_CALL_RESERVE = 20_000;
+// (How much a scope may spend in a day is the tenant's limit: see ../limits.)
+
 /** The note left in place of a turn that read outside text. Fixed words, but for what the tool itself said it read. */
 function outsideRemoved(read: string[]): string {
   return `[In this turn you used a tool that read text from outside. What it returned, and what you made of it, are not kept here.${read.length > 0 ? ` Read in this turn: ${read.join(", ")}.` : ""} What you said to the person in this turn, as it reached them, follows this note: answer a follow-up from that, and read the source again (one the person pointed to) only if you need more than you said.]`;
@@ -557,7 +557,11 @@ export class Runner {
       const release = () => this.#b.registry().adjustUsage(this.#s.scope().tenant, -MODEL_CALL_RESERVE, reservedOn).catch(() => undefined);
       // From here, a run that stops being this object's while waiting gives the reservation back.
       if (!this.#stillActive(runId)) return void (await release());
-      if (!tenant.allowed || this.tokensToday() >= DAILY_TOKEN_BUDGET) {
+      // The tenant's limits as the registry has them now: gone by here, and kept for what is decided
+      // without asking it (how many tasks this scope may have under way).
+      const limits = limitsFrom((tenant as { limits?: unknown }).limits);
+      if (this.#s.meta("limits") !== JSON.stringify(limits)) this.#s.setMeta("limits", JSON.stringify(limits));
+      if (!tenant.allowed || this.tokensToday() >= limits.scope_daily_tokens) {
         await release();
         if (!this.#stillActive(runId)) return;
         // A request that was being carried on cannot wait until tomorrow: its time would be up.
