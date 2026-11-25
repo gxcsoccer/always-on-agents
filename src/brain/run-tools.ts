@@ -333,7 +333,8 @@ export class RunTools {
         return { ok: true, id, fires_at: new Date(stored.due_at).toISOString() };
       },
       listTimers: () => ({
-        timers: this.#s.rows<Row>("SELECT id, due_at, every_s, note FROM timers WHERE status = 'active' AND data IS NULL ORDER BY due_at").map((t) => ({
+        // The agent's own timers: not a task's watchdog, which is the system's and is told by the task it names.
+        timers: this.#s.rows<Row>("SELECT id, due_at, every_s, note FROM timers WHERE status = 'active' AND (data IS NULL OR json_extract(data, '$.task_id') IS NULL) ORDER BY due_at").map((t) => ({
           id: t.id,
           fires_at: new Date(t.due_at).toISOString(),
           repeat_every_seconds: t.every_s,
@@ -341,7 +342,7 @@ export class RunTools {
         })),
       }),
       cancelTimer: (id) => {
-        const active = this.#s.rows("SELECT 1 FROM timers WHERE id = ? AND status = 'active' AND data IS NULL", id).length > 0;
+        const active = this.#s.rows("SELECT 1 FROM timers WHERE id = ? AND status = 'active' AND (data IS NULL OR json_extract(data, '$.task_id') IS NULL)", id).length > 0;
         if (active) sql.exec("UPDATE timers SET status = 'cancelled' WHERE id = ?", id);
         return { ok: true, cancelled: active };
       },
