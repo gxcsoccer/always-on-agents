@@ -9,7 +9,7 @@ import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
 import type { InboundEvent, Principal, Scope, Target } from "../events";
-import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Quoted, Receipt, Standing } from "./types";
+import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Picture, PictureRef, Quoted, Receipt, Standing } from "./types";
 import { DeliveryVoid } from "./types";
 
 export type * from "./types";
@@ -177,6 +177,15 @@ export async function quoted(env: Env, name: string, scope: Scope, event: { prin
   const ask = byName.get(name)?.channel?.quoted;
   if (!ask) return undefined;
   return ask(env, scope, event).catch(() => ({}));
+}
+
+/** The pictures named, fetched through the connector they came by: null for each that cannot be had. Never throws. */
+export async function pictures(env: Env, name: string, scope: Scope, event: { data?: Record<string, unknown> }, refs: PictureRef[]): Promise<(Picture | null)[]> {
+  const fetchThem = byName.get(name)?.channel?.pictures;
+  const none = refs.map(() => null);
+  if (!fetchThem) return none;
+  const got = await fetchThem(env, scope, event, refs).catch(() => none);
+  return got.length === refs.length ? got : none;
 }
 
 /** Takes off a mark `received` put on. Never throws. */

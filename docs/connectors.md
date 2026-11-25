@@ -223,6 +223,12 @@ To see what Feishu says about one chat (to check the permissions, say): `GET /v1
 
 What the agent writes itself goes out as a Feishu post with one Markdown element, so bold, lists, links, code and tables render. Mention markup in it (`<at …>`), in code too, is shown as text and notifies nobody (it gains one invisible character). The system's own fixed words go out as plain text, and questions and invitations as cards. A post that would exceed Feishu's 30 KB is sent as plain text instead. The form is decided from the message alone, so a retry sends exactly the same thing.
 
+### Pictures
+
+A picture a person sends (alone, or among the words of a rich-text message) is shown to the model. It is marked `[picture]` where it stands in their words, and the picture itself is fetched from Feishu with the app's own token for the run that acts on the message, and handed to the model after those words. Also shown: the pictures of the message it was written in reply to, where that is the person's own, and those the same person sent in that conversation in the ten minutes before (a picture and the question about it often come as two messages). At most four per run: those of the message itself and of the one replied to first, then the latest of the earlier ones for the room that is left. None larger than 5 MB, and only PNG, JPEG, GIF and WebP. Each is shown under a line saying where it is from; one that cannot be fetched is said in its place. A message brought into a conversation from another one (an approval answered in another topic) carries no picture with it.
+
+Nothing of a picture is kept: not by the Brain, whose record holds the words and Feishu's name for the picture, and not across runs. Later the agent has what it said about it. The app needs leave to read message resources (`im:resource`, or `im:message`).
+
 ### Language
 
 The card's fixed text is currently Chinese only.
@@ -287,6 +293,8 @@ Each part is optional and independent. A connector that only reports events (a C
 - It throws `DeliveryVoid`: there is no longer anything to send (what the message was to show can no longer be used). Nothing was posted and it is not tried again; the message is recorded as `void` (or as `unverified`, if an earlier attempt may have arrived).
 - It throws `DeliveryRejected`: the outside system answered and refused, so it is certain that nothing was posted. `DeliveryDeferred` (the system said to wait) is equally certain. The message is retried, and if every retry ends this way it is recorded as `dead`.
 - It throws anything else: this attempt may have arrived. The message is retried with the same `idem`, which is safe for as long as the system drops repeats. Once the first attempt is older than `dedupeMs`, or the retries are used up, the message is not sent again and is recorded as `unverified`: it may have reached the person, and a second copy could not be told from the first. A connector without `dedupeMs` gets the earlier behaviour: retried, then `dead`. Approval questions keep their own reckoning (see [Approvals](approvals.md)).
+
+**Pictures.** A connector whose messages can hold pictures names them in the message's `data.pictures` (`{ message, key }`, its own names for where the picture is; never the bytes) and implements `channel.pictures(env, scope, event, refs)`, which fetches them: each in its place, or `null` where it cannot be had. The Brain asks for the pictures of the messages a run acts on, shows them to the model for that run, and keeps nothing.
 
 ### Tools
 

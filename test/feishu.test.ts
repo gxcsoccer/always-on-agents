@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { approvalCard, chatFacts, decrypt, normalize, normalizeCardAction, quotedBy, sentAt, verifySignature } from "../src/connectors/feishu";
+import { approvalCard, chatFacts, decrypt, normalize, normalizeCardAction, picturesBy, quotedBy, sentAt, verifySignature } from "../src/connectors/feishu";
 import { privateSessionKey } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 
@@ -199,9 +199,17 @@ describe("turning a Feishu message into an event", () => {
 
   it("says so when a message is not text instead of dropping it", () => {
     expect(normalize(app, envelope({ chat_type: "p2p", message_type: "image", content: "{}" }))?.event.text).toContain("image");
-    // Words and a picture in one message: the words and links are read, the picture is named as unseen.
+    expect(normalize(app, envelope({ chat_type: "p2p", message_type: "file", content: "{}" }))?.event.text).toBe("[a file message, which I cannot read yet]");
+    // A picture alone: marked, and named by Feishu's key and the message it is in, for fetching.
+    const alone = normalize(app, envelope({ chat_type: "p2p", message_type: "image", content: JSON.stringify({ image_key: "img_v3_alone" }) }));
+    expect(alone?.event.text).toBe("[picture]");
+    expect((alone?.event.data as any).pictures).toEqual([{ message: (alone?.event.data as any).message_id, key: "img_v3_alone" }]);
+    // A key that is not one is no picture.
+    expect((normalize(app, envelope({ chat_type: "p2p", message_type: "image", content: JSON.stringify({ image_key: "../x" }) }))?.event.data as any).pictures).toBeUndefined();
+    // Words and a picture in one message: the words and links are read, the picture is marked where it stands and named.
     const post = normalize(app, envelope({ chat_type: "p2p", message_type: "post", content: JSON.stringify({ title: "", content: [[{ tag: "img", image_key: "img_1" }], [{ tag: "text", text: "我想回复他，应该怎么回复？" }, { tag: "a", text: "方案", href: "https://x.feishu.cn/docx/DocPost0000000000001" }]] }) }));
-    expect(post?.event.text).toBe("[a picture, which I cannot see yet]\n我想回复他，应该怎么回复？方案 (https://x.feishu.cn/docx/DocPost0000000000001)");
+    expect(post?.event.text).toBe("[picture]\n我想回复他，应该怎么回复？方案 (https://x.feishu.cn/docx/DocPost0000000000001)");
+    expect((post?.event.data as any).pictures).toEqual([{ message: (post?.event.data as any).message_id, key: "img_1" }]);
     expect((post?.event.data as any).documents).toMatchObject([{ token: "DocPost0000000000001" }]);
     // In a chat: the bot's own mention is dropped as in a plain message, so a decision typed after it reads the same; a colleague is named from the event's list.
     const mentionBot = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
@@ -239,7 +247,8 @@ describe("fetching the message a group message was written in reply to", () => {
     feishu(item({ body: { content: JSON.stringify({ text: "@_user_1 and @_user_2\nlook" }) }, mentions: [{ key: "@_user_1", id: "cli_test", id_type: "app_id", name: "Agent" }, { key: "@_user_2", id: "ou_carol", id_type: "open_id", name: "Carol Approve" }] }));
     expect(await look()).toEqual({ text: "and @CarolApprove look" });
     feishu(item({ msg_type: "post", body: { content: JSON.stringify({ title: "Plan", content: [[{ tag: "text", text: "see " }, { tag: "a", text: "the doc", href: "https://x.feishu.cn/docx/Doc2" }], [{ tag: "at", user_id: "ou_carol", user_name: "Carol" }, { tag: "img", image_key: "k" }]] }) } }));
-    expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [a picture, which I cannot see yet]");
+    expect((await look()).text).toBe("Plan\nsee the doc (https://x.feishu.cn/docx/Doc2)\n@Carol [picture]");
+    expect((await look()).pictures).toEqual([{ message: expect.any(String), key: "k" }]);
     feishu(item({ body: { content: JSON.stringify({ text: "x".repeat(5_000) }) } }));
     expect((await look()).text).toHaveLength(1_000);
     // A link with nowhere to lead is its words; a post with nothing in it is not something read.
@@ -250,7 +259,7 @@ describe("fetching the message a group message was written in reply to", () => {
     feishu(item({ msg_type: "post", body: { content: "null" } }));
     expect(await look()).toEqual({});
     feishu(item({ msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
-    expect((await look()).text).toBe("[a image message, which I cannot read yet]");
+    expect(await look()).toMatchObject({ text: "[picture]", pictures: [{ key: "k" }] });
   });
 
   it("gives nobody else's words: another member's, a bot's, the agent's own, someone from another organisation, or another message of a forwarded bundle", async () => {
@@ -288,6 +297,42 @@ describe("fetching the message a group message was written in reply to", () => {
     const asked = feishu(item({}));
     expect(await quotedBy("t-app", app, "oc_chat", "../x", alice)).toEqual({});
     expect(asked).toEqual([]);
+  });
+
+  it("fetches a picture by the message it is in, and gives nothing for one that is gone, too large, or not a picture", async () => {
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    const asked: string[] = [];
+    let cancelled = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      asked.push(`${url.pathname}${url.search} ${new Headers(init?.headers).get("authorization")}`);
+      if (url.pathname.endsWith("/img_good")) return new Response(PNG, { headers: { "content-type": "application/octet-stream" } });
+      if (url.pathname.endsWith("/img_gone")) return Response.json({ code: 234003 }, { status: 400 });
+      if (url.pathname.endsWith("/img_huge")) return new Response(PNG, { headers: { "content-length": String(6 * 1024 * 1024) } });
+      if (url.pathname.endsWith("/img_text")) return new Response("<html>not a picture</html>");
+      // Too large, and not saying how large: read only as far as a picture may be, then given up.
+      if (url.pathname.endsWith("/img_endless")) {
+        let sent = 0;
+        return new Response(new ReadableStream({ pull: (controller) => (sent++ < 12 ? controller.enqueue(new Uint8Array(1024 * 1024).fill(sent === 1 ? 0x89 : 0)) : controller.close()), cancel: () => void (cancelled = sent) }));
+      }
+      throw new Error("no route");
+    });
+    const got = await picturesBy("t-app", [
+      { message: "om_1", key: "img_good" },
+      { message: "om_1", key: "img_gone" },
+      { message: "om_2", key: "img_huge" },
+      { message: "om_2", key: "img_text" },
+      { message: "om_2", key: "img_unreachable" },
+      { message: "../x", key: "img_good" },
+      { message: "om_3", key: "img_endless" },
+    ]);
+    // What kind it is, is read from the bytes, not from what the answer calls itself.
+    expect(got).toEqual([{ mime: "image/png", data: btoa(String.fromCharCode(...PNG)) }, null, null, null, null, null, null]);
+    expect(cancelled).toBeGreaterThan(0);
+    expect(cancelled).toBeLessThan(10);
+    expect(asked[0]).toBe("/open-apis/im/v1/messages/om_1/resources/img_good?type=image Bearer t-app");
+    // A name that is not one is not asked about.
+    expect(asked).toHaveLength(6);
   });
 
   it("reports a lapsed app token as such, so the caller can get a fresh one", async () => {

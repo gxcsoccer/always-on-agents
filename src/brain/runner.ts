@@ -9,6 +9,7 @@
  * text, the connectors, the registry, the model) and the other parts are handed in (RunnerHost).
  */
 import type { ConnectorTool, Quoted } from "../connectors";
+import type { Picture, PictureRef } from "../connectors/types";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
 import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
@@ -35,6 +36,10 @@ export const QUOTED_WAIT_MS = 3_000;
 /** How far up the chain of replies a message stands in is followed. */
 export const MAX_CHAIN = 5;
 const MAX_EVENT_BYTES_PER_RUN = 120_000;
+/** How many pictures a run is shown at most: the latest. */
+const MAX_PICTURES_SHOWN = 4;
+/** How long before a message the same person's pictures here still count as going with it. */
+const PICTURES_RECENT_MS = 10 * 60_000;
 const DAILY_TOKEN_BUDGET = 2_000_000;
 /** Tokens set aside against the tenant's budget before a model call, corrected to the real figure after. */
 const MODEL_CALL_RESERVE = 20_000;
@@ -71,6 +76,8 @@ export interface RunnerHost {
   respond(request: ModelRequest): Promise<ModelResponse>;
   /** The message one was written in reply to, asked of the connector it came through. Never throws. */
   quoted(connector: string, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
+  /** Pictures people sent, fetched through the connector they came by: null for each that cannot be had. Never throws. */
+  pictures(connector: string, event: { data?: Record<string, unknown> }, refs: PictureRef[]): Promise<(Picture | null)[]>;
   /** The message something sent to this address is written under, where the connector says. */
   under(target: Target): string | undefined;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised" | "told">;
@@ -383,7 +390,7 @@ export class Runner {
         // Where the connector has no such thing at all, nothing is kept, as before.
         if (found === undefined) break;
         const own = typeof found.text === "string";
-        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(typeof found.at === "number" ? { at: found.at } : {}) } : {};
+        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(Array.isArray(found.pictures) && found.pictures.length > 0 ? { pictures: found.pictures } : {}), ...(typeof found.at === "number" ? { at: found.at } : {}) } : {};
         next = typeof found.replies_to === "string" ? found.replies_to : undefined;
         if (level === 1) quoted = { ...kept, ...(own && next ? { replies_to: next } : {}) };
         else chain.push({ subject, ...(own ? kept : { hidden: true }) });
@@ -442,6 +449,8 @@ export class Runner {
     if (this.#b.requests.guards(runId).some((each) => each.retired)) return this.#retire(runId);
 
     for (;;) {
+      // The pictures this run is shown, fetched once for the run and held only while it lasts.
+      const pictures = await this.#picturesShown(runId);
       const run = this.#stillActive(runId);
       if (!run) return;
       const items = this.#transcript(run.session_id, runId);
@@ -621,7 +630,9 @@ export class Runner {
       }
 
       const offered = this.#toolsFor(runId);
-      this.#noteShape(runId, items, offered);
+      // What the model is asked with: the same for the note of its shape and for the call.
+      const input = this.#withPictures(runId, items, pictures);
+      this.#noteShape(runId, input, offered);
       let response;
       try {
         response = await this.#b.respond({
@@ -629,7 +640,7 @@ export class Runner {
           apiKey: this.#b.env.OPENAI_API_KEY,
           model: this.#b.env.BRAIN_MODEL,
           instructions,
-          input: items,
+          input,
           tools: offered,
         });
       } catch (err) {
@@ -739,6 +750,8 @@ export class Runner {
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+      // The pictures it was shown are let go with it.
+      if (this.#shown?.run === runId) this.#shown = undefined;
     });
   }
 
@@ -1033,6 +1046,85 @@ export class Runner {
   }
 
   /**
+   * Which pictures a run is shown, by name: those in the messages it was started by; those in
+   * the message one of them was written in reply to (the person's own); and, where there is
+   * room left, those the same person wrote in this conversation in the minutes before, since a
+   * picture and the question about it often come as two messages. The first two come first:
+   * what the person sent now, or pointed at, is never pushed out by what they sent earlier.
+   * Only people's own messages, written in this very conversation through one connector and
+   * origin: a message brought here from another conversation carries no picture with it.
+   */
+  #picturesFor(runId: string): { connector: string; data: Record<string, unknown>; refs: (PictureRef & { from: "now" | "replied" | "earlier" })[]; left: number } | undefined {
+    if (this.#b.requests.continuationOf(runId)) return undefined;
+    const dataOf = (row: InboxRow) => JSON.parse(row.data ?? "{}") as Record<string, unknown>;
+    const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
+    // Written here, by a person: not something routed here from where it was written.
+    const here = (row: InboxRow) => who(row).kind === "human" && dataOf(row).routed_from === undefined;
+    const events = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId).filter(here);
+    const last = events.at(-1);
+    // Started by more than one person's messages: nobody's pictures are shown, since each is its sender's alone.
+    if (!last || events.some((each) => who(each).id !== who(last).id)) return undefined;
+    const origin = JSON.stringify(originOf(last));
+    const same = (row: InboxRow) => row.source === last.source && JSON.stringify(originOf(row)) === origin;
+    const named = (value: unknown): PictureRef[] => (Array.isArray(value) ? value.filter((each): each is PictureRef => typeof each?.message === "string" && typeof each?.key === "string").map((each) => ({ message: each.message, key: each.key })) : []);
+    const now: PictureRef[] = [];
+    const replied: PictureRef[] = [];
+    for (const event of events.filter(same)) {
+      const data = dataOf(event);
+      now.push(...named(data.pictures));
+      // The message it was written in reply to: fetched for it, or on record here as the same person's.
+      replied.push(...named((data.quoted as { pictures?: unknown } | undefined)?.pictures));
+      const parent = typeof data.replies_to === "string" && data.replies_to.startsWith(`${event.source}:message:`) ? data.replies_to.slice(`${event.source}:message:`.length) : undefined;
+      const kept = parent ? this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND source_id = ? AND session_key = ?", event.source, parent, event.session_key)[0] : undefined;
+      if (kept && here(kept) && same(kept) && who(kept).id === who(event).id) replied.push(...named(dataOf(kept).pictures));
+    }
+    // Earlier messages of the same person here, shortly before: the latest of them, for the room that is left.
+    const first = events[0];
+    const earlier = this.#s
+      .rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND session_key = ? AND received_at >= ? AND id < ? AND data LIKE '%\"pictures\"%' ORDER BY id", last.source, last.session_key, first.received_at - PICTURES_RECENT_MS, first.id)
+      .filter((row) => here(row) && same(row) && who(row).id === who(last).id)
+      .flatMap((row) => named(dataOf(row).pictures));
+    // Every one that could go with it, once, in the order they were written; where one is named twice, its nearest standing counts.
+    const all = [...earlier.map((each) => ({ ...each, from: "earlier" as const })), ...replied.map((each) => ({ ...each, from: "replied" as const })), ...now.map((each) => ({ ...each, from: "now" as const }))];
+    const rank = { now: 0, replied: 1, earlier: 2 };
+    const once = all.filter((ref, at) => !all.some((other, there) => other.message === ref.message && other.key === ref.key && (rank[other.from] < rank[ref.from] || (rank[other.from] === rank[ref.from] && there < at))));
+    // Chosen by standing, and within one standing the latest first; shown in the order they were written.
+    const chosen = new Set([...once].reverse().sort((a, b) => rank[a.from] - rank[b.from]).slice(0, MAX_PICTURES_SHOWN));
+    const refs = once.filter((each) => chosen.has(each));
+    return refs.length > 0 ? { connector: last.source, data: dataOf(last), refs, left: once.length - refs.length } : undefined;
+  }
+
+  /** The pictures of the one run under way, as they are being fetched: held in memory and nowhere else. */
+  #shown?: { run: string; parts: Promise<Item[]> };
+
+  /** What is put after the words of a run's own turn: each picture under a line saying where it is from, and a line in its place for one that could not be had. */
+  #picturesShown(runId: string): Promise<Item[]> {
+    if (this.#shown?.run === runId) return this.#shown.parts;
+    const wanted = this.#picturesFor(runId);
+    const FROM = { now: "of what is above", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs here" };
+    const parts = !wanted
+      ? Promise.resolve([])
+      : this.#b.pictures(wanted.connector, { data: wanted.data }, wanted.refs.map((each) => ({ message: each.message, key: each.key }))).then((got) => [
+          { type: "input_text", text: "[The pictures that go with this follow, each under a line saying where it is from; those of one message in the order they stand in it. You see them in this turn only.]" + (wanted.left > 0 ? ` [${wanted.left} more that would go with this ${wanted.left === 1 ? "is" : "are"} not shown: only the latest ${wanted.refs.length} are, and earlier ones were left out. Do not take the last one shown for the last one sent without saying so.]` : "") },
+          ...wanted.refs.flatMap((ref, at): Item[] => {
+            const picture = got[at];
+            return picture ? [{ type: "input_text", text: `[A picture ${FROM[ref.from]}:]` }, { type: "input_image", image_url: `data:${picture.mime};base64,${picture.data}` }] : [{ type: "input_text", text: `[A picture ${FROM[ref.from]} could not be shown to you.]` }];
+          }),
+        ]);
+    this.#shown = { run: runId, parts };
+    return parts;
+  }
+
+  /** The transcript with a run's pictures put after the words of its own turn. Nothing of them is stored. */
+  #withPictures(runId: string, items: Item[], pictures: Item[]): Item[] {
+    if (pictures.length === 0) return items;
+    const own = this.#s.rows<{ item: string }>("SELECT item FROM items WHERE run_id = ? AND is_user = 1 ORDER BY seq LIMIT 1", runId)[0];
+    const content = own ? (JSON.parse(own.item) as { content?: unknown }).content : undefined;
+    const at = typeof content === "string" ? items.map((each) => each.role === "user" && each.content === content).lastIndexOf(true) : -1;
+    return at < 0 ? items : items.map((each, index) => (index === at ? { ...each, content: [{ type: "input_text", text: content }, ...pictures] } : each));
+  }
+
+  /**
    * For the operator: the shape of what the model was shown the last time it was asked in a
    * run, noted at that moment (see #noteShape). Undefined where nothing was noted: a run from
    * before this was kept, one that never reached the model, or one no longer among the latest.
@@ -1056,7 +1148,8 @@ export class Runner {
       const content = typeof body.content === "string" ? body.content : Array.isArray(body.content) ? (body.content as { text?: unknown }[]).map((each) => String(each?.text ?? "")).join("") : String(body.output ?? body.arguments ?? "");
       const kind = SHAPE_KINDS.find(([, starts]) => starts.test(content))?.[0];
       const notes = body.role === "user" ? Object.fromEntries(SHAPE_NOTES.map(([name, line]) => [name, content.split("\n").filter((each) => line.test(each)).length] as const).filter(([, count]) => count > 0)) : {};
-      return { role: String(body.role ?? body.type ?? "?"), chars: content.length, ...(kind ? { kind } : {}), ...(Object.keys(notes).length > 0 ? { notes } : {}) };
+      const images = Array.isArray(body.content) ? (body.content as { type?: unknown }[]).filter((each) => each?.type === "input_image").length : 0;
+      return { role: String(body.role ?? body.type ?? "?"), chars: content.length, ...(images > 0 ? { pictures: images } : {}), ...(kind ? { kind } : {}), ...(Object.keys(notes).length > 0 ? { notes } : {}) };
     });
     const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
       const principal = JSON.parse(event.principal) as Principal;
@@ -1293,7 +1386,7 @@ export interface Shape {
   acting: boolean;
   /** How many entries it was shown in all; `shown` is the last of them. */
   entries: number;
-  shown: { role: string; chars: number; kind?: string; notes?: Record<string, number> }[];
+  shown: { role: string; chars: number; pictures?: number; kind?: string; notes?: Record<string, number> }[];
 }
 
 /** The system's own kinds of entry, by how they begin. */

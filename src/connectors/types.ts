@@ -400,6 +400,13 @@ export interface Channel {
    */
   quoted?(env: Env, scope: Scope, event: { principal: Principal; data?: Record<string, unknown>; signal?: AbortSignal }): Promise<Quoted | undefined>;
   /**
+   * Fetches pictures people sent, by the names this connector itself put in a message's
+   * `data.pictures` (or a quoted message's `pictures`). `event` is the message the run acts on:
+   * it says through what the pictures are asked for. Each comes back in its place, or null
+   * where it cannot be had (gone, too large, not a picture). Never throws for one picture.
+   */
+  pictures?(env: Env, scope: Scope, event: { data?: Record<string, unknown> }, refs: PictureRef[]): Promise<(Picture | null)[]>;
+  /**
    * For how long the outside system drops a repeat of the same `idem`. A message whose first
    * attempt is older than this and was never confirmed is not sent again: it may have arrived,
    * and a second copy could no longer be told from the first. It can depend on the address: 0
@@ -531,11 +538,27 @@ export type Outcome =
   /** An answer was sent and it can no longer be found out whether it took effect. */
   | { state: "unknown" };
 
+/** A picture in a message, named so that the connector it came through can fetch it: never the picture itself. */
+export interface PictureRef {
+  /** The message it is in, as the outside system names it. */
+  message: string;
+  /** The picture, as the outside system names it within that message. */
+  key: string;
+}
+
+/** A picture as fetched: what kind it is, and its bytes in base64. Held for the run it is shown in and never kept. */
+export interface Picture {
+  mime: string;
+  data: string;
+}
+
 /** A message another was written in reply to: the person's own words where they could be read and are theirs; empty when there was one that is not shown. */
 export interface Quoted {
   text?: string;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
+  /** The pictures in that message, as the connector records them for any message (see a message's `data.pictures`). */
+  pictures?: PictureRef[];
   /** When that message was written, in milliseconds, where the outside system says. */
   at?: number;
   /**
