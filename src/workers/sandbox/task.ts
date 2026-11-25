@@ -139,6 +139,12 @@ export interface StartInput {
   prompt?: string;
   repository?: string;
   ref?: string;
+  /**
+   * The latest moment this task may first be taken, as whoever hands it over fixed it when the
+   * work was first written (the same for every repeat of the start). One that first arrives
+   * later is turned away: by then nobody counts on it, and its place may have been given away.
+   */
+  accept_by?: number;
 }
 
 interface CommandResult {
@@ -287,6 +293,11 @@ export class TaskSandbox extends DurableObject<Env> {
   async start(input: StartInput): Promise<{ phase: Phase; error?: string }> {
     // Closed before any start arrived (see `claimed`): one that arrives after that is turned away, for good.
     if (!this.#state() && this.ctx.storage.kv.get("closed") === true) return { phase: "failed", error: "this task was closed before it started" };
+    // Too late to be taken for the first time: closed, like one that was asked about and found absent.
+    if (!this.#state() && typeof input.accept_by === "number" && Date.now() > input.accept_by) {
+      this.ctx.storage.kv.put("closed", true);
+      return { phase: "failed", error: "the start arrived too late to be taken" };
+    }
     const state = await this.#start(input);
     return { phase: state.phase, error: state.error };
   }
@@ -1066,8 +1077,12 @@ export class TaskSandbox extends DurableObject<Env> {
       kind === "resume" ? RESUME_PROMPT : (state.prompt ?? ""),
     ];
 
+    // Launched only out of "starting": one that was stopped, or ended by the watchdog, while it
+    // was being set up is left as it ended, before the process is started and after.
+    if ((this.#state() ?? state).phase !== "starting") return;
     await this.#files.remove(EXIT_CODE_PATH, { force: true });
     await this.#files.remove(PID_PATH, { force: true });
+    if ((this.#state() ?? state).phase !== "starting") return;
     await this.#container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", ...argv], {
       cwd: state.cwd,
       env: this.#agentEnv(state),
@@ -1076,7 +1091,7 @@ export class TaskSandbox extends DurableObject<Env> {
     });
     // Re-read: the awaits above let other calls in (a cancellation, a counted model call).
     const fresh = this.#state() ?? state;
-    if (fresh.phase === "cancelled") return;
+    if (fresh.phase !== "starting") return;
     fresh.runs.push({ kind, started_at: Date.now() });
     fresh.phase = "running";
     this.#save(fresh);

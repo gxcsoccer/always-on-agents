@@ -8,7 +8,7 @@ export const sandboxWorker: Worker = {
   options: { repository: { type: ["string", "null"], description: "An https://github.com/... URL to clone first, or null." } },
   async start(env, work) {
     const repository = typeof work.options.repository === "string" ? work.options.repository : undefined;
-    const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository, brain: work.brain });
+    const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}) });
     return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "unknown error" } : { state: "started" };
   },
   async standing(env, id) {

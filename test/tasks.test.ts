@@ -174,7 +174,7 @@ describe("tasks, by themselves", () => {
         expect(JSON.parse(watch.data)).toEqual({ task_id: result.task_id });
         expect(watch.due_at).toBeGreaterThanOrEqual(before + (2 * 60 * 60 + 10 * 60) * 1_000);
         expect(slots.acquired).toEqual([`acme:${result.task_id}`]);
-        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName() }]);
+        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName(), accept_by: expect.any(Number) }]);
         expect(audited("task.dispatched")).toEqual([{ actor: "alice", task_id: result.task_id, title: "Fix the build", repository: "https://github.com/acme/app" }]);
       });
     });
@@ -420,6 +420,55 @@ describe("tasks, by themselves", () => {
         expect(slots.released).toEqual([id]);
         await tasks.event(id, 2, "result", { status: "succeeded", summary: "late" });
         expect(slots.released).toEqual([id, id]);
+      });
+    });
+
+    it("does not wait for ever for a start that neither answers nor fails: past its time the task is kept as not confirmed, and a late answer changes nothing", async () => {
+      await within(async ({ tasks, store, kept, slots, worker }) => {
+        vi.useFakeTimers();
+        try {
+          let answer: (value: { phase: string }) => void = () => undefined;
+          worker.start = () => new Promise((resolve) => (answer = resolve));
+          const asked = tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null) as Promise<{ task_id: string; status: string }>;
+          await vi.advanceTimersByTimeAsync(7 * 60_000);
+          const said = await asked;
+          expect(said.status).toBe("unconfirmed");
+          expect(kept(said.task_id).status).toBe("unconfirmed");
+          // Asked once: there was no time left for a second try.
+          expect(worker.started).toHaveLength(1);
+          expect(slots.released).toEqual([]);
+          // The answer comes after all: it is not used; the task is found out about as any unconfirmed one.
+          answer({ phase: "running" });
+          await vi.advanceTimersByTimeAsync(1);
+          expect(kept(said.task_id).status).toBe("unconfirmed");
+          expect(store.rows("SELECT task_id FROM unconfirmed")).toEqual([{ task_id: said.task_id }]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+
+    it("tells the worker until when it may first take the work: fixed when the task was first written, the same for every repeat", async () => {
+      await within(async ({ tasks, store, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const created = store.rows<{ created_at: number }>("SELECT created_at FROM tasks WHERE id = ?", id)[0].created_at;
+        expect(worker.started.map((each: any) => each.accept_by)).toEqual([created + 15 * 60_000, created + 15 * 60_000]);
+      });
+    });
+
+    it("counts, once, what a task ended here as lost turns out to have spent", async () => {
+      await within(async ({ tasks, store, kept, slots, worker, spent }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        worker.has = new Error("connection reset");
+        for (let n = 0; n < 6; n++) await later(store, tasks);
+        expect(kept(id).status).toBe("lost");
+        await tasks.event(id, 1, "result", { status: "succeeded", summary: "late", usage: { total_tokens: 1234 } });
+        await tasks.event(id, 1, "result", { status: "succeeded", summary: "late", usage: { total_tokens: 1234 } });
+        expect(kept(id).status).toBe("lost");
+        expect(spent).toEqual([1234]);
+        expect(slots.usage).toEqual([["acme", 1234]]);
       });
     });
 

@@ -31,15 +31,24 @@ const CONFIRM_FIRST_MS = 15_000;
 
 /** How long one call to a worker is waited for when a start is being found out about. */
 const CONFIRM_CALL_MS = 10_000;
+/**
+ * How long the hand-over waits for the worker to answer a start, both tries together. A start
+ * answers once the sandbox is up and the repository cloned, which the sandbox itself gives five
+ * minutes; past this the call is not waited for any more and the task is found out about.
+ */
+export const START_WAIT_MS = 6 * 60_000;
+/** How long after a task was first written its worker may still take it for the first time. */
+export const ACCEPT_WITHIN_MS = 15 * 60_000;
 
-/** A call that is given up, as unanswered, once it has taken that long. */
-function within<T>(call: Promise<T>): Promise<T> {
+/** A call that is given up, as unanswered, once it has taken that long. What it answers later is not used. */
+function within<T>(call: Promise<T>, ms = CONFIRM_CALL_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([call, new Promise<never>((_resolve, reject) => (timer = setTimeout(() => reject(new Error("not answered in time")), CONFIRM_CALL_MS)))]).finally(() => clearTimeout(timer));
+  call.catch(() => undefined);
+  return Promise.race([call, new Promise<never>((_resolve, reject) => (timer = setTimeout(() => reject(new Error("not answered in time")), ms)))]).finally(() => clearTimeout(timer));
 }
 
 /** Why a task whose worker could never be asked is ended. */
-const NOT_KNOWN = "its sandbox could not be reached after it was started: it is not known whether it began, or what became of it";
+const NOT_KNOWN = "its sandbox could not be reached after the start was requested: it is not known whether it began, or what became of it";
 
 /** What is said of a task whose start was not answered, wherever its standing is told. */
 export const UNCONFIRMED_NOTE = "It is not known yet whether this began: the worker did not answer when it was started. It is being checked, and you will be told how it ends. Do not hand the same work over again; if the person asks, tell them it may or may not have started.";
@@ -182,11 +191,15 @@ export class Tasks implements Wakes {
     }
     // The same start, made again, is the same piece of work (it is named by the id written before
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
-    const start = () => worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() }).catch(() => undefined);
+    // The waiting has an end of its own, for both tries together: a call that neither answers nor
+    // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
+    // The worker may first take it only so long after it was first written, however often this is repeated.
+    const until = Date.now() + START_WAIT_MS;
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
-    // Asked once more only if nothing was heard meanwhile.
-    if (!started && !heard()) started = await start();
+    // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
+    if (!started && !heard() && Date.now() < until) started = await start();
     // Read again after the wait: the worker may have reported meanwhile, and what it reported is
     // what happened, whatever became of the answer to the call.
     const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
@@ -535,7 +548,16 @@ export class Tasks implements Wakes {
       else return { known: true, wake: false, terminal: false };
       // Not applied: the task had ended already. Where the worker says it has ended too, nothing
       // runs under it any more: one ended here as lost may still hold its place, and gives it back now.
-      if (!applied) return { known: true, wake: false, terminal: task.status === "lost" && kind !== "needs_input" };
+      if (!applied) {
+        // One ended here as lost, whose worker now reports how it really ended: it stays lost in
+        // its conversation, but what it spent was spent, and is counted, once (a repeat of this
+        // report is caught above).
+        const late = task.status === "lost" && kind !== "needs_input";
+        const used = late ? Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0) : 0;
+        const spent = Number.isFinite(used) && used > 0 ? used : 0;
+        if (spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
+        return { known: true, wake: false, terminal: late, spent };
+      }
 
       // What the worker spent counts against the same daily budget as the Brain's own calls.
       const said = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);

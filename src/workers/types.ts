@@ -20,6 +20,12 @@ export interface Work {
   options: Record<string, unknown>;
   /** The scope name of the Brain to report to. */
   brain: string;
+  /**
+   * The latest moment the worker may first take this work, fixed when it was first written and
+   * the same for every repeat of the start. A worker that would first take it later turns it
+   * away, so that how long it can run is bounded from when it was handed over.
+   */
+  accept_by?: number;
 }
 
 /**
