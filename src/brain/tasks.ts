@@ -11,8 +11,8 @@ import type { ApprovalQuestion, Outcome, Receipt, Standing } from "../connectors
 import type { Env } from "../env";
 import type { Principal, Target, WorkerEventKind } from "../events";
 import type { registry } from "../registry";
-import { type RefUpdate, standingEligible } from "../workers/sandbox/outbound";
-import { type QuestionFate, clipResult } from "../workers/sandbox/result";
+import { type RefUpdate, standingEligible } from "../workers/questions";
+import { type QuestionFate, clipResult } from "../workers/result";
 import type { Started, Worker } from "../workers";
 import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
@@ -49,7 +49,7 @@ function within<T>(call: Promise<T>, ms = CONFIRM_CALL_MS): Promise<T> {
 }
 
 /** Why a task whose worker could never be asked is ended. */
-const NOT_KNOWN = "its sandbox could not be reached after the start was requested: it is not known whether it began, or what became of it";
+const NOT_KNOWN = "its worker could not be reached after the start was requested: it is not known whether it began, or what became of it";
 
 /** What is said of a task whose start was not answered, wherever its standing is told. */
 export const UNCONFIRMED_NOTE = "It is not known yet whether this began: the worker did not answer when it was started. It is being checked, and you will be told how it ends. Do not hand the same work over again; if the person asks, tell them it may or may not have started.";
@@ -61,9 +61,9 @@ export interface TasksHost {
   workerNamed(name: string): Worker | undefined;
   /** The worker a task was written for, listed or not: what was taken is carried through and can be stopped. */
   workerOf(name: string): Worker;
-  /** The sandbox of one task, for what is still its own: the questions it asks. */
-  worker(taskId: string): Pick<ReturnType<Env["TASKS"]["getByName"]>, "answer" | "decisionOn">;
-  /** Where sandbox slots and the tenant's usage are kept. */
+  /** Every worker this deployment offers for new work. */
+  workers(): Worker[];
+  /** Where the tenant's places for tasks and its usage are kept. */
   registry(): Pick<ReturnType<typeof registry>, "acquireTaskSlot" | "releaseTaskSlot" | "recordUsage">;
   /** The people whose word counts in this run. */
   deciders(runId: string): Principal[];
@@ -86,9 +86,6 @@ export interface TasksHost {
 
 /** What a task's last status is, as a piece of work. */
 export const taskEnd = (status: string): WorkEnd => ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown";
-
-/** The worker tasks are written for. */
-const WORKER = "sandbox";
 
 export class Tasks implements Wakes {
   readonly #s: BrainStore;
@@ -115,23 +112,28 @@ export class Tasks implements Wakes {
     return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM (SELECT next_at FROM unsettled UNION ALL SELECT next_at FROM unconfirmed)")[0]?.next_at ?? null;
   }
 
-  async dispatch(run: RunRow, sessionKey: string, callId: string, title: string, brief: string, repository: string | null): Promise<unknown> {
-    if (repository !== null && !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+?(\.git)?$/.test(repository)) throw new Error("repository must be an https://github.com/owner/name URL");
+  /**
+   * Hands a piece of work to a worker the Brain starts, and says how it then stands. `name` is
+   * the worker it is for; null where the call does not say (a tool call from before there was
+   * more than one): then the one worker this deployment has that is started this way. `options`
+   * are that worker's own, and it is the worker that says whether they will do.
+   */
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>): Promise<unknown> {
     const scope = this.#s.scope();
-    // Credentials for a repository are lent only inside that repository's own scope, so that is the
-    // only repository such a scope may send a worker to.
-    if (scope.kind === "repo" && repository !== null && repository.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").toLowerCase() !== scope.id.toLowerCase()) {
-      throw new Error(`in this repository's conversation a task can only work on ${scope.id}`);
-    }
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
     // and continues with the same task id, so a lost response can never start a second task.
     let task = this.#s.rows<Row>("SELECT * FROM tasks WHERE op_id = ?", callId)[0];
     // The same call made again: an earlier attempt at it may have got as far as starting the worker.
     const replayed = task !== undefined;
+    // What is asked of it is the worker's to look at, before anything is written or started.
+    const startable = this.#b.workers().filter((each) => each.start !== undefined);
+    const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : startable.length === 1 ? startable[0] : undefined;
+    (task ? this.#b.workerOf(String(task.worker)) : offered)?.accepts?.(options, scope);
     if (!task) {
-      // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
-      if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
+      // Something new is taken only by a worker this deployment lists, and one that is started from here. Nothing is written for any other.
+      if (!offered?.start) throw new Error("this deployment has no worker to hand this to");
+      const WORKER = offered.name;
       const most = this.#limits().scope_active_tasks;
       if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= most) {
         // Said as what it is where no task may be had here at all: there is none to wait for.
@@ -147,9 +149,10 @@ export class Tasks implements Wakes {
       // The task and its row in the index of work exist together or not at all.
       this.#s.transaction(() => {
         this.#s.sql.exec(
-          "INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', ?, ?, ?, ?, 'dispatching', ?, ?)",
+          "INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)",
           id,
           callId,
+          WORKER,
           title,
           brief,
           sessionKey,
@@ -168,7 +171,7 @@ export class Tasks implements Wakes {
         JSON.stringify({ task_id: id }),
         now,
       );
-      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, repository });
+      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, ...options });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
     if (task.status !== "dispatching") return this.#told(task);
@@ -211,14 +214,14 @@ export class Tasks implements Wakes {
     }
     if (slot !== true) {
       if (slot === false) {
-        this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
-        throw new Error("too many sandboxes are running for this tenant right now; try again later");
+        this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's limit of tasks at once is reached" }) });
+        throw new Error("too many tasks are running for this tenant right now; try again later");
       }
       // The reservation may have been made even though its reply was lost; give it back.
       await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
       // The task must not be left "dispatching": nothing would ever pick it up again.
       this.#set(task.id, "failed", { result: JSON.stringify({ error: `the registry could not be reached: ${String(slot).slice(0, 300)}` }) });
-      throw new Error("the sandbox could not be started; try again");
+      throw new Error("the worker could not be started; try again");
     }
     // The same start, made again, is the same piece of work (it is named by the id written before
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
@@ -226,7 +229,7 @@ export class Tasks implements Wakes {
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
@@ -238,7 +241,7 @@ export class Tasks implements Wakes {
     if (started?.state === "refused") {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: started.error }) });
       await this.#b.registry().releaseTaskSlot(task.id);
-      throw new Error(`the sandbox did not start: ${started.error}`);
+      throw new Error(`the worker did not start: ${started.error}`);
     }
     // Answered, or heard from in the meantime: it began.
     if (started || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {
@@ -421,7 +424,9 @@ export class Tasks implements Wakes {
       this.#s.audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id, ...(standing ? { standing: true } : {}) });
     }
 
-    const answered = await this.#b.worker(taskId).answer(intent.decision, intent.reason, intent.pending_id, intent.standing === true);
+    const asking = this.#b.workerOf(String(task.worker));
+    if (!asking.answer) throw new Error("the worker of this task takes no answers");
+    const answered = await asking.answer(this.#b.env, taskId, intent.decision, intent.reason, intent.pending_id, intent.standing === true);
     if (!answered.ok) throw new Error(answered.error);
     // The worker may already have acted on an earlier answer to this question; report what it holds.
     const decided = answered.decision ?? intent.decision;
@@ -654,7 +659,9 @@ export class Tasks implements Wakes {
     for (const row of this.#s.rows<{ ask: string; task_id: string; question_id: string; attempts: number }>("SELECT * FROM unsettled WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
       let fate: QuestionFate | { state: "unreachable"; error: string };
       try {
-        fate = await this.#b.worker(row.task_id).decisionOn(row.question_id);
+        const worker = this.#b.workerOf(String(this.#s.rows<Row>("SELECT worker FROM tasks WHERE id = ?", row.task_id)[0]?.worker ?? ""));
+        // One that keeps no record of its questions cannot say: not to be found out.
+        fate = worker.decisionOn ? await worker.decisionOn(this.#b.env, row.task_id, row.question_id) : { state: "unknown" };
       } catch (err) {
         fate = { state: "unreachable", error: String(err).slice(0, 300) };
       }
@@ -721,7 +728,7 @@ export class Tasks implements Wakes {
       }
       const last = row.attempts + 1 >= CONFIRM_ATTEMPTS;
       if (standing === "none") {
-        await this.#ended(task, "failed", "the sandbox never started: it has no record of this task", true);
+        await this.#ended(task, "failed", "the worker never took it: it has no record of this task", true);
       } else if (standing === "unreachable" && last) {
         await this.#ended(task, "lost", NOT_KNOWN, false);
       } else {
@@ -799,6 +806,6 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   }
   if (kind === "result") return `${head} finished. The worker's own summary (unverified): ${clipResult(String(body.text ?? ""))}`;
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
-  // The Brain's own finding says why; a worker's report of a lost task means its sandbox stopped under it.
-  return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: its sandbox stopped and could not be restored.`;
+  // The Brain's own finding says why; a worker's report of a lost task means that where it ran stopped under it.
+  return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: it stopped where it was running and could not be restored.`;
 }

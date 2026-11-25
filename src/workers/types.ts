@@ -10,6 +10,8 @@
  * any such tool. To the model both are the same: a worker to hand a piece of work to.
  */
 import type { Env } from "../env";
+import type { Scope } from "../events";
+import type { QuestionFate } from "./result";
 
 /** One piece of work, as the Brain hands it over. `id` is the Brain's, kept before the worker is asked: the same id is the same piece of work. */
 export interface Work {
@@ -43,6 +45,12 @@ export interface Worker {
   acts_as: "agent" | "person";
   /** Its own parameters, as JSON schema properties (a repository to work in, say). */
   options?: Record<string, unknown>;
+  /**
+   * Looks at what it is asked to do before anything is written or started: its own options as
+   * the model gave them, and where it is asked from. Throws, in words for the model, for what it
+   * will not take (an option that is not what it should be, work it does not do from that place).
+   */
+  accepts?(options: Record<string, unknown>, scope: Scope): void;
   /** Starts a piece of work. The same `work.id` again is the same piece of work, not a second one. */
   start?(env: Env, work: Work): Promise<Started>;
   /**
@@ -57,6 +65,15 @@ export interface Worker {
    * has stopped, or only the waiting for it here (it may go on over there).
    */
   cancel?(env: Env, id: string): Promise<"stopped" | "no_longer_waited_for">;
+  /**
+   * For a worker that asks people to approve things: passes on a person's decision on one
+   * question of one piece of work. `standing`: allowed for the rest of that piece of work, where
+   * the question was one that may be. Says what the worker then holds as decided (the first
+   * answer to a question stands). Throwing means it is not known whether it arrived.
+   */
+  answer?(env: Env, id: string, decision: "allow" | "deny", reason: string, question: string, standing: boolean): Promise<{ ok: true; decision: "allow" | "deny"; standing?: boolean } | { ok: false; error: string }>;
+  /** How one such question ended, by the worker's own record: asked when an answer's arrival is not known. */
+  decisionOn?(env: Env, id: string, question: string): Promise<QuestionFate>;
   /**
    * Whether the worker has this piece of work at all, settled as it is asked: "there" once it has
    * taken it (whatever has become of it since: it reports that itself); "none" if it never did,

@@ -356,7 +356,7 @@ export class RunTools {
       handOver: async (callId, name, title, brief, options, continueFrom, replaces) => {
         // A call made before and made again is the piece of work it was, whatever the deployment lists now.
         if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) {
-          const again = (await this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, typeof options.repository === "string" ? options.repository : null)) as { task_id: string; status: string; note?: string };
+          const again = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, options)) as { task_id: string; status: string; note?: string };
           return { work_id: again.task_id, status: again.status, ...(again.note ? { note: again.note } : {}) };
         }
         const kept = this.#b.requests.record(callId) ?? this.#b.requests.record((JSON.parse(this.#s.meta(`waited:${callId}`) ?? "null") as { request?: string } | null)?.request ?? "");
@@ -371,7 +371,7 @@ export class RunTools {
         // Said before anything is started: a worker the Brain starts does not take a waiting request's place.
         if (replaces !== null) throw new Error(`the worker "${name}" cannot take the place of a request that waits; if the person no longer wants that one, call it off first, then hand this over`);
         if (continueFrom !== null) throw new Error(`the worker "${name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
-        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, typeof options.repository === "string" ? options.repository : null)) as { task_id: string; status: string; note?: string };
+        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, options)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
       workStatus: async (workId) => {
@@ -392,7 +392,8 @@ export class RunTools {
           : { ok: true, cancelled: workId, how: "no_longer_waited_for", note: "Nothing of it will be brought back here. The worker may still finish it over there: tell the person that, not that it was stopped." };
       },
       dispatchTask: async (callId, title, brief, repository) => {
-        return this.#b.tasks.dispatch(run, session.session_key, callId, title, brief, repository);
+        // The tool from before there was more than one worker: for the one this deployment starts, with what was then its one option.
+        return this.#b.tasks.dispatch(run, session.session_key, callId, null, title, brief, { repository });
       },
       taskStatus: (taskId) => this.#b.tasks.status(taskId),
       answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),

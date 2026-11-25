@@ -11,13 +11,17 @@ import { sandboxWorker } from "./workers/sandbox/worker";
 import type { Worker } from "./workers/types";
 import guidance from "./workers.md";
 
-const config: { connectors: Connector[]; workers: Worker[]; guidance: string; trusted: string[] } = {
+const config: { connectors: Connector[]; workers: Worker[]; retired?: Worker[]; guidance: string; trusted: string[] } = {
   connectors: [consoleConnector, githubConnector, feishuConnector, doubaoConnector],
   /**
    * Where the agent can hand work to (see `src/workers/types.ts`). Taking one out stops new work
-   * going to it; what it was already doing can still report, be answered and be stopped.
+   * going to it. To have what it was already doing still report, be answered and be stopped,
+   * move it to `retired` rather than deleting it, and take it out of there once none of its work
+   * is left.
    */
   workers: [sandboxWorker, doubaoWorker],
+  /** Workers no longer offered for new work, whose work under way is still carried through. */
+  retired: [],
   /**
    * Which worker a piece of work goes to: guidance for the agent, in words (`src/workers.md`).
    * It is the deployment's to write; nobody in a conversation can change it. Each worker says

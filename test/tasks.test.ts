@@ -8,6 +8,7 @@ import { Revisions } from "../src/brain/revisions";
 import { BrainStore, type RunRow } from "../src/brain/store";
 import { Tasks, type TasksHost } from "../src/brain/tasks";
 import { sandboxWorker } from "../src/workers/sandbox/worker";
+import type { Worker } from "../src/workers/types";
 
 /**
  * Tasks handed to workers, and the approval questions they raise, by themselves on a real Brain's
@@ -36,6 +37,8 @@ function bench(state: DurableObjectState) {
     now: {} as Record<string, Standing>,
     /** The workers this deployment lists, by name. */
     workers: ["sandbox"],
+    /** Workers of another kind altogether that this deployment has, for showing that nothing here is the sandbox's own. */
+    others: [] as Worker[],
   };
   /** The worker of every task: what it was told, and what it says back. */
   const worker = {
@@ -83,9 +86,9 @@ function bench(state: DurableObjectState) {
   const host: TasksHost & { amend: TasksHost["amend"] } = {
     env: { TASKS: { getByName: sandboxOf } } as never,
     // The deployment's workers, by name: the real sandbox worker, unless a test takes it out.
-    workerNamed: (name) => (settings.workers.includes(name) && name === sandboxWorker.name ? sandboxWorker : undefined),
-    workerOf: () => sandboxWorker,
-    worker: sandboxOf,
+    workerNamed: (name) => settings.others.find((each) => each.name === name) ?? (settings.workers.includes(name) && name === sandboxWorker.name ? sandboxWorker : undefined),
+    workers: () => [...(settings.workers.includes(sandboxWorker.name) ? [sandboxWorker] : []), ...settings.others],
+    workerOf: (name) => settings.others.find((each) => each.name === name) ?? sandboxWorker,
     registry: () =>
       ({
         acquireTaskSlot: async (tenant: string, taskId: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.acquire()),
@@ -166,7 +169,7 @@ describe("tasks, by themselves", () => {
     it("writes the task and its watchdog first, takes a sandbox slot, starts the worker, and says it is running", async () => {
       await within(async ({ tasks, store, kept, worker, slots, audited }) => {
         const before = Date.now();
-        const result = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "Fix the build", "do it", "https://github.com/acme/app")) as { task_id: string; status: string };
+        const result = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "Fix the build", "do it", { repository: "https://github.com/acme/app" })) as { task_id: string; status: string };
         expect(result.status).toBe("running");
         expect(kept(result.task_id)).toMatchObject({ op_id: "call_1", worker: "sandbox", title: "Fix the build", brief: "do it", session_key: SESSION_KEY, requested_by: "alice", status: "running" });
         const [watch] = store.rows<Record<string, any>>("SELECT * FROM timers WHERE id = ?", `watch_${result.task_id}`);
@@ -185,14 +188,14 @@ describe("tasks, by themselves", () => {
           { kind: "human", id: "alice", explicit: true },
           { kind: "human", id: "alice", explicit: true },
         ];
-        const one = (await tasks.dispatch(RUN, SESSION_KEY, "c1", "t", "b", null)) as { task_id: string };
+        const one = (await tasks.dispatch(RUN, SESSION_KEY, "c1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         settings.deciders = [
           { kind: "human", id: "alice", explicit: true },
           { kind: "human", id: "bob", explicit: true },
         ];
-        const two = (await tasks.dispatch(RUN, SESSION_KEY, "c2", "t", "b", null)) as { task_id: string };
+        const two = (await tasks.dispatch(RUN, SESSION_KEY, "c2", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         settings.deciders = [];
-        const none = (await tasks.dispatch(RUN, SESSION_KEY, "c3", "t", "b", null)) as { task_id: string };
+        const none = (await tasks.dispatch(RUN, SESSION_KEY, "c3", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         expect([kept(one.task_id).requested_by, kept(two.task_id).requested_by, kept(none.task_id).requested_by]).toEqual(["alice", null, null]);
         expect(audited("task.dispatched").map((each) => each.actor)).toEqual(["alice", "(automation)", "(automation)"]);
       });
@@ -200,21 +203,21 @@ describe("tasks, by themselves", () => {
 
     it("accepts only a GitHub https URL, and in a repository's own scope only that repository", async () => {
       await within(async ({ tasks }) => {
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "c1", "t", "b", "git@github.com:acme/app.git")).rejects.toThrow("repository must be an https://github.com/owner/name URL");
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "c2", "t", "b", "https://github.com/acme/app.git")).resolves.toMatchObject({ status: "running" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "c1", "sandbox", "t", "b", { repository: "git@github.com:acme/app.git" })).rejects.toThrow("repository must be an https://github.com/owner/name URL");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "c2", "sandbox", "t", "b", { repository: "https://github.com/acme/app.git" })).resolves.toMatchObject({ status: "running" });
       });
       await within(async ({ tasks, store }) => {
         const own = store.scope().id;
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "c1", "t", "b", "https://github.com/other/repo")).rejects.toThrow(`in this repository's conversation a task can only work on ${own}`);
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "c2", "t", "b", `https://github.com/${own.toUpperCase()}.git`)).resolves.toMatchObject({ status: "running" });
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "c3", "t", "b", null)).resolves.toMatchObject({ status: "running" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "c1", "sandbox", "t", "b", { repository: "https://github.com/other/repo" })).rejects.toThrow(`in this repository's conversation a task can only work on ${own}`);
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "c2", "sandbox", "t", "b", { repository: `https://github.com/${own.toUpperCase()}.git` })).resolves.toMatchObject({ status: "running" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "c3", "sandbox", "t", "b", { repository: null })).resolves.toMatchObject({ status: "running" });
       }, "repo:acme/app");
     });
 
     it("never starts a second task for the same call, and does not start an already started one again", async () => {
       await within(async ({ tasks, store, worker }) => {
-        const first = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        const again = await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null);
+        const first = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
+        const again = await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null });
         expect(again).toEqual({ task_id: first.task_id, status: "running" });
         expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(1);
         expect(worker.started).toHaveLength(1);
@@ -224,7 +227,7 @@ describe("tasks, by themselves", () => {
     it("continues a task that was written but never started, under the same id", async () => {
       await within(async ({ tasks, task, kept, worker }) => {
         task("t1", { status: "dispatching" });
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "op_t1", "t", "b", null)).toEqual({ task_id: "t1", status: "running" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "op_t1", "sandbox", "t", "b", { repository: null })).toEqual({ task_id: "t1", status: "running" });
         expect(worker.started).toHaveLength(1);
         expect(kept("t1").status).toBe("running");
       });
@@ -236,7 +239,7 @@ describe("tasks, by themselves", () => {
         task("t2", { status: "running" });
         task("t3", { status: "needs_input" });
         task("t4", { status: "succeeded" });
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("there are already 3 tasks running here; wait for one to finish or cancel one");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).rejects.toThrow("there are already 3 tasks running here; wait for one to finish or cancel one");
         expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(4);
       });
     });
@@ -246,7 +249,7 @@ describe("tasks, by themselves", () => {
         slots.acquire = async () => {
           throw new Error("registry down");
         };
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("the sandbox could not be started; try again");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).rejects.toThrow("the worker could not be started; try again");
         const id = store.rows<{ id: string }>("SELECT id FROM tasks")[0].id;
         expect(kept(id).status).toBe("failed");
         expect(JSON.parse(kept(id).result).error).toMatch(/^the registry could not be reached: Error: registry down/);
@@ -260,9 +263,9 @@ describe("tasks, by themselves", () => {
     it("fails the task when the tenant has no sandbox left", async () => {
       await within(async ({ tasks, store, kept, slots, worker }) => {
         slots.acquire = async () => false;
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("too many sandboxes are running for this tenant right now; try again later");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).rejects.toThrow("too many tasks are running for this tenant right now; try again later");
         const id = store.rows<{ id: string }>("SELECT id FROM tasks")[0].id;
-        expect(JSON.parse(kept(id).result)).toEqual({ error: "the tenant's sandbox limit is reached" });
+        expect(JSON.parse(kept(id).result)).toEqual({ error: "the tenant's limit of tasks at once is reached" });
         expect(worker.started).toEqual([]);
       });
     });
@@ -283,7 +286,7 @@ describe("tasks, by themselves", () => {
           if (++calls === 1) throw new Error("connection reset");
           return { phase: "running" };
         };
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).toMatchObject({ status: "running" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).toMatchObject({ status: "running" });
         const id = store.rows<{ id: string }>("SELECT id FROM tasks")[0].id;
         expect(worker.started.map((each: any) => each.id)).toEqual([id, id]);
         expect(kept(id).status).toBe("running");
@@ -296,7 +299,7 @@ describe("tasks, by themselves", () => {
     it("keeps a task whose start was not answered as not confirmed, with its place, and says the same to the call made again", async () => {
       await within(async ({ tasks, store, kept, slots, worker, woken }) => {
         worker.start = lost;
-        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string; status: string; note: string };
+        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string; status: string; note: string };
         expect(said).toMatchObject({ status: "unconfirmed", note: expect.stringContaining("Do not hand the same work over again") });
         const id = said.task_id;
         // Nothing is stopped or given back on a guess, and nobody is told to try again.
@@ -306,7 +309,7 @@ describe("tasks, by themselves", () => {
         expect(woken.length).toBeGreaterThan(0);
         expect(tasks.nextWakeAt(0)).not.toBeNull();
         // The same call again (a replay), and a look at how it stands: the same, with the same word.
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).toEqual(said);
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).toEqual(said);
         expect(await tasks.status(id)).toMatchObject({ status: "unconfirmed", note: said.note });
         expect(worker.started).toHaveLength(2);
         // It holds one of the conversation's places while it is not known.
@@ -322,7 +325,7 @@ describe("tasks, by themselves", () => {
           if (kept(id).status === "dispatching") await tasks.event(id, 1, "result", { status: "succeeded", summary: "done" });
           throw new Error("connection reset");
         };
-        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string; status: string };
+        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string; status: string };
         expect(said.status).toBe("succeeded");
         expect(JSON.parse(kept(said.task_id).result)).toMatchObject({ summary: "done" });
         // Heard from: it is not asked to start a second time.
@@ -337,7 +340,7 @@ describe("tasks, by themselves", () => {
           await tasks.event(id, 1, "progress", { message: "cloning" });
           throw new Error("connection reset");
         };
-        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string; status: string };
+        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string; status: string };
         expect(said.status).toBe("running");
         expect(kept(said.task_id).status).toBe("running");
       });
@@ -347,7 +350,7 @@ describe("tasks, by themselves", () => {
       // The worker has it: it began.
       await within(async ({ tasks, store, kept, slots, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         worker.has = "there";
         await later(store, tasks);
         expect(kept(id).status).toBe("running");
@@ -358,7 +361,7 @@ describe("tasks, by themselves", () => {
       // The worker never took it, and has closed it against a start still on its way: it never began. Failed, said in its conversation, its place given back.
       await within(async ({ tasks, store, kept, slots, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         // Not to be asked at first; then asked, and it says none.
         worker.has = new Error("connection reset");
         await later(store, tasks);
@@ -366,7 +369,7 @@ describe("tasks, by themselves", () => {
         worker.has = "none";
         await later(store, tasks);
         expect(kept(id).status).toBe("failed");
-        expect(JSON.parse(kept(id).result).error).toContain("never started");
+        expect(JSON.parse(kept(id).result).error).toContain("never took it");
         expect(slots.released).toEqual([id]);
         expect(store.rows<{ kind: string }>("SELECT kind FROM inbox WHERE source = 'worker'")).toEqual([{ kind: "worker.failed" }]);
         expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
@@ -375,7 +378,7 @@ describe("tasks, by themselves", () => {
       // It reports before it is asked about: what it reported stands, and nothing more is asked.
       await within(async ({ tasks, store, kept, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         await tasks.event(id, 1, "progress", { message: "cloning" });
         await later(store, tasks);
         expect(kept(id).status).toBe("running");
@@ -386,7 +389,7 @@ describe("tasks, by themselves", () => {
     it("gives up a task whose worker cannot be asked after a bounded number of tries: lost, said as not known, its place kept until it is certain that nothing runs", async () => {
       await within(async ({ tasks, store, kept, slots, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         worker.has = new Error("connection reset");
         for (let n = 0; n < 5; n++) {
           await later(store, tasks);
@@ -406,7 +409,7 @@ describe("tasks, by themselves", () => {
         const said = store.rows<{ kind: string; text: string }>("SELECT kind, text FROM inbox WHERE source = 'worker'");
         expect(said.map((each) => each.kind)).toEqual(["worker.lost"]);
         expect(said[0].text).toContain("it is not known whether it began");
-        expect(said[0].text).not.toContain("its sandbox stopped");
+        expect(said[0].text).not.toContain("it stopped where it was running");
         // It no longer counts against the conversation's own places.
         expect(store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n).toBe(0);
         // Word of progress that comes after all, also repeated, does not bring it back and gives no place back: it has not been said to have ended.
@@ -429,7 +432,7 @@ describe("tasks, by themselves", () => {
         try {
           let answer: (value: { phase: string }) => void = () => undefined;
           worker.start = () => new Promise((resolve) => (answer = resolve));
-          const asked = tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null) as Promise<{ task_id: string; status: string }>;
+          const asked = tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null }) as Promise<{ task_id: string; status: string }>;
           await vi.advanceTimersByTimeAsync(7 * 60_000);
           const said = await asked;
           expect(said.status).toBe("unconfirmed");
@@ -451,7 +454,7 @@ describe("tasks, by themselves", () => {
     it("tells the worker until when it may first take the work: fixed when the task was first written, the same for every repeat", async () => {
       await within(async ({ tasks, store, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         const created = store.rows<{ created_at: number }>("SELECT created_at FROM tasks WHERE id = ?", id)[0].created_at;
         expect(worker.started.map((each: any) => each.accept_by)).toEqual([created + 15 * 60_000, created + 15 * 60_000]);
       });
@@ -460,7 +463,7 @@ describe("tasks, by themselves", () => {
     it("counts, once, what a task ended here as lost turns out to have spent", async () => {
       await within(async ({ tasks, store, kept, slots, worker, spent }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         worker.has = new Error("connection reset");
         for (let n = 0; n < 6; n++) await later(store, tasks);
         expect(kept(id).status).toBe("lost");
@@ -475,7 +478,7 @@ describe("tasks, by themselves", () => {
     it("takes any word from the worker as showing that it began: not confirmed no longer, at once", async () => {
       await within(async ({ tasks, store, kept, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         expect(kept(id).status).toBe("unconfirmed");
         await tasks.event(id, 1, "progress", { message: "cloning" });
         expect(kept(id)).toMatchObject({ status: "running", last_progress: "cloning" });
@@ -492,7 +495,7 @@ describe("tasks, by themselves", () => {
         slots.acquire = async () => {
           throw new Error("registry down");
         };
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ task_id: "t_again", status: "unconfirmed" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "sandbox", "t", "b", { repository: null })).toMatchObject({ task_id: "t_again", status: "unconfirmed" });
         expect(kept("t_again").status).toBe("unconfirmed");
         expect(worker.started).toEqual([]);
         expect(store.rows("SELECT task_id FROM unconfirmed")).toEqual([{ task_id: "t_again" }]);
@@ -502,7 +505,7 @@ describe("tasks, by themselves", () => {
         task("t_again", { status: "dispatching" });
         store.sql.exec("UPDATE tasks SET op_id = 'call_again' WHERE id = 't_again'");
         slots.acquire = async () => false;
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ status: "unconfirmed" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "sandbox", "t", "b", { repository: null })).toMatchObject({ status: "unconfirmed" });
         expect(kept("t_again").status).toBe("unconfirmed");
       });
       // It has reported meanwhile: it began, whatever the registry says. And one that ended meanwhile is told as it ended.
@@ -513,7 +516,7 @@ describe("tasks, by themselves", () => {
           await tasks.event("t_again", 1, "progress", { message: "cloning" });
           return false;
         };
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ status: "running" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "sandbox", "t", "b", { repository: null })).toMatchObject({ status: "running" });
         expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
         task("t_done", { status: "dispatching" });
         store.sql.exec("UPDATE tasks SET op_id = 'call_done' WHERE id = 't_done'");
@@ -521,7 +524,7 @@ describe("tasks, by themselves", () => {
           await tasks.event("t_done", 1, "result", { status: "succeeded", summary: "done" });
           throw new Error("registry down");
         };
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_done", "t", "b", null)).toMatchObject({ status: "succeeded" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_done", "sandbox", "t", "b", { repository: null })).toMatchObject({ status: "succeeded" });
         expect(kept("t_done").status).toBe("succeeded");
         // The registry gave no answer: it may have taken a place all the same, so one is given back.
         expect(slots.released.filter((each) => each === "t_done").length).toBeGreaterThanOrEqual(2);
@@ -535,7 +538,7 @@ describe("tasks, by themselves", () => {
           slots.released.length = 0;
           return true;
         };
-        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_had", "t", "b", null)).toMatchObject({ status: "succeeded" });
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_had", "sandbox", "t", "b", { repository: null })).toMatchObject({ status: "succeeded" });
         expect(worker.started).toEqual([]);
         expect(slots.released).toEqual(["t_had"]);
         expect(kept("t_had").status).toBe("succeeded");
@@ -545,7 +548,7 @@ describe("tasks, by themselves", () => {
     it("lets a task that is not confirmed be called off like any other", async () => {
       await within(async ({ tasks, store, kept, slots, worker }) => {
         worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         await tasks.cancel(SESSION_KEY, id);
         expect(kept(id).status).toBe("cancelled");
         expect(worker.cancelled).toEqual([id]);
@@ -557,16 +560,16 @@ describe("tasks, by themselves", () => {
     it("keeps one row for each task in the index of work, opened as it is written and ended once", async () => {
       await within(async ({ tasks, store, task }) => {
         const work = () => store.rows<Record<string, unknown>>("SELECT id, worker, session_key, person, state FROM work ORDER BY created_at, id");
-        const one = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const one = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         // The same call again is the same task, and the same row.
-        await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null);
+        await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null });
         expect(work()).toEqual([{ id: one.task_id, worker: "sandbox", session_key: SESSION_KEY, person: "alice", state: "open" }]);
         await tasks.event(one.task_id, 1, "result", { status: "succeeded", summary: "done" });
         expect(work()).toMatchObject([{ id: one.task_id, state: "done" }]);
         // A late word on it changes nothing.
         await tasks.cancel(SESSION_KEY, one.task_id);
         expect(work()).toMatchObject([{ state: "done" }]);
-        const two = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", "t", "b", null)) as { task_id: string };
+        const two = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         await tasks.cancel(SESSION_KEY, two.task_id);
         expect(work().map((each) => each.state).sort()).toEqual(["cancelled", "done"]);
         // A task taken before there was an index has no row; it gets one when it ends.
@@ -576,12 +579,59 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("hands work to any worker that is started from here, by the contract alone: its own options, its own say on them, its own name on the record", async () => {
+      await within(async ({ tasks, store, kept, settings, slots, worker }) => {
+        // A worker that is nothing like the sandbox, and the only one this deployment has.
+        const calls: unknown[][] = [];
+        const probe: Worker = {
+          name: "probe",
+          description: "Looks something up, to a depth.",
+          acts_as: "agent",
+          options: { depth: { type: ["integer", "null"] } },
+          accepts(options) {
+            if (typeof options.depth === "number" && options.depth > 3) throw new Error("depth is at most 3");
+          },
+          start: async (_env, work) => (calls.push(["start", work.id, work.options, work.brain, typeof work.accept_by]), { state: "started" }),
+          cancel: async (_env, id) => (calls.push(["cancel", id]), "stopped"),
+          standing: async () => "there",
+        };
+        settings.workers = [];
+        settings.others = [probe];
+
+        // What it will not take is said by it, before anything is written.
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_0", "probe", "t", "b", { depth: 9 })).rejects.toThrow("depth is at most 3");
+        expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
+
+        const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "probe", "Look it up", "find x", { depth: 2 })) as { task_id: string; status: string };
+        expect(said.status).toBe("running");
+        expect(calls).toEqual([["start", said.task_id, { depth: 2 }, store.scopeName(), "number"]]);
+        expect(worker.started).toEqual([]);
+        // Recorded under its own name, in the task and in the index of work.
+        expect(kept(said.task_id).worker).toBe("probe");
+        expect(store.rows<{ worker: string; state: string }>("SELECT worker, state FROM work WHERE id = ?", said.task_id)).toEqual([{ worker: "probe", state: "open" }]);
+        // A call that names no worker (the tool from before there were several) goes to the one there is.
+        const unnamed = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", null, "t", "b", { depth: 1 })) as { task_id: string };
+        expect(kept(unnamed.task_id).worker).toBe("probe");
+
+        // It reports as any worker does, and is stopped through its own stopping.
+        await tasks.event(said.task_id, 1, "result", { text: "x is 42" });
+        expect(kept(said.task_id).status).toBe("succeeded");
+        await tasks.cancel(SESSION_KEY, unnamed.task_id);
+        expect(calls.at(-1)).toEqual(["cancel", unnamed.task_id]);
+        expect(slots.released).toEqual([said.task_id, unnamed.task_id]);
+
+        // With two workers that are started from here, a call that names neither is not guessed at.
+        settings.workers = ["sandbox"];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_5", null, "t", "b", { repository: null })).rejects.toThrow("this deployment has no worker to hand this to");
+      });
+    });
+
     it("takes nothing new where the deployment lists no such worker, writes nothing for it, and still stops a task taken before", async () => {
       await within(async ({ tasks, store, kept, settings, worker, slots }) => {
         // Started while the worker was listed.
-        const before = (await tasks.dispatch(RUN, SESSION_KEY, "call_0", "t", "b", null)) as { task_id: string };
+        const before = (await tasks.dispatch(RUN, SESSION_KEY, "call_0", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         settings.workers = [];
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("this deployment has no worker to hand this to");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).rejects.toThrow("this deployment has no worker to hand this to");
         expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(1);
         expect(worker.started).toHaveLength(1);
         expect(slots.acquired).toHaveLength(1);
@@ -597,7 +647,7 @@ describe("tasks, by themselves", () => {
         // Written, slot perhaps taken, the worker perhaps already at it: only the Brain's "running" is missing.
         task("t_before", { status: "dispatching" });
         settings.workers = [];
-        const result = (await tasks.dispatch(RUN, SESSION_KEY, "op_t_before", "t", "b", null)) as { task_id: string; status: string };
+        const result = (await tasks.dispatch(RUN, SESSION_KEY, "op_t_before", "sandbox", "t", "b", { repository: null })) as { task_id: string; status: string };
         expect(result).toEqual({ task_id: "t_before", status: "running" });
         expect(worker.started).toMatchObject([{ id: "t_before" }]);
         expect(kept("t_before")).toMatchObject({ status: "running" });
@@ -608,7 +658,7 @@ describe("tasks, by themselves", () => {
       for (const phase of ["failed", "lost"]) {
         await within(async ({ tasks, store, kept, slots, worker }) => {
           worker.start = async () => ({ phase, error: "image missing" });
-          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)).rejects.toThrow("the sandbox did not start: image missing");
+          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })).rejects.toThrow("the worker did not start: image missing");
           const id = store.rows<{ id: string }>("SELECT id FROM tasks")[0].id;
           expect(JSON.parse(kept(id).result)).toEqual({ error: "image missing" });
           expect(slots.released).toEqual([id]);
@@ -622,7 +672,7 @@ describe("tasks, by themselves", () => {
           store.sql.exec("UPDATE tasks SET status = 'succeeded' WHERE id = ?", (input as { id: string }).id);
           return { phase: "running" };
         };
-        const result = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        const result = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         expect(kept(result.task_id).status).toBe("succeeded");
       });
     });
@@ -758,7 +808,7 @@ describe("tasks, by themselves", () => {
         await tasks.event("t1", 1, "failed", { error: "tests failed" });
         await tasks.event("t2", 1, "lost", {});
         expect([kept("t1").status, kept("t2").status]).toEqual(["failed", "lost"]);
-        expect(events().map((each) => each.text)).toEqual(['Task t1 "Title of t1" failed: tests failed', 'Task t2 "Title of t2" was lost: its sandbox stopped and could not be restored.']);
+        expect(events().map((each) => each.text)).toEqual(['Task t1 "Title of t1" failed: tests failed', 'Task t2 "Title of t2" was lost: it stopped where it was running and could not be restored.']);
         expect(lines.map((line) => JSON.parse(line).event)).toEqual(["task_failed", "task_lost"]);
       });
     });

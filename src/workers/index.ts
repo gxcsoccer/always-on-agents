@@ -17,6 +17,18 @@ export function guidance(): string {
   return config.guidance.trim();
 }
 
+/**
+ * Every worker this deployment has, offered for new work or retired: a piece of work written for
+ * a worker is carried through by that worker (its reports, its questions, its stopping) also
+ * after the deployment stopped offering it.
+ */
+const known = new Map<string, Worker>([...(config.retired ?? []), ...config.workers].map((each) => [each.name, each]));
+
+/** The worker of this name, for work that was already written for it: listed for new work or not. */
+export function workerKnown(name: string): Worker | undefined {
+  return known.get(name);
+}
+
 /** The worker listed under this name, if this deployment has it. */
 export function workerNamed(name: string): Worker | undefined {
   return byName.get(name);

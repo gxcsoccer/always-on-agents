@@ -6,6 +6,7 @@ A worker is somewhere the agent can hand a piece of work to, that takes a while 
 const config = {
   connectors: [...],
   workers: [sandboxWorker],
+  retired: [],
   trusted: [...],
 };
 ```
@@ -20,9 +21,17 @@ A worker is an object of the type in `src/workers/types.ts`:
 | `options` | Its own parameters, as JSON schema properties (the sandbox's `repository`). |
 | `start(env, work)` | For a worker the Brain starts (one that acts as the agent). Starts a piece of work. `work.id` is the Brain's and is kept before the worker is asked: the same id again is the same piece of work. Resolve to `{ state: "started" }` or `{ state: "refused", error }`; throw when it is not known whether the work was taken. |
 | `tool` | For a worker carried by a connector's tool (one that acts as a person): the tool's name. See below. |
-| `cancel(env, id)` | Optional. Stops a piece of work, and says whether the work itself stopped (`"stopped"`) or only the waiting for it here (`"no_longer_waited_for"`). |
+| `accepts(options, scope)` | Optional. Looks at what it is asked to do before anything is written or started: its own options as the model gave them, and where it is asked from. Throws, in words for the model, for what it will not take. |
+| `cancel(env, id)` | Optional. Stops a piece of work, and says whether the work itself stopped (`"stopped"`) or only the waiting for it here (`"no_longer_waited_for"`). The Brain takes only `"stopped"` as stopped. |
+| `standing(env, id)` | Optional. Whether the worker ever took this piece of work: `"there"`, or `"none"`, and then it must never take it (a start under that id that arrives later is turned away). Asked when a start was not answered. |
+| `answer(env, id, decision, reason, question, standing)` | Optional, for a worker that asks people to approve things: passes on a person's decision on one question. |
+| `decisionOn(env, id, question)` | Optional. How one such question ended, by the worker's own record: asked when it is not known whether an answer arrived. |
 
-Taking a worker out of the list stops new work going to it, and nothing is written for work it is refused. Work it was given before (written down, even if not yet confirmed as started) is carried through: it can still be started under the same id, report, be answered and be stopped.
+A piece of work handed over carries, beside its id, brief and options: `accept_by` (the latest moment the worker may first take it) and `bounds` (how long it may run and how often it may ask the model, as the tenant's limits say). A worker that has such bounds of its own goes by these.
+
+The Brain knows no worker by name. Which workers are offered, what options each has, whether those will do, how one is started, stopped, asked about and answered are all the worker's own, through this contract. What the Brain reads of a result or of a question a worker puts to people is in `src/workers/result.ts` and `src/workers/questions.ts`, which belong to no one worker.
+
+Taking a worker out of `workers` stops new work going to it, and nothing is written for work it is refused. To have work it was given before (written down, even if not yet confirmed as started) carried through, move it to `retired` rather than deleting it: it can then still be started under the same id, report, be answered and be stopped. Take it out of `retired` once none of its work is left.
 
 ## The index of work
 

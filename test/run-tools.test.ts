@@ -316,7 +316,8 @@ describe("a run's tools", () => {
       await t.taskStatus("t1");
       await t.answerTask("c3", "t1", "allow", "ok");
       await t.cancelTask("t1");
-      expect(of("dispatch")).toEqual([[run, SESSION_KEY, "c2", "title", "brief", null]]);
+      // The tool from before there was more than one worker names none: the tasks part finds the one that is started from here.
+      expect(of("dispatch")).toEqual([[run, SESSION_KEY, "c2", null, "title", "brief", { repository: null }]]);
       expect(of("status")).toEqual([["t1"]]);
       expect(of("answer")).toEqual([[run, SESSION_KEY, "c3", "t1", "allow", "ok"]]);
       expect(of("cancelTask")).toEqual([[SESSION_KEY, "t1"]]);

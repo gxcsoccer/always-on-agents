@@ -109,6 +109,7 @@ const config = {
    - 验收：一次重新授权加一次进程重启之后，一行索引、一次实际提交、一份最终回执。
 3. **一组工具和统一接续**：向模型开放 `hand_over` 等三个工具，提示里列出 worker 和最近的工作。旧工具名留作内部别名，给在途请求的重放和已送达答复的引用用；不能只凭"当前没有在跑的"就下线。从这步起用户看到的行为才变。
 4. **Brain 里不再有具体 worker 的名字**：沙箱专属的东西（并发名额的数法、按仓库派活的参数、审批提问）移到 `sandboxWorker` 自己那边或契约的可选部分；验收是配置里去掉沙箱后全部测试（除沙箱自己的）照过。
+   - 已实现的做法：契约新增可选的 `accepts`（worker 自己检查参数和来处，沙箱的仓库地址和“仓库作用域只能派到本仓库”搬到这里）、`answer` 和 `decisionOn`（审批问题的回答和复核，原来 Brain 直接找沙箱对象）。`Tasks.dispatch` 改为按 worker 名字和它自己的 options 交办，记录里写的是实际的 worker 名字。Brain 读结果和读审批问题用到的类型搬到不属于任何 worker 的 `src/workers/result.ts`、`src/workers/questions.ts`。沙箱的说明从通用提示词搬进它自己的描述。配置里多一项 `retired`：停用但还有在途工作的 worker 放这里，Brain 不再靠名字兜底。验收用一个和沙箱毫无关系的 worker 走完交办、汇报、取消；没有做到“去掉沙箱后全部测试照过”，因为现有测试大多就是拿沙箱当那个被启动的 worker 来测的。
 5. **之后再定**：要不要把 worker 那边的记录搬进 Brain；沙箱的接着做（[task-continuation](task-continuation.zh-CN.md) 的快照方案）独立做，接在同一个 `continue_from` 上。
 
 ### 4.1 每步都要守住的
