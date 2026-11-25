@@ -708,6 +708,17 @@ describe("the run loop, by itself", () => {
         ]);
         expect(JSON.stringify(content)).not.toContain("BYTES-earlier");
       });
+      // More pointed at than can be shown: the latest reply's are kept, whoever's they are.
+      await within(async (b) => {
+        b.settings.pictures = Object.fromEntries(["a", "b", "c", "d", "latest"].map((key) => [key, { mime: "image/png", data: `BYTES-${key}` }]));
+        b.event("先看这些", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_bobs", replied_directly: true, quoted: { text: "[picture]", other: true, pictures: ["a", "b", "c", "d"].map((key) => ({ message: "om_bobs", key })) } } });
+        b.event("再看我这张", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_bobs", replied_directly: true, quoted: { text: "[picture]", pictures: [{ message: "om_own", key: "latest" }] } } });
+        b.model.push(answer([says("好")]));
+        await b.go();
+        const all = b.log.filter((each) => each[0] === "pictures").flatMap((each) => each[2] as string[]);
+        expect(all).toContain("latest");
+        expect(all).not.toContain("a");
+      });
     });
 
     it("never lets earlier pictures push out the one replied to, and takes none from a message brought here from another conversation", async () => {

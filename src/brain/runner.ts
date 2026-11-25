@@ -1097,18 +1097,19 @@ export class Runner {
     const same = (row: InboxRow) => row.source === last.source && JSON.stringify(originOf(row)) === origin;
     const named = (value: unknown): PictureRef[] => (Array.isArray(value) ? value.filter((each): each is PictureRef => typeof each?.message === "string" && typeof each?.key === "string").map((each) => ({ message: each.message, key: each.key })) : []);
     const now: PictureRef[] = [];
-    const replied: PictureRef[] = [];
-    const pointed: PictureRef[] = [];
+    // What the replies point at, in the order the replies were written: the person's own, and a colleague's said to be that.
+    const replied: (PictureRef & { from: "replied" | "colleague" })[] = [];
+    const of = (refs: PictureRef[], from: "replied" | "colleague") => refs.map((each) => ({ ...each, from }));
     for (const event of events.filter(same)) {
       const data = dataOf(event);
       now.push(...named(data.pictures));
       // The message it was written in reply to: fetched for it, or on record here as the same person's.
       // (A colleague's, where that is the message replied to: what the person points at by replying, and said to be a colleague's.)
       const quoted = data.quoted as { pictures?: unknown; other?: unknown } | undefined;
-      (quoted?.other === true ? pointed : replied).push(...named(quoted?.pictures));
+      replied.push(...of(named(quoted?.pictures), quoted?.other === true ? "colleague" : "replied"));
       const parent = typeof data.replies_to === "string" && data.replies_to.startsWith(`${event.source}:message:`) ? data.replies_to.slice(`${event.source}:message:`.length) : undefined;
       const kept = parent ? this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND source_id = ? AND session_key = ?", event.source, parent, event.session_key)[0] : undefined;
-      if (kept && here(kept) && same(kept) && who(kept).id === who(event).id) replied.push(...named(dataOf(kept).pictures));
+      if (kept && here(kept) && same(kept) && who(kept).id === who(event).id) replied.push(...of(named(dataOf(kept).pictures), "replied"));
     }
     // Earlier messages of the same person here, shortly before: the latest of them, for the room that is left.
     const first = events[0];
@@ -1117,7 +1118,7 @@ export class Runner {
       .filter((row) => here(row) && same(row) && who(row).id === who(last).id)
       .flatMap((row) => named(dataOf(row).pictures));
     // Every one that could go with it, once, in the order they were written; where one is named twice, its nearest standing counts.
-    const all = [...earlier.map((each) => ({ ...each, from: "earlier" as const })), ...replied.map((each) => ({ ...each, from: "replied" as const })), ...pointed.map((each) => ({ ...each, from: "colleague" as const })), ...now.map((each) => ({ ...each, from: "now" as const }))];
+    const all = [...earlier.map((each) => ({ ...each, from: "earlier" as const })), ...replied, ...now.map((each) => ({ ...each, from: "now" as const }))];
     const rank = { now: 0, replied: 1, colleague: 1, earlier: 2 };
     const once = all.filter((ref, at) => !all.some((other, there) => other.message === ref.message && other.key === ref.key && (rank[other.from] < rank[ref.from] || (rank[other.from] === rank[ref.from] && there < at))));
     // Chosen by standing, and within one standing the latest first; shown in the order they were written.
