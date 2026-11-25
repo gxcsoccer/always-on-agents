@@ -15,7 +15,7 @@
  * consented is the very person who was invited.
  */
 import type { Env } from "../env";
-import { registry } from "../registry";
+import { type FeishuApp, registry } from "../registry";
 import { type Scope, chainLevels, scopeName } from "../events";
 import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFactsFor } from "./feishu-api";
 import { OFFLINE, SCOPES, type Who, grantName, grantsKey, lifetime, sameSet } from "./feishu-grant";
@@ -374,7 +374,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (!place) {
       const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
       if (invitation === "superseded") return superseded;
-      return { waiting: { on: "authorisation", subject: name, condition: conditionOf(name, needed), generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
+      // It waits on the person being authorised, whichever card does it; and on the card it was shown not having failed.
+      return { waiting: { on: "authorisation", subject: name, condition: `invited|${name}|${invitation.nonce}|${[...needed].sort().join(" ")}`, generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
     }
     // Where several people talk, the invitation is this question's alone: named by the message
     // that asked, as Feishu named it. It waits on that very invitation being answered by the
@@ -505,6 +506,13 @@ export async function authorisationHolds(env: Env, scope: Scope, condition: stri
     if (unasked(facts.info) || unasked(facts.member)) throw new Error("Feishu cannot be asked about the chat just now");
     return chatIs(facts, part[4]) === "internal" ? held : { state: "gone" };
   }
+  // A request in the person's own conversation, waiting to be authorised, by the card it was shown or another.
+  if (part[0] === "invited" && part.length === 4) {
+    const needed = scopesOf(part[3]);
+    if (!needed || !/^[0-9a-f]{64}$/.test(part[1]) || !/^[A-Za-z0-9_-]{20,100}$/.test(part[2])) return { state: "gone" };
+    return env.FEISHU_GRANTS.getByName(part[1]).invited(part[2], needed, generation);
+  }
+  // Something read there (and a request that began waiting before it waited on its own card).
   const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);
   const needed = found ? scopesOf(found[2]) : undefined;
   if (!found || !needed) return { state: "gone" };
@@ -541,12 +549,12 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   // An invitation made for one question was claimed by this answer. However it ends short of
   // the person's own token being kept, that invitation is over (a no-op for any other kind).
   if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
   }
 
   const refused = async (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
     // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
     // sent is logged.
@@ -554,6 +562,11 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
     console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}), ...(answer.endpoint ? { endpoint: answer.endpoint } : {}) } : {}) }));
     return page("授权没有成功", "请回到飞书，重新向我发起请求。如果一直不成功，请联系管理员。", 400);
   };
+  // Everything up to keeping the token: whatever goes wrong in it, also something thrown (a
+  // connection that broke, an answer that is not what it should be, the registry not answering),
+  // ends the invitation like any other failure. Keeping the token comes after, on its own: if
+  // that throws, whether it was kept is not known, and the invitation is not called failed.
+  const prepared = await (async (): Promise<Response | { app: FeishuApp; issued: { access_token: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number }; granted: string[]; lasting: boolean }> => {
   const app = await registry(env).feishuApp(who.app_id);
   if (!app) return refused("unknown_app");
   // Lasting authorisations were turned off for this app after the invitation went out: it is
@@ -563,11 +576,13 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
   // to hold. The code is used once.
   // One endpoint per code, chosen by the app's setting; never one after the other.
+  // No answer at all (the connection broke) is a failure like any other: the invitation is spent.
   const exchange = await fetch(app.oauth_v2 ? TOKEN_V2 : TOKEN_V3, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
-  });
+  }).catch(() => undefined);
+  if (!exchange) return refused("exchange_unanswered");
   const answer = ((await exchange.json().catch(() => null)) as unknown) ?? {};
   const issued = (typeof answer === "object" ? answer : {}) as { code?: number; access_token?: string; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number };
   // A token that is there and has time left, or nothing.
@@ -580,11 +595,13 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
 
   // Whose token is it? The answer must be the person the invitation was sent to, in the same
   // organisation. Anyone else who opened the link and consented gets nothing installed.
-  const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } });
-  const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
+  const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } }).catch(() => undefined);
+  if (!asked) return refused("identity_unanswered");
+  const told = ((await asked.json().catch(() => null)) as unknown) ?? {};
+  const info = (typeof told === "object" ? told : {}) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
   if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     console.log(JSON.stringify({ feishu_authorisation_refused: "another_account", app: who.app_id }));
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }
@@ -595,6 +612,10 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   if (invitation.scope.includes(OFFLINE) && !lasting) return refused("no_refresh_token");
   // And if it was turned off while Feishu was answering, what came back is not kept.
   if (invitation.scope.includes(OFFLINE) && !(await registry(env).feishuApp(who.app_id))?.oauth_offline) return refused("offline_turned_off");
+  return { app, issued: issued as { access_token: string }, granted, lasting };
+  })().catch(() => refused("interrupted"));
+  if (prepared instanceof Response) return prepared;
+  const { app, issued, granted, lasting } = prepared;
   const kept = await grant.install(invitation.generation, {
     access_token: issued.access_token,
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,

@@ -575,17 +575,26 @@ describe("the run loop, by itself", () => {
         b.model.push(answer([says("对比如下")]));
         await b.go();
         const many = b.asked[3].input.at(-1).content;
-        // What was sent now and what was pointed at come first; the one that cannot be had is said in its place.
-        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["k3", "k4", "k5", "k6"]]);
-        expect(many.filter((each: any) => each.type === "input_image")).toHaveLength(3);
-        expect(many.map((each: any) => each.text).filter(Boolean).slice(2)).toEqual(["[A picture of the message this was written in reply to could not be shown to you.]", "[A picture of what is above:]", "[A picture of what is above:]", "[A picture of what is above:]"]);
+        // What was sent now comes first, then what was pointed at; what does not fit is said to be left out.
+        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["k2", "k4", "k5", "k6"]]);
+        expect(many.filter((each: any) => each.type === "input_image")).toHaveLength(4);
+        expect(many[1].text).toContain("[1 more that would go with this is not shown");
+        expect(many.map((each: any) => each.text).filter(Boolean).slice(2)).toEqual(["[A picture of the message this was written in reply to:]", "[A picture of what is above:]", "[A picture of what is above:]", "[A picture of what is above:]"]);
+
+        // One that cannot be had is said in its place.
+        b.store.sql.exec("UPDATE inbox SET received_at = received_at - 3600000");
+        b.event("[picture]\n这两张呢", { data: { direct: true, origin: ORIGIN, quoted: { text: "[picture]", pictures: [{ message: "om_q", key: "k3" }] }, pictures: [{ message: "om_m", key: "k4" }] } });
+        b.model.push(answer([says("只看到一张")]));
+        await b.go();
+        expect(b.asked[4].input.at(-1).content.map((each: any) => each.text).filter(Boolean).slice(2)).toEqual(["[A picture of the message this was written in reply to could not be shown to you.]", "[A picture of what is above:]"]);
 
         // None can be had: the model is told so, and shown nothing.
         b.settings.pictures = {};
         b.event("[picture]", { data: { direct: true, origin: ORIGIN, pictures: [{ message: "om_x", key: "kx" }] } });
         b.model.push(answer([says("看不到")]));
         await b.go();
-        const none = b.asked[4].input.at(-1).content;
+        b.store.sql.exec("UPDATE inbox SET received_at = received_at - 3600000");
+        const none = b.asked[5].input.at(-1).content;
         expect(none.filter((each: any) => each.type === "input_image")).toEqual([]);
         expect(none.at(-1).text).toBe("[A picture of what is above could not be shown to you.]");
       });
@@ -602,6 +611,42 @@ describe("the run loop, by itself", () => {
         expect(typeof b.asked[0].input.at(-1).content).toBe("string");
         expect(b.log.filter((each) => each[0] === "pictures")).toEqual([]);
       });
+    });
+
+    it("shows the latest when more were sent at once than can be shown, and says that earlier ones were left out", async () => {
+      await within(async (b) => {
+        b.settings.pictures = Object.fromEntries([1, 2, 3, 4, 5, 6].map((n) => [`p${n}`, { mime: "image/png", data: `BYTES-p${n}` }]));
+        for (const n of [1, 2, 3, 4, 5, 6]) b.event("[picture]", { source_id: `om_p${n}`, data: { direct: true, origin: ORIGIN, pictures: [{ message: `om_p${n}`, key: `p${n}` }] } });
+        b.event("最后一张是什么？", {});
+        b.model.push(answer([says("第六张")]));
+        const id = (await b.go())!;
+        expect(b.log.filter((each) => each[0] === "pictures")).toEqual([["pictures", "feishu", ["p3", "p4", "p5", "p6"]]]);
+        const content = b.asked[0].input.at(-1).content;
+        expect(content[1].text).toContain("[2 more that would go with this are not shown: only the latest 4 are");
+        expect(content.at(-1).image_url).toContain("BYTES-p6");
+        // The operator's note of the shape counts the pictures and holds none of them.
+        expect(b.runner.shapeOf(id)!.shown.at(-1)).toMatchObject({ role: "user", kind: "turn", pictures: 4 });
+        expect(JSON.stringify(b.runner.shapeOf(id))).not.toContain("BYTES-");
+        expect(JSON.stringify(b.store.rows("SELECT value FROM meta"))).not.toContain("BYTES-");
+      });
+    });
+
+    it("shows no pictures to a run started by more than one person's messages", async () => {
+      await within(async (b) => {
+        b.settings.pictures = { k1: { mime: "image/png", data: "BYTES-k1" }, k2: { mime: "image/png", data: "BYTES-k2" } };
+        const HERE = { shared: true, group: true, origin: ORIGIN };
+        b.event("[picture] 看这个", { session_key: "chat", principal: { kind: "human", id: "ou_a", explicit: true }, data: { ...HERE, pictures: [{ message: "om_a", key: "k1" }] } });
+        b.event("[picture] 还有这个", { session_key: "chat", principal: { kind: "human", id: "ou_b", explicit: true }, data: { ...HERE, pictures: [{ message: "om_b", key: "k2" }] } });
+        b.model.push(answer([says("好")]));
+        await b.go();
+        // Whether they are batched into one run or not, no run is shown a picture that is not its one author's.
+        for (const asked of b.asked) {
+          const turn = asked.input.at(-1);
+          const text = JSON.stringify(turn.content);
+          expect(text.includes("BYTES-k1") && text.includes("BYTES-k2")).toBe(false);
+          if (text.includes("看这个") && text.includes("还有这个")) expect(typeof turn.content).toBe("string");
+        }
+      }, "chat:oc_1");
     });
 
     it("never lets earlier pictures push out the one replied to, and takes none from a message brought here from another conversation", async () => {
@@ -1299,6 +1344,36 @@ describe("the run loop, by itself", () => {
             expect(said).not.toContain(CHAIN);
           });
         }
+      });
+    });
+
+    it("tells the operator the shape of what a run was shown when the model was asked, and nothing anyone said", async () => {
+      await within(async (b) => {
+        b.settings.connectorTools = [{ name: "feishu_read_document", effect: "read", description: "", parameters: {} } as unknown as ConnectorTool];
+        b.event("SECRET plan https://x/docx/SECRETDOC", { source_id: "om_first", status: "done", received_at: Date.UTC(2026, 10, 23, 7) });
+        b.settings.quoted = (event: { data?: Record<string, unknown> }) => (event.data?.replies_to === "feishu:message:om_unseen" ? { text: "SECRET question", replies_to: "feishu:message:om_first" } : {});
+        // Lines of the person's own that look like the system's notes or labels give nothing of what they say.
+        b.event("[SECRET title] SECRET words\n  (SECRET aside)\n  (written as a reply to their own earlier message: SECRET)", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_unseen" } });
+        // An answer of the model's that begins like a label gives nothing either.
+        b.model.push(answer([says("[SECRET heading] SECRET answer")]));
+        const id = (await b.go())!;
+        const shape = b.runner.shapeOf(id)!;
+        expect(JSON.stringify(shape)).not.toContain("SECRET");
+        expect(shape).toMatchObject({ step: 0, waiting: true, acting: true, entries: 3 });
+        expect(shape.tools).toContain("feishu_read_document");
+        expect(shape.shown).toEqual([
+          { role: "user", chars: expect.any(Number), kind: "earlier_own_kept" },
+          { role: "user", chars: expect.any(Number), kind: "earlier_own_fetched" },
+          { role: "user", chars: expect.any(Number), kind: "turn", notes: { reply_to_own_quoted: 1, reply_to_own_fetched: 1, in_a_chain: 1 } },
+        ]);
+        // Noted when the model was asked: a later run in the same conversation does not change it.
+        b.event("SECRET again", {});
+        b.model.push(answer([says("ok")]));
+        const next = (await b.go())!;
+        expect(b.runner.shapeOf(id)).toEqual(shape);
+        expect(b.runner.shapeOf(next)!.entries).toBeGreaterThan(3);
+        expect(JSON.stringify(b.runner.shapeOf(next))).not.toContain("SECRET");
+        expect(b.runner.shapeOf("no-such-run")).toBeUndefined();
       });
     });
 
