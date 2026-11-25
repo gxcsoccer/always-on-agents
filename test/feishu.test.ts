@@ -302,6 +302,7 @@ describe("fetching the message a group message was written in reply to", () => {
   it("fetches a picture by the message it is in, and gives nothing for one that is gone, too large, or not a picture", async () => {
     const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
     const asked: string[] = [];
+    let cancelled = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       asked.push(`${url.pathname}${url.search} ${new Headers(init?.headers).get("authorization")}`);
@@ -309,6 +310,11 @@ describe("fetching the message a group message was written in reply to", () => {
       if (url.pathname.endsWith("/img_gone")) return Response.json({ code: 234003 }, { status: 400 });
       if (url.pathname.endsWith("/img_huge")) return new Response(PNG, { headers: { "content-length": String(6 * 1024 * 1024) } });
       if (url.pathname.endsWith("/img_text")) return new Response("<html>not a picture</html>");
+      // Too large, and not saying how large: read only as far as a picture may be, then given up.
+      if (url.pathname.endsWith("/img_endless")) {
+        let sent = 0;
+        return new Response(new ReadableStream({ pull: (controller) => (sent++ < 12 ? controller.enqueue(new Uint8Array(1024 * 1024).fill(sent === 1 ? 0x89 : 0)) : controller.close()), cancel: () => void (cancelled = sent) }));
+      }
       throw new Error("no route");
     });
     const got = await picturesBy("t-app", [
@@ -318,12 +324,15 @@ describe("fetching the message a group message was written in reply to", () => {
       { message: "om_2", key: "img_text" },
       { message: "om_2", key: "img_unreachable" },
       { message: "../x", key: "img_good" },
+      { message: "om_3", key: "img_endless" },
     ]);
     // What kind it is, is read from the bytes, not from what the answer calls itself.
-    expect(got).toEqual([{ mime: "image/png", data: btoa(String.fromCharCode(...PNG)) }, null, null, null, null, null]);
+    expect(got).toEqual([{ mime: "image/png", data: btoa(String.fromCharCode(...PNG)) }, null, null, null, null, null, null]);
+    expect(cancelled).toBeGreaterThan(0);
+    expect(cancelled).toBeLessThan(10);
     expect(asked[0]).toBe("/open-apis/im/v1/messages/om_1/resources/img_good?type=image Bearer t-app");
     // A name that is not one is not asked about.
-    expect(asked).toHaveLength(5);
+    expect(asked).toHaveLength(6);
   });
 
   it("reports a lapsed app token as such, so the caller can get a fresh one", async () => {

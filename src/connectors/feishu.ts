@@ -488,20 +488,33 @@ export async function picturesFeishu(env: Env, scope: Scope, event: { data?: Rec
   const origin = event.data?.origin as { app_id?: unknown } | undefined;
   const app = typeof origin?.app_id === "string" ? await registry(env).feishuApp(origin.app_id) : null;
   if (!app || app.tenant !== scope.tenant) return refs.map(() => null);
-  return picturesBy(await tenantAccessToken(env, app.app_id), refs);
+  // One time limit for all of it: the app's token and every picture.
+  const signal = AbortSignal.timeout(20_000);
+  return picturesBy(await tenantAccessToken(env, app.app_id, signal), refs, signal);
 }
 
-/** Those pictures, asked of Feishu with the app's token. */
-export function picturesBy(bearer: string, refs: PictureRef[]): Promise<(Picture | null)[]> {
+/** Those pictures, asked of Feishu with the app's token. Each is read only as far as the most a picture may be, and given up beyond that. */
+export function picturesBy(bearer: string, refs: PictureRef[], signal: AbortSignal = AbortSignal.timeout(20_000)): Promise<(Picture | null)[]> {
   return Promise.all(
     refs.map(async (ref) => {
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(ref.message) || !/^[A-Za-z0-9_-]{1,200}$/.test(ref.key)) return null;
       try {
-        const response = await fetch(`${API}/im/v1/messages/${ref.message}/resources/${ref.key}?type=image`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(15_000) });
-        if (!response.ok || Number(response.headers.get("content-length") ?? 0) > MAX_PICTURE_BYTES) return (await response.body?.cancel(), null);
-        const bytes = new Uint8Array(await response.arrayBuffer());
+        const response = await fetch(`${API}/im/v1/messages/${ref.message}/resources/${ref.key}?type=image`, { headers: { authorization: `Bearer ${bearer}` }, signal });
+        const reader = response.ok && Number(response.headers.get("content-length") ?? 0) <= MAX_PICTURE_BYTES ? response.body?.getReader() : undefined;
+        if (!reader) return (await response.body?.cancel(), null);
+        const chunks: Uint8Array[] = [];
+        let size = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.length;
+          if (size > MAX_PICTURE_BYTES) return (await reader.cancel(), null);
+          chunks.push(value);
+        }
+        const bytes = new Uint8Array(size);
+        chunks.reduce((at, chunk) => (bytes.set(chunk, at), at + chunk.length), 0);
         const mime = kindOf(bytes);
-        if (!mime || bytes.length > MAX_PICTURE_BYTES) return null;
+        if (!mime) return null;
         let binary = "";
         for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
         return { mime, data: btoa(binary) };

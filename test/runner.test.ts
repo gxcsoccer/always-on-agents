@@ -539,10 +539,11 @@ describe("the run loop, by itself", () => {
         const first = (await b.go())!;
         const turn = b.asked[0].input.at(-1);
         expect(turn.role).toBe("user");
-        expect(turn.content.map((each: any) => each.type)).toEqual(["input_text", "input_text", "input_image"]);
+        expect(turn.content.map((each: any) => each.type)).toEqual(["input_text", "input_text", "input_text", "input_image"]);
         expect(turn.content[0].text).toContain("这是什么？");
-        expect(turn.content[1].text).toMatch(/^\[The picture of what is above, in the order they stand, follows\..*this turn only/);
-        expect(turn.content[2]).toEqual({ type: "input_image", image_url: "data:image/png;base64,BYTES-k1" });
+        expect(turn.content[1].text).toMatch(/^\[The pictures that go with this follow.*this turn only/);
+        expect(turn.content[2].text).toBe("[A picture of what is above:]");
+        expect(turn.content[3]).toEqual({ type: "input_image", image_url: "data:image/png;base64,BYTES-k1" });
         // Nothing of it is stored: the turn is kept as its words.
         const kept = JSON.stringify(b.store.rows("SELECT item FROM items"));
         expect(kept).not.toContain("BYTES-");
@@ -555,7 +556,8 @@ describe("the run loop, by itself", () => {
         await b.go();
         const again = b.asked[1].input;
         expect(again.filter((each: any) => Array.isArray(each.content) && each.content.some((part: any) => part.type === "input_image"))).toHaveLength(1);
-        expect(again.at(-1).content[2].image_url).toContain("BYTES-k1");
+        expect(again.at(-1).content[2].text).toBe("[A picture of an earlier message of theirs here:]");
+        expect(again.at(-1).content[3].image_url).toContain("BYTES-k1");
         expect(typeof again.find((each: any) => each.role === "user").content).toBe("string");
         void first;
 
@@ -573,8 +575,10 @@ describe("the run loop, by itself", () => {
         b.model.push(answer([says("对比如下")]));
         await b.go();
         const many = b.asked[3].input.at(-1).content;
-        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["k2", "k4", "k5", "k6"]]);
-        expect(many.filter((each: any) => each.type === "input_image")).toHaveLength(4);
+        // What was sent now and what was pointed at come first; the one that cannot be had is said in its place.
+        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["k3", "k4", "k5", "k6"]]);
+        expect(many.filter((each: any) => each.type === "input_image")).toHaveLength(3);
+        expect(many.map((each: any) => each.text).filter(Boolean).slice(2)).toEqual(["[A picture of the message this was written in reply to could not be shown to you.]", "[A picture of what is above:]", "[A picture of what is above:]", "[A picture of what is above:]"]);
 
         // None can be had: the model is told so, and shown nothing.
         b.settings.pictures = {};
@@ -583,7 +587,7 @@ describe("the run loop, by itself", () => {
         await b.go();
         const none = b.asked[4].input.at(-1).content;
         expect(none.filter((each: any) => each.type === "input_image")).toEqual([]);
-        expect(none[1].text).toBe("[No picture of what is above could be shown to you. Say so if it matters.]");
+        expect(none.at(-1).text).toBe("[A picture of what is above could not be shown to you.]");
       });
     });
 
@@ -597,6 +601,29 @@ describe("the run loop, by itself", () => {
         await b.go();
         expect(typeof b.asked[0].input.at(-1).content).toBe("string");
         expect(b.log.filter((each) => each[0] === "pictures")).toEqual([]);
+      });
+    });
+
+    it("never lets earlier pictures push out the one replied to, and takes none from a message brought here from another conversation", async () => {
+      await within(async (b) => {
+        b.settings.pictures = Object.fromEntries(["a", "b", "c", "d", "e", "r"].map((key) => [key, { mime: "image/png", data: `BYTES-${key}` }]));
+        // Five pictures in the last minutes, and a reply to the first of them.
+        ["a", "b", "c", "d", "e"].forEach((key) => b.event("[picture]", { source_id: `om_${key}`, status: "done", data: { direct: true, origin: ORIGIN, pictures: [{ message: `om_${key}`, key }] } }));
+        b.event("这张里的数字是多少", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_a" } });
+        b.model.push(answer([says("42")]));
+        await b.go();
+        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["c", "d", "e", "a"]]);
+        const labels = b.asked[0].input.at(-1).content.map((each: any) => each.text).filter(Boolean).slice(2);
+        expect(labels).toEqual(["[A picture of an earlier message of theirs here:]", "[A picture of an earlier message of theirs here:]", "[A picture of an earlier message of theirs here:]", "[A picture of the message this was written in reply to:]"]);
+
+        // A message brought here from another conversation carries no picture, as what the run acts on or as what came before.
+        b.store.sql.exec("UPDATE inbox SET received_at = received_at - 3600000");
+        b.event("[picture]", { status: "done", data: { direct: true, origin: ORIGIN, routed_from: "thread:other", pictures: [{ message: "om_r", key: "r" }] } });
+        b.event("approve [picture]", { data: { direct: true, origin: ORIGIN, routed_from: "thread:other", pictures: [{ message: "om_r2", key: "r" }] } });
+        b.model.push(answer([says("ok")]));
+        await b.go();
+        expect(typeof b.asked[1].input.at(-1).content).toBe("string");
+        expect(b.log.filter((each) => each[0] === "pictures")).toHaveLength(1);
       });
     });
 

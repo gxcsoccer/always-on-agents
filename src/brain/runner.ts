@@ -1042,53 +1042,73 @@ export class Runner {
   }
 
   /**
-   * Which pictures a run is shown, by name: those in the messages it was started by, in the
-   * message one of them was written in reply to (the person's own), and in what the same person
-   * wrote in this conversation in the minutes before, since a picture and the question about it
-   * often come as two messages. The latest few. Only people's own messages, through one connector.
+   * Which pictures a run is shown, by name: those in the messages it was started by; those in
+   * the message one of them was written in reply to (the person's own); and, where there is
+   * room left, those the same person wrote in this conversation in the minutes before, since a
+   * picture and the question about it often come as two messages. The first two come first:
+   * what the person sent now, or pointed at, is never pushed out by what they sent earlier.
+   * Only people's own messages, written in this very conversation through one connector and
+   * origin: a message brought here from another conversation carries no picture with it.
    */
-  #picturesFor(runId: string): { connector: string; data: Record<string, unknown>; refs: PictureRef[] } | undefined {
+  #picturesFor(runId: string): { connector: string; data: Record<string, unknown>; refs: (PictureRef & { from: "now" | "replied" | "earlier" })[] } | undefined {
     if (this.#b.requests.continuationOf(runId)) return undefined;
-    const events = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId).filter((each) => (JSON.parse(each.principal) as Principal).kind === "human");
+    const dataOf = (row: InboxRow) => JSON.parse(row.data ?? "{}") as Record<string, unknown>;
+    const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
+    // Written here, by a person: not something routed here from where it was written.
+    const here = (row: InboxRow) => who(row).kind === "human" && dataOf(row).routed_from === undefined;
+    const events = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId).filter(here);
     const last = events.at(-1);
     if (!last) return undefined;
-    const named = (value: unknown): PictureRef[] => (Array.isArray(value) ? value.filter((each): each is PictureRef => typeof each?.message === "string" && typeof each?.key === "string") : []);
-    const dataOf = (row: InboxRow) => JSON.parse(row.data ?? "{}") as Record<string, unknown>;
-    const who = (row: InboxRow) => (JSON.parse(row.principal) as Principal).id;
-    const refs: PictureRef[] = [];
-    // Earlier messages of the same person here, shortly before: oldest first.
-    const first = events[0];
-    for (const row of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND session_key = ? AND received_at >= ? AND id < ? AND data LIKE '%\"pictures\"%' ORDER BY id", last.source, last.session_key, first.received_at - PICTURES_RECENT_MS, first.id)) {
-      if (who(row) === who(last)) refs.push(...named(dataOf(row).pictures));
-    }
-    for (const event of events.filter((each) => each.source === last.source)) {
+    const origin = JSON.stringify(originOf(last));
+    const same = (row: InboxRow) => row.source === last.source && JSON.stringify(originOf(row)) === origin;
+    const named = (value: unknown): PictureRef[] => (Array.isArray(value) ? value.filter((each): each is PictureRef => typeof each?.message === "string" && typeof each?.key === "string").map((each) => ({ message: each.message, key: each.key })) : []);
+    const now: PictureRef[] = [];
+    const replied: PictureRef[] = [];
+    for (const event of events.filter(same)) {
       const data = dataOf(event);
+      now.push(...named(data.pictures));
       // The message it was written in reply to: fetched for it, or on record here as the same person's.
-      refs.push(...named((data.quoted as { pictures?: unknown } | undefined)?.pictures));
+      replied.push(...named((data.quoted as { pictures?: unknown } | undefined)?.pictures));
       const parent = typeof data.replies_to === "string" && data.replies_to.startsWith(`${event.source}:message:`) ? data.replies_to.slice(`${event.source}:message:`.length) : undefined;
       const kept = parent ? this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND source_id = ? AND session_key = ?", event.source, parent, event.session_key)[0] : undefined;
-      if (kept && who(kept) === who(event)) refs.push(...named(dataOf(kept).pictures));
-      refs.push(...named(data.pictures));
+      if (kept && here(kept) && same(kept) && who(kept).id === who(event).id) replied.push(...named(dataOf(kept).pictures));
     }
-    const each = refs.filter((ref, at) => refs.findIndex((other) => other.message === ref.message && other.key === ref.key) === at).slice(-MAX_PICTURES_SHOWN);
-    return each.length > 0 ? { connector: last.source, data: dataOf(last), refs: each } : undefined;
+    // Earlier messages of the same person here, shortly before: the latest of them, for the room that is left.
+    const first = events[0];
+    const earlier = this.#s
+      .rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND session_key = ? AND received_at >= ? AND id < ? AND data LIKE '%\"pictures\"%' ORDER BY id", last.source, last.session_key, first.received_at - PICTURES_RECENT_MS, first.id)
+      .filter((row) => here(row) && same(row) && who(row).id === who(last).id)
+      .flatMap((row) => named(dataOf(row).pictures));
+    const chosen: (PictureRef & { from: "now" | "replied" | "earlier" })[] = [];
+    const take = (refs: PictureRef[], from: "now" | "replied" | "earlier") => {
+      for (const ref of refs) if (chosen.length < MAX_PICTURES_SHOWN && !chosen.some((each) => each.message === ref.message && each.key === ref.key)) chosen.push({ ...ref, from });
+    };
+    take(now, "now");
+    take(replied, "replied");
+    take(earlier.reverse(), "earlier");
+    // Shown in the order they were written: earlier ones first, then the one replied to, then this message's own.
+    const order = { earlier: 0, replied: 1, now: 2 };
+    const refs = [...chosen.filter((each) => each.from === "earlier").reverse(), ...chosen.filter((each) => each.from !== "earlier")].sort((a, b) => order[a.from] - order[b.from]);
+    return refs.length > 0 ? { connector: last.source, data: dataOf(last), refs } : undefined;
   }
 
   /** The pictures of the one run under way, as they are being fetched: held in memory and nowhere else. */
   #shown?: { run: string; parts: Promise<Item[]> };
 
-  /** What is put after the words of a run's own turn: its pictures, and a line saying how many there are and how many could not be had. */
+  /** What is put after the words of a run's own turn: each picture under a line saying where it is from, and a line in its place for one that could not be had. */
   #picturesShown(runId: string): Promise<Item[]> {
     if (this.#shown?.run === runId) return this.#shown.parts;
     const wanted = this.#picturesFor(runId);
+    const FROM = { now: "of what is above", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs here" };
     const parts = !wanted
       ? Promise.resolve([])
-      : this.#b.pictures(wanted.connector, { data: wanted.data }, wanted.refs).then((got) => {
-          const had = got.filter((each): each is Picture => each !== null);
-          const missing = got.length - had.length;
-          const note = `[${had.length === 0 ? "No picture" : had.length === 1 ? "The picture" : `The ${had.length} pictures`} of what is above${had.length > 0 ? ", in the order they stand," : ""} ${had.length === 0 ? "could be shown to you" : had.length === 1 ? "follows" : "follow"}.${missing > 0 && had.length > 0 ? ` ${missing} more could not be shown to you.` : ""}${had.length > 0 ? " You see them in this turn only: afterwards you have what you said about them." : " Say so if it matters."}]`;
-          return [{ type: "input_text", text: note }, ...had.map((each) => ({ type: "input_image", image_url: `data:${each.mime};base64,${each.data}` }))] as Item[];
-        });
+      : this.#b.pictures(wanted.connector, { data: wanted.data }, wanted.refs.map((each) => ({ message: each.message, key: each.key }))).then((got) => [
+          { type: "input_text", text: "[The pictures that go with this follow, each under a line saying where it is from; those of one message in the order they stand in it. You see them in this turn only.]" },
+          ...wanted.refs.flatMap((ref, at): Item[] => {
+            const picture = got[at];
+            return picture ? [{ type: "input_text", text: `[A picture ${FROM[ref.from]}:]` }, { type: "input_image", image_url: `data:${picture.mime};base64,${picture.data}` }] : [{ type: "input_text", text: `[A picture ${FROM[ref.from]} could not be shown to you.]` }];
+          }),
+        ]);
     this.#shown = { run: runId, parts };
     return parts;
   }
