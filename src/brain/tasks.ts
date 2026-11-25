@@ -153,7 +153,7 @@ export class Tasks implements Wakes {
   /**
    * Hands a piece of work to a worker the Brain starts, and says how it then stands. `name` is
    * the worker it is for; null where the call does not say (a tool call from before there was
-   * more than one): then the one worker this deployment has that is started this way. `options`
+   * more than one): then the worker the deployment names for that tool (`firstWorker`), while it is offered. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
   async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null): Promise<unknown> {
@@ -171,8 +171,6 @@ export class Tasks implements Wakes {
     // that names no worker is the tool from before there were several: it goes to the worker the
     // deployment says that tool was for, if it still offers that one, and to no other.
     const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : this.#b.firstWorker();
-    // (Only for something new: one already written was taken, and is not turned away by a check made again.)
-    if (!task) offered?.accepts?.(options, scope);
     // Going on from an earlier piece of work: it has to be this conversation's, this worker's, and
     // one that ended well; and the worker has to be one that goes on at all. Whoever asks, and
     // whatever was approved then, are this new piece's own: nothing of the earlier one's is carried.
@@ -189,6 +187,8 @@ export class Tasks implements Wakes {
     if (!task) {
       // Something new is taken only by a worker this deployment lists, and one that is started from here. Nothing is written for any other.
       if (!offered?.start) throw new Error("this deployment has no worker to hand this to");
+      // (Only for something new: one already written was taken, and is not turned away by a check made again.)
+      offered.accepts?.(options, scope);
       const WORKER = offered.name;
       const most = this.#limits().scope_active_tasks;
       if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= most) {
@@ -231,7 +231,7 @@ export class Tasks implements Wakes {
         JSON.stringify({ task_id: id }),
         now,
       );
-      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, ...options, ...(from !== null ? { continue_from: from } : {}) });
+      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { ...options, task_id: id, title, ...(from !== null ? { continue_from: from } : {}) });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
     // One that was written is one that was taken: it is carried through by the worker it was
@@ -448,6 +448,9 @@ export class Tasks implements Wakes {
         intent = undefined;
       }
     }
+    // Known before anything is written: an answer nobody can be given is not recorded as given.
+    const asking = this.#b.workerOf(String(task.worker));
+    if (!asking.answer) throw new Error("the worker of this task takes no answers");
     if (!intent) {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
       const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
@@ -500,8 +503,6 @@ export class Tasks implements Wakes {
       this.#s.audit(intent.decided_by, `task.${decision === "allow" ? "approved" : "denied"}`, { task_id: taskId, question: pending, reason, deciding_event: deciding.event.id, ...(standing ? { standing: true } : {}) });
     }
 
-    const asking = this.#b.workerOf(String(task.worker));
-    if (!asking.answer) throw new Error("the worker of this task takes no answers");
     const answered = await asking.answer(this.#b.env, taskId, intent.decision, intent.reason, intent.pending_id, intent.standing === true);
     if (!answered.ok) throw new Error(answered.error);
     // The worker may already have acted on an earlier answer to this question; report what it holds.
