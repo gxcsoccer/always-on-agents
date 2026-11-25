@@ -33,7 +33,7 @@ const saysGone = (text: unknown): boolean =>
   /找不回|拿不回|取不回|无法恢复|恢复不了|不能恢复|不在了|已不存在|丢失|已丢|丢了|被回收|已回收|回收了|没留下|没有留下|没有保留|没能保留|不再保留|(?:无法|没法|不能|没办法)再?(?:从[^，。；]*)?(?:接着|继续)/.test(String(text)) &&
   !/改动还在|仍然还在|已经?(?:重新)?接上|已在原|(?<!无法|没法|不能|没办法|无法再)从上次的位置继续|我(?:现在|这就|马上)?(?:接着|继续)(?:把|补)|现在就?(?:继续|接着)|已经?(?:开始|继续)补/.test(String(text));
 /** Names this branch or this commit, whole: not another whose name only contains it. */
-const names = (text: unknown, branch: string, commit: string): boolean => new RegExp(`(?<![\\w/.-])${branch.replace("/", "\\/")}(?![\\w/-])|(?<![0-9a-f])${commit}(?![0-9a-f])`).test(String(text));
+const names = (text: unknown, branch: string, commit: string): boolean => new RegExp(`(?<![\\w/.-])${branch.replace("/", "\\/")}(?![\\w/-]|\\.[\\w/-])|(?<![0-9a-f])${commit}(?![0-9a-f])`).test(String(text));
 const workers = [sandboxWorker, doubaoWorker].map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true }));
 const tools = [...TOOLS, ...workTools(workers, REPLACES)];
 const now = Date.parse("2026-11-25T02:00:00Z");
@@ -112,7 +112,7 @@ for (const [text, gone] of [
   ["改动只存在于原沙箱里，我接着把单测补上。", false],
 ] as const) if (saysGone(text) !== gone) throw new Error(`the rule for "the changes are gone" reads this wrongly: ${text}`);
 for (const [url, name] of [["https://github.com/acme/docs", "acme/docs"], ["https://github.com/Acme/Docs.git", "acme/docs"], ["https://github.com/acme/docs/", ""], ["https://GITHUB.COM/acme/docs", ""], ["https://github.com/acme/docs-old", "acme/docs-old"], [null, ""]] as const) if (repo(url) !== name) throw new Error(`the rule for a repository reads this wrongly: ${url}`);
-for (const [text, named] of [["在 fix/login-build 分支上补测试", true], ["基于提交 3f9c2ab 继续", true], ["从 hotfix/login-build 补测试", false], ["在 fix/login-build-old 上补测试", false], ["提交 3f9c2ab1 之后", false]] as const) if (names(text, "fix/login-build", "3f9c2ab") !== named) throw new Error(`the rule for naming a branch or commit reads this wrongly: ${text}`);
+for (const [text, named] of [["在 fix/login-build 分支上补测试", true], ["基于提交 3f9c2ab 继续", true], ["从 hotfix/login-build 补测试", false], ["从 fix/login-build.v2 补测试", false], ["Continue on fix/login-build. Then add tests", true], ["branch is fix/login-build.", true], ["在 fix/login-build-old 上补测试", false], ["提交 3f9c2ab1 之后", false]] as const) if (names(text, "fix/login-build", "3f9c2ab") !== named) throw new Error(`the rule for naming a branch or commit reads this wrongly: ${text}`);
 
 const chosen = cases.filter((c) => !process.env.ONLY || c.name.startsWith(process.env.ONLY + " "));
 if (chosen.length === 0) {
