@@ -665,7 +665,7 @@ describe("tasks, by themselves", () => {
     });
 
     it("is not stopped by work whose worker has been taken out of the deployment altogether: that work is said to be what it is, and the rest goes on", async () => {
-      await within(async ({ tasks, store, kept, settings, worker, slots }) => {
+      await within(async ({ tasks, store, kept, settings, worker, slots, task }) => {
         // One that finished, one whose start was never answered, one that is running: all the sandbox's.
         const done = (await tasks.dispatch(RUN, SESSION_KEY, "call_done", "sandbox", "t", "b", { repository: null })) as { task_id: string };
         await tasks.event(done.task_id, 1, "result", { text: "ok" });
@@ -694,6 +694,17 @@ describe("tasks, by themselves", () => {
         await tasks.event(running.task_id, 1, "result", { text: "late but fine" });
         expect(kept(running.task_id).status).toBe("succeeded");
         expect(slots.released).toContain(running.task_id);
+        // One that was written and never got as far as being started, its call made again now: not left as it is for ever. It is
+        // kept as not confirmed, given up in its time, and its place here is free again for other work.
+        task("t_mid", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_mid' WHERE id = 't_mid'");
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_mid", "sandbox", "t", "b", { repository: null })).toMatchObject({ task_id: "t_mid", status: "unconfirmed" });
+        for (let n = 0; n < 6; n++) {
+          store.sql.exec("UPDATE unconfirmed SET next_at = 0");
+          await tasks.settle();
+        }
+        expect(kept("t_mid").status).toBe("lost");
+        expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
         // And one that is asked to stop cannot be, which is said as that.
         const other = (await (async () => {
           settings.gone = [];
