@@ -547,7 +547,7 @@ export class Runner {
       const awaitingModel = last && (last.role === "user" || last.type === "function_call_output");
       if (!awaitingModel) break;
 
-      // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
+      // Two limits: this scope's own, and the tenant's across all of its scopes and workers.
       // The tenant's share is reserved before the call and trued up after it, so several scopes
       // admitted at the same moment cannot all slip under the limit together.
       const tenant = await this.#b.registry().recordUsage(this.#s.scope().tenant, MODEL_CALL_RESERVE);

@@ -17,6 +17,28 @@ export function guidance(): string {
   return config.guidance.trim();
 }
 
+/**
+ * Every worker this deployment has, offered for new work or retired: a piece of work written for
+ * a worker is carried through by that worker (its reports, its questions, its stopping) also
+ * after the deployment stopped offering it.
+ */
+const known = new Map<string, Worker>([...(config.retired ?? []), ...config.workers].map((each) => [each.name, each]));
+if (known.size !== config.workers.length + (config.retired ?? []).length) throw new Error("two workers have the same name (among those offered and those retired)");
+
+/**
+ * The worker that the tool from before there were several workers (`dispatch_task`) was for, as
+ * the deployment says; only while it is still offered. A call of that tool already made, and made
+ * again, goes to it and to no other: never to whichever worker happens to be the only one now.
+ */
+export function firstWorker(): Worker | undefined {
+  return config.first_worker ? byName.get(config.first_worker) : undefined;
+}
+
+/** The worker of this name, for work that was already written for it: listed for new work or not. */
+export function workerKnown(name: string): Worker | undefined {
+  return known.get(name);
+}
+
 /** The worker listed under this name, if this deployment has it. */
 export function workerNamed(name: string): Worker | undefined {
   return byName.get(name);
