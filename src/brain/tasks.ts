@@ -195,6 +195,9 @@ export class Tasks implements Wakes {
       const asker = people.length === 1 ? people[0] : null;
       if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
       // (Work nobody in particular asked for, or a run that is not one person's, has nobody whose it is: it is not gone on from.)
+      // Said as what it is where this run is not one person's own (it was started by a worker's report, say, or several people spoke):
+      // the work may well be there, and theirs; it is this run that cannot ask for it.
+      if (asker === null && earlier && earlier.session_key === sessionKey) throw new Error("going on from earlier work can only be asked for in answer to the one person whose work it was, and this step was not started by a message of theirs alone; nothing was started. Tell them how things stand; it is gone on from when they ask again");
       if (!earlier || asker === null || earlier.session_key !== sessionKey || earlier.worker !== offered.name || earlier.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
       if (earlier.status !== "succeeded") throw new Error(`that piece of work ${TERMINAL_TASK.has(String(earlier.status)) ? "did not end well" : "has not ended yet"}, so there is nothing of it to go on from; ${TERMINAL_TASK.has(String(earlier.status)) ? "hand this over as something new" : "wait for it, or hand this over as something new"}`);
     }

@@ -394,7 +394,8 @@ export class TaskSandbox extends DurableObject<Env> {
         state.timings.seed_ms = Date.now() - t1;
         // What the earlier run left of its own ending and its own logs is not this task's: its files and the agent's record are.
         for (const left of [EXIT_CODE_PATH, PID_PATH, EVENTS_PATH, STDERR_PATH, HOOK_LOG_PATH, REPORT_LOG_PATH]) await this.#files.remove(left, { force: true });
-        await this.#files.mkdir(TASK_DIRECTORY);
+        // (It came with the earlier workspace, and is there already: made only if it is not.)
+        await this.#files.mkdir(TASK_DIRECTORY, { recursive: true });
       } else {
         await this.#files.mkdir(WORKSPACE_DIRECTORY);
         await this.#files.mkdir(TASK_DIRECTORY);

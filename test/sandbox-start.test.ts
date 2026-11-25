@@ -17,7 +17,11 @@ vi.mock("cloudflare:workers", async (original) => ({
 }));
 vi.mock("@cloudflare/sandbox", () => ({
   Files: class {
-    async mkdir() {}
+    // As the real one: making a directory that is there already fails, unless asked to accept it.
+    async mkdir(path: string, options?: { recursive?: boolean }) {
+      if (backups.there.has(path) && !options?.recursive) throw new Error(`SandboxFileError: mkdir '${path}': File exists (os error 17)`);
+      backups.there.add(path);
+    }
     async remove() {}
   },
   DirectoryBackup: class {
@@ -29,6 +33,8 @@ vi.mock("@cloudflare/sandbox", () => ({
     async intercept() {}
     async restore(record: { id: string }, into: { dir: string }) {
       backups.restored.push({ prefix: this.where.prefix, id: record.id, dir: into.dir });
+      // What a workspace holds comes back with it.
+      for (const each of [into.dir, `${into.dir}/task`, `${into.dir}/repo`]) backups.there.add(each);
       await restoring.now?.();
     }
     async backup() {
@@ -45,7 +51,7 @@ vi.mock("@cloudflare/sandbox", () => ({
 }));
 
 /** What was asked of the store of checkpoints: copies taken, restored (from whose, which, to where) and removed. */
-const backups = { taken: 0, restored: [] as { prefix: string; id: string; dir: string }[], deleted: [] as string[], whileTaking: undefined as (() => Promise<void>) | undefined, deleteFails: false };
+const backups = { taken: 0, restored: [] as { prefix: string; id: string; dir: string }[], deleted: [] as string[], there: new Set<string>(), whileTaking: undefined as (() => Promise<void>) | undefined, deleteFails: false };
 /** Something that happens while a checkpoint is being restored, for the fixture that is restoring. */
 const restoring: { now?: () => Promise<void> } = {};
 
@@ -75,7 +81,7 @@ function fixture() {
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
   const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
   restoring.now = undefined;
-  Object.assign(backups, { taken: 0, restored: [], deleted: [], whileTaking: undefined, deleteFails: false });
+  Object.assign(backups, { taken: 0, restored: [], deleted: [], there: new Set<string>(), whileTaking: undefined, deleteFails: false });
   return {
     task: new TaskSandbox(ctx as never, env as never),
     container,
@@ -161,7 +167,7 @@ describe("a sandbox task that a later one goes on from", () => {
     };
     expect(await slow.task.start({ id: "fixture", prompt: "x", brain: "brain", bounds: { lifetime_ms: 300_000 }, seed: { from: "earlier", record: { id: "kept" } as never, cwd: "/workspace/job/scratch" } })).toMatchObject({ phase: "failed", error: expect.stringContaining("exceeded the maximum lifetime") });
     expect(given.some((each) => each.join(" ").includes("--continue"))).toBe(false);
-    Object.assign(backups, { taken: 0, restored: [], deleted: [] });
+    Object.assign(backups, { taken: 0, restored: [], deleted: [], there: new Set<string>() });
 
     // And what it leaves in its turn is its own.
     await task.alarm();
