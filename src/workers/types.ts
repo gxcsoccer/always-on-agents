@@ -34,6 +34,12 @@ export interface Work {
    * worker says (by refusing) if what it left can no longer be had.
    */
   continue_from?: string;
+  /**
+   * How far the tenant lets this piece of work go: how long it may run and how often it may ask
+   * the model. Fixed as the work is handed over; a worker that has such bounds of its own goes
+   * by these where they are given.
+   */
+  bounds?: { lifetime_ms?: number; model_calls?: number };
 }
 
 /**

@@ -22,6 +22,12 @@ export class FakeTask extends DurableObject {
     if (String((input as { prompt?: unknown })?.prompt ?? "").includes("(the start is not answered)")) throw new Error("connection lost");
     return { phase: "running" };
   }
+  /** As the real task: what it left for a later one to go on from, once it was started with a repository or without. */
+  async snapshot() {
+    const first = ((this.ctx.storage.kv.get("calls") as { method: string; args: any }[] | undefined) ?? []).find((each) => each.method === "start")?.args;
+    if (!first) return null;
+    return { record: { id: "kept", dir: "/workspace/job" }, cwd: first.repository ? "/workspace/job/repo" : "/workspace/job/scratch", ...(first.repository ? { repository: first.repository } : {}), until: Date.now() + 3_600_000 };
+  }
   /** As the real task: whether it was ever started here. (The real one also closes an id it never took; nothing here starts one afterwards.) */
   async claimed() {
     return this.ctx.storage.kv.get("started") === true ? "there" : "none";

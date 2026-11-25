@@ -171,7 +171,7 @@ The first two share one key, `withheld:<run id>`, so a person gets at most one o
 
 ## Limits
 
-The first four can be set for each tenant; the table gives what holds where they were not. The rest are constants in the code.
+Those marked "can be set" can be set for each tenant; the table gives what holds where they were not. The rest are constants in the code.
 
 ```bash
 # A tenant's limits as they stand, and the defaults
@@ -182,7 +182,7 @@ curl -X PUT -H "authorization: Bearer $ADMIN_KEY" -H "content-type: application/
   https://<your domain>/v1/admin/tenants/<tenant>/limits
 ```
 
-Their names: `scope_daily_tokens`, `tenant_daily_tokens`, `scope_active_tasks`, `tenant_sandboxes`. Each is a whole number, 0 or more; `tenant_daily_tokens` is either 0 or at least 20000 (that much is set aside before every call to the model, so a smaller day could never begin one). The answer's `overrides` are the figures set for this tenant, and `most` the largest each may be. A tenant that does not exist answers 404; a change that is not well formed, 400.
+Their names: `scope_daily_tokens`, `tenant_daily_tokens`, `scope_active_tasks`, `tenant_sandboxes`, and `run_steps` (how many times one run of the agent may ask the model, 1–100), `task_minutes` (how long one sandbox task may run, 5–480), `task_model_calls` (how many times one sandbox task may ask the model, 1–5000). The first four are whole numbers, 0 or more; the last three have their own ranges and cannot be 0 (to have no tasks run, set how many may be under way to 0). `task_minutes` and `task_model_calls` are fixed for a task as it is handed over: one already running goes by what held when it began; `tenant_daily_tokens` is either 0 or at least 20000 (that much is set aside before every call to the model, so a smaller day could never begin one). The answer's `overrides` are the figures set for this tenant, and `least` and `most` the smallest and largest each may be. A tenant that does not exist answers 404; a change that is not well formed, 400.
 
 What 0 means: with `scope_daily_tokens` at 0 the agent itself makes no more calls to the model in that scope; sandbox tasks already under way finish, and what they spent is counted when they end. With `tenant_daily_tokens` at 0 neither the agent nor any sandbox of the tenant may begin another call. The two limits on work at once, at 0, only keep new work from being taken; what is under way is finished.
 
@@ -192,11 +192,11 @@ A change takes effect in a scope from its next call to the model (a tool call al
 |---|---|
 | Tokens per scope per day | 2,000,000 (can be set) |
 | Tokens per tenant per day | 20,000,000 (can be set) |
-| Model steps per run | 16 |
+| Model steps per run | 16 (can be set) |
 | Events claimed into one run | 40 |
 | Sandbox tasks at once | 3 per scope, 5 per tenant (both can be set) |
-| Sandbox task: startup / idle / lifetime | 5 min / 15 min / 2 h |
-| Sandbox task: model calls | 400 |
+| Sandbox task: startup / idle / lifetime | 5 min / 15 min / 2 h (the lifetime can be set) |
+| Sandbox task: model calls | 400 (can be set) |
 | Sandbox task: recoveries after losing the container | 2 |
 | A push held for approval | 50 min |
 | A carried-on request, from being taken up to its answer being handed to the channel | 1 hour. Past it nothing more is read and an unsent answer is not sent. |

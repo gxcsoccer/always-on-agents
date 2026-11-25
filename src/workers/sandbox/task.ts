@@ -136,6 +136,8 @@ export interface TaskState {
   /** What each alarm tick saw, to show the keep-alive actually held. */
   checks: { at: number; phase: Phase; container_running: boolean }[];
   error?: string;
+  /** How long this task may run and how often it may ask the model, as it was told when it started. */
+  bounds?: { lifetime_ms?: number; model_calls?: number };
 }
 
 
@@ -158,6 +160,8 @@ export interface StartInput {
    * Whoever starts this task has made sure it may: the earlier one is this conversation's.
    */
   seed?: { from: string; record: DirectoryBackupRecord; cwd: string; repository?: string };
+  /** How long this task may run and how often it may ask the model, where whoever hands it over says; the fixed figures here otherwise. */
+  bounds?: { lifetime_ms?: number; model_calls?: number };
 }
 
 interface CommandResult {
@@ -338,6 +342,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const existing = this.#state();
     if (existing) return { ...existing, token: "(hidden)" };
     const t0 = Date.now();
+    const bounds = bounded(input.bounds);
     const state: TaskState = {
       id: input.id,
       token: crypto.randomUUID(),
@@ -348,6 +353,7 @@ export class TaskSandbox extends DurableObject<Env> {
       cwd: input.seed ? input.seed.cwd : input.repository ? REPOSITORY_DIRECTORY : SCRATCH_DIRECTORY,
       ...(input.seed ? { follows: input.seed.from } : {}),
       created_at: t0,
+      ...(bounds ? { bounds } : {}),
       timings: {},
       runs: [],
       inbox: [],
@@ -642,7 +648,7 @@ export class TaskSandbox extends DurableObject<Env> {
   async countModelCall(): Promise<boolean> {
     const state = this.#state();
     if (!state || !(ACTIVE.has(state.phase) || state.phase === "starting")) return false;
-    if ((state.model_calls ?? 0) >= MAX_MODEL_CALLS_PER_TASK) return false;
+    if ((state.model_calls ?? 0) >= (state.bounds?.model_calls ?? MAX_MODEL_CALLS_PER_TASK)) return false;
     state.model_calls = (state.model_calls ?? 0) + 1;
     this.#save(state);
     // A worker already running must stop spending when its tenant's daily budget is gone. Its own
@@ -989,7 +995,7 @@ export class TaskSandbox extends DurableObject<Env> {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    const overdue = Date.now() - before.created_at > MAX_LIFETIME_MS;
+    const overdue = Date.now() - before.created_at > lifetimeOf(before);
     if (ACTIVE.has(before.phase) && !overdue) {
       try {
         await this.#settle("alarm");
@@ -1013,11 +1019,18 @@ export class TaskSandbox extends DurableObject<Env> {
     const alive = ACTIVE.has(state.phase) || state.phase === "idle" || state.phase === "starting";
     let expired = false;
     if (alive && state.phase === "starting") {
-      expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
-      if (expired) state.error = "startup did not finish in time";
+      // Starting, for the first time or again after its container was lost: it has the time a start
+      // may take, and no longer than the whole of its life.
+      if (age > lifetimeOf(state)) {
+        expired = true;
+        state.error = "exceeded the maximum lifetime";
+      } else {
+        expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
+        if (expired) state.error = "startup did not finish in time";
+      }
     } else if (alive && !running) {
       // Judged on the task's age now, not as it was before the awaits above.
-      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && age <= MAX_LIFETIME_MS) {
+      if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && age <= lifetimeOf(state)) {
         this.#save(state);
         await this.#recover();
         return;
@@ -1025,7 +1038,7 @@ export class TaskSandbox extends DurableObject<Env> {
       state.phase = "lost";
       state.error = "container stopped before the task finished";
       this.#emit(state, "lost", { error: state.error });
-    } else if (alive && age > (state.phase === "idle" ? MAX_IDLE_MS : MAX_LIFETIME_MS)) {
+    } else if (alive && age > (state.phase === "idle" ? Math.min(MAX_IDLE_MS, lifetimeOf(state)) : lifetimeOf(state))) {
       expired = true;
       state.error = "exceeded the maximum lifetime";
     }
@@ -1150,7 +1163,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const before = this.#state();
     if (!before || !ACTIVE.has(before.phase)) return;
     // Past its lifetime a task is ended by the alarm, without looking at its files.
-    if (Date.now() - before.created_at > MAX_LIFETIME_MS) return;
+    if (Date.now() - before.created_at > lifetimeOf(before)) return;
 
     let exitCode: number | undefined;
     let lost: string | undefined;
@@ -1279,6 +1292,19 @@ export class TaskSandbox extends DurableObject<Env> {
 
 /** Phases in which the agent process is expected to be alive. */
 const ACTIVE = new Set<Phase>(["running", "needs_input"]);
+
+/** How long a task may live: as it was told when it was started, or the fixed time. */
+function lifetimeOf(state: TaskState): number {
+  return state.bounds?.lifetime_ms ?? MAX_LIFETIME_MS;
+}
+
+/** Bounds as given at the start, each kept only if it is a positive whole number; nothing if none is. */
+function bounded(given: StartInput["bounds"]): TaskState["bounds"] {
+  const whole = (figure: unknown) => (typeof figure === "number" && Number.isInteger(figure) && figure > 0 ? figure : undefined);
+  const lifetime_ms = whole(given?.lifetime_ms);
+  const model_calls = whole(given?.model_calls);
+  return lifetime_ms === undefined && model_calls === undefined ? undefined : { ...(lifetime_ms !== undefined ? { lifetime_ms } : {}), ...(model_calls !== undefined ? { model_calls } : {}) };
+}
 
 /** Pulls the session id, final message, usage and failure reason out of `pi --mode json` output. */
 function summarize(jsonl: string) {
