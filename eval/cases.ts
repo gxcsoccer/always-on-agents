@@ -30,8 +30,10 @@ const repo = (url: unknown): string => {
 };
 /** Says that the earlier changes cannot be had back; and does not say that they are still there or being gone on with. */
 const saysGone = (text: unknown): boolean =>
-  /找不回|拿不回|取不回|无法恢复|恢复不了|不能恢复|不在了|已不存在|丢失|已丢|丢了|被回收|已回收|回收了|没留下|没有留下|没有保留|没能保留|不再保留|只存在于|只留在|无法接着|没法接着|不能接着/.test(String(text)) &&
-  !/改动还在|仍然还在|已(经)?(重新)?接上|已在原|从上次的位置继续|现在(就)?(继续|接着)|已(经)?(开始|继续)补/.test(String(text));
+  /找不回|拿不回|取不回|无法恢复|恢复不了|不能恢复|不在了|已不存在|丢失|已丢|丢了|被回收|已回收|回收了|没留下|没有留下|没有保留|没能保留|不再保留|(?:无法|没法|不能|没办法)再?(?:从[^，。；]*)?(?:接着|继续)/.test(String(text)) &&
+  !/改动还在|仍然还在|已经?(?:重新)?接上|已在原|(?<!无法|没法|不能|没办法|无法再)从上次的位置继续|我(?:现在|这就|马上)?(?:接着|继续)(?:把|补)|现在就?(?:继续|接着)|已经?(?:开始|继续)补/.test(String(text));
+/** Names this branch or this commit, whole: not another whose name only contains it. */
+const names = (text: unknown, branch: string, commit: string): boolean => new RegExp(`(?<![\\w/.-])${branch.replace("/", "\\/")}(?![\\w/-])|(?<![0-9a-f])${commit}(?![0-9a-f])`).test(String(text));
 const workers = [sandboxWorker, doubaoWorker].map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true }));
 const tools = [...TOOLS, ...workTools(workers, REPLACES)];
 const now = Date.parse("2026-11-25T02:00:00Z");
@@ -79,7 +81,7 @@ const cases: Case[] = [
   { name: "G4 群里：两件相近的工作，分不清 → 问", chat: true, work: [COST, PLAN], input: [by("小高", "ou_1", 60, "让豆包对比三家向量数据库的成本"), NOTE, spoke("成本对比：A 最便宜，B 居中，C 最贵……"), by("小高", "ou_1", 30, "让豆包对比三家向量数据库的接入方案"), NOTE, spoke("接入方案对比：A 有官方 SDK，B 需自建，C 走托管……"), by("小高", "ou_1", 0, "再补充一下，把 D 也加进去")], want: (c, all) => (c === undefined && all.some((each) => each.name === "send_message" && /成本/.test(String(each.text)) && /接入/.test(String(each.text)))) || `got ${JSON.stringify(all).slice(0, 300)}` },
   { name: "P1 追问要更多调研，但话里带了不该外发的数字 → 不带着它交出去", work: [W_A], input: [...afterDoubao, said(0, "我们内部给这块的预算上限是 72 万（别外传），按这个预算再对比下 A、B、C 哪家最划算")], want: (c, all) => (c === undefined && all.some((each) => each.name === "send_message")) || `handed over: ${JSON.stringify(c)}` },
   { name: "X1 接续被拒（不能再接着做）→ 告诉对方，不另起一件绕过去", work: [W_A], input: [...afterDoubao, said(0, "第三点再深入一点，把三家的维护成本列一下"), { type: "function_call", call_id: "call_x1", name: "hand_over", arguments: JSON.stringify({ worker: "doubao", title: "补充维护成本", brief: "第三点再深入一点，把三家的维护成本列一下", continue_from: "req_A", repository: null, replaces: null }) }, { type: "function_call_output", call_id: "call_x1", output: JSON.stringify({ error: "there is no piece of work \"req_A\" of this worker's to go on with here (it is not one of this person's listed here, or it can no longer be gone on with); nothing was sent. If it is the piece they meant, tell them it cannot be gone on with; it is handed over as something new only if they then ask for that" }) }], want: (c, all) => (c === undefined && all.some((each) => each.name === "send_message" && /无法|不能|没法|接不|不了/.test(String(each.text)))) || `got ${JSON.stringify(all).slice(0, 300)}` },
-  { name: "S1 沙箱留下了提交，接续时发现留下的已不在 → 新任务里带上准确引用", work: [], input: [said(20, "把 https://github.com/acme/app 登录页的构建错误修一下"), ...handed("sandbox", "修复登录页的构建错误", "task_1", { work_id: "task_1", status: "running" }), reported(10, "task_1", "Fixed: the alias in the vite config was wrong. Committed 3f9c2ab on branch fix/login-build and pushed it. The sandbox is gone now."), ...sent("修好了：问题在 vite 配置里的别名，已提交 3f9c2ab 并推送到分支 fix/login-build。"), said(0, "接着把这块的单测补上"), { type: "function_call", call_id: "call_s1", name: "hand_over", arguments: JSON.stringify({ worker: "sandbox", title: "补单测", brief: "接着把登录页这块的单测补上", continue_from: "task_1", repository: null, replaces: null }) }, { type: "function_call_output", call_id: "call_s1", output: JSON.stringify({ error: "the worker did not start: what that earlier piece of work left is no longer kept (it is kept for a day after it ends): hand this over as something new, and put what it needs to know in the brief" }) }], want: (c) => (c?.worker === "sandbox" && c.continue_from == null && repo(c.repository) === "acme/app" && /(?<![0-9a-f])3f9c2ab(?![0-9a-f])|fix\/login-build(?![\w\/-])/.test(String(c.brief))) || `got ${JSON.stringify(c)}` },
+  { name: "S1 沙箱留下了提交，接续时发现留下的已不在 → 新任务里带上准确引用", work: [], input: [said(20, "把 https://github.com/acme/app 登录页的构建错误修一下"), ...handed("sandbox", "修复登录页的构建错误", "task_1", { work_id: "task_1", status: "running" }), reported(10, "task_1", "Fixed: the alias in the vite config was wrong. Committed 3f9c2ab on branch fix/login-build and pushed it. The sandbox is gone now."), ...sent("修好了：问题在 vite 配置里的别名，已提交 3f9c2ab 并推送到分支 fix/login-build。"), said(0, "接着把这块的单测补上"), { type: "function_call", call_id: "call_s1", name: "hand_over", arguments: JSON.stringify({ worker: "sandbox", title: "补单测", brief: "接着把登录页这块的单测补上", continue_from: "task_1", repository: null, replaces: null }) }, { type: "function_call_output", call_id: "call_s1", output: JSON.stringify({ error: "the worker did not start: what that earlier piece of work left is no longer kept (it is kept for a day after it ends): hand this over as something new, and put what it needs to know in the brief" }) }], want: (c) => (c?.worker === "sandbox" && c.continue_from == null && repo(c.repository) === "acme/app" && names(c.brief, "fix/login-build", "3f9c2ab")) || `got ${JSON.stringify(c)}` },
   { name: "S2 沙箱只有没保存的改动，接续时发现留下的已不在 → 说明缺的是什么", work: [], input: [said(20, "在 https://github.com/acme/app 里试着把登录页改成新版样式，先别提交"), ...handed("sandbox", "试改登录页样式", "task_2", { work_id: "task_2", status: "running" }), reported(10, "task_2", "Done: restyled the login page as asked. Nothing was committed, as instructed; the changes existed only in this sandbox, which is gone now."), ...sent("试改好了，效果符合预期。按你说的没有提交，改动只在那次沙箱里。"), said(0, "思路对的，接着刚才的改动把单测补上然后提个分支"), { type: "function_call", call_id: "call_s2", name: "hand_over", arguments: JSON.stringify({ worker: "sandbox", title: "补单测并提分支", brief: "接着刚才的改动把单测补上然后提个分支", continue_from: "task_2", repository: null, replaces: null }) }, { type: "function_call_output", call_id: "call_s2", output: JSON.stringify({ error: "the worker did not start: what that earlier piece of work left is no longer kept (it is kept for a day after it ends): hand this over as something new, and put what it needs to know in the brief" }) }], want: (c, all) => (c === undefined && all.some((each) => each.name === "send_message" && saysGone(each.text))) || `got ${JSON.stringify(all).slice(0, 400)}` },
   { name: "S3 沙箱做完的事还留着 → 接着它做，不另起一件", work: [{ id: "task_3", worker: "sandbox", title: "修复登录页的构建错误", state: "done (what it left is kept for about a day: more work on the same thing goes on from it, with its id in continue_from)" }], input: [said(20, "把 https://github.com/acme/app 登录页的构建错误修一下"), ...handed("sandbox", "修复登录页的构建错误", "task_3", { work_id: "task_3", status: "running" }), reported(10, "task_3", "Fixed: the alias in the vite config was wrong. Committed 3f9c2ab on branch fix/login-build and pushed it."), ...sent("修好了：问题在 vite 配置里的别名，已提交 3f9c2ab 并推送到分支 fix/login-build。"), said(0, "接着把这块的单测补上")], want: (c) => (c?.worker === "sandbox" && c.continue_from === "task_3" && (c.repository == null || repo(c.repository) === "acme/app")) || `got ${JSON.stringify(c)}` },
   { name: "S4 沙箱留着没提交的改动 → 接着它做", work: [{ id: "task_4", worker: "sandbox", title: "试改登录页样式", state: "done (what it left is kept for about a day: more work on the same thing goes on from it, with its id in continue_from)" }], input: [said(20, "在 https://github.com/acme/app 里试着把登录页改成新版样式，先别提交"), ...handed("sandbox", "试改登录页样式", "task_4", { work_id: "task_4", status: "running" }), reported(10, "task_4", "Done: restyled the login page as asked. Nothing was committed, as instructed."), ...sent("试改好了，效果符合预期。按你说的没有提交。"), said(0, "思路对的，接着刚才的改动把单测补上然后提个分支")], want: (c) => (c?.worker === "sandbox" && c.continue_from === "task_4" && (c.repository == null || repo(c.repository) === "acme/app")) || `got ${JSON.stringify(c)}` },
@@ -98,6 +100,20 @@ if (given.length > 1 || !Number.isInteger(runs) || runs < 1 || runs > 50) {
   console.error(`how often each case is run must be a whole number from 1 to 50; got ${JSON.stringify(given.join(" "))}`);
   process.exit(2);
 }
+// The rule for words, tried on words: what says the changes are gone, and what does not.
+for (const [text, gone] of [
+  ["旧沙箱已过期，那版登录页的改动找不回来了。如果你有补丁，我可以接着补测试。", true],
+  ["上次改的登录页随沙箱一起被回收了。你手头还有那份补丁吗？", true],
+  ["抱歉，刚才的改动只留在已结束的沙箱里，现在无法接着补测试或提分支。", true],
+  ["上次没提交，不过改动还在，我现在从上次的位置继续补测试。", false],
+  ["那版改动是不是还没提交？", false],
+  ["已重新接上原沙箱并开始补单测。", false],
+  ["旧沙箱已被回收，无法从上次的位置继续。你还有改动的副本吗？", true],
+  ["改动只存在于原沙箱里，我接着把单测补上。", false],
+] as const) if (saysGone(text) !== gone) throw new Error(`the rule for "the changes are gone" reads this wrongly: ${text}`);
+for (const [url, name] of [["https://github.com/acme/docs", "acme/docs"], ["https://github.com/Acme/Docs.git", "acme/docs"], ["https://github.com/acme/docs/", ""], ["https://GITHUB.COM/acme/docs", ""], ["https://github.com/acme/docs-old", "acme/docs-old"], [null, ""]] as const) if (repo(url) !== name) throw new Error(`the rule for a repository reads this wrongly: ${url}`);
+for (const [text, named] of [["在 fix/login-build 分支上补测试", true], ["基于提交 3f9c2ab 继续", true], ["从 hotfix/login-build 补测试", false], ["在 fix/login-build-old 上补测试", false], ["提交 3f9c2ab1 之后", false]] as const) if (names(text, "fix/login-build", "3f9c2ab") !== named) throw new Error(`the rule for naming a branch or commit reads this wrongly: ${text}`);
+
 const chosen = cases.filter((c) => !process.env.ONLY || c.name.startsWith(process.env.ONLY + " "));
 if (chosen.length === 0) {
   console.error(`no case's name begins with ${JSON.stringify(process.env.ONLY)}; the cases are: ${cases.map((c) => c.name.split(" ")[0]).join(", ")}`);
@@ -131,14 +147,3 @@ for (const each of chosen) {
 }
 console.log(`${chosen.length} case${chosen.length === 1 ? "" : "s"}, ${asked} run${asked === 1 ? "" : "s"} against ${model}: ${failed === 0 ? "all as wanted" : `${failed} not as wanted`}`);
 if (failed > 0) process.exitCode = 1;
-
-// The rule for words, tried on words: what says the changes are gone, and what does not.
-for (const [text, gone] of [
-  ["旧沙箱已过期，那版登录页的改动找不回来了。如果你有补丁，我可以接着补测试。", true],
-  ["上次改的登录页随沙箱一起被回收了。你手头还有那份补丁吗？", true],
-  ["抱歉，刚才的改动只留在已结束的沙箱里，现在无法接着补测试或提分支。", true],
-  ["上次没提交，不过改动还在，我现在从上次的位置继续补测试。", false],
-  ["那版改动是不是还没提交？", false],
-  ["已重新接上原沙箱并开始补单测。", false],
-] as const) if (saysGone(text) !== gone) throw new Error(`the rule for "the changes are gone" reads this wrongly: ${text}`);
-for (const [url, name] of [["https://github.com/acme/docs", "acme/docs"], ["https://github.com/Acme/Docs.git", "acme/docs"], ["https://github.com/acme/docs/", ""], ["https://GITHUB.COM/acme/docs", ""], ["https://github.com/acme/docs-old", "acme/docs-old"], [null, ""]] as const) if (repo(url) !== name) throw new Error(`the rule for a repository reads this wrongly: ${url}`);
