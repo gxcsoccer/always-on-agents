@@ -185,6 +185,36 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("says that it is not known whether work began when the sandbox did not answer, keeps saying so, and finds out by itself", async () => {
+    const { stub } = brain();
+    const rowsOf = (of: any, query: string, ...args: unknown[]): Promise<any[]> => runInDurableObject(of, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
+    // The sandbox takes the work and its answer never comes back, twice.
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "(the start is not answered) do it", continue_from: null, repository: null })], [call("send_message", { text: "交办了，但还不确定它是否已经开始。" })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const handed = toolOutputs().find((each: any) => each.work_id);
+    expect(handed).toMatchObject({ status: "unconfirmed", note: expect.stringContaining("Do not hand the same work over again") });
+    const id = handed.work_id;
+    expect((await rowsOf(stub, "SELECT status FROM tasks WHERE id = ?", id))[0].status).toBe("unconfirmed");
+    // Asked how it stands, and in what it is told of the work in hand: the same.
+    model.replies([call("work_status", { work_id: id })], [say("")]);
+    await stub.ingest(message("how is it going?"));
+    await rowsOf(stub, "UPDATE unconfirmed SET next_at = next_at + 3600000");
+    await wake(stub);
+    expect(modelCalls.at(-2).instructions).toContain(`- ${id} [sandbox] "Fix the build": start not confirmed (it is not known yet whether it began`);
+    expect(toolOutputs().at(-1)).toMatchObject({ status: "unconfirmed", note: expect.stringContaining("It is not known yet whether this began") });
+    // The time to ask comes: the sandbox has it, so it began, and it goes on as any task.
+    await rowsOf(stub, "UPDATE unconfirmed SET next_at = 0");
+    await wake(stub);
+    expect((await rowsOf(stub, "SELECT status FROM tasks WHERE id = ?", id))[0].status).toBe("running");
+    expect(await rowsOf(stub, "SELECT 1 FROM unconfirmed")).toEqual([]);
+    await stub.taskEvent(id, 1, "result", { text: "Done." });
+    expect((await rowsOf(stub, "SELECT status FROM tasks WHERE id = ?", id))[0].status).toBe("succeeded");
+    // (The run its result starts is let finish here: left going, it would take the next test's model replies.)
+    model.replies([say("")]);
+    await wake(stub);
+  });
+
   it("hands work to the sandbox through the one tool for all workers, lists it by its id, and tells how it stands and stops it by that id", async () => {
     const { stub } = brain();
     model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: null })], [say("")]);

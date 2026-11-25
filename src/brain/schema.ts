@@ -315,6 +315,13 @@ export const MIGRATIONS: string[] = [
   // 31: whether a piece of work was handed over to its worker, or may have been, as whoever
   // carries it out says: stopping one that was is only to stop waiting for it here.
   `ALTER TABLE work ADD COLUMN handed INTEGER NOT NULL DEFAULT 0;`,
+  // 32: tasks whose start was not answered, each to be asked about until it is known whether
+  // the worker has it (see Tasks.settle).
+  `CREATE TABLE IF NOT EXISTS unconfirmed (
+     task_id TEXT PRIMARY KEY,
+     attempts INTEGER NOT NULL DEFAULT 0,
+     next_at INTEGER NOT NULL
+   );`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

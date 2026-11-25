@@ -24,7 +24,7 @@ export interface Work {
 
 /**
  * How starting went. Throwing means it is not known whether the worker took the work: the Brain
- * then tries to stop it, and says so.
+ * keeps it as not confirmed, and finds out (see `standing`).
  */
 export type Started = { state: "started" } | { state: "refused"; error: string };
 
@@ -51,4 +51,10 @@ export interface Worker {
    * has stopped, or only the waiting for it here (it may go on over there).
    */
   cancel?(env: Env, id: string): Promise<"stopped" | "no_longer_waited_for">;
+  /**
+   * Whether the worker has this piece of work at all: "there" once it has taken it (whatever has
+   * become of it since: it reports that itself), "none" if it never heard of it. Asked when a
+   * start was not answered. Throwing means it could not be asked.
+   */
+  standing?(env: Env, id: string): Promise<"there" | "none">;
 }

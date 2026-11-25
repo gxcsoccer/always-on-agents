@@ -796,6 +796,20 @@ describe("the run loop, by itself", () => {
         expect(store.rows<{ status: string }>("SELECT status FROM inbox")).toEqual([{ status: "dead" }]);
         void items;
       });
+    });
+
+    it("leaves a task that never got past being started, when its run is abandoned, as not confirmed and to be asked about: not failed on a guess", async () => {
+      await within(async ({ runner, model, event, store }) => {
+        event("hello");
+        const id = (await runner.next())!;
+        const session = store.rows<{ session_key: string }>("SELECT s.session_key FROM sessions s JOIN runs r ON r.session_id = s.id WHERE r.id = ?", id)[0].session_key;
+        store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES ('t_mid', 'op_mid', 'sandbox', 't', 'b', ?, 'dispatching', 1, 1)", session);
+        store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES ('t_elsewhere', 'op_else', 'sandbox', 't', 'b', 'another', 'dispatching', 1, 1)");
+        model.push(new ModelError("bad request", 400, false));
+        await runner.execute(id);
+        expect(store.rows<{ id: string; status: string }>("SELECT id, status FROM tasks ORDER BY id")).toEqual([{ id: "t_elsewhere", status: "dispatching" }, { id: "t_mid", status: "unconfirmed" }]);
+        expect(store.rows<{ task_id: string; attempts: number }>("SELECT task_id, attempts FROM unconfirmed")).toEqual([{ task_id: "t_mid", attempts: 0 }]);
+      });
       await within(async ({ runner, model, run, items, event }) => {
         event("hello");
         const id = (await runner.next())!;

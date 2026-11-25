@@ -359,6 +359,10 @@ export class TaskSandbox extends DurableObject<Env> {
     } catch (err) {
       state.phase = "failed";
       state.error = String(err);
+      // Said to whoever started it in answer to the call, and reported as well: the caller may no
+      // longer be waiting for this answer (its connection broke, and it asked again and was told
+      // only that the task was starting).
+      this.#emit(state, "failed", { error: state.error });
       this.#save(state);
       if (this.#container.running) await this.#container.destroy();
       return state;

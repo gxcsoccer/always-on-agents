@@ -24,6 +24,13 @@ const MAX_ACTIVE_TASKS = 3;
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
+/** How often a task whose start was not answered is asked about before it is given up as lost: about a quarter of an hour in all. */
+const CONFIRM_ATTEMPTS = 6;
+/** How long after a start that was not answered the worker is first asked whether it has the task. */
+const CONFIRM_FIRST_MS = 15_000;
+
+/** What is said of a task whose start was not answered, wherever its standing is told. */
+export const UNCONFIRMED_NOTE = "It is not known yet whether this began: the worker did not answer when it was started. It is being checked, and you will be told how it ends. Do not hand the same work over again; if the person asks, tell them it may or may not have started.";
 
 /** What tasks need from the Brain they are part of, and from the systems outside it. */
 export interface TasksHost {
@@ -72,9 +79,9 @@ export class Tasks implements Wakes {
     this.#b = host;
   }
 
-  /** When the earliest set-aside question is to be asked about again. */
+  /** When the earliest set-aside question, or task whose start was not answered, is to be asked about again. */
   nextWakeAt(_now: number): number | null {
-    return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM unsettled")[0]?.next_at ?? null;
+    return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM (SELECT next_at FROM unsettled UNION ALL SELECT next_at FROM unconfirmed)")[0]?.next_at ?? null;
   }
 
   async dispatch(run: RunRow, sessionKey: string, callId: string, title: string, brief: string, repository: string | null): Promise<unknown> {
@@ -92,7 +99,7 @@ export class Tasks implements Wakes {
     if (!task) {
       // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
       if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
-      if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'running', 'needs_input')")[0].n >= MAX_ACTIVE_TASKS) {
+      if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= MAX_ACTIVE_TASKS) {
         throw new Error(`there are already ${MAX_ACTIVE_TASKS} tasks running here; wait for one to finish or cancel one`);
       }
       const now = Date.now();
@@ -128,7 +135,7 @@ export class Tasks implements Wakes {
       this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, repository });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
-    if (task.status !== "dispatching") return { task_id: task.id, status: task.status };
+    if (task.status !== "dispatching") return this.#told(task);
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
@@ -147,26 +154,48 @@ export class Tasks implements Wakes {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
       throw new Error("too many sandboxes are running for this tenant right now; try again later");
     }
-    let started: Started;
-    try {
+    // The same start, made again, is the same piece of work (it is named by the id written before
+    // anything was sent): so a start whose answer was lost is asked for once more, and is found.
+    const start = async (): Promise<Started> => {
       if (!worker.start) throw new Error("this worker is not started by the Brain");
-      started = await worker.start(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() });
-    } catch (err) {
-      // Whether the worker heard us is unknown. Stop it if it did, and free the slot either way, so
-      // a start that failed in transit does not hold one of this scope's task slots for good.
-      await this.#stop(task).catch(() => undefined);
-      this.#set(task.id, "failed", { result: JSON.stringify({ error: `the sandbox could not be reached: ${String(err).slice(0, 300)}` }) });
-      await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
-      throw new Error("the sandbox could not be started; try again");
-    }
-    if (started.state === "refused") {
+      return worker.start(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() });
+    };
+    const started = await start()
+      .catch(start)
+      .catch(() => undefined);
+    // Read again after the wait: the worker may have reported meanwhile, and what it reported is
+    // what happened, whatever became of the answer to the call.
+    const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
+    if (now.status !== "dispatching") return this.#told(now);
+    if (started?.state === "refused") {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: started.error }) });
       await this.#b.registry().releaseTaskSlot(task.id);
       throw new Error(`the sandbox did not start: ${started.error}`);
     }
-    // Only move forward: the worker may already have reported while start() was returning.
-    this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
-    return { task_id: task.id, status: "running" };
+    // Answered, or heard from in the meantime: it began.
+    if (started || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {
+      this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
+      return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+    }
+    // Not answered, twice: whether the worker took it is not known. It is kept as exactly that,
+    // with its place, and found out by asking the worker (see settle); nothing is stopped or
+    // given back on a guess, and the model is not told to try again.
+    this.#unconfirmed(task.id);
+    await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+    return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+  }
+
+  /** Keeps a task as one whose start was not answered, to be asked about. */
+  #unconfirmed(taskId: string): void {
+    this.#s.transaction(() => {
+      this.#s.sql.exec("UPDATE tasks SET status = 'unconfirmed', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), taskId);
+      if (this.#s.rows("SELECT 1 FROM tasks WHERE id = ? AND status = 'unconfirmed'", taskId).length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO unconfirmed (task_id, attempts, next_at) VALUES (?, 0, ?)", taskId, Date.now() + CONFIRM_FIRST_MS);
+    });
+  }
+
+  /** How a task stands, as a call that made it (or made it again) is told. */
+  #told(task: Row): { task_id: string; status: string; note?: string } {
+    return { task_id: String(task.id), status: String(task.status), ...(task.status === "unconfirmed" ? { note: UNCONFIRMED_NOTE } : {}) };
   }
 
   async status(taskId: string): Promise<unknown> {
@@ -174,6 +203,7 @@ export class Tasks implements Wakes {
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
     return {
       ...task,
+      ...(task.status === "unconfirmed" ? { note: UNCONFIRMED_NOTE } : {}),
       pending: task.pending ? JSON.parse(task.pending) : null,
       result: task.result ? JSON.parse(task.result) : null,
       created_at: new Date(task.created_at).toISOString(),
@@ -387,6 +417,8 @@ export class Tasks implements Wakes {
     if (TERMINAL_TASK.has(status)) workIs(this.#s, { id: taskId, worker: String(current.worker), sessionKey: String(current.session_key), person: (current.requested_by as string | null) ?? null }, taskEnd(status));
     // The watchdog has nothing left to watch.
     if (TERMINAL_TASK.has(status)) this.#s.sql.exec("UPDATE timers SET status = 'done' WHERE id = ? AND status = 'active'", `watch_${taskId}`);
+    // However it left "not confirmed", there is nothing left to ask about.
+    if (status !== "unconfirmed") this.#s.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", taskId);
     return true;
   }
 
@@ -528,6 +560,7 @@ export class Tasks implements Wakes {
    * cannot be reached, or still has the question open, it is asked again later.
    */
   async settle(): Promise<void> {
+    await this.#confirm();
     for (const row of this.#s.rows<{ ask: string; task_id: string; question_id: string; attempts: number }>("SELECT * FROM unsettled WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
       let fate: QuestionFate | { state: "unreachable"; error: string };
       try {
@@ -551,6 +584,80 @@ export class Tasks implements Wakes {
         this.#s.sql.exec("UPDATE unsettled SET attempts = attempts + 1, next_at = ? WHERE ask = ?", Date.now() + Math.min(30_000 * 2 ** row.attempts, 3_600_000), row.ask);
       }
     }
+  }
+
+  /**
+   * Finds out whether each task whose start was not answered began, by asking its worker
+   * whether it has it; a bounded number of times, whatever the model does or can spend.
+   * - The worker has it, or has reported on it: it began, and goes on as any task.
+   * - The worker never heard of it (said so twice, so that a start still on its way is not
+   *   taken for none): it never began. Failed, its place given back, and said.
+   * - The worker cannot be asked, to the last attempt: it is stopped if it can be, and ended as
+   *   lost, its place given back, saying that it is not known whether it began.
+   */
+  async #confirm(): Promise<void> {
+    for (const row of this.#s.rows<{ task_id: string; attempts: number }>("SELECT * FROM unconfirmed WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
+      const waiting = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ? AND status = 'unconfirmed'", row.task_id)[0];
+      const reported = () => this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", row.task_id).length > 0;
+      const began = () => {
+        this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'unconfirmed'", Date.now(), row.task_id);
+        this.#s.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", row.task_id);
+      };
+      const task = waiting();
+      if (!task) {
+        this.#s.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", row.task_id);
+        continue;
+      }
+      if (reported()) {
+        began();
+        continue;
+      }
+      const worker = this.#b.workerOf(String(task.worker));
+      let standing: "there" | "none" | "unreachable";
+      try {
+        standing = worker.standing ? await worker.standing(this.#b.env, row.task_id) : "unreachable";
+      } catch {
+        standing = "unreachable";
+      }
+      // Read again after the wait: a report that came meanwhile is what happened.
+      if (!waiting()) continue;
+      if (standing === "there" || reported()) {
+        began();
+        continue;
+      }
+      const last = row.attempts + 1 >= CONFIRM_ATTEMPTS;
+      if (standing === "none" && row.attempts >= 1) {
+        await this.#ended(task, "failed", "the sandbox never started: it has no record of this task");
+      } else if (standing === "unreachable" && last) {
+        // Stopped if it can be; whether or not that is answered, this is where the waiting ends.
+        await this.#stop(task).catch(() => undefined);
+        if (waiting()) await this.#ended(task, "lost", "the sandbox could not be reached: it is not known whether this began, or what became of it");
+      } else {
+        this.#s.sql.exec("UPDATE unconfirmed SET attempts = attempts + 1, next_at = ? WHERE task_id = ?", Date.now() + CONFIRM_FIRST_MS * 2 ** (row.attempts + 1), row.task_id);
+      }
+    }
+  }
+
+  /** Ends a task by the Brain's own finding, as a report from its worker would: recorded, said in its conversation, its place given back. */
+  async #ended(task: Row, kind: "failed" | "lost", error: string): Promise<void> {
+    const applied = this.#s.transaction(() => {
+      if (!this.#set(String(task.id), kind, { result: JSON.stringify({ error }) })) return false;
+      this.#setAside(task);
+      this.#s.log(`task_${kind}`, { task: task.id, error });
+      this.#s.insertEvent({
+        source: "worker",
+        source_id: `${task.id}:start`,
+        kind: `worker.${kind}`,
+        session_key: String(task.session_key),
+        principal: { kind: "worker", id: String(task.id), explicit: false },
+        text: renderWorkerEvent(task, kind, { error }),
+        data: { task_id: task.id, error },
+      });
+      return true;
+    });
+    if (!applied) return;
+    await this.#b.registry().releaseTaskSlot(String(task.id)).catch(() => undefined);
+    await this.#b.wakeBy(Date.now() + 300);
   }
 
   /**
