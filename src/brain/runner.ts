@@ -746,6 +746,8 @@ export class Runner {
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+      // The pictures it was shown are let go with it.
+      if (this.#shown?.run === runId) this.#shown = undefined;
     });
   }
 
