@@ -117,6 +117,8 @@ export class RunTools {
     // Whether it was ever handed over, by the record: waiting for the person again does not undo that.
     // (As whoever carries it out said when it was kept; or, for one kept before that was recorded, as the person was told.)
     const handed = row.handed === 1 || waits === "result" || (record !== undefined && this.#b.requests.promised(id));
+    // Once it is known to have been handed over, that is kept with the work: what it was told by (a notice, the wait it was in) does not last as long as the work's own row.
+    if (handed && row.handed !== 1) this.#s.sql.exec("UPDATE work SET handed = 1 WHERE id = ?", id);
     return { task: false, worker: row.worker, state: row.state, standing: standingOf(row.state, waits, handed), handed, ...(waits ? { waits } : {}) };
   }
 

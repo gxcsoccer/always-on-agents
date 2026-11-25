@@ -629,6 +629,22 @@ describe("handing work to Doubao Work", () => {
     await cy.says("怎么样了？算了");
     expect(toolOutputs(modelCalls.at(-3))[0].state).toMatch(/^waiting_for_authorisation \(it was handed over already/);
     expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
+
+    // A piece from before this was kept with the work: known to have been handed over only by what the person was told.
+    const old = someone();
+    await handsOver(old, "调研 B");
+    const was = (await rowsOf(old.stub, "SELECT id FROM continuations"))[0].id;
+    await rowsOf(old.stub, "UPDATE work SET handed = 0");
+    model.replies([call("cancel_work", { work_id: was })], [call("send_message", { text: "不等了" })], [say("")]);
+    await old.says("算了");
+    expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ cancelled: was, how: "no_longer_waited_for" });
+    // It is kept from then on, so it is still said once the notice it was read from is gone.
+    expect(await rowsOf(old.stub, "SELECT handed FROM work")).toEqual([{ handed: 1 }]);
+    await rowsOf(old.stub, "DELETE FROM outbox WHERE idem LIKE 'underway:%'");
+    model.replies([call("work_status", { work_id: was })], [call("cancel_work", { work_id: was })], [say("")]);
+    await old.says("取消了吗");
+    expect(toolOutputs(modelCalls.at(-2))[0].state).toMatch(/^cancelled \(no longer waited for here/);
+    expect(JSON.stringify(toolOutputs(modelCalls.at(-1))[1])).toContain("the worker may still finish it over there");
   });
 
   it("says the same of work that is called off under the name for requests: that it may still be finished over there", async () => {
