@@ -174,7 +174,7 @@ export class RunTools {
           const from = typeof asked.continue_from === "string" ? asked.continue_from : "";
           const row = this.#s.rows<{ worker: string; state: string; session_key: string; person: string | null; condition: string | null; generation: number | null }>("SELECT worker, state, session_key, person, condition, generation FROM work WHERE id = ?", from)[0];
           if (!row || row.worker !== found.hands_to || row.session_key !== String(session.session_key) || row.person !== acting.person || !(await this.#b.workStands({ id: from, ...row }))) {
-            throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was sent`);
+            throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here (it is not one of this person's listed here, or it can no longer be gone on with); nothing was sent. If it is the piece they meant, tell them it cannot be gone on with; it is handed over as something new only if they then ask for that`);
           }
         }
         const given = carried ? (JSON.parse(carried.args) as Record<string, unknown>) : asked;
