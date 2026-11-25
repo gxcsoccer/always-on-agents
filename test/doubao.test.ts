@@ -403,6 +403,7 @@ describe("handing work to Doubao Work", () => {
     model.replies([asks("再补充", true)], [say("")]);
     await cy.says("再补充");
     expect(JSON.stringify(toolOutputs())).toContain("was not said which piece of work");
+    expect(JSON.stringify(toolOutputs())).not.toContain("something new");
     model.replies([asks("再补充", "call_nope")], [say("")]);
     await cy.says("再补充一下");
     expect(JSON.stringify(toolOutputs())).toContain("there is no piece of work");
