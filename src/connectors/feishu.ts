@@ -23,7 +23,7 @@ import { API, chatFactsFor, hex, tenantAccessToken, forgetTenantAccessToken } fr
 export { type ChatFacts, chatFacts } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, linksIn, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { markOf, type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Quoted, type Receipt } from "./types";
+import { markOf, type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Picture, type PictureRef, type Quoted, type Receipt } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -86,7 +86,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, closeInvitation: closeInvitationFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
+  channel: { deliver: deliverFeishu, amend: amendFeishu, closeInvitation: closeInvitationFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, pictures: picturesFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
   holds: (env, scope, condition, generation) => authorisationHolds(env, scope, condition, generation),
 };
@@ -254,6 +254,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // The documents the person linked, taken from what they typed before anything is put into it:
   // a mentioned person's display name is theirs to choose, and is not the sender's word.
   let documents: DocumentRef[] = [];
+  // The pictures in it, by the names Feishu gives them: fetched for the run that acts on the message, and never kept.
+  let pictures: PictureRef[] = [];
   if (message.message_type === "text") {
     try {
       text = String(JSON.parse(message.content).text ?? "");
@@ -269,7 +271,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = named(text, mentions, [app.bot_open_id]);
   } else if (message.message_type === "post") {
     // Words with formatting, links or pictures among them: the words and links are read as they
-    // are for a message replied to; a picture is named as something that cannot be seen yet.
+    // are for a message replied to; a picture is marked where it stands and named for fetching.
     let content: unknown;
     try {
       content = JSON.parse(message.content);
@@ -278,6 +280,17 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     }
     text = flat(content, mentions, [app.bot_open_id]);
     documents = linkedIn(content);
+    pictures = picturesIn(content, message.message_id);
+  } else if (message.message_type === "image") {
+    // A picture alone.
+    let content: any;
+    try {
+      content = JSON.parse(message.content);
+    } catch {
+      return undefined;
+    }
+    pictures = pictureRefs([content?.image_key], message.message_id);
+    text = pictures.length > 0 ? PICTURE : "[a image message, which I cannot read yet]";
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
@@ -312,6 +325,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         ...(group ? { group: true } : {}),
         // Which documents this message links to, for a tool that reads what the person pointed at.
         ...(documents.length ? { documents } : {}),
+        ...(pictures.length ? { pictures } : {}),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,
@@ -420,7 +434,8 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
       return further;
     }
     const mentions: any[] = Array.isArray(found.mentions) ? found.mentions : [];
-    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
+    const pictures = found.msg_type === "post" ? picturesIn(content, messageId) : found.msg_type === "image" ? pictureRefs([content?.image_key], messageId) : [];
+    const text = found.msg_type === "text" ? named(String(content.text ?? ""), mentions, [app.bot_open_id, app.app_id]) : found.msg_type === "post" ? flat(content) : pictures.length > 0 ? PICTURE : `[a ${String(found.msg_type)} message, which I cannot read yet]`;
     // Which documents it links, from all of it and by where its links really lead: kept apart from its words.
     // In words the person typed, an address counts; a link counts for where it leads, never for what it shows.
     // Taken from what was written, as for a message that arrives; a message of another kind links nothing.
@@ -429,10 +444,72 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // Nothing could be made of it: not something read.
     // When it was written, as Feishu says (milliseconds): what it links is something they linked then, not now.
     const at = Number(found.create_time);
-    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
+    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...(pictures.length > 0 ? { pictures } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
   } catch {
     return {};
   }
+}
+
+/** How a picture is marked in a message's words, where it stands. */
+const PICTURE = "[picture]";
+/** How many pictures of one message are named. */
+const MAX_PICTURES_NAMED = 9;
+/** No picture larger than this is fetched. */
+const MAX_PICTURE_BYTES = 5 * 1024 * 1024;
+
+/** Names for pictures by Feishu's keys, each once, for the message they are in. */
+function pictureRefs(keys: unknown[], message: string): PictureRef[] {
+  const good = keys.filter((each): each is string => typeof each === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(each));
+  return [...new Set(good)].slice(0, MAX_PICTURES_NAMED).map((key) => ({ message, key }));
+}
+
+/** The pictures in a rich-text message, in the order they stand. */
+function picturesIn(post: any, message: string): PictureRef[] {
+  const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
+  return pictureRefs(((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap((each: any) => (each?.tag === "img" ? [each.image_key] : [])) : [])), message);
+}
+
+/** What kind of picture these bytes are, by how they begin; undefined for anything else. */
+function kindOf(bytes: Uint8Array): string | undefined {
+  const starts = (...head: number[]) => head.every((byte, at) => bytes[at] === byte);
+  if (starts(0x89, 0x50, 0x4e, 0x47)) return "image/png";
+  if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (starts(0x47, 0x49, 0x46, 0x38)) return "image/gif";
+  if (starts(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return undefined;
+}
+
+/**
+ * Pictures people sent, asked of Feishu as the app, each by the message it is in: the app can
+ * fetch only from messages in chats it is in. One that is too large, gone, or not a picture
+ * comes back as null.
+ */
+export async function picturesFeishu(env: Env, scope: Scope, event: { data?: Record<string, unknown> }, refs: PictureRef[]): Promise<(Picture | null)[]> {
+  const origin = event.data?.origin as { app_id?: unknown } | undefined;
+  const app = typeof origin?.app_id === "string" ? await registry(env).feishuApp(origin.app_id) : null;
+  if (!app || app.tenant !== scope.tenant) return refs.map(() => null);
+  return picturesBy(await tenantAccessToken(env, app.app_id), refs);
+}
+
+/** Those pictures, asked of Feishu with the app's token. */
+export function picturesBy(bearer: string, refs: PictureRef[]): Promise<(Picture | null)[]> {
+  return Promise.all(
+    refs.map(async (ref) => {
+      if (!/^[A-Za-z0-9_-]{1,100}$/.test(ref.message) || !/^[A-Za-z0-9_-]{1,200}$/.test(ref.key)) return null;
+      try {
+        const response = await fetch(`${API}/im/v1/messages/${ref.message}/resources/${ref.key}?type=image`, { headers: { authorization: `Bearer ${bearer}` }, signal: AbortSignal.timeout(15_000) });
+        if (!response.ok || Number(response.headers.get("content-length") ?? 0) > MAX_PICTURE_BYTES) return (await response.body?.cancel(), null);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const mime = kindOf(bytes);
+        if (!mime || bytes.length > MAX_PICTURE_BYTES) return null;
+        let binary = "";
+        for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+        return { mime, data: btoa(binary) };
+      } catch {
+        return null;
+      }
+    }),
+  );
 }
 
 /** The documents a rich-text message links: addresses written in its plain words, and where its links lead. */
@@ -466,7 +543,7 @@ function flat(post: any, mentions: any[] = [], own: (string | null)[] = []): str
       if (typeof id === "string" && own.includes(id)) return " ";
       return `${token(meant?.name ?? each.user_name)} `;
     }
-    if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? "[a picture, which I cannot see yet]" : "[a video, which I cannot see yet]";
+    if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? PICTURE : "[a video, which I cannot see yet]";
     return `[${String(each?.tag ?? "?")}]`;
   };
   const lines: string[] = ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map(piece).join("").trim() : ""));

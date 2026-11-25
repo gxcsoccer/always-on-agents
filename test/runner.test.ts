@@ -40,6 +40,8 @@ function bench(state: DurableObjectState) {
   const settings = {
     /** What the connector says a replied-to message was: a value, or a function giving it. */
     quoted: undefined as any,
+    /** The pictures the connector can fetch, by key. */
+    pictures: undefined as Record<string, { mime: string; data: string }> | undefined,
     carried: undefined as Partial<Continuation> | undefined,
     allowed: true,
     mayNotDisclose: undefined as string | undefined | Error,
@@ -74,6 +76,7 @@ function bench(state: DurableObjectState) {
     workers: () => settings.workers,
     guidance: () => "",
     workStands: async () => true,
+    pictures: async (connector, _event, refs) => (log.push(["pictures", connector, refs.map((each) => each.key)]), refs.map((each) => (settings.pictures ?? {})[each.key] ?? null)),
     quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
     // As Feishu's does: a reply in a chat is written under the message it names.
     under: (target) => (target.address.message_id ? `${target.connector}:message:${target.address.message_id}` : undefined),
@@ -522,6 +525,78 @@ describe("the run loop, by itself", () => {
         ]);
         // And in this scope's own count: the tokens were spent.
         expect(runner.tokensToday()).toBe(250);
+      });
+    });
+
+    it("shows a run the pictures of its messages after their words, for that run only, and keeps nothing of them", async () => {
+      await within(async (b) => {
+        const P = (name: string) => ({ mime: "image/png", data: `BYTES-${name}` });
+        b.settings.pictures = { k1: P("k1"), k2: P("k2"), k4: P("k4"), k5: P("k5"), k6: P("k6") };
+        // A picture alone, then the question about it as a second message: one run, both shown.
+        b.event("[picture]", { source_id: "om_pic", data: { direct: true, origin: ORIGIN, pictures: [{ message: "om_pic", key: "k1" }] } });
+        b.event("这是什么？", {});
+        b.model.push(answer([says("一张架构图")]));
+        const first = (await b.go())!;
+        const turn = b.asked[0].input.at(-1);
+        expect(turn.role).toBe("user");
+        expect(turn.content.map((each: any) => each.type)).toEqual(["input_text", "input_text", "input_image"]);
+        expect(turn.content[0].text).toContain("这是什么？");
+        expect(turn.content[1].text).toMatch(/^\[The picture of what is above, in the order they stand, follows\..*this turn only/);
+        expect(turn.content[2]).toEqual({ type: "input_image", image_url: "data:image/png;base64,BYTES-k1" });
+        // Nothing of it is stored: the turn is kept as its words.
+        const kept = JSON.stringify(b.store.rows("SELECT item FROM items"));
+        expect(kept).not.toContain("BYTES-");
+        expect(kept).not.toContain("input_image");
+        expect(b.log.filter((each) => each[0] === "pictures")).toEqual([["pictures", "feishu", ["k1"]]]);
+
+        // What they write next, minutes later: the picture still goes with it. An earlier run's turn stays words.
+        b.event("左上角那个框呢", {});
+        b.model.push(answer([says("是网关")]));
+        await b.go();
+        const again = b.asked[1].input;
+        expect(again.filter((each: any) => Array.isArray(each.content) && each.content.some((part: any) => part.type === "input_image"))).toHaveLength(1);
+        expect(again.at(-1).content[2].image_url).toContain("BYTES-k1");
+        expect(typeof again.find((each: any) => each.role === "user").content).toBe("string");
+        void first;
+
+        // Much later, a plain message: nothing is shown, and nothing is asked for.
+        b.store.sql.exec("UPDATE inbox SET received_at = received_at - 3600000");
+        b.event("还在吗", {});
+        b.model.push(answer([says("在")]));
+        await b.go();
+        expect(typeof b.asked[2].input.at(-1).content).toBe("string");
+        expect(b.log.filter((each) => each[0] === "pictures")).toHaveLength(2);
+
+        // A reply to an older message of their own that holds a picture; one fetched for a reply; one that cannot be had; the latest four at most.
+        b.event("看这张", { source_id: "om_old", status: "done", received_at: Date.now() - 7200000, data: { direct: true, origin: ORIGIN, pictures: [{ message: "om_old", key: "k2" }] } });
+        b.event("[picture] [picture] [picture]\n对比一下", { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_old", quoted: { text: "[picture]", pictures: [{ message: "om_q", key: "k3" }] }, pictures: [{ message: "om_n", key: "k4" }, { message: "om_n", key: "k5" }, { message: "om_n", key: "k6" }] } });
+        b.model.push(answer([says("对比如下")]));
+        await b.go();
+        const many = b.asked[3].input.at(-1).content;
+        expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["k2", "k4", "k5", "k6"]]);
+        expect(many.filter((each: any) => each.type === "input_image")).toHaveLength(4);
+
+        // None can be had: the model is told so, and shown nothing.
+        b.settings.pictures = {};
+        b.event("[picture]", { data: { direct: true, origin: ORIGIN, pictures: [{ message: "om_x", key: "kx" }] } });
+        b.model.push(answer([says("看不到")]));
+        await b.go();
+        const none = b.asked[4].input.at(-1).content;
+        expect(none.filter((each: any) => each.type === "input_image")).toEqual([]);
+        expect(none[1].text).toBe("[No picture of what is above could be shown to you. Say so if it matters.]");
+      });
+    });
+
+    it("shows nobody the pictures someone else sent", async () => {
+      await within(async (b) => {
+        b.settings.pictures = { k1: { mime: "image/png", data: "BYTES-k1" } };
+        // Another person's picture here, just before: it is not theirs to be shown with.
+        b.event("[picture]", { status: "done", principal: { kind: "human", id: "ou_other", explicit: true }, data: { direct: true, origin: ORIGIN, pictures: [{ message: "om_o", key: "k1" }] } });
+        b.event("这是什么？", {});
+        b.model.push(answer([says("没有图")]));
+        await b.go();
+        expect(typeof b.asked[0].input.at(-1).content).toBe("string");
+        expect(b.log.filter((each) => each[0] === "pictures")).toEqual([]);
       });
     });
 
