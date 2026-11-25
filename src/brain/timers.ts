@@ -4,6 +4,9 @@
  */
 import { type BrainStore, type Row, TERMINAL_TASK, type Wakes } from "./store";
 
+/** How long a repeating timer repeats before it ends by itself. */
+export const REPEATS_FOR_MS = 24 * 60 * 60_000;
+
 export class Timers implements Wakes {
   readonly #s: BrainStore;
 
@@ -11,25 +14,39 @@ export class Timers implements Wakes {
     this.#s = store;
   }
 
-  /** Turns every timer due by `now` into an event, and moves it on or ends it, in one step. */
+  /**
+   * Turns every timer due by `now` into an event, and moves it on or ends it, in one step.
+   *
+   * A repeating timer has one event waiting at a time: while the last one has not been dealt
+   * with, a new firing adds nothing, so a scope that cannot run for a while (its day's usage
+   * spent, say) is not met by hundreds of the same reminder when it can again. And it does not
+   * repeat for ever: after a day it ends by itself, and its last event says so, so that one
+   * nobody cancelled stops costing a run every time it fires. Set again, it runs another day.
+   */
   fire(now: number): void {
     this.#s.transaction(() => {
+      // Firings of one timer that piled up before only one was kept waiting: the latest stands for them all.
+      this.#s.sql.exec(
+        "UPDATE inbox SET status = 'done' WHERE source = 'timer' AND kind = 'timer' AND status = 'pending' AND id NOT IN (SELECT MAX(id) FROM inbox WHERE source = 'timer' AND kind = 'timer' AND status = 'pending' GROUP BY json_extract(principal, '$.id'))",
+      );
       for (const timer of this.#s.rows<Row>("SELECT * FROM timers WHERE status = 'active' AND due_at <= ?", now)) {
         const data = timer.data ? JSON.parse(timer.data) : {};
         // A watchdog for a task that already ended has nothing to say.
         const stale = data.task_id && TERMINAL_TASK.has(this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", data.task_id)[0]?.status);
-        if (!stale) {
+        const last = Boolean(timer.every_s) && now - timer.created_at >= REPEATS_FOR_MS;
+        const waiting = Boolean(timer.every_s) && this.#s.rows("SELECT 1 FROM inbox WHERE source = 'timer' AND status = 'pending' AND json_extract(principal, '$.id') = ? LIMIT 1", timer.id).length > 0;
+        if (!stale && (!waiting || last)) {
           this.#s.insertEvent({
             source: "timer",
             source_id: `${timer.id}:${timer.due_at}`,
             kind: data.task_id ? "task.overdue" : "timer",
             session_key: timer.session_key,
             principal: { kind: "timer", id: timer.id, explicit: false },
-            text: timer.note,
+            text: timer.every_s ? `${timer.note}\n  (${last ? "this repeating timer has run for a day and has now ended: set it again only if it is still needed" : `a repeating timer, id ${timer.id}: cancel it once what it is for is done or no longer wanted`})` : timer.note,
             data,
           });
         }
-        if (timer.every_s && !stale) {
+        if (timer.every_s && !stale && !last) {
           // Skip occurrences that were missed while asleep rather than firing them all at once.
           const next = Math.max(timer.due_at + timer.every_s * 1_000, now + timer.every_s * 1_000);
           this.#s.sql.exec("UPDATE timers SET due_at = ? WHERE id = ?", next, timer.id);
