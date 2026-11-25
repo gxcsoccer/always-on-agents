@@ -29,6 +29,15 @@ const CONFIRM_ATTEMPTS = 6;
 /** How long after a start that was not answered the worker is first asked whether it has the task. */
 const CONFIRM_FIRST_MS = 15_000;
 
+/** How long one call to a worker is waited for when a start is being found out about. */
+const CONFIRM_CALL_MS = 10_000;
+
+/** A call that is given up, as unanswered, once it has taken that long. */
+function within<T>(call: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([call, new Promise<never>((_resolve, reject) => (timer = setTimeout(() => reject(new Error("not answered in time")), CONFIRM_CALL_MS)))]).finally(() => clearTimeout(timer));
+}
+
 /** What is said of a task whose start was not answered, wherever its standing is told. */
 export const UNCONFIRMED_NOTE = "It is not known yet whether this began: the worker did not answer when it was started. It is being checked, and you will be told how it ends. Do not hand the same work over again; if the person asks, tell them it may or may not have started.";
 
@@ -499,7 +508,9 @@ export class Tasks implements Wakes {
         if (applied) this.#setAside(task);
       }
       else return { known: true, wake: false, terminal: false };
-      if (!applied) return { known: true, wake: false, terminal: false };
+      // Not applied: the task had ended already. Where the worker says it has ended too, nothing
+      // runs under it any more: one ended here as lost may still hold its place, and gives it back now.
+      if (!applied) return { known: true, wake: false, terminal: task.status === "lost" && kind !== "needs_input" };
 
       // What the worker spent counts against the same daily budget as the Brain's own calls.
       const said = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);
@@ -590,10 +601,14 @@ export class Tasks implements Wakes {
    * Finds out whether each task whose start was not answered began, by asking its worker
    * whether it has it; a bounded number of times, whatever the model does or can spend.
    * - The worker has it, or has reported on it: it began, and goes on as any task.
-   * - The worker never heard of it (said so twice, so that a start still on its way is not
-   *   taken for none): it never began. Failed, its place given back, and said.
-   * - The worker cannot be asked, to the last attempt: it is stopped if it can be, and ended as
-   *   lost, its place given back, saying that it is not known whether it began.
+   * - The worker never took it, and by saying so has closed it against a start that is still
+   *   on its way: it never began and never will. Failed, its place given back, and said.
+   * - The worker cannot be asked, to the last attempt: it is stopped if it can be. If the stop
+   *   is answered, nothing runs: ended, its place given back. If not, and it has reported
+   *   meanwhile, it began: it goes on as any task. Otherwise the waiting ends here: lost, said
+   *   as not known whether it began; its place with the tenant is not given back on a guess,
+   *   and lapses by its own time limit, which is longer than a sandbox can live.
+   * No call to the worker is waited for longer than a fixed time.
    */
   async #confirm(): Promise<void> {
     for (const row of this.#s.rows<{ task_id: string; attempts: number }>("SELECT * FROM unconfirmed WHERE next_at <= ? ORDER BY next_at LIMIT 20", Date.now())) {
@@ -615,7 +630,7 @@ export class Tasks implements Wakes {
       const worker = this.#b.workerOf(String(task.worker));
       let standing: "there" | "none" | "unreachable";
       try {
-        standing = worker.standing ? await worker.standing(this.#b.env, row.task_id) : "unreachable";
+        standing = worker.standing ? await within(worker.standing(this.#b.env, row.task_id)) : "unreachable";
       } catch {
         standing = "unreachable";
       }
@@ -626,12 +641,18 @@ export class Tasks implements Wakes {
         continue;
       }
       const last = row.attempts + 1 >= CONFIRM_ATTEMPTS;
-      if (standing === "none" && row.attempts >= 1) {
-        await this.#ended(task, "failed", "the sandbox never started: it has no record of this task");
+      if (standing === "none") {
+        await this.#ended(task, "failed", "the sandbox never started: it has no record of this task", true);
       } else if (standing === "unreachable" && last) {
-        // Stopped if it can be; whether or not that is answered, this is where the waiting ends.
-        await this.#stop(task).catch(() => undefined);
-        if (waiting()) await this.#ended(task, "lost", "the sandbox could not be reached: it is not known whether this began, or what became of it");
+        const stopped = await within(this.#stop(task)).then(
+          () => true,
+          () => false,
+        );
+        // Read again after the wait: what came meanwhile is what happened.
+        if (!waiting()) continue;
+        if (stopped) await this.#ended(task, "lost", reported() ? "the sandbox could not be reached; it had begun, and was stopped" : "the sandbox could not be reached: it was stopped, and it is not known whether it had begun", true);
+        else if (reported()) began();
+        else await this.#ended(task, "lost", "the sandbox could not be reached: it is not known whether this began, or what became of it", false);
       } else {
         this.#s.sql.exec("UPDATE unconfirmed SET attempts = attempts + 1, next_at = ? WHERE task_id = ?", Date.now() + CONFIRM_FIRST_MS * 2 ** (row.attempts + 1), row.task_id);
       }
@@ -639,7 +660,7 @@ export class Tasks implements Wakes {
   }
 
   /** Ends a task by the Brain's own finding, as a report from its worker would: recorded, said in its conversation, its place given back. */
-  async #ended(task: Row, kind: "failed" | "lost", error: string): Promise<void> {
+  async #ended(task: Row, kind: "failed" | "lost", error: string, release: boolean): Promise<void> {
     const applied = this.#s.transaction(() => {
       if (!this.#set(String(task.id), kind, { result: JSON.stringify({ error }) })) return false;
       this.#setAside(task);
@@ -656,7 +677,8 @@ export class Tasks implements Wakes {
       return true;
     });
     if (!applied) return;
-    await this.#b.registry().releaseTaskSlot(String(task.id)).catch(() => undefined);
+    // Its place with the tenant is given back only where it is certain that nothing runs under it.
+    if (release) await this.#b.registry().releaseTaskSlot(String(task.id)).catch(() => undefined);
     await this.#b.wakeBy(Date.now() + 300);
   }
 

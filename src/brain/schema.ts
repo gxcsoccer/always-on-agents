@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   brief TEXT NOT NULL,
   session_key TEXT NOT NULL,
   requested_by TEXT,
-  status TEXT NOT NULL,                      -- dispatching | running | needs_input | succeeded | failed | lost | cancelled
+  status TEXT NOT NULL,                      -- dispatching | unconfirmed | running | needs_input | succeeded | failed | lost | cancelled
   pending TEXT,
   last_progress TEXT,
   result TEXT,

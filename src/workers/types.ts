@@ -52,9 +52,10 @@ export interface Worker {
    */
   cancel?(env: Env, id: string): Promise<"stopped" | "no_longer_waited_for">;
   /**
-   * Whether the worker has this piece of work at all: "there" once it has taken it (whatever has
-   * become of it since: it reports that itself), "none" if it never heard of it. Asked when a
-   * start was not answered. Throwing means it could not be asked.
+   * Whether the worker has this piece of work at all, settled as it is asked: "there" once it has
+   * taken it (whatever has become of it since: it reports that itself); "none" if it never did,
+   * and then it must never take it: a start under this id that arrives later is turned away.
+   * Asked when a start was not answered. Throwing means it could not be asked.
    */
   standing?(env: Env, id: string): Promise<"there" | "none">;
 }

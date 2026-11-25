@@ -43,6 +43,8 @@ function bench(state: DurableObjectState) {
     cancelled: [] as string[],
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
+    /** Something that happens while the sandbox is being asked to stop. */
+    duringCancel: undefined as undefined | (() => Promise<unknown>),
     /** What the sandbox says when asked whether it has a task: its state, that it has none, or no answer at all. */
     has: "none" as "there" | "none" | Error,
     asked: [] as string[],
@@ -64,13 +66,14 @@ function bench(state: DurableObjectState) {
     ({
       start: async (input: unknown) => (worker.started.push(input), worker.start(input)),
       cancel: async () => {
+        await worker.duringCancel?.();
         if (worker.cancelFails) throw new Error("connection reset");
         return (worker.cancelled.push(taskId), { ok: true });
       },
-      status: async () => {
+      claimed: async () => {
         worker.asked.push(taskId);
         if (worker.has instanceof Error) throw worker.has;
-        return worker.has === "there" ? { id: taskId, phase: "running" } : { error: "no such task" };
+        return worker.has;
       },
       answer: async (...args: unknown[]) => (worker.answered.push(args), worker.answer(...args)),
       decisionOn: async (questionId: string) => {
@@ -352,14 +355,15 @@ describe("tasks, by themselves", () => {
         expect(slots.released).toEqual([]);
         expect(tasks.nextWakeAt(0)).toBeNull();
       });
-      // The worker never heard of it, said twice: it never began. Failed, said in its conversation, its place given back.
+      // The worker never took it, and has closed it against a start still on its way: it never began. Failed, said in its conversation, its place given back.
       await within(async ({ tasks, store, kept, slots, worker }) => {
         worker.start = lost;
         const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        worker.has = "none";
+        // Not to be asked at first; then asked, and it says none.
+        worker.has = new Error("connection reset");
         await later(store, tasks);
-        // Once is not enough: a start still on its way would look the same.
         expect(kept(id).status).toBe("unconfirmed");
+        worker.has = "none";
         await later(store, tasks);
         expect(kept(id).status).toBe("failed");
         expect(JSON.parse(kept(id).result).error).toContain("never started");
@@ -379,29 +383,61 @@ describe("tasks, by themselves", () => {
       });
     });
 
-    it("gives up a task whose worker cannot be asked after a bounded number of tries: stopped if it can be, ended as lost, its place given back", async () => {
-      await within(async ({ tasks, store, kept, slots, worker }) => {
-        worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        worker.has = new Error("connection reset");
-        worker.cancelFails = true;
+    it("gives up a task whose worker cannot be asked after a bounded number of tries, and gives its place back only where it is certain that nothing runs", async () => {
+      const unreachable = async (store: BrainStore, tasks: Tasks, kept: (id: string) => any, id: string) => {
         for (let n = 0; n < 5; n++) {
           await later(store, tasks);
           expect(kept(id).status).toBe("unconfirmed");
           // Asked again later each time, further apart.
           expect(store.rows<{ attempts: number }>("SELECT attempts FROM unconfirmed")[0].attempts).toBe(n + 1);
         }
-        expect(slots.released).toEqual([]);
+      };
+      // The stop is not answered either: the waiting ends, said as not known; its place with the tenant is not given back on a guess.
+      await within(async ({ tasks, store, kept, slots, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        worker.has = new Error("connection reset");
+        worker.cancelFails = true;
+        await unreachable(store, tasks, kept, id);
         await later(store, tasks);
         expect(kept(id).status).toBe("lost");
         expect(JSON.parse(kept(id).result).error).toContain("it is not known whether this began");
-        expect(slots.released).toEqual([id]);
+        expect(slots.released).toEqual([]);
         expect(store.rows<{ kind: string }>("SELECT kind FROM inbox WHERE source = 'worker'")).toEqual([{ kind: "worker.lost" }]);
         expect(worker.asked).toHaveLength(6);
         expect(tasks.nextWakeAt(0)).toBeNull();
-        // A result that comes after all does not bring it back.
+        // It no longer counts against the conversation's own places.
+        expect(store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n).toBe(0);
+        // A result that comes after all does not bring it back; but it shows that nothing runs any more, and the place is given back then.
         await tasks.event(id, 1, "result", { status: "succeeded", summary: "late" });
         expect(kept(id).status).toBe("lost");
+        expect(slots.released).toEqual([id]);
+      });
+      // The stop is answered: nothing runs, and the place is given back.
+      await within(async ({ tasks, store, kept, slots, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        worker.has = new Error("connection reset");
+        await unreachable(store, tasks, kept, id);
+        await later(store, tasks);
+        expect(kept(id).status).toBe("lost");
+        expect(JSON.parse(kept(id).result).error).toContain("it was stopped");
+        expect(worker.cancelled).toEqual([id]);
+        expect(slots.released).toEqual([id]);
+      });
+      // It reports while the stop is being asked for, and the stop is not answered: it began, and goes on.
+      await within(async ({ tasks, store, kept, slots, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        worker.has = new Error("connection reset");
+        worker.cancelFails = true;
+        await unreachable(store, tasks, kept, id);
+        worker.duringCancel = () => tasks.event(id, 1, "progress", { message: "cloning" });
+        await later(store, tasks);
+        expect(kept(id).status).toBe("running");
+        expect(kept(id).last_progress).toBe("cloning");
+        expect(slots.released).toEqual([]);
+        expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
       });
     });
 

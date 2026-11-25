@@ -22,9 +22,9 @@ export class FakeTask extends DurableObject {
     if (String((input as { prompt?: unknown })?.prompt ?? "").includes("(the start is not answered)")) throw new Error("connection lost");
     return { phase: "running" };
   }
-  /** As the real task: how it stands, or that there is no such task. */
-  async status() {
-    return this.ctx.storage.kv.get("started") === true ? { phase: "running" } : { error: "no such task" };
+  /** As the real task: whether it was ever started here; if not, it is closed. */
+  async claimed() {
+    return this.ctx.storage.kv.get("started") === true ? "there" : "none";
   }
   async answer(decision: string, reason: string, questionId?: string, standing = false) {
     this.#record("answer", { decision, reason, questionId, standing });

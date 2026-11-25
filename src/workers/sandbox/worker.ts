@@ -12,8 +12,7 @@ export const sandboxWorker: Worker = {
     return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "unknown error" } : { state: "started" };
   },
   async standing(env, id) {
-    const state = await env.TASKS.getByName(id).status();
-    return "error" in state ? "none" : "there";
+    return env.TASKS.getByName(id).claimed();
   },
   async cancel(env, id) {
     await env.TASKS.getByName(id).cancel();

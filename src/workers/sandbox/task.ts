@@ -285,8 +285,23 @@ export class TaskSandbox extends DurableObject<Env> {
 
   /** Starts the task, or returns where it stands if it was already started. Safe to call again. */
   async start(input: StartInput): Promise<{ phase: Phase; error?: string }> {
+    // Closed before any start arrived (see `claimed`): one that arrives after that is turned away, for good.
+    if (!this.#state() && this.ctx.storage.kv.get("closed") === true) return { phase: "failed", error: "this task was closed before it started" };
     const state = await this.#start(input);
     return { phase: state.phase, error: state.error };
+  }
+
+  /**
+   * Whether this task was ever started here, settled in one step: "there" if it was (whatever
+   * has become of it since); otherwise it is closed, so that a start that arrives later is
+   * turned away, and "none". Asked by whoever started it and got no answer: after "none" it is
+   * certain that nothing runs under this id and nothing ever will.
+   */
+  async claimed(): Promise<"there" | "none"> {
+    // kv is synchronous: nothing can come between looking and closing.
+    if (this.#state()) return "there";
+    this.ctx.storage.kv.put("closed", true);
+    return "none";
   }
 
   async #start(input: StartInput): Promise<TaskState> {
