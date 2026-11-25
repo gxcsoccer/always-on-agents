@@ -11,7 +11,7 @@ import { sandboxWorker } from "./workers/sandbox/worker";
 import type { Worker } from "./workers/types";
 import guidance from "./workers.md";
 
-const config: { connectors: Connector[]; workers: Worker[]; retired?: Worker[]; guidance: string; trusted: string[] } = {
+const config: { connectors: Connector[]; workers: Worker[]; retired?: Worker[]; first_worker?: string; guidance: string; trusted: string[] } = {
   connectors: [consoleConnector, githubConnector, feishuConnector, doubaoConnector],
   /**
    * Where the agent can hand work to (see `src/workers/types.ts`). Taking one out stops new work
@@ -22,6 +22,12 @@ const config: { connectors: Connector[]; workers: Worker[]; retired?: Worker[]; 
   workers: [sandboxWorker, doubaoWorker],
   /** Workers no longer offered for new work, whose work under way is still carried through. */
   retired: [],
+  /**
+   * The worker that the one tool for handing work over was for before there were several
+   * (`dispatch_task`). Calls of that tool made back then can still be made again after an
+   * interruption; they go to this worker, while it is offered, and are refused otherwise.
+   */
+  first_worker: "sandbox",
   /**
    * Which worker a piece of work goes to: guidance for the agent, in words (`src/workers.md`).
    * It is the deployment's to write; nobody in a conversation can change it. Each worker says

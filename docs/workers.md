@@ -7,6 +7,7 @@ const config = {
   connectors: [...],
   workers: [sandboxWorker],
   retired: [],
+  first_worker: "sandbox",
   trusted: [...],
 };
 ```
@@ -31,7 +32,9 @@ A piece of work handed over carries, beside its id, brief and options: `accept_b
 
 The Brain knows no worker by name. Which workers are offered, what options each has, whether those will do, how one is started, stopped, asked about and answered are all the worker's own, through this contract. What the Brain reads of a result or of a question a worker puts to people is in `src/workers/result.ts` and `src/workers/questions.ts`, which belong to no one worker.
 
-Taking a worker out of `workers` stops new work going to it, and nothing is written for work it is refused. To have work it was given before (written down, even if not yet confirmed as started) carried through, move it to `retired` rather than deleting it: it can then still be started under the same id, report, be answered and be stopped. Take it out of `retired` once none of its work is left.
+Taking a worker out of `workers` stops new work going to it, and nothing is written for work it is refused. To have work it was given before (written down, even if not yet confirmed as started) carried through, move it to `retired` rather than deleting it: it can then still be started under the same id, report, be answered and be stopped. Take it out of `retired` once none of its work is left (nothing of its under way, and no approval question of its still to be looked up). Work whose worker is gone altogether still takes that worker's reports; it can no longer be asked about, answered or stopped from here, which is said as that and does not hold anything else up.
+
+`first_worker` names the worker that the one tool for handing work over was for before there were several. A call of that tool made back then can still be made again after an interruption; it goes to that worker while it is offered, and is refused otherwise.
 
 ## The index of work
 

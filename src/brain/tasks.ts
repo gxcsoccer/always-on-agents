@@ -63,6 +63,8 @@ export interface TasksHost {
   workerOf(name: string): Worker;
   /** Every worker this deployment offers for new work. */
   workers(): Worker[];
+  /** The worker the tool from before there were several was for, if the deployment says which and still offers it. */
+  firstWorker(): Worker | undefined;
   /** Where the tenant's places for tasks and its usage are kept. */
   registry(): Pick<ReturnType<typeof registry>, "acquireTaskSlot" | "releaseTaskSlot" | "recordUsage">;
   /** The people whose word counts in this run. */
@@ -126,9 +128,13 @@ export class Tasks implements Wakes {
     let task = this.#s.rows<Row>("SELECT * FROM tasks WHERE op_id = ?", callId)[0];
     // The same call made again: an earlier attempt at it may have got as far as starting the worker.
     const replayed = task !== undefined;
-    // What is asked of it is the worker's to look at, before anything is written or started.
-    const startable = this.#b.workers().filter((each) => each.start !== undefined);
-    const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : startable.length === 1 ? startable[0] : undefined;
+    // One that was written and has got past being started is told as it stands, before anything else is
+    // looked at: also where its worker has since been taken out of the deployment altogether.
+    if (task && task.status !== "dispatching") return this.#told(task);
+    // What is asked of it is the worker's to look at, before anything is written or started. A call
+    // that names no worker is the tool from before there were several: it goes to the worker the
+    // deployment says that tool was for, if it still offers that one, and to no other.
+    const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : this.#b.firstWorker();
     (task ? this.#b.workerOf(String(task.worker)) : offered)?.accepts?.(options, scope);
     if (!task) {
       // Something new is taken only by a worker this deployment lists, and one that is started from here. Nothing is written for any other.
@@ -174,7 +180,6 @@ export class Tasks implements Wakes {
       this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, ...options });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
-    if (task.status !== "dispatching") return this.#told(task);
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
@@ -472,7 +477,13 @@ export class Tasks implements Wakes {
   /** Stops a task through the worker it was written for. */
   async #stop(task: Row): Promise<void> {
     // Only the worker's word that the work itself stopped counts: not that it cannot be stopped, nor that only the waiting ended.
-    const how = await this.#b.workerOf(String(task.worker)).cancel?.(this.#b.env, String(task.id));
+    let worker: Worker;
+    try {
+      worker = this.#b.workerOf(String(task.worker));
+    } catch {
+      throw new Error("the worker of this task is no longer part of this deployment, so it cannot be asked to stop; whether it is still running is not known");
+    }
+    const how = await worker.cancel?.(this.#b.env, String(task.id));
     if (how !== "stopped") throw new Error("the worker did not say that this stopped");
   }
 
@@ -713,9 +724,10 @@ export class Tasks implements Wakes {
         began();
         continue;
       }
-      const worker = this.#b.workerOf(String(task.worker));
       let standing: "there" | "none" | "unreachable";
       try {
+        // (A worker that is no longer part of the deployment at all cannot be asked: as one that does not answer, not as something that stops everything else.)
+        const worker = this.#b.workerOf(String(task.worker));
         standing = worker.standing ? await within(worker.standing(this.#b.env, row.task_id)) : "unreachable";
       } catch {
         standing = "unreachable";
