@@ -6,6 +6,7 @@
 import { connector, connectors } from "./connectors";
 import type { Env } from "./env";
 import { registry } from "./registry";
+import { DEFAULT_LIMITS } from "./limits";
 
 export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
@@ -51,6 +52,17 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
   if (path[0] === "tenants" && path.length === 1 && method === "POST") {
     const { id, name } = await body();
     return json(await registry(env).createTenant(String(id ?? ""), String(name ?? id ?? "")), 201);
+  }
+  // What a tenant may use: read, and set by figure (null: back to the default; not named: left as it is).
+  if (path[0] === "tenants" && path[2] === "limits" && path.length === 3) {
+    if (method === "GET") return json({ limits: await registry(env).limits(path[1]), defaults: DEFAULT_LIMITS });
+    if (method === "PUT" || method === "POST" || method === "PATCH") {
+      try {
+        return json({ limits: await registry(env).setLimits(path[1], await body()), defaults: DEFAULT_LIMITS });
+      } catch (err) {
+        return json({ error: String(err instanceof Error ? err.message : err) }, 400);
+      }
+    }
   }
   if (path[0] === "tenants" && path[2] === "chat-repos" && method === "POST") {
     const { chat, repo } = await body();

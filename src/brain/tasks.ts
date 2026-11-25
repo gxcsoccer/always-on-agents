@@ -18,9 +18,11 @@ import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
+import { type Limits, limitsFrom } from "../limits";
 import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
 
-const MAX_ACTIVE_TASKS = 3;
+// (How many tasks a scope may have under way is the tenant's limit: see ../limits. It is read
+// from what the registry last said, kept by the run loop before every call to the model.)
 const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
@@ -100,6 +102,15 @@ export class Tasks implements Wakes {
     this.#b = host;
   }
 
+  /** The tenant's limits as the registry last gave them to this scope; the defaults before it ever did. */
+  #limits(): Limits {
+    try {
+      return limitsFrom(JSON.parse(this.#s.meta("limits") ?? "null"));
+    } catch {
+      return limitsFrom(null);
+    }
+  }
+
   /** When the earliest set-aside question, or task whose start was not answered, is to be asked about again. */
   nextWakeAt(_now: number): number | null {
     return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM (SELECT next_at FROM unsettled UNION ALL SELECT next_at FROM unconfirmed)")[0]?.next_at ?? null;
@@ -122,8 +133,9 @@ export class Tasks implements Wakes {
     if (!task) {
       // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
       if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
-      if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= MAX_ACTIVE_TASKS) {
-        throw new Error(`there are already ${MAX_ACTIVE_TASKS} tasks running here; wait for one to finish or cancel one`);
+      const most = this.#limits().scope_active_tasks;
+      if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= most) {
+        throw new Error(`there are already ${most} tasks running here; wait for one to finish or cancel one`);
       }
       const now = Date.now();
       // A task has a requester only when exactly one person asked. With several speakers in the

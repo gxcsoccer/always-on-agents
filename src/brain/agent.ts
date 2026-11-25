@@ -35,6 +35,7 @@ import { Timers } from "./timers";
 import { type Continuation, Requests } from "./requests";
 import { RunTools } from "./run-tools";
 import { Runner } from "./runner";
+import { limitsFrom } from "../limits";
 
 /** Events arriving within this window are answered in one run. */
 const BATCH_WINDOW_MS = 2_000;
@@ -510,6 +511,14 @@ export class BrainAgent extends DurableObject<Env> {
       tasks: this.#store.rows("SELECT id, title, status, requested_by, last_progress, substr(result, 1, 300) AS result FROM tasks ORDER BY created_at DESC LIMIT 10"),
       // What was written after reading outside text is not shown here either, sent or not.
       outbox: this.#store.rows("SELECT id, status, attempts, CASE WHEN private = 1 OR continuation IS NOT NULL THEN '' ELSE substr(text, 1, 200) END AS text, error FROM outbox ORDER BY id DESC LIMIT 10"),
+      // What this scope's tenant may use, as the registry last gave it here (the defaults before it ever did).
+      limits: (() => {
+        try {
+          return limitsFrom(JSON.parse(this.#store.meta("limits") ?? "null"));
+        } catch {
+          return limitsFrom(null);
+        }
+      })(),
       tokens_today: this.#runner.tokensToday(),
       health: {
         oldest_pending_age_ms: (() => {

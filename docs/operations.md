@@ -171,15 +171,26 @@ The first two share one key, `withheld:<run id>`, so a person gets at most one o
 
 ## Limits
 
-These are constants in the code, not configuration.
+The first four can be set for each tenant; the table gives what holds where they were not. The rest are constants in the code.
+
+```bash
+# A tenant's limits as they stand, and the defaults
+curl -H "authorization: Bearer $ADMIN_KEY" https://<your domain>/v1/admin/tenants/<tenant>/limits
+# Set some of them: those not named stay as they are, and null puts one back to the default
+curl -X PUT -H "authorization: Bearer $ADMIN_KEY" -H "content-type: application/json" \
+  -d '{"scope_daily_tokens": 5000000, "scope_active_tasks": null}' \
+  https://<your domain>/v1/admin/tenants/<tenant>/limits
+```
+
+Their names: `scope_daily_tokens`, `tenant_daily_tokens`, `scope_active_tasks`, `tenant_sandboxes`. Each is a whole number, 0 or more. A change takes effect in a scope from its next call to the model. A scope already paused because its day was spent goes on the next day (UTC): raising a limit does not wake it earlier.
 
 | What | Limit |
 |---|---|
-| Tokens per scope per day | 2,000,000 |
-| Tokens per tenant per day | 20,000,000 |
+| Tokens per scope per day | 2,000,000 (can be set) |
+| Tokens per tenant per day | 20,000,000 (can be set) |
 | Model steps per run | 16 |
 | Events claimed into one run | 40 |
-| Sandbox tasks at once | 3 per scope, 5 per tenant |
+| Sandbox tasks at once | 3 per scope, 5 per tenant (both can be set) |
 | Sandbox task: startup / idle / lifetime | 5 min / 15 min / 2 h |
 | Sandbox task: model calls | 400 |
 | Sandbox task: recoveries after losing the container | 2 |
