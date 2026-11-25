@@ -2082,6 +2082,41 @@ describe("a request that waits and is carried on", () => {
     expect(model.remaining()).toBe(0);
   });
 
+  it("ends the request also when Feishu gives no answer at all to the exchange, and when the authorisation is taken away while it is exchanged", async () => {
+    // The connection breaks while the code is being exchanged.
+    const vera = owner("DocVera00000000000001");
+    const first = await asksFor(vera, "DocVera00000000000001");
+    feishu.duringExchange = async () => {
+      feishu.duringExchange = undefined;
+      throw new TypeError("network connection lost");
+    };
+    expect((await consent(invitation(vera.openId), vera)).status).toBe(400);
+    await vera.settle();
+    expect(await vera.requests()).toMatchObject([{ id: first, status: "void" }]);
+    expect(vera.heard()).toEqual([NOT_AUTHORISED]);
+    const second = await asksFor(vera, "DocVera00000000000001");
+    carriesOn("好了");
+    await authorises(vera);
+    expect(vera.heard()).toEqual([NOT_AUTHORISED, "好了"]);
+    expect(await vera.requests()).toMatchObject([{ id: first, status: "void" }, { id: second, status: "done" }]);
+    expect(read()).toEqual(["DocVera00000000000001"]);
+
+    // Taken away while it is exchanged: nothing is kept, nothing is put on record under the new
+    // generation, and the request that waited is over at once.
+    const wade = owner("DocWade00000000000001");
+    const waited = await asksFor(wade, "DocWade00000000000001");
+    feishu.duringExchange = async () => {
+      feishu.duringExchange = undefined;
+      await (await wade.grant()).drop(wade.who);
+    };
+    expect((await consent(invitation(wade.openId), wade)).status).toBe(400);
+    await wade.settle();
+    expect(await wade.requests()).toMatchObject([{ id: waited, status: "void" }]);
+    expect((await (await wade.grant()).status()).authorised).toBe(false);
+    const kept = await runInDurableObject(await wade.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"));
+    expect(kept.outcomes).toBeUndefined();
+  });
+
   it("wakes every request the authorisation covers, whichever card it was given with (F16)", async () => {
     const tom = owner("DocTom000000000000001");
     feishu.wiki.set("WikiTom00000000000001", { obj_type: "docx", obj_token: "DocTom000000000000001" });
@@ -3342,12 +3377,12 @@ describe("the answer to an invitation made for one question", () => {
     const denied = someone();
     const first = await asked(denied);
     await consent(first.authorize, denied, "deny");
-    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toMatchObject({ state: "gone", refused: true });
+    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toEqual({ state: "gone" });
 
     const victim = someone();
     const second = await asked(victim);
     expect((await consent(second.authorize, someone())).status).toBe(403);
-    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toMatchObject({ state: "gone", refused: true });
+    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toEqual({ state: "gone" });
     expect((await second.grant.status()).authorised).toBe(false);
 
     const unlucky = someone();
@@ -3356,7 +3391,7 @@ describe("the answer to an invitation made for one question", () => {
     back.searchParams.set("state", third.authorize.searchParams.get("state")!);
     back.searchParams.set("code", "a-code-feishu-never-gave");
     expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
-    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toMatchObject({ state: "gone", refused: true });
+    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toEqual({ state: "gone" });
   });
 });
 

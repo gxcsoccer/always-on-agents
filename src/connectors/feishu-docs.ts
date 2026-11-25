@@ -549,12 +549,12 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   // An invitation made for one question was claimed by this answer. However it ends short of
   // the person's own token being kept, that invitation is over (a no-op for any other kind).
   if (url.searchParams.has("error") || !/^[A-Za-z0-9_-]{1,512}$/.test(code)) {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     return page("没有授权", "你没有完成授权，我不会读取你的文档。需要时可以回到飞书重新发起请求。");
   }
 
   const refused = async (why: string, answer?: { status: number; code?: unknown; endpoint?: "v2" | "v3" }) => {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     // Which step failed, for the operator, and for a call Feishu turned down, its HTTP status and
     // Feishu's own numeric error code: both from fixed lists. Nothing else Feishu or the browser
     // sent is logged.
@@ -571,11 +571,13 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   // allowed the app before: Feishu's consent is cumulative, and a token for all of it is not ours
   // to hold. The code is used once.
   // One endpoint per code, chosen by the app's setting; never one after the other.
+  // No answer at all (the connection broke) is a failure like any other: the invitation is spent.
   const exchange = await fetch(app.oauth_v2 ? TOKEN_V2 : TOKEN_V3, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ grant_type: "authorization_code", client_id: app.app_id, client_secret: app.app_secret, code, redirect_uri: invitation.redirect, code_verifier: invitation.verifier, scope: invitation.scope.join(" ") }),
-  });
+  }).catch(() => undefined);
+  if (!exchange) return refused("exchange_unanswered");
   const answer = ((await exchange.json().catch(() => null)) as unknown) ?? {};
   const issued = (typeof answer === "object" ? answer : {}) as { code?: number; access_token?: string; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number };
   // A token that is there and has time left, or nothing.
@@ -588,11 +590,12 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
 
   // Whose token is it? The answer must be the person the invitation was sent to, in the same
   // organisation. Anyone else who opened the link and consented gets nothing installed.
-  const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } });
+  const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } }).catch(() => undefined);
+  if (!asked) return refused("identity_unanswered");
   const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
   if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
-    await grant.fail(state[2]);
+    await grant.fail(state[2], invitation);
     console.log(JSON.stringify({ feishu_authorisation_refused: "another_account", app: who.app_id }));
     return page("授权的账号不对", "完成授权的飞书账号，不是发起请求的那个账号，所以没有生效。请用发起请求的账号重新操作。", 403);
   }

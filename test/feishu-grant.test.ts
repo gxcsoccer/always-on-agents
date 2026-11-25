@@ -147,11 +147,11 @@ describe("an invitation made for one question", () => {
     const p = await someone();
     const nonce = await p.asks("om_1");
     await p.inside((grant) => grant.redeem(nonce));
-    await p.inside((grant) => grant.fail(nonce));
-    expect(await p.answered(nonce)).toEqual({ state: "gone", refused: true });
+    await p.inside((grant) => grant.fail(nonce, { generation: 1, brain: "acme:chat:oc_1" }));
+    expect(await p.answered(nonce)).toEqual({ state: "gone" });
     expect(await p.inside((grant) => grant.install(1, TOKEN, nonce))).toBe(false);
     expect((await p.stored()).grant).toBeUndefined();
-    expect(await p.answered(nonce)).toEqual({ state: "gone", refused: true });
+    expect(await p.answered(nonce)).toEqual({ state: "gone" });
     expect(await p.inside((grant) => grant.redeem(nonce))).toBeNull();
     // The same question asked again is given a new one.
     expect(await p.asks("om_1")).not.toBe(nonce);
