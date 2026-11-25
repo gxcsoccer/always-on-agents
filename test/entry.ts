@@ -22,7 +22,7 @@ export class FakeTask extends DurableObject {
     if (String((input as { prompt?: unknown })?.prompt ?? "").includes("(the start is not answered)")) throw new Error("connection lost");
     return { phase: "running" };
   }
-  /** As the real task: whether it was ever started here; if not, it is closed. */
+  /** As the real task: whether it was ever started here. (The real one also closes an id it never took; nothing here starts one afterwards.) */
   async claimed() {
     return this.ctx.storage.kv.get("started") === true ? "there" : "none";
   }

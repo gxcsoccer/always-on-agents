@@ -497,6 +497,33 @@ describe("tasks, by themselves", () => {
         expect(worker.started).toEqual([]);
         expect(store.rows("SELECT task_id FROM unconfirmed")).toEqual([{ task_id: "t_again" }]);
       });
+      // No place to be had, on the same call made again: not failed either, for the same reason.
+      await within(async ({ tasks, store, kept, slots, task }) => {
+        task("t_again", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_again' WHERE id = 't_again'");
+        slots.acquire = async () => false;
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ status: "unconfirmed" });
+        expect(kept("t_again").status).toBe("unconfirmed");
+      });
+      // It has reported meanwhile: it began, whatever the registry says. And one that ended meanwhile is told as it ended.
+      await within(async ({ tasks, store, kept, slots, task }) => {
+        task("t_again", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_again' WHERE id = 't_again'");
+        slots.acquire = async () => {
+          await tasks.event("t_again", 1, "progress", { message: "cloning" });
+          return false;
+        };
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ status: "running" });
+        expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
+        task("t_done", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_done' WHERE id = 't_done'");
+        slots.acquire = async () => {
+          await tasks.event("t_done", 1, "result", { status: "succeeded", summary: "done" });
+          throw new Error("registry down");
+        };
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_done", "t", "b", null)).toMatchObject({ status: "succeeded" });
+        expect(kept("t_done").status).toBe("succeeded");
+      });
     });
 
     it("lets a task that is not confirmed be called off like any other", async () => {

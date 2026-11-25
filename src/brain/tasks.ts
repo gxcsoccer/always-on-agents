@@ -168,26 +168,36 @@ export class Tasks implements Wakes {
       throw new Error("this worker cannot be started from here");
     }
 
-    let slot: boolean;
+    let slot: boolean | Error;
     try {
       slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id);
     } catch (err) {
-      // The same call made again, for a task an earlier attempt may already have started: whether
-      // it did is not known, and is found out rather than guessed.
+      slot = err instanceof Error ? err : new Error(String(err));
+    }
+    if (slot !== true) {
+      // The same call made again, for a task an earlier attempt may already have started. Read
+      // again after the wait: what the worker reported meanwhile is what happened. Otherwise
+      // whether it started is not known, and is found out rather than guessed.
       if (replayed) {
-        this.#unconfirmed(task.id);
-        await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+        const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
+        if (now.status !== "dispatching") return this.#told(now);
+        if (this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {
+          this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
+        } else {
+          this.#unconfirmed(task.id);
+          await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+        }
         return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+      }
+      if (slot === false) {
+        this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
+        throw new Error("too many sandboxes are running for this tenant right now; try again later");
       }
       // The reservation may have been made even though its reply was lost; give it back.
       await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
       // The task must not be left "dispatching": nothing would ever pick it up again.
-      this.#set(task.id, "failed", { result: JSON.stringify({ error: `the registry could not be reached: ${String(err).slice(0, 300)}` }) });
+      this.#set(task.id, "failed", { result: JSON.stringify({ error: `the registry could not be reached: ${String(slot).slice(0, 300)}` }) });
       throw new Error("the sandbox could not be started; try again");
-    }
-    if (!slot) {
-      this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
-      throw new Error("too many sandboxes are running for this tenant right now; try again later");
     }
     // The same start, made again, is the same piece of work (it is named by the id written before
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
