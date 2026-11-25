@@ -47,6 +47,8 @@ const feishu = {
   renewalFault: undefined as undefined | "no_answer" | "garbage" | "wider" | "null" | "no_lifetime" | "twice",
   /** Runs while a code is being exchanged. */
   duringExchange: undefined as undefined | (() => Promise<void>),
+  /** What the question "whose token is this" is answered with, once, in place of the truth. */
+  identityAnswer: undefined as undefined | (() => Response),
   /** Runs while a renewal is being answered. */
   duringRenewal: undefined as undefined | (() => Promise<void>),
   /** Every token exchange: which endpoint, for which app. */
@@ -124,6 +126,7 @@ function installFakeFeishu() {
   feishu.renewalFault = undefined;
   feishu.duringRenewal = undefined;
   feishu.duringExchange = undefined;
+  feishu.identityAnswer = undefined;
   feishu.sendAttempts = 0;
   feishu.wikiNotCovered = false;
   feishu.duringRead = undefined;
@@ -255,6 +258,11 @@ function installFakeFeishu() {
     }
     if (url.host !== "open.feishu.cn") throw new Error(`unexpected fetch to ${url.href}`);
     const user = feishu.tokens.get(bearer);
+    if (url.pathname.endsWith("/authen/v1/user_info") && feishu.identityAnswer) {
+      const answer = feishu.identityAnswer;
+      feishu.identityAnswer = undefined;
+      return answer();
+    }
     if (url.pathname.endsWith("/authen/v1/user_info")) return user?.good ? Response.json({ code: 0, data: { open_id: user.open_id, tenant_key: user.tenant_key } }) : Response.json({ code: 99991668 }, { status: 401 });
     // What a document is made of, looked up when it holds little text. Not a read of its content,
     // so it is counted apart; the same person's token and the same access apply.
@@ -2100,6 +2108,16 @@ describe("a request that waits and is carried on", () => {
     expect(vera.heard()).toEqual([NOT_AUTHORISED, "好了"]);
     expect(await vera.requests()).toMatchObject([{ id: first, status: "void" }, { id: second, status: "done" }]);
     expect(read()).toEqual(["DocVera00000000000001"]);
+
+    // Feishu answers "whose token is this" with something that is no answer: over, like any other failure.
+    const xia = owner("DocXia000000000000001");
+    const lost = await asksFor(xia, "DocXia000000000000001");
+    feishu.identityAnswer = () => new Response("null", { headers: { "content-type": "application/json" } });
+    expect((await consent(invitation(xia.openId), xia)).status).toBe(400);
+    await xia.settle();
+    expect(await xia.requests()).toMatchObject([{ id: lost, status: "void" }]);
+    expect(xia.heard()).toEqual([NOT_AUTHORISED]);
+    expect((await (await xia.grant()).status()).authorised).toBe(false);
 
     // Taken away while it is exchanged: nothing is kept, nothing is put on record under the new
     // generation, and the request that waited is over at once.

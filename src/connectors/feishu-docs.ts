@@ -15,7 +15,7 @@
  * consented is the very person who was invited.
  */
 import type { Env } from "../env";
-import { registry } from "../registry";
+import { type FeishuApp, registry } from "../registry";
 import { type Scope, chainLevels, scopeName } from "../events";
 import { API, type ChatFacts, TOKEN_V2, TOKEN_V3, chatFactsFor } from "./feishu-api";
 import { OFFLINE, SCOPES, type Who, grantName, grantsKey, lifetime, sameSet } from "./feishu-grant";
@@ -562,6 +562,11 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
     console.log(JSON.stringify({ feishu_authorisation_refused: why, app: who.app_id, ...(answer ? { status: answer.status, ...(code !== undefined ? { code } : {}), ...(answer.endpoint ? { endpoint: answer.endpoint } : {}) } : {}) }));
     return page("授权没有成功", "请回到飞书，重新向我发起请求。如果一直不成功，请联系管理员。", 400);
   };
+  // Everything up to keeping the token: whatever goes wrong in it, also something thrown (a
+  // connection that broke, an answer that is not what it should be, the registry not answering),
+  // ends the invitation like any other failure. Keeping the token comes after, on its own: if
+  // that throws, whether it was kept is not known, and the invitation is not called failed.
+  const prepared = await (async (): Promise<Response | { app: FeishuApp; issued: { access_token: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number }; granted: string[]; lasting: boolean }> => {
   const app = await registry(env).feishuApp(who.app_id);
   if (!app) return refused("unknown_app");
   // Lasting authorisations were turned off for this app after the invitation went out: it is
@@ -592,7 +597,8 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   // organisation. Anyone else who opened the link and consented gets nothing installed.
   const asked = await fetch(`${API}/authen/v1/user_info`, { headers: { authorization: `Bearer ${issued.access_token}` } }).catch(() => undefined);
   if (!asked) return refused("identity_unanswered");
-  const info = (await asked.json().catch(() => ({}))) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
+  const told = ((await asked.json().catch(() => null)) as unknown) ?? {};
+  const info = (typeof told === "object" ? told : {}) as { code?: number; data?: { open_id?: string; tenant_key?: string } };
   if (!asked.ok || info.code !== 0) return refused("identity_unknown", { status: asked.status, code: info.code });
   if (info.data?.open_id !== who.open_id || info.data?.tenant_key !== who.tenant_key) {
     await grant.fail(state[2], invitation);
@@ -606,6 +612,10 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
   if (invitation.scope.includes(OFFLINE) && !lasting) return refused("no_refresh_token");
   // And if it was turned off while Feishu was answering, what came back is not kept.
   if (invitation.scope.includes(OFFLINE) && !(await registry(env).feishuApp(who.app_id))?.oauth_offline) return refused("offline_turned_off");
+  return { app, issued: issued as { access_token: string }, granted, lasting };
+  })().catch(() => refused("interrupted"));
+  if (prepared instanceof Response) return prepared;
+  const { app, issued, granted, lasting } = prepared;
   const kept = await grant.install(invitation.generation, {
     access_token: issued.access_token,
     expires_at: Date.now() + lifetime(issued.expires_in) * 1_000,
