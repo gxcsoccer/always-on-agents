@@ -753,7 +753,7 @@ describe("tasks, by themselves", () => {
         store.sql.exec("UPDATE tasks SET requested_by = NULL WHERE id = 't_nobodys'");
         const one = settings.deciders;
         settings.deciders = [];
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_nobody", "sandbox", "t", "b", { repository: null }, "t_nobodys")).rejects.toThrow("there is no piece of work");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_nobody", "sandbox", "t", "b", { repository: null }, "t_nobodys")).rejects.toThrow("can only be asked for in answer to the one person");
         settings.deciders = one;
 
         // A worker that does not say it goes on is never asked to.
