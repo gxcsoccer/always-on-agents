@@ -524,6 +524,20 @@ describe("tasks, by themselves", () => {
         expect(await tasks.dispatch(RUN, SESSION_KEY, "call_done", "t", "b", null)).toMatchObject({ status: "succeeded" });
         expect(kept("t_done").status).toBe("succeeded");
       });
+      // The same where the place is had: one that has ended meanwhile is told as it ended, nothing more is asked of its worker, and the place just taken is given back.
+      await within(async ({ tasks, store, kept, slots, worker, task }) => {
+        task("t_had", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_had' WHERE id = 't_had'");
+        slots.acquire = async () => {
+          await tasks.event("t_had", 1, "result", { status: "succeeded", summary: "done" });
+          slots.released.length = 0;
+          return true;
+        };
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_had", "t", "b", null)).toMatchObject({ status: "succeeded" });
+        expect(worker.started).toEqual([]);
+        expect(slots.released).toEqual(["t_had"]);
+        expect(kept("t_had").status).toBe("succeeded");
+      });
     });
 
     it("lets a task that is not confirmed be called off like any other", async () => {
