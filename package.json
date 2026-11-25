@@ -14,7 +14,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "tsc --noEmit && vitest run"
+    "check": "tsc --noEmit && vitest run",
+    "eval": "node eval/run.mjs"
   },
   "dependencies": {
     "@cloudflare/sandbox": "1.0.3"
