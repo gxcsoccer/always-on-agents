@@ -657,6 +657,14 @@ describe("tasks, by themselves", () => {
         expect(calls.at(-1)).toEqual(["cancel", unnamed.task_id]);
         expect(slots.released).toEqual([said.task_id, unnamed.task_id]);
 
+        // Another worker's options, left null by the call, never reach it: not on the first call, and not when the call is made again.
+        const before = calls.length;
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", unnamed.task_id);
+        await tasks.dispatch(RUN, SESSION_KEY, "call_2b", "probe", "t", "b", { depth: 1, repository: null });
+        expect(calls.slice(before).filter((each) => each[0] === "start").map((each) => each[2])).toEqual([{ depth: 1 }]);
+        // And a call is the call it was only in its own conversation.
+        await expect(tasks.dispatch(RUN, "thread:elsewhere", "call_2b", "probe", "t", "b", { depth: 1 })).rejects.toThrow("first made in another conversation");
+
         // With the worker that tool was for offered again, such a call goes to it, whatever else there is.
         settings.workers = ["sandbox"];
         const old = (await tasks.dispatch(RUN, SESSION_KEY, "call_5", null, "t", "b", { repository: null })) as { task_id: string };
