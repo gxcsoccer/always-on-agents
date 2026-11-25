@@ -202,6 +202,30 @@ describe("a sandbox task whose agent ended just inside its life", () => {
   });
 });
 
+describe("a sandbox task started again from a checkpoint while its earlier run's ending was being read", () => {
+  it("is not ended by that earlier ending: the run it has now goes on, and the copy taken of the old one is put with those to remove", async () => {
+    const { task, container, records } = fixture();
+    await task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    ended(container, { code: "0", events: DONE });
+    backups.whileTaking = async () => {
+      // The container was lost and the task brought back meanwhile: it has a new run now.
+      const state = records.get("state");
+      state.recoveries += 1;
+      state.runs.push({ kind: "resume", started_at: Date.now() });
+      records.set("state", state);
+    };
+    backups.deleteFails = true;
+    await task.callback("exit", records.get("state").token, {});
+    const now = records.get("state");
+    expect(now.phase).toBe("running");
+    expect(now.runs.at(-1)).toMatchObject({ kind: "resume" });
+    expect(now.runs.at(-1).ended_at).toBeUndefined();
+    expect(now.checkpoint?.final).toBeUndefined();
+    expect(now.stale_checkpoints).toEqual([{ id: "taken-1" }]);
+    expect(await task.snapshot()).toBeNull();
+  });
+});
+
 describe("a sandbox task, started and stopped", () => {
   it("turns away a start that arrives after it was stopped, or asked about and found absent", async () => {
     const stopped = fixture();

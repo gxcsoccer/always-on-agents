@@ -173,7 +173,10 @@ export class Tasks implements Wakes {
     // (A call is the call it was only in the conversation it was made in: looked at before anything is told or taken.)
     if (task && task.session_key !== sessionKey) throw new Error("this call was first made in another conversation; nothing further was started");
     // One that goes on from earlier work is, besides, only the call of the one person it was made for.
-    if (task && this.#s.rows("SELECT 1 FROM task_follows WHERE task_id = ?", task.id).length > 0) {
+    // And what it goes on from is what was written with it when that was found to be allowed: a call that says otherwise is not this call.
+    const wrote = task ? (this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null) : null;
+    if (task && from !== wrote) throw new Error("this call was first made for something else; nothing further was started");
+    if (task && wrote !== null) {
       const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
       if (people.length !== 1 || people[0] !== task.requested_by) throw new Error("this call was first made for someone else; nothing further was started");
     }
@@ -313,10 +316,8 @@ export class Tasks implements Wakes {
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
     // The waiting has an end of its own, for both tries together: a call that neither answers nor
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
-    // What it goes on from is what was written with it when that was found to be allowed: a call
-    // made again that says otherwise is not this call. (One written before this was kept goes on from nothing.)
+    // (What it goes on from: as written with it, see above. One written before this was kept goes on from nothing.)
     const follows = this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null;
-    if (replayed && from !== null && follows !== null && from !== follows) throw new Error("this call was first made for something else; nothing further was started");
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
     const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);

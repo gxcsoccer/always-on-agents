@@ -1003,6 +1003,17 @@ export class TaskSandbox extends DurableObject<Env> {
     } catch (err) {
       const state = this.#state();
       if (!state) return;
+      // Its life ran out while it was being brought back: ended for that, as it is wherever else
+      // that is found, and the container made for it is not kept.
+      if (state.phase === "starting" && Date.now() - state.created_at > lifetimeOf(state)) {
+        state.phase = "failed";
+        state.error = "exceeded the maximum lifetime";
+        this.#emit(state, "failed", { error: state.error });
+        this.#save(state);
+        this.ctx.waitUntil(this.#flush());
+        if (this.#container.running) await this.#container.destroy();
+        return;
+      }
       state.phase = "lost";
       state.error = `recovery failed: ${String(err)}`;
       this.#emit(state, "lost", { error: state.error });
@@ -1210,6 +1221,12 @@ export class TaskSandbox extends DurableObject<Env> {
     let lost: string | undefined;
     let events = "";
     let stderr = "";
+    // What is read below is the ending of this run of the agent, and settles this run only. If
+    // the container is lost meanwhile and the task is started again from a checkpoint, or it is
+    // stopped, what was read is of a run that is no longer the task's: it ends nothing.
+    const round = before.runs.length;
+    const recoveries = before.recoveries;
+    const same = (now: TaskState | undefined): boolean => now !== undefined && ACTIVE.has(now.phase) && now.runs.length === round && now.recoveries === recoveries;
 
     // A missing container is the alarm's business: it decides between restoring and giving up.
     if (!this.#container.running) return;
@@ -1243,7 +1260,7 @@ export class TaskSandbox extends DurableObject<Env> {
     // (Both paths can come here for the same ending: the one that finds the copy being taken, or the
     // ending already settled while it was reading, leaves it to the other. Nothing is awaited from here to the mark.)
     const still = this.#state();
-    if (this.#leaving || !still || !ACTIVE.has(still.phase)) return;
+    if (this.#leaving || !same(still)) return;
     if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
       this.#leaving = true;
@@ -1258,8 +1275,8 @@ export class TaskSandbox extends DurableObject<Env> {
 
     // Re-read: the other path may have settled this run while we were reading files.
     const state = this.#state();
-    if (!state || !ACTIVE.has(state.phase)) {
-      // Settled by the other path, or stopped, meanwhile: the copy just taken is nobody's. It is
+    if (!state || !same(state)) {
+      // Settled by the other path, stopped, or started again from a checkpoint, meanwhile: the copy just taken is nobody's. It is
       // written down as one to remove before it is removed, so that a removal that fails is tried
       // again when the task's records are cleared.
       if (last) {
