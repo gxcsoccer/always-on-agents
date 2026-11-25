@@ -37,6 +37,10 @@ export const QUOTED_WAIT_MS = 3_000;
 /** How far up the chain of replies a message stands in is followed. */
 export const MAX_CHAIN = 5;
 const MAX_EVENT_BYTES_PER_RUN = 120_000;
+/** For how long finished work of a worker that can go on from it is listed as such: a little under the day its worker keeps what it left. */
+const GOES_ON_FOR_MS = 23 * 60 * 60_000;
+/** How many pieces of finished work are listed that way: the latest. */
+const MAX_FINISHED_LISTED = 5;
 /** How many pictures a run is shown at most: the latest. */
 const MAX_PICTURES_SHOWN = 4;
 /** How long before a message the same person's pictures here still count as going with it. */
@@ -1207,7 +1211,7 @@ export class Runner {
     const workers = workersIn(acting, this.#b.toolsOf, this.#b.workers());
     const carrying = new Set(workers.flatMap((each) => (each.tool ? [each.tool] : [])));
     // (Nor where its worker is not among them: such a tool is a worker's way in and nothing else.)
-    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined })), carrying.size > 0 ? REPLACES : undefined);
+    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true })), carrying.size > 0 ? REPLACES : undefined);
     const own = [...TOOLS, ...handing];
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
@@ -1272,6 +1276,11 @@ export class Runner {
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
         ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status === "unconfirmed" ? "start not confirmed (it is not known yet whether it began; this is being checked and you will be told: do not hand the same work over again)" : each.status })),
+        // Work that ended well in this conversation in the last day, of a worker that can go on from it: its files are kept that long.
+        ...(session ? this.#s.rows<{ id: string; worker: string; title: string }>("SELECT id, worker, title FROM tasks WHERE status = 'succeeded' AND session_key = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?", session.session_key, Date.now() - GOES_ON_FOR_MS, MAX_FINISHED_LISTED) : [])
+          .filter((each) => this.#b.workers().some((worker) => worker.name === each.worker && worker.goes_on === true))
+          .reverse()
+          .map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: "done (what it left is kept for about a day: more work on the same thing goes on from it, with its id in continue_from)" })),
         ...theirs.map((each) => {
           const record = this.#b.requests.record(each.id);
           const waits = each.state === "open" && record?.status === "waiting" ? (record.interaction !== "" ? ("authorisation" as const) : ("result" as const)) : undefined;

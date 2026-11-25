@@ -118,7 +118,7 @@ export class Tasks implements Wakes {
    * more than one): then the one worker this deployment has that is started this way. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
-  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>): Promise<unknown> {
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null): Promise<unknown> {
     const scope = this.#s.scope();
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
@@ -130,6 +130,15 @@ export class Tasks implements Wakes {
     const startable = this.#b.workers().filter((each) => each.start !== undefined);
     const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : startable.length === 1 ? startable[0] : undefined;
     (task ? this.#b.workerOf(String(task.worker)) : offered)?.accepts?.(options, scope);
+    // Going on from an earlier piece of work: it has to be this conversation's, this worker's, and
+    // one that ended well; and the worker has to be one that goes on at all. Whoever asks, and
+    // whatever was approved then, are this new piece's own: nothing of the earlier one's is carried.
+    if (!task && from !== null) {
+      const earlier = this.#s.rows<Row>("SELECT worker, session_key, status FROM tasks WHERE id = ?", from)[0];
+      if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
+      if (!earlier || earlier.session_key !== sessionKey || earlier.worker !== offered.name) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
+      if (earlier.status !== "succeeded") throw new Error(`that piece of work ${TERMINAL_TASK.has(String(earlier.status)) ? "did not end well" : "has not ended yet"}, so there is nothing of it to go on from; ${TERMINAL_TASK.has(String(earlier.status)) ? "hand this over as something new" : "wait for it, or hand this over as something new"}`);
+    }
     if (!task) {
       // Something new is taken only by a worker this deployment lists, and one that is started from here. Nothing is written for any other.
       if (!offered?.start) throw new Error("this deployment has no worker to hand this to");
@@ -171,7 +180,7 @@ export class Tasks implements Wakes {
         JSON.stringify({ task_id: id }),
         now,
       );
-      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, ...options });
+      this.#s.audit(requestedBy ?? "(automation)", "task.dispatched", { task_id: id, title, ...options, ...(from !== null ? { continue_from: from } : {}) });
       task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", id)[0];
     }
     if (task.status !== "dispatching") return this.#told(task);
@@ -229,7 +238,7 @@ export class Tasks implements Wakes {
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, ...(from !== null ? { continue_from: from } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
