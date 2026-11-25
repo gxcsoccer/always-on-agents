@@ -318,7 +318,7 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
   });
   // Where several people talk, the agent is sent only what mentions it: a link they posted without that never arrived.
   const shared = context.scope.kind === "chat";
-  if (!chosen.some(matches)) return { error: `only a document the person linked themselves can be read: in this request, or in their own messages here over the last day; ask them to ${shared ? "reply to their message with the link and mention you, or to send the link again" : "send the link"}` };
+  if (!chosen.some(matches)) return { error: `only a document the person linked themselves can be read: in this request, or in their own messages here over the last day; ask them to ${shared ? "reply to their message with the link and mention you, to send the link again, or (for a colleague's message that links it) to reply to that message and mention you" : "send the link"}` };
 
   const redirect = redirectUri(env);
   // Which of the two settings is missing or malformed is said apart, so the operator can tell.

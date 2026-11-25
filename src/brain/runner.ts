@@ -329,7 +329,8 @@ export class Runner {
       const principal = JSON.parse(event.principal) as Principal;
       // Only a person's ordinary message written as a reply, and only once: not an answer to a question.
       if (event.kind !== "message" || principal.kind !== "human" || typeof data.replies_to !== "string" || data.quoted !== undefined || data.chain !== undefined || data.question !== undefined) continue;
-      const key = JSON.stringify([event.source, principal.id, data.replies_to, data.origin ?? null]);
+      // (And how surely it names it: what is found for a reply to the very message is not what is found for one that only stands under it.)
+      const key = JSON.stringify([event.source, principal.id, data.replies_to, data.replied_directly === true, data.origin ?? null]);
       const same = asked.get(key);
       if (same) same.ids.push(event.id);
       else asked.set(key, { event, ids: [event.id] });
@@ -387,7 +388,7 @@ export class Runner {
         next = here.next;
         if (level > 1) chain.push({ subject });
       } else {
-        const found: Quoted | "late" | undefined = await Promise.race([this.#b.quoted(event.source, { principal, data: { ...data, replies_to: subject }, signal }), late]).catch((): Quoted => ({}));
+        const found: Quoted | "late" | undefined = await Promise.race([this.#b.quoted(event.source, { principal, data: { ...data, replies_to: subject, replied_directly: level === 1 ? data.replied_directly : undefined }, signal }), late]).catch((): Quoted => ({}));
         // One that is on record here (a colleague's, asked about so that its words might be shown)
         // and could not be had from the connector, for whatever reason: it is treated as it was
         // before its words were ever asked for. It stands in the conversation already, and the
@@ -1364,10 +1365,14 @@ function plain(data: Record<string, unknown>): boolean {
   return ["card", "question", "reply_only", "routed_from", "about_question"].every((each) => data[each] === undefined);
 }
 
-/** What a message replies to, if anything. */
+/**
+ * What a message replies to, if anything, and how surely: named as the very message replied to,
+ * or only as where the exchange began. The two may name the same message and are still not the
+ * same binding: what may be shown of that message differs.
+ */
 function repliesTo(event: InboxRow): string | null {
-  const to = event.data ? (JSON.parse(event.data) as { replies_to?: unknown }).replies_to : undefined;
-  return typeof to === "string" ? to : null;
+  const data = event.data ? (JSON.parse(event.data) as { replies_to?: unknown; replied_directly?: unknown }) : {};
+  return typeof data.replies_to === "string" ? `${data.replied_directly === true ? "directly" : "somewhere under"} ${data.replies_to}` : null;
 }
 
 /** The strings in what some reads were made with (their canonical calls): what a person or a model can recognise them by. */

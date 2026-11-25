@@ -363,6 +363,31 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("keeps a reply to the very message apart from one that only stands under it, whichever arrives first", async () => {
+      for (const order of [["direct", "under"], ["under", "direct"]]) {
+        await within(async ({ runner, store, event, items, settings, log }) => {
+          // As a connector does: a colleague's words only where the event said this is the very message replied to.
+          settings.quoted = (asked: { data?: Record<string, unknown> }) => (asked.data?.replied_directly === true ? { text: "the colleague's plan", other: true } : {});
+          for (const kind of order) event(`asked ${kind}`, { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_plan", ...(kind === "direct" ? { replied_directly: true } : {}) } });
+          const seen: Record<string, string> = {};
+          for (let n = 0; n < 2; n++) {
+            store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'");
+            store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+            const content = items((await runner.next())!)[0].content as string;
+            // Each is a run of its own, read under its own binding.
+            expect(content.match(/asked (direct|under)/g)).toHaveLength(1);
+            seen[content.includes("asked direct") ? "direct" : "under"] = content;
+          }
+          expect(seen.direct).toContain("written as a reply to a message of another member here");
+          expect(seen.under).toContain("a message here that is not shown to you");
+          const kept = store.rows<{ text: string; data: string }>("SELECT text, data FROM inbox ORDER BY id");
+          expect(kept.map((each) => [each.text, JSON.parse(each.data).quoted])).toEqual(order.map((kind) => [`asked ${kind}`, kind === "direct" ? { text: "the colleague's plan", other: true } : {}]));
+          // Each was asked about on its own: what was found for one is not written to the other.
+          expect(log.filter((each) => each[0] === "quoted")).toHaveLength(2);
+        });
+      }
+    });
+
     it("does not ask about a message that is on record, whoever wrote it and whatever is left of it, nor about an answer to a question", async () => {
       await within(async ({ runner, store, event, items, settings, log }) => {
         settings.quoted = { text: "fetched again" };
