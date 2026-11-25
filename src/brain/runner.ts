@@ -1034,7 +1034,8 @@ export class Runner {
    * For the operator: the shape of what the model is shown for a run, as it would be put
    * together now. For each of the last entries: whose it is, how long, and the label the system
    * itself wrote at its head (the bracketed words: a time, or what kind of thing it is). For the
-   * turn the run was started by, also the notes the system wrote under it, each cut short. Never
+   * turn the run was started by, also the notes the system wrote under it: only those it writes
+   * itself about replies, and each only up to where a person's words would begin. Never
    * what a person or a document said. With it: which tools it would be offered, and whether it
    * counts as someone waiting.
    */
@@ -1047,7 +1048,7 @@ export class Runner {
       .map((item) => {
         const body = item as Record<string, unknown>;
         const content = typeof body.content === "string" ? body.content : Array.isArray(body.content) ? (body.content as { text?: unknown }[]).map((each) => String(each?.text ?? "")).join("") : String(body.output ?? body.arguments ?? "");
-        const notes = body.role === "user" ? content.split("\n").filter((line) => line.startsWith("  (")).map((line) => line.trim().slice(0, 70)) : [];
+        const notes = body.role === "user" ? content.split("\n").filter((line) => /^  \((written as a reply to|that stands in a chain of replies)/.test(line)).map((line) => line.trim().split(":")[0].slice(0, 70)) : [];
         return { role: String(body.role ?? body.type ?? "?") + (typeof body.name === "string" ? `:${body.name}` : ""), chars: content.length, ...(label(content) ? { label: label(content) } : {}), ...(notes.length > 0 ? { notes } : {}) };
       });
     const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
