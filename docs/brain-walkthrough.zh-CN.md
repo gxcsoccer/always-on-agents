@@ -150,7 +150,7 @@ flowchart TD
 - **超日预算**：作用域每日上限 200 万 Token、租户每日上限 2,000 万 Token。一旦触顶，先退还刚才预扣的 20k 额度。普通 `run` 将 `entries` 减 1（不算故障），把 `retry_at` 设为次日 UTC `00:00:30` 暂停等待，消息一条不丢；续办等待请求的 run 等不到明天（请求有期限），这个 run 就此结束；若请求正处于续办中（`resuming`），它转入 `answering`，排队一条「额度用完」的固定通知代替回答，通知投递完成后请求才结束。
 - **失败退避与 `#abandon()`**：模型可重试错误（429 / 5xx / 网络断连）按 `5s → 30s → 2m → 5m` 退避重试；超过 `MAX_RUN_ENTRIES = 5` 次重入或遇到不可重试错误时触发 `#abandon()`：
   1. 为所有悬空的 `function_call` 补写错误 `function_call_output`，保持对话历史合法、不拖累后续 `run`；
-  2. 把本会话仍停留在 `dispatching` 的任务标记为 `failed`；
+  2. 把本会话仍停留在 `dispatching` 的任务标记为 `unconfirmed`（启动未确认），交给后台去问 worker 它到底有没有接到（见 `Tasks.settle`）：确认从未开始的记失败并立刻归还名额，确认已开始的转为运行中，始终问不到的记为丢失（租户名额等期限或 worker 的结束汇报再还）；
   3. 通知用户出错，将本批 `inbox` 标 `dead` 并清除 `active_run`，确保作用域永不被单条坏事件卡死。
 
 ---

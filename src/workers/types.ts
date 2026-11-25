@@ -20,11 +20,17 @@ export interface Work {
   options: Record<string, unknown>;
   /** The scope name of the Brain to report to. */
   brain: string;
+  /**
+   * The latest moment the worker may first take this work, fixed when it was first written and
+   * the same for every repeat of the start. A worker that would first take it later turns it
+   * away, so that how long it can run is bounded from when it was handed over.
+   */
+  accept_by?: number;
 }
 
 /**
  * How starting went. Throwing means it is not known whether the worker took the work: the Brain
- * then tries to stop it, and says so.
+ * keeps it as not confirmed, and finds out (see `standing`).
  */
 export type Started = { state: "started" } | { state: "refused"; error: string };
 
@@ -51,4 +57,11 @@ export interface Worker {
    * has stopped, or only the waiting for it here (it may go on over there).
    */
   cancel?(env: Env, id: string): Promise<"stopped" | "no_longer_waited_for">;
+  /**
+   * Whether the worker has this piece of work at all, settled as it is asked: "there" once it has
+   * taken it (whatever has become of it since: it reports that itself); "none" if it never did,
+   * and then it must never take it: a start under this id that arrives later is turned away.
+   * Asked when a start was not answered. Throwing means it could not be asked.
+   */
+  standing?(env: Env, id: string): Promise<"there" | "none">;
 }

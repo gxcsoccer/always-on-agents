@@ -17,7 +17,14 @@ export { Outbound } from "../src/workers/sandbox/outbound";
 export class FakeTask extends DurableObject {
   async start(input: unknown) {
     this.#record("start", input);
+    this.ctx.storage.kv.put("started", true);
+    // A test can have the start take effect and the word of it never get back: by what the work is said to be.
+    if (String((input as { prompt?: unknown })?.prompt ?? "").includes("(the start is not answered)")) throw new Error("connection lost");
     return { phase: "running" };
+  }
+  /** As the real task: whether it was ever started here. (The real one also closes an id it never took; nothing here starts one afterwards.) */
+  async claimed() {
+    return this.ctx.storage.kv.get("started") === true ? "there" : "none";
   }
   async answer(decision: string, reason: string, questionId?: string, standing = false) {
     this.#record("answer", { decision, reason, questionId, standing });

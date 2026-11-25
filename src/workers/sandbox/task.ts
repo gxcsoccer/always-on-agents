@@ -139,6 +139,12 @@ export interface StartInput {
   prompt?: string;
   repository?: string;
   ref?: string;
+  /**
+   * The latest moment this task may first be taken, as whoever hands it over fixed it when the
+   * work was first written (the same for every repeat of the start). One that first arrives
+   * later is turned away: by then nobody counts on it, and its place may have been given away.
+   */
+  accept_by?: number;
 }
 
 interface CommandResult {
@@ -285,8 +291,28 @@ export class TaskSandbox extends DurableObject<Env> {
 
   /** Starts the task, or returns where it stands if it was already started. Safe to call again. */
   async start(input: StartInput): Promise<{ phase: Phase; error?: string }> {
+    // Closed before any start arrived (see `claimed`): one that arrives after that is turned away, for good.
+    if (!this.#state() && this.ctx.storage.kv.get("closed") === true) return { phase: "failed", error: "this task was closed before it started" };
+    // Too late to be taken for the first time: closed, like one that was asked about and found absent.
+    if (!this.#state() && typeof input.accept_by === "number" && Date.now() > input.accept_by) {
+      this.ctx.storage.kv.put("closed", true);
+      return { phase: "failed", error: "the start arrived too late to be taken" };
+    }
     const state = await this.#start(input);
     return { phase: state.phase, error: state.error };
+  }
+
+  /**
+   * Whether this task was ever started here, settled in one step: "there" if it was (whatever
+   * has become of it since); otherwise it is closed, so that a start that arrives later is
+   * turned away, and "none". Asked by whoever started it and got no answer: after "none" it is
+   * certain that nothing runs under this id and nothing ever will.
+   */
+  async claimed(): Promise<"there" | "none"> {
+    // kv is synchronous: nothing can come between looking and closing.
+    if (this.#state()) return "there";
+    this.ctx.storage.kv.put("closed", true);
+    return "none";
   }
 
   async #start(input: StartInput): Promise<TaskState> {
@@ -345,6 +371,9 @@ export class TaskSandbox extends DurableObject<Env> {
         await this.#files.mkdir(SCRATCH_DIRECTORY);
       }
 
+      // Stopped, or ended by the watchdog, while it was being set up: it does not go on to run.
+      const still = this.#state();
+      if (still && still.phase !== "starting") return still;
       if (input.prompt === undefined) {
         state.phase = "idle";
         this.#save(state);
@@ -357,11 +386,20 @@ export class TaskSandbox extends DurableObject<Env> {
       this.#save(fresh);
       return fresh;
     } catch (err) {
-      state.phase = "failed";
-      state.error = String(err);
-      this.#save(state);
+      // As it stands now, not as it stood when this began: it may have been stopped, or ended by
+      // the watchdog, meanwhile (which is likely what made this throw). Then that stands.
+      const fresh = this.#state() ?? state;
+      if (fresh.phase !== "starting") return fresh;
+      fresh.phase = "failed";
+      fresh.error = String(err);
+      // Said to whoever started it in answer to the call, and reported as well: the caller may no
+      // longer be waiting for this answer (its connection broke, and it asked again and was told
+      // only that the task was starting).
+      this.#emit(fresh, "failed", { error: fresh.error });
+      this.#save(fresh);
+      this.ctx.waitUntil(this.#flush());
       if (this.#container.running) await this.#container.destroy();
-      return state;
+      return fresh;
     }
   }
 
@@ -673,6 +711,9 @@ export class TaskSandbox extends DurableObject<Env> {
   /** Stops the task for good and discards its container. */
   async cancel(): Promise<{ ok: true }> {
     const state = this.#state();
+    // Nothing was ever started here: closed, so that a start still on its way is turned away
+    // when it arrives. Stopping what never began means it never will (see `claimed`).
+    if (!state) this.ctx.storage.kv.put("closed", true);
     if (this.#container.running) await this.#container.destroy();
     if (state && (ACTIVE.has(state.phase) || state.phase === "starting" || state.phase === "idle")) {
       const fresh = this.#state() ?? state;
@@ -1036,8 +1077,12 @@ export class TaskSandbox extends DurableObject<Env> {
       kind === "resume" ? RESUME_PROMPT : (state.prompt ?? ""),
     ];
 
+    // Launched only out of "starting": one that was stopped, or ended by the watchdog, while it
+    // was being set up is left as it ended, before the process is started and after.
+    if ((this.#state() ?? state).phase !== "starting") return;
     await this.#files.remove(EXIT_CODE_PATH, { force: true });
     await this.#files.remove(PID_PATH, { force: true });
+    if ((this.#state() ?? state).phase !== "starting") return;
     await this.#container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", ...argv], {
       cwd: state.cwd,
       env: this.#agentEnv(state),
@@ -1046,7 +1091,7 @@ export class TaskSandbox extends DurableObject<Env> {
     });
     // Re-read: the awaits above let other calls in (a cancellation, a counted model call).
     const fresh = this.#state() ?? state;
-    if (fresh.phase === "cancelled") return;
+    if (fresh.phase !== "starting") return;
     fresh.runs.push({ kind, started_at: Date.now() });
     fresh.phase = "running";
     this.#save(fresh);
