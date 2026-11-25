@@ -133,6 +133,12 @@ export class RunTools {
   for(run: RunRow): ToolHost {
     const session = this.#s.rows<Row>("SELECT * FROM sessions WHERE id = ?", run.session_id)[0];
     const sql = this.#s.sql;
+    /** Calls a waiting request of the person's off. */
+    const callOff = (callId: string, requestId: string, ask: string) => {
+      const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
+      this.#b.requests.cancel(chosen.record, callId, chosen.choosing);
+      return { ok: true, cancelled: chosen.record.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
+    };
     const host: ToolHost = {
       connectorTool: async (callId, name, args) => {
         // Decided afresh at the moment of use, from what is stored: also after an interruption.
@@ -276,11 +282,9 @@ export class RunTools {
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
         return this.#b.requests.draft(carried, run, text, true);
       },
-      cancelRequest: (callId, requestId, ask) => {
-        const chosen = this.#b.requests.mayCancel(run, requestId, callId, ask);
-        this.#b.requests.cancel(chosen.record, callId, chosen.choosing);
-        return { ok: true, cancelled: chosen.record.id, note: "It will not be carried on and nothing of it will be sent. Tell the person it has been cancelled." };
-      },
+      // A piece of work handed to a worker is called off as that, whichever of the two tools named it:
+      // what is said of it then (stopped, or only no longer waited for) is the same either way.
+      cancelRequest: (callId, requestId, ask) => (this.#s.rows("SELECT 1 FROM work WHERE id = ?", requestId).length > 0 ? host.cancelWork(callId, requestId) : callOff(callId, requestId, ask)),
       sendReview: (callId, summary, commit, comments) => {
         // The same review in words, for wherever comments cannot be attached to lines.
         const said = [summary, ...comments.map((c) => `${c.path}:${c.line}\n${c.body}`)].join("\n\n");
@@ -377,7 +381,7 @@ export class RunTools {
         if (work.task) return this.#b.tasks.cancel(session.session_key, workId);
         if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : "It had already ended; there was nothing to stop." };
         // The request that carries it is called off, as any request of the person's is.
-        const off = (await host.cancelRequest(callId, workId, "")) as { cancelled?: string };
+        const off = callOff(callId, workId, "") as { cancelled?: string };
         if (off.cancelled !== workId) return off;
         // Whether the work itself stopped, or only the waiting for it here.
         return !work.handed

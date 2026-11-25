@@ -631,6 +631,20 @@ describe("handing work to Doubao Work", () => {
     expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
   });
 
+  it("says the same of work that is called off under the name for requests: that it may still be finished over there", async () => {
+    await pair();
+    const cy = someone();
+    await handsOver(cy, "调研 A");
+    const id = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    for (const token of world.tokens.values()) token.good = false;
+    await cy.later();
+    // The model reaches for the tool that calls a request off: it is the same piece of work, and is told the same of it.
+    model.replies([call("cancel_request", { request_id: id, ask: "你是说取消刚才的调研吗？" })], [call("send_message", { text: "不等了" })], [say("")]);
+    await cy.says("算了");
+    expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
+    expect((await cy.requests()).map((each: any) => each.status)).toEqual(["cancelled"]);
+  });
+
   it("is there where several people talk: for the one who asked and as them, with the way in shown to them alone and the answer said to all", async () => {
     await pair();
     const ann = someone();
