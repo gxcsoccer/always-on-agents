@@ -322,6 +322,10 @@ export const MIGRATIONS: string[] = [
      attempts INTEGER NOT NULL DEFAULT 0,
      next_at INTEGER NOT NULL
    );`,
+  // 33: how far a task may go (how long it may run, how often it may ask the model), fixed as
+  // the task is written: its worker, its place with the tenant and its watchdog all go by this.
+  // (A table of its own, so that this step can be gone through again without harm.)
+  `CREATE TABLE IF NOT EXISTS task_bounds (task_id TEXT PRIMARY KEY, bounds TEXT NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

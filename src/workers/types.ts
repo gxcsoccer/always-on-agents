@@ -28,6 +28,12 @@ export interface Work {
    * away, so that how long it can run is bounded from when it was handed over.
    */
   accept_by?: number;
+  /**
+   * How far the tenant lets this piece of work go: how long it may run and how often it may ask
+   * the model. Fixed as the work is handed over; a worker that has such bounds of its own goes
+   * by these where they are given.
+   */
+  bounds?: { lifetime_ms?: number; model_calls?: number };
 }
 
 /**

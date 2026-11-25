@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "./env";
-import { type Limits, changed, limitsFrom, overridesFrom } from "./limits";
+import { type Limits, MOST, changed, limitsFrom, overridesFrom } from "./limits";
 
 /** Which Doubao app a chat app's people are served with, and how a person is known to be the same on both sides. */
 export interface DoubaoApp {
@@ -73,7 +73,7 @@ export class Registry extends DurableObject<Env> {
         tenant TEXT NOT NULL, provider TEXT NOT NULL, external_id TEXT NOT NULL, user_id TEXT NOT NULL,
         PRIMARY KEY (tenant, provider, external_id)
       );
-      CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL, until INTEGER);
       CREATE TABLE IF NOT EXISTS chat_repos (tenant TEXT NOT NULL, chat TEXT NOT NULL, repo TEXT NOT NULL, PRIMARY KEY (tenant, chat));
       CREATE TABLE IF NOT EXISTS doubao_apps (
         chat_app_id TEXT PRIMARY KEY, chat_connector TEXT NOT NULL, tenant TEXT NOT NULL, app_id TEXT NOT NULL, app_secret TEXT NOT NULL,
@@ -88,6 +88,7 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
+    this.#addColumn("task_slots", "until INTEGER");
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
     this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
     this.#addColumn("feishu_apps", "oauth_offline INTEGER NOT NULL DEFAULT 0");
@@ -370,13 +371,20 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */
-  async acquireTaskSlot(tenant: string, taskId: string): Promise<boolean> {
+  async acquireTaskSlot(tenant: string, taskId: string, lifetimeMs?: number): Promise<boolean> {
     const sql = this.ctx.storage.sql;
-    sql.exec("DELETE FROM task_slots WHERE taken_at < ?", Date.now() - SLOT_TTL_MS);
+    const now = Date.now();
+    // Each place lapses at a time fixed when it was taken (one from before that was kept: after the fixed time).
+    sql.exec("DELETE FROM task_slots WHERE COALESCE(until, taken_at + ?) < ?", SLOT_TTL_MS, now);
     if (sql.exec("SELECT 1 FROM task_slots WHERE task_id = ?", taskId).toArray().length > 0) return true;
+    const limits = this.#limits(tenant);
     const used = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM task_slots WHERE tenant = ?", tenant).one().n;
-    if (used >= this.#limits(tenant).tenant_sandboxes) return false;
-    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at) VALUES (?, ?, ?)", taskId, tenant, Date.now());
+    if (used >= limits.tenant_sandboxes) return false;
+    // Held for longer than this task can live: as long as it may run, and an hour more for it to be taken and to end.
+    // How long it may run is what whoever takes the place says it has fixed for the task (the tenant's limit as it stands, if it
+    // does not say), so that the place and the task go by one figure whatever is changed in between or later.
+    const lifetime = typeof lifetimeMs === "number" && Number.isFinite(lifetimeMs) && lifetimeMs > 0 ? Math.min(lifetimeMs, MOST.task_minutes * 60_000) : limits.task_minutes * 60_000;
+    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until) VALUES (?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, lifetime + 60 * 60_000));
     return true;
   }
 

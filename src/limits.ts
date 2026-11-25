@@ -12,6 +12,12 @@ export interface Limits {
   scope_active_tasks: number;
   /** How many sandbox containers the tenant may run at once. */
   tenant_sandboxes: number;
+  /** How many times the model may be asked in one run of the agent, before the run ends as it stands. */
+  run_steps: number;
+  /** How long a sandbox task may run, in minutes, from when its sandbox took it. */
+  task_minutes: number;
+  /** How many times the model may be asked within one sandbox task. */
+  task_model_calls: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -19,6 +25,9 @@ export const DEFAULT_LIMITS: Limits = {
   tenant_daily_tokens: 20_000_000,
   scope_active_tasks: 3,
   tenant_sandboxes: 5,
+  run_steps: 16,
+  task_minutes: 120,
+  task_model_calls: 400,
 };
 
 /**
@@ -34,6 +43,24 @@ export const MOST: Limits = {
   tenant_daily_tokens: 10_000_000_000,
   scope_active_tasks: 50,
   tenant_sandboxes: 100,
+  run_steps: 100,
+  task_minutes: 480,
+  task_model_calls: 5_000,
+};
+
+/**
+ * The least each may be set to. Nothing is 0 for the four that say how much may be used: that
+ * turns the thing off. The rest say how far one run or one task may go, and a run of no steps
+ * or a task of no time is not a limit but a mistake; to have no tasks, set how many may be under way.
+ */
+export const LEAST: Limits = {
+  scope_daily_tokens: 0,
+  tenant_daily_tokens: 0,
+  scope_active_tasks: 0,
+  tenant_sandboxes: 0,
+  run_steps: 1,
+  task_minutes: 5,
+  task_model_calls: 1,
 };
 
 const NAMES = Object.keys(DEFAULT_LIMITS) as (keyof Limits)[];
@@ -56,13 +83,13 @@ export function changed(kept: unknown, change: unknown): Partial<Limits> {
     if (!NAMES.includes(name as keyof Limits)) throw new Error(`${name} is not a limit; the limits are ${NAMES.join(", ")}`);
     if (figure === null) delete next[name as keyof Limits];
     else if (valid(name as keyof Limits, figure)) next[name as keyof Limits] = figure as number;
-    else throw new Error(`${name} must be a whole number from 0 to ${MOST[name as keyof Limits]}${name === "tenant_daily_tokens" ? ` (and, unless it is 0, at least ${MODEL_CALL_RESERVE}: that much is set aside before every call to the model)` : ""}, or null for the default`);
+    else throw new Error(`${name} must be a whole number from ${LEAST[name as keyof Limits]} to ${MOST[name as keyof Limits]}${name === "tenant_daily_tokens" ? ` (and, unless it is 0, at least ${MODEL_CALL_RESERVE}: that much is set aside before every call to the model)` : ""}, or null for the default`);
   }
   return next;
 }
 
 function valid(name: keyof Limits, figure: unknown): boolean {
-  if (typeof figure !== "number" || !Number.isInteger(figure) || figure < 0 || figure > MOST[name]) return false;
+  if (typeof figure !== "number" || !Number.isInteger(figure) || figure < LEAST[name] || figure > MOST[name]) return false;
   return name !== "tenant_daily_tokens" || figure === 0 || figure >= MODEL_CALL_RESERVE;
 }
 

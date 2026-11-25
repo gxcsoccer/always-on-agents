@@ -17,7 +17,7 @@ export const sandboxWorker: Worker = {
   },
   async start(env, work) {
     const repository = typeof work.options.repository === "string" ? work.options.repository : undefined;
-    const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}) });
+    const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}) });
     return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "unknown error" } : { state: "started" };
   },
   answer: (env, id, decision, reason, question, standing) => env.TASKS.getByName(id).answer(decision, reason, question, standing),
