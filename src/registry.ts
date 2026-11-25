@@ -309,9 +309,11 @@ export class Registry extends DurableObject<Env> {
   async setLimits(tenant: string, change: unknown): Promise<{ limits: Limits; overrides: Partial<Limits> } | { error: string; missing?: true }> {
     const sql = this.ctx.storage.sql;
     if (sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) return { error: "no such tenant", missing: true };
+    // Read apart from the check below: failing to read what is kept is something going wrong here, not a mistake in what was asked.
+    const kept = this.#kept(tenant);
     let next: Partial<Limits>;
     try {
-      next = changed(this.#kept(tenant), change);
+      next = changed(kept, change);
     } catch (err) {
       // What was asked for is not a change that can be made: said as that, apart from anything going wrong here.
       return { error: err instanceof Error ? err.message : String(err) };

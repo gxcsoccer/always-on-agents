@@ -135,6 +135,8 @@ export class Tasks implements Wakes {
       if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
       const most = this.#limits().scope_active_tasks;
       if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n >= most) {
+        // Said as what it is where no task may be had here at all: there is none to wait for.
+        if (most === 0) throw new Error("tasks cannot be handed to a worker here at present: the limit set for this place is none. Tell the person so; waiting or trying again will not change it");
         throw new Error(`there are already ${most} tasks running here; wait for one to finish or cancel one`);
       }
       const now = Date.now();

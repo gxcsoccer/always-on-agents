@@ -1765,6 +1765,11 @@ describe("records and limits", () => {
     expect((await raw(tenant, "PUT", "{not json")).status).toBe(400);
     expect((await raw(tenant, "PUT", "null")).status).toBe(400);
     expect((await admin("GET")).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
+    // What is kept cannot be read: that is something going wrong here, not a mistake in a change that is well formed.
+    await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("ALTER TABLE tenant_limits RENAME TO tenant_limits_away"));
+    expect((await raw(tenant, "PUT", JSON.stringify({ scope_active_tasks: 2 }))).status).toBeGreaterThanOrEqual(500);
+    await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("ALTER TABLE tenant_limits_away RENAME TO tenant_limits"));
+    expect((await admin("GET")).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
     // A tenant there is none of: not found, to read or to set.
     expect((await raw("no-such-tenant", "GET")).status).toBe(404);
     expect((await raw("no-such-tenant", "PUT", "{}")).status).toBe(404);
@@ -1779,6 +1784,15 @@ describe("records and limits", () => {
     expect(outputs[0]).toMatchObject({ status: "running" });
     expect(String(outputs[1].error)).toContain("there are already 1 tasks running here");
     expect((await stub.inspect()).limits).toMatchObject({ scope_active_tasks: 1, scope_daily_tokens: 900_000 });
+    // No task at all in a scope: said as that, not as tasks to wait for.
+    await admin("PUT", { scope_active_tasks: 0 });
+    const elsewhere = (env as any).BRAIN.getByName(`${tenant}:user:y`) as any;
+    model.replies([call("hand_over", { worker: "sandbox", title: "Three", brief: "c", continue_from: null, repository: null })], [say("")]);
+    await elsewhere.ingest(message("do this"));
+    await wake(elsewhere);
+    expect(String(toolOutputs().at(-1).error)).toContain("the limit set for this place is none");
+    await admin("PUT", { scope_active_tasks: 1 });
+
     // And what it may spend in a day: set to nothing, the next run waits for tomorrow without asking the model.
     await admin("PUT", { scope_daily_tokens: 0 });
     const asked = modelCalls.length;

@@ -26,7 +26,8 @@ export default {
 
       if (path[1] === "admin") {
         if (!env.ADMIN_KEY || !(await sameSecret(bearer(request), env.ADMIN_KEY))) return json({ error: "missing or wrong admin key" }, 401);
-        return admin(request, env, path.slice(2), url);
+        // Awaited here, so that something going wrong in it is answered as that below, not left to the platform.
+        return await admin(request, env, path.slice(2), url);
       }
       // Everything else under /v1/<name>/ belongs to the connector of that name.
       const owner = connector(path[1] ?? "");
