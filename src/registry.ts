@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "./env";
-import { type Limits, changed, limitsFrom, overridesFrom } from "./limits";
+import { type Limits, MOST, changed, limitsFrom, overridesFrom } from "./limits";
 
 /** Which Doubao app a chat app's people are served with, and how a person is known to be the same on both sides. */
 export interface DoubaoApp {
@@ -371,7 +371,7 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */
-  async acquireTaskSlot(tenant: string, taskId: string): Promise<boolean> {
+  async acquireTaskSlot(tenant: string, taskId: string, lifetimeMs?: number): Promise<boolean> {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
     // Each place lapses at a time fixed when it was taken (one from before that was kept: after the fixed time).
@@ -380,9 +380,11 @@ export class Registry extends DurableObject<Env> {
     const limits = this.#limits(tenant);
     const used = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM task_slots WHERE tenant = ?", tenant).one().n;
     if (used >= limits.tenant_sandboxes) return false;
-    // Held for longer than a task taken now can live: as long as it may run, and an hour more for it to be taken and to end.
-    // Fixed here, so that a limit changed later does not give away the place of a task still running under the old one.
-    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until) VALUES (?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, (limits.task_minutes + 60) * 60_000));
+    // Held for longer than this task can live: as long as it may run, and an hour more for it to be taken and to end.
+    // How long it may run is what whoever takes the place says it has fixed for the task (the tenant's limit as it stands, if it
+    // does not say), so that the place and the task go by one figure whatever is changed in between or later.
+    const lifetime = typeof lifetimeMs === "number" && Number.isFinite(lifetimeMs) && lifetimeMs > 0 ? Math.min(lifetimeMs, MOST.task_minutes * 60_000) : limits.task_minutes * 60_000;
+    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until) VALUES (?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, lifetime + 60 * 60_000));
     return true;
   }
 

@@ -52,7 +52,7 @@ function bench(state: DurableObjectState) {
     answer: (async (decision: "allow" | "deny") => ({ ok: true, decision })) as (...args: any[]) => Promise<any>,
     fate: {} as Record<string, unknown>,
   };
-  const slots = { acquired: [] as string[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean> };
+  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean> };
   const amended: unknown[][] = [];
   const background: Promise<unknown>[] = [];
   const woken: number[] = [];
@@ -88,7 +88,7 @@ function bench(state: DurableObjectState) {
     worker: sandboxOf,
     registry: () =>
       ({
-        acquireTaskSlot: async (tenant: string, taskId: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.acquire()),
+        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.acquire()),
         releaseTaskSlot: async (taskId: string) => void slots.released.push(taskId),
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
@@ -472,16 +472,30 @@ describe("tasks, by themselves", () => {
       });
     });
 
-    it("hands a task the bounds the tenant set, and sets its watchdog by how long it may run", async () => {
-      await within(async ({ tasks, store, worker }) => {
+    it("fixes how far a task may go as it is written: its worker, its place and its watchdog go by that, whatever is changed afterwards", async () => {
+      await within(async ({ tasks, store, worker, slots, task }) => {
         store.setMeta("limits", JSON.stringify({ task_minutes: 30, task_model_calls: 50 }));
         const before = Date.now();
         const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
         expect((worker.started[0] as any).bounds).toEqual({ lifetime_ms: 30 * 60_000, model_calls: 50 });
+        // The place is asked for with the same figure.
+        expect(slots.lifetimes).toEqual([30 * 60_000]);
+        // The watchdog speaks after the latest it may still be running: taken as late as it may be (a quarter of an hour), run for its half hour, and ten minutes to say how it ended.
         const due = store.rows<{ due_at: number }>("SELECT due_at FROM timers WHERE id = ?", `watch_${id}`)[0].due_at;
-        // Half an hour, and ten minutes for it to say how it ended.
-        expect(due - before).toBeGreaterThanOrEqual(40 * 60_000);
-        expect(due - before).toBeLessThan(41 * 60_000);
+        expect(due - before).toBeGreaterThanOrEqual(55 * 60_000);
+        expect(due - before).toBeLessThan(56 * 60_000);
+
+        // The limits change while a task that was written has not been started yet: it goes by what was fixed for it.
+        store.setMeta("limits", JSON.stringify({ task_minutes: 480, task_model_calls: 5 }));
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", id);
+        await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null);
+        expect((worker.started.at(-1) as any).bounds).toEqual({ lifetime_ms: 30 * 60_000, model_calls: 50 });
+        expect(slots.lifetimes.at(-1)).toBe(30 * 60_000);
+        // One written before this was kept: by the limits as they stand.
+        task("t_old", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_old' WHERE id = 't_old'");
+        await tasks.dispatch(RUN, SESSION_KEY, "call_old", "t", "b", null);
+        expect((worker.started.at(-1) as any).bounds).toEqual({ lifetime_ms: 480 * 60_000, model_calls: 5 });
       });
     });
 

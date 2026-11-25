@@ -327,6 +327,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const existing = this.#state();
     if (existing) return { ...existing, token: "(hidden)" };
     const t0 = Date.now();
+    const bounds = bounded(input.bounds);
     const state: TaskState = {
       id: input.id,
       token: crypto.randomUUID(),
@@ -335,7 +336,7 @@ export class TaskSandbox extends DurableObject<Env> {
       repository: input.repository,
       cwd: input.repository ? REPOSITORY_DIRECTORY : SCRATCH_DIRECTORY,
       created_at: t0,
-      ...(bounded(input.bounds) ? { bounds: bounded(input.bounds) } : {}),
+      ...(bounds ? { bounds } : {}),
       timings: {},
       runs: [],
       inbox: [],
@@ -985,7 +986,7 @@ export class TaskSandbox extends DurableObject<Env> {
       state.phase = "lost";
       state.error = "container stopped before the task finished";
       this.#emit(state, "lost", { error: state.error });
-    } else if (alive && age > (state.phase === "idle" ? MAX_IDLE_MS : lifetimeOf(state))) {
+    } else if (alive && age > (state.phase === "idle" ? Math.min(MAX_IDLE_MS, lifetimeOf(state)) : lifetimeOf(state))) {
       expired = true;
       state.error = "exceeded the maximum lifetime";
     }

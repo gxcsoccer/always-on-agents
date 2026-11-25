@@ -102,6 +102,18 @@ export class Tasks implements Wakes {
     this.#b = host;
   }
 
+  /** How far a task may go, as kept with it; for one from before that was kept, as the limits stand now. */
+  #boundsOf(task: Row): { lifetime_ms: number; model_calls: number } {
+    let kept: { lifetime_ms?: unknown; model_calls?: unknown } = {};
+    try {
+      kept = JSON.parse(this.#s.rows<{ bounds: string }>("SELECT bounds FROM task_bounds WHERE task_id = ?", task.id)[0]?.bounds ?? "{}") ?? {};
+    } catch {
+      kept = {};
+    }
+    const whole = (figure: unknown, otherwise: number) => (typeof figure === "number" && Number.isInteger(figure) && figure > 0 ? figure : otherwise);
+    return { lifetime_ms: whole(kept.lifetime_ms, this.#limits().task_minutes * 60_000), model_calls: whole(kept.model_calls, this.#limits().task_model_calls) };
+  }
+
   /** The tenant's limits as the registry last gave them to this scope; the defaults before it ever did. */
   #limits(): Limits {
     try {
@@ -158,12 +170,15 @@ export class Tasks implements Wakes {
           now,
           now,
         );
+        // How far it may go, by the tenant's limits as they stand at this moment: fixed here, for good.
+        this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
       });
       this.#s.sql.exec(
         "INSERT INTO timers (id, due_at, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         `watch_${id}`,
-        now + (this.#limits().task_minutes * 60 + TASK_WATCHDOG_GRACE_S) * 1_000,
+        // After the latest moment it may still be running: taken as late as it may be, and run for as long as it may.
+        now + ACCEPT_WITHIN_MS + this.#limits().task_minutes * 60_000 + TASK_WATCHDOG_GRACE_S * 1_000,
         sessionKey,
         `Task ${id} "${title}" has not reported a result in time.`,
         JSON.stringify({ task_id: id }),
@@ -176,6 +191,9 @@ export class Tasks implements Wakes {
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
+    // How far this task may go, as it was fixed when it was written (one written before that was
+    // kept: as the limits stand now). Its worker, its place and its watchdog go by the same figures.
+    const bounds = this.#boundsOf(task);
     // Known here, before anything is asked of anyone: not something to find out about later.
     if (!worker.start) {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: "this worker is not started by the Brain" }) });
@@ -184,7 +202,7 @@ export class Tasks implements Wakes {
 
     let slot: boolean | Error;
     try {
-      slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id);
+      slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id, bounds.lifetime_ms);
     } catch (err) {
       slot = err instanceof Error ? err : new Error(String(err));
     }
@@ -227,8 +245,6 @@ export class Tasks implements Wakes {
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    // How far the tenant lets a task go, as it stands now: the worker keeps what it is told at its first start.
-    const bounds = { lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls };
     const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();

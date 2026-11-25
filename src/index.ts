@@ -6,7 +6,7 @@
 import { connector, connectors } from "./connectors";
 import type { Env } from "./env";
 import { registry } from "./registry";
-import { DEFAULT_LIMITS, MODEL_CALL_RESERVE, MOST } from "./limits";
+import { DEFAULT_LIMITS, LEAST, MODEL_CALL_RESERVE, MOST } from "./limits";
 
 export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
@@ -57,7 +57,7 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
   // What a tenant may use: read, and set by figure (null: back to the default; not named: left as it is).
   // With it: which of the figures were set for this tenant, the defaults, and the most each may be.
   if (path[0] === "tenants" && path[2] === "limits" && path.length === 3) {
-    const told = (found: { limits: unknown; overrides: unknown }) => json({ ...found, defaults: DEFAULT_LIMITS, most: MOST, least_tenant_daily_tokens: MODEL_CALL_RESERVE });
+    const told = (found: { limits: unknown; overrides: unknown }) => json({ ...found, defaults: DEFAULT_LIMITS, least: LEAST, most: MOST, least_tenant_daily_tokens: MODEL_CALL_RESERVE });
     if (method === "GET") {
       const found = await registry(env).limits(path[1]);
       return found ? told(found) : json({ error: "no such tenant" }, 404);
