@@ -18,7 +18,7 @@ import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
-import { type Limits, limitsFrom } from "../limits";
+import { DEFAULT_LIMITS, type Limits, limitsFrom } from "../limits";
 import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
 
 // (How many tasks a scope may have under way is the tenant's limit: see ../limits. It is read
@@ -102,7 +102,11 @@ export class Tasks implements Wakes {
     this.#b = host;
   }
 
-  /** How far a task may go, as kept with it; for one from before that was kept, as the limits stand now. */
+  /**
+   * How far a task may go, as kept with it. One from before that was kept goes by what held for
+   * every task then (the defaults): its place with the tenant was taken for that long, whatever
+   * the limits have become since.
+   */
   #boundsOf(task: Row): { lifetime_ms: number; model_calls: number } {
     let kept: { lifetime_ms?: unknown; model_calls?: unknown } = {};
     try {
@@ -111,7 +115,7 @@ export class Tasks implements Wakes {
       kept = {};
     }
     const whole = (figure: unknown, otherwise: number) => (typeof figure === "number" && Number.isInteger(figure) && figure > 0 ? figure : otherwise);
-    return { lifetime_ms: whole(kept.lifetime_ms, this.#limits().task_minutes * 60_000), model_calls: whole(kept.model_calls, this.#limits().task_model_calls) };
+    return { lifetime_ms: whole(kept.lifetime_ms, DEFAULT_LIMITS.task_minutes * 60_000), model_calls: whole(kept.model_calls, DEFAULT_LIMITS.task_model_calls) };
   }
 
   /** The tenant's limits as the registry last gave them to this scope; the defaults before it ever did. */
@@ -192,7 +196,7 @@ export class Tasks implements Wakes {
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
     // How far this task may go, as it was fixed when it was written (one written before that was
-    // kept: as the limits stand now). Its worker, its place and its watchdog go by the same figures.
+    // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
     const bounds = this.#boundsOf(task);
     // Known here, before anything is asked of anyone: not something to find out about later.
     if (!worker.start) {

@@ -491,11 +491,12 @@ describe("tasks, by themselves", () => {
         await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null);
         expect((worker.started.at(-1) as any).bounds).toEqual({ lifetime_ms: 30 * 60_000, model_calls: 50 });
         expect(slots.lifetimes.at(-1)).toBe(30 * 60_000);
-        // One written before this was kept: by the limits as they stand.
+        // One written before this was kept: by what held for every task then, which is what its place was taken for.
         task("t_old", { status: "dispatching" });
         store.sql.exec("UPDATE tasks SET op_id = 'call_old' WHERE id = 't_old'");
         await tasks.dispatch(RUN, SESSION_KEY, "call_old", "t", "b", null);
-        expect((worker.started.at(-1) as any).bounds).toEqual({ lifetime_ms: 480 * 60_000, model_calls: 5 });
+        expect((worker.started.at(-1) as any).bounds).toEqual({ lifetime_ms: 120 * 60_000, model_calls: 400 });
+        expect(slots.lifetimes.at(-1)).toBe(120 * 60_000);
       });
     });
 

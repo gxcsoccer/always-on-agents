@@ -974,8 +974,15 @@ export class TaskSandbox extends DurableObject<Env> {
     const alive = ACTIVE.has(state.phase) || state.phase === "idle" || state.phase === "starting";
     let expired = false;
     if (alive && state.phase === "starting") {
-      expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
-      if (expired) state.error = "startup did not finish in time";
+      // Starting, for the first time or again after its container was lost: it has the time a start
+      // may take, and no longer than the whole of its life.
+      if (age > lifetimeOf(state)) {
+        expired = true;
+        state.error = "exceeded the maximum lifetime";
+      } else {
+        expired = Date.now() - (state.starting_since ?? state.created_at) > STARTUP_DEADLINE_MS;
+        if (expired) state.error = "startup did not finish in time";
+      }
     } else if (alive && !running) {
       // Judged on the task's age now, not as it was before the awaits above.
       if (ACTIVE.has(state.phase) && state.checkpoint && state.recoveries < MAX_RECOVERIES && age <= lifetimeOf(state)) {

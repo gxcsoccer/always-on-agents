@@ -151,6 +151,18 @@ describe("a sandbox task, started and stopped", () => {
     await brief.task.alarm();
     expect(await brief.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
 
+    // Starting again after its container was lost, with its whole life already over: ended for that, however fresh this start is.
+    const again = fixture();
+    await again.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 5 * 60_000 } });
+    const starting = again.records.get("state");
+    starting.phase = "starting";
+    starting.created_at = Date.now() - 6 * 60_000;
+    starting.starting_since = Date.now() - 2 * 60_000;
+    again.records.set("state", starting);
+    await again.task.alarm();
+    expect(await again.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+    expect(await again.task.countModelCall()).toBe(false);
+
     // Given none, or nothing that is a bound: its own.
     const plain = fixture();
     await plain.task.start({ id: "fixture", prompt: "hello", bounds: { lifetime_ms: -5, model_calls: 1.5 } as never });
