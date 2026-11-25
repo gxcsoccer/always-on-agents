@@ -603,6 +603,8 @@ export class TaskSandbox extends DurableObject<Env> {
   async countModelCall(): Promise<boolean> {
     const state = this.#state();
     if (!state || !(ACTIVE.has(state.phase) || state.phase === "starting")) return false;
+    // Past its life no further call is let through, whether or not the watchdog has ended it yet.
+    if (Date.now() - state.created_at > lifetimeOf(state)) return false;
     if ((state.model_calls ?? 0) >= (state.bounds?.model_calls ?? MAX_MODEL_CALLS_PER_TASK)) return false;
     state.model_calls = (state.model_calls ?? 0) + 1;
     this.#save(state);
@@ -614,7 +616,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const allowed = (await registry(this.env).recordUsage(tenant, 0)).allowed;
     // The lookup took time; the task may have been cancelled or have ended meanwhile.
     const now = this.#state();
-    return allowed && Boolean(now) && (ACTIVE.has(now!.phase) || now!.phase === "starting");
+    return allowed && now !== undefined && (ACTIVE.has(now.phase) || now.phase === "starting") && Date.now() - now.created_at <= lifetimeOf(now);
   }
 
   /**
@@ -916,6 +918,19 @@ export class TaskSandbox extends DurableObject<Env> {
       await this.#backups.restore(before.checkpoint.record, { dir: WORKSPACE_DIRECTORY });
       const state = this.#state();
       if (!state) return;
+      // Bringing it back took time too. If its life ran out meanwhile, it ends here: it is not
+      // started again, and nothing is said of a recovery that came to nothing.
+      if (Date.now() - state.created_at > lifetimeOf(state)) {
+        if (state.phase === "starting") {
+          state.phase = "failed";
+          state.error = "exceeded the maximum lifetime";
+          this.#emit(state, "failed", { error: state.error });
+          this.#save(state);
+          this.ctx.waitUntil(this.#flush());
+        }
+        if (this.#container.running) await this.#container.destroy();
+        return;
+      }
       state.timings[`recovery_${state.recoveries}_ms`] = Date.now() - started;
       this.#emit(state, "recovered", { message: "the sandbox was replaced and the work resumed from a checkpoint" });
       await this.#launch(state, "resume");

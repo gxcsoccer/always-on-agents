@@ -22,9 +22,19 @@ vi.mock("@cloudflare/sandbox", () => ({
   },
   DirectoryBackup: class {
     async intercept() {}
+    async restore() {
+      await restoring.now?.();
+    }
+    async backup() {
+      return { id: "taken" };
+    }
+    async delete() {}
   },
   DirectoryBackupGateway: class {},
 }));
+
+/** Something that happens while a checkpoint is being restored, for the fixture that is restoring. */
+const restoring: { now?: () => Promise<void> } = {};
 
 function fixture() {
   const records = new Map<string, any>();
@@ -51,7 +61,18 @@ function fixture() {
   };
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
   const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
-  return { task: new TaskSandbox(ctx as never, env as never), container, reported, background, records, process };
+  restoring.now = undefined;
+  return {
+    task: new TaskSandbox(ctx as never, env as never),
+    container,
+    reported,
+    background,
+    records,
+    process,
+    set restoring(what: () => Promise<void>) {
+      restoring.now = what;
+    },
+  };
 }
 
 describe("a sandbox task, started and stopped", () => {
@@ -162,6 +183,29 @@ describe("a sandbox task, started and stopped", () => {
     await again.task.alarm();
     expect(await again.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
     expect(await again.task.countModelCall()).toBe(false);
+
+    // Brought back from a checkpoint with a moment of its life left, and the bringing back takes longer than that:
+    // it is not started again, no recovery is reported, and no further call to the model is let through.
+    const late = fixture();
+    await late.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 5 * 60_000 } });
+    const lost = late.records.get("state");
+    lost.created_at = Date.now() - (5 * 60_000 - 1_000);
+    lost.checkpoint = { record: { id: "cp" }, at: Date.now() - 60_000, took_ms: 10 };
+    late.records.set("state", lost);
+    late.container.running = false;
+    const launches: string[] = [];
+    late.container.exec = async (argv) => (argv[0] === "/bin/sh" && launches.push("agent"), late.process);
+    late.restoring = async () => {
+      const state = late.records.get("state");
+      state.created_at -= 2_000;
+      late.records.set("state", state);
+    };
+    await late.task.alarm();
+    await Promise.all(late.background);
+    expect(launches).toEqual([]);
+    expect(await late.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+    expect(late.reported).not.toContain("recovered");
+    expect(await late.task.countModelCall()).toBe(false);
 
     // Given none, or nothing that is a bound: its own.
     const plain = fixture();
