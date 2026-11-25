@@ -66,6 +66,8 @@ export interface RunnerHost {
   toolsOf(connector: string): ConnectorTool[];
   /** Every worker this deployment lists. */
   workers(): Worker[];
+  /** Finished work the person this run is for can go on from: see Tasks. */
+  leftToGoOnFrom(runId: string, sessionKey: string): { id: string; worker: string; title: string }[];
   /** The deployment's guidance on which worker a piece of work goes to. */
   guidance(): string;
   /** Whether a piece of work done in a person's name still stands under what it was done under: see BrainAgent. */
@@ -1212,7 +1214,7 @@ export class Runner {
     const workers = workersIn(acting, this.#b.toolsOf, this.#b.workers());
     const carrying = new Set(workers.flatMap((each) => (each.tool ? [each.tool] : [])));
     // (Nor where its worker is not among them: such a tool is a worker's way in and nothing else.)
-    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined })), carrying.size > 0 ? REPLACES : undefined);
+    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true })), carrying.size > 0 ? REPLACES : undefined);
     const own = [...TOOLS, ...handing];
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));
@@ -1277,6 +1279,10 @@ export class Runner {
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
         ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status === "unconfirmed" ? "start not confirmed (it is not known yet whether it began; this is being checked and you will be told: do not hand the same work over again)" : each.status })),
+        // Work that ended well in this conversation in the last day, of a worker that can go on from it: its files are kept that long.
+        // Listed for the person who asked for it and for nobody else: it is theirs to go on from.
+        ...(session ? this.#b.leftToGoOnFrom(runId, session.session_key) : [])
+          .map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: "done (what it left is kept for about a day: more work on the same thing goes on from it, with its id in continue_from)" })),
         ...theirs.map((each) => {
           const record = this.#b.requests.record(each.id);
           const waits = each.state === "open" && record?.status === "waiting" ? (record.interaction !== "" ? ("authorisation" as const) : ("result" as const)) : undefined;

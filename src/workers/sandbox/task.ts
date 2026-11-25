@@ -40,8 +40,12 @@ interface TaskCtx extends DurableObjectState {
 export type Phase = "starting" | "idle" | "running" | "needs_input" | "succeeded" | "failed" | "lost" | "cancelled";
 
 interface Run {
-  /** `resume` continues the same pi session in a new container after the old one was lost. */
-  kind: "first" | "resume";
+  /**
+   * `resume` continues the same pi session in a new container after the old one was lost.
+   * `follow_up` continues the session an earlier task left, in this task's new container, with
+   * something further that was asked.
+   */
+  kind: "first" | "resume" | "follow_up";
   started_at: number;
   ended_at?: number;
   exit_code?: number;
@@ -114,7 +118,10 @@ export interface TaskState {
   out: { seq: number; kind: WorkerEventKind; body: Record<string, unknown> }[];
   out_seq: number;
   /** The latest copy of /workspace in R2: the agent's files and its session transcript. */
-  checkpoint?: { record: DirectoryBackupRecord; at: number; took_ms: number };
+  /** `final`: taken after the agent had finished, of the workspace as it left it; what a later task may go on from. */
+  checkpoint?: { record: DirectoryBackupRecord; at: number; took_ms: number; final?: true };
+  /** The earlier task this one goes on from, where it does. */
+  follows?: string;
   checkpoints_taken: number;
   /** Earlier checkpoints whose deletion failed. Deleted with the task. */
   stale_checkpoints?: DirectoryBackupRecord[];
@@ -147,6 +154,12 @@ export interface StartInput {
    * later is turned away: by then nobody counts on it, and its place may have been given away.
    */
   accept_by?: number;
+  /**
+   * What an earlier task left, for this one to go on from: its workspace as it was when it
+   * finished (its files, and the agent's own record of what it did), by where that is kept.
+   * Whoever starts this task has made sure it may: the earlier one is this conversation's.
+   */
+  seed?: { from: string; record: DirectoryBackupRecord; cwd: string; repository?: string };
   /** How long this task may run and how often it may ask the model, where whoever hands it over says; the fixed figures here otherwise. */
   bounds?: { lifetime_ms?: number; model_calls?: number };
 }
@@ -229,6 +242,7 @@ After each meaningful step, run the shell command: report progress "<one sentenc
 Some commands pause until a person approves them; that is expected, just wait. A git push in particular is held until someone approves it, which can take up to an hour: run it with a timeout of at least 3600 seconds, and never treat the wait as a failure, cancel it, or retry it while it is waiting.
 If a command is denied, do not retry it or work around it; say so in your final answer.`;
 
+const FOLLOW_UP_PROMPT = `You are going on from a task that finished earlier, in a fresh sandbox. Its files and your record of what you did there are already here, as they were when it ended; look at the current state of the directory if you need to. Nothing that was approved then is approved now. What is asked of you now:`;
 const RESUME_PROMPT = `The sandbox you were working in was replaced. Your files and this conversation were restored from a checkpoint, so the last few things you did before the interruption may be missing. Look at the current state of the directory, work out which steps are actually done, and continue the original task from there. Do not redo steps that are already done.`;
 
 export class TaskSandbox extends DurableObject<Env> {
@@ -236,7 +250,16 @@ export class TaskSandbox extends DurableObject<Env> {
   readonly #files: Files;
   readonly #outbound: Fetcher;
   readonly #backups: DirectoryBackup;
+  /** Reads what another task of this conversation's keeps, for a task that goes on from it. */
+  readonly #backupsOf: (taskId: string) => DirectoryBackup;
   #checkpointing = false;
+  /**
+   * While the last copy of a finished agent's workspace is being taken (see #settle). The agent
+   * has ended in time; the copying is not held against the task's life, and is done once.
+   */
+  #leaving: string | undefined;
+  /** Which run of the agent a task is on: its ending, and the copying of what it left, are that run's and no other's. */
+  static #round = (state: TaskState): string => `${state.runs.length}:${state.recoveries}`;
   #flushing = false;
 
   constructor(ctx: TaskCtx, env: Env) {
@@ -246,10 +269,9 @@ export class TaskSandbox extends DurableObject<Env> {
     this.#files = new Files(this.#container);
     // The task id is this object's name. The proxy gets it from us, never from the guest.
     this.#outbound = ctx.exports.Outbound({ props: { taskId: ctx.id.name ?? "" } });
-    this.#backups = new DirectoryBackup(this.#container, ctx.exports.DirectoryBackupGateway, {
-      binding: "CHECKPOINTS",
-      prefix: `tasks/${ctx.id.name ?? "unknown"}/`,
-    });
+    const backupsOf = (taskId: string) => new DirectoryBackup(this.#container, ctx.exports.DirectoryBackupGateway, { binding: "CHECKPOINTS", prefix: `tasks/${taskId}/` });
+    this.#backups = backupsOf(ctx.id.name ?? "unknown");
+    this.#backupsOf = backupsOf;
     // A restarted instance (deploy, eviction) inherits a running container but not its wiring: the
     // inactivity timeout is per instance, and the container's route out goes through the old
     // instance's entrypoint. Without re-attaching, the agent can neither reach the model nor report.
@@ -333,8 +355,10 @@ export class TaskSandbox extends DurableObject<Env> {
       token: crypto.randomUUID(),
       phase: "starting",
       prompt: input.prompt,
-      repository: input.repository,
-      cwd: input.repository ? REPOSITORY_DIRECTORY : SCRATCH_DIRECTORY,
+      // One that goes on from an earlier task works where that one worked, on what it worked on.
+      repository: input.seed ? input.seed.repository : input.repository,
+      cwd: input.seed ? input.seed.cwd : input.repository ? REPOSITORY_DIRECTORY : SCRATCH_DIRECTORY,
+      ...(input.seed ? { follows: input.seed.from } : {}),
       created_at: t0,
       ...(bounds ? { bounds } : {}),
       timings: {},
@@ -361,9 +385,23 @@ export class TaskSandbox extends DurableObject<Env> {
       state.agent_version = await this.#boot(input.id);
       state.timings.container_ready_ms = Date.now() - t0;
 
-      await this.#files.mkdir(WORKSPACE_DIRECTORY);
-      await this.#files.mkdir(TASK_DIRECTORY);
-      if (input.repository) {
+      if (input.seed) {
+        // The earlier task's workspace, as it left it: read from where that task keeps it, into
+        // this task's own container. From here on the two have nothing to do with each other:
+        // this one's checkpoints are its own, and the earlier one's being removed later changes nothing here.
+        const t1 = Date.now();
+        await this.#backupsOf(input.seed.from).restore(input.seed.record, { dir: WORKSPACE_DIRECTORY });
+        state.timings.seed_ms = Date.now() - t1;
+        // What the earlier run left of its own ending and its own logs is not this task's: its files and the agent's record are.
+        for (const left of [EXIT_CODE_PATH, PID_PATH, EVENTS_PATH, STDERR_PATH, HOOK_LOG_PATH, REPORT_LOG_PATH]) await this.#files.remove(left, { force: true });
+        await this.#files.mkdir(TASK_DIRECTORY);
+      } else {
+        await this.#files.mkdir(WORKSPACE_DIRECTORY);
+        await this.#files.mkdir(TASK_DIRECTORY);
+      }
+      if (input.seed) {
+        // Nothing to fetch: it is all here.
+      } else if (input.repository) {
         const t1 = Date.now();
         const branch = input.ref ? ["--branch", input.ref] : [];
         const clone = await this.#run(
@@ -387,7 +425,9 @@ export class TaskSandbox extends DurableObject<Env> {
         this.#save(state);
         return state;
       }
-      await this.#launch(state, "first");
+      // (Getting ready took time, most of all bringing an earlier task's workspace in: a task whose
+      // life ran out meanwhile is not started. See #launch; ended below, as any start that fails.)
+      await this.#launch(state, input.seed ? "follow_up" : "first");
       // Re-read: the agent is running now and may already have reported.
       const fresh = this.#state() ?? state;
       fresh.timings.launched_ms = Date.now() - t0;
@@ -409,6 +449,20 @@ export class TaskSandbox extends DurableObject<Env> {
       if (this.#container.running) await this.#container.destroy();
       return fresh;
     }
+  }
+
+  /**
+   * What this task left for a later one to go on from: its workspace as it was when the agent
+   * finished, where it is kept, and until when. Nothing unless the task succeeded, a checkpoint
+   * was taken after it had (see #settle), and it has not yet been removed.
+   */
+  async snapshot(): Promise<{ record: DirectoryBackupRecord; cwd: string; repository?: string; until: number } | null> {
+    const state = this.#state();
+    if (!state || state.phase !== "succeeded" || !state.checkpoint?.final) return null;
+    const until = (state.finished_at ?? state.checkpoint.at) + PURGE_AFTER_MS;
+    // Not handed out in its last minutes: whoever takes it needs time to read it before it is removed.
+    if (Date.now() > until - 5 * 60_000) return null;
+    return { record: state.checkpoint.record, cwd: state.cwd, ...(state.repository ? { repository: state.repository } : {}), until };
   }
 
   async status(): Promise<TaskState | { error: string }> {
@@ -861,7 +915,7 @@ export class TaskSandbox extends DurableObject<Env> {
    */
   async #checkpoint(): Promise<void> {
     const before = this.#state();
-    if (!before || this.#checkpointing || !ACTIVE.has(before.phase) || !this.#container.running) return;
+    if (!before || this.#checkpointing || this.#leaving === TaskSandbox.#round(before) || !ACTIVE.has(before.phase) || !this.#container.running) return;
     if (before.checkpoint && Date.now() - before.checkpoint.at < CHECKPOINT_MIN_INTERVAL_MS) return;
     // If old checkpoints cannot be deleted, stop making new ones rather than pile them up: every
     // one that is made has to be remembered until it is gone.
@@ -872,6 +926,19 @@ export class TaskSandbox extends DurableObject<Env> {
       const record = await this.#backups.backup({ dir: WORKSPACE_DIRECTORY, name: `task ${before.id}` });
       const state = this.#state();
       if (!state) return;
+      // The task ended while this copy was being taken: what it left is already kept (see #settle),
+      // and is not replaced by a copy from before it had finished. This one is removed.
+      if (!ACTIVE.has(state.phase)) {
+        state.stale_checkpoints = [...(state.stale_checkpoints ?? []), record];
+        this.#save(state);
+        await this.#backups.delete(record);
+        const later = this.#state();
+        if (later) {
+          later.stale_checkpoints = (later.stale_checkpoints ?? []).filter((stale) => stale.id !== record.id);
+          this.#save(later);
+        }
+        return;
+      }
       // The checkpoint being replaced is written down as stale in the same save that installs the
       // new one. If this object stops before the old one is deleted, the record survives and the
       // clean-up at the end of the task removes it; it is the only pointer to that object.
@@ -938,6 +1005,20 @@ export class TaskSandbox extends DurableObject<Env> {
     } catch (err) {
       const state = this.#state();
       if (!state) return;
+      // Its life ran out while it was being brought back: ended for that, as it is wherever else
+      // that is found, and the container made for it is not kept.
+      // One that was stopped, or ended, while it was being brought back stands as that: the
+      // failing of what was being done to it changes nothing.
+      if (state.phase !== "starting") return;
+      if (Date.now() - state.created_at > lifetimeOf(state)) {
+        state.phase = "failed";
+        state.error = "exceeded the maximum lifetime";
+        this.#emit(state, "failed", { error: state.error });
+        this.#save(state);
+        this.ctx.waitUntil(this.#flush());
+        if (this.#container.running) await this.#container.destroy();
+        return;
+      }
       state.phase = "lost";
       state.error = `recovery failed: ${String(err)}`;
       this.#emit(state, "lost", { error: state.error });
@@ -1008,6 +1089,8 @@ export class TaskSandbox extends DurableObject<Env> {
       state.phase = "lost";
       state.error = "container stopped before the task finished";
       this.#emit(state, "lost", { error: state.error });
+    } else if (this.#leaving === TaskSandbox.#round(state)) {
+      // Its agent ended in time and what it left is being copied: that is finished by #settle, not ended here.
     } else if (alive && age > (state.phase === "idle" ? Math.min(MAX_IDLE_MS, lifetimeOf(state)) : lifetimeOf(state))) {
       expired = true;
       state.error = "exceeded the maximum lifetime";
@@ -1102,9 +1185,9 @@ export class TaskSandbox extends DurableObject<Env> {
       "--append-system-prompt",
       SYSTEM_PROMPT,
       // Continue the session that was restored with the workspace.
-      ...(kind === "resume" ? ["--continue"] : []),
+      ...(kind === "resume" || kind === "follow_up" ? ["--continue"] : []),
       "--",
-      kind === "resume" ? RESUME_PROMPT : (state.prompt ?? ""),
+      kind === "resume" ? RESUME_PROMPT : kind === "follow_up" ? `${FOLLOW_UP_PROMPT}\n\n${state.prompt ?? ""}` : (state.prompt ?? ""),
     ];
 
     // Launched only out of "starting": one that was stopped, or ended by the watchdog, while it
@@ -1112,7 +1195,11 @@ export class TaskSandbox extends DurableObject<Env> {
     if ((this.#state() ?? state).phase !== "starting") return;
     await this.#files.remove(EXIT_CODE_PATH, { force: true });
     await this.#files.remove(PID_PATH, { force: true });
-    if ((this.#state() ?? state).phase !== "starting") return;
+    // Looked at last of all, with nothing awaited between this and the process being started:
+    // still starting, and still within its life (getting here took time).
+    const kept = this.#state() ?? state;
+    if (kept.phase !== "starting") return;
+    if (Date.now() - kept.created_at > lifetimeOf(kept)) throw new Error("exceeded the maximum lifetime");
     await this.#container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", ...argv], {
       cwd: state.cwd,
       env: this.#agentEnv(state),
@@ -1139,6 +1226,12 @@ export class TaskSandbox extends DurableObject<Env> {
     let lost: string | undefined;
     let events = "";
     let stderr = "";
+    // What is read below is the ending of this run of the agent, and settles this run only. If
+    // the container is lost meanwhile and the task is started again from a checkpoint, or it is
+    // stopped, what was read is of a run that is no longer the task's: it ends nothing.
+    const round = before.runs.length;
+    const recoveries = before.recoveries;
+    const same = (now: TaskState | undefined): boolean => now !== undefined && ACTIVE.has(now.phase) && now.runs.length === round && now.recoveries === recoveries;
 
     // A missing container is the alarm's business: it decides between restoring and giving up.
     if (!this.#container.running) return;
@@ -1164,9 +1257,49 @@ export class TaskSandbox extends DurableObject<Env> {
       }
     }
 
+    // The agent has stopped and its files are still: a last copy of the workspace is taken now,
+    // so that what a later task goes on from is what this one left, not what it had some seconds
+    // before. Whether it is kept is decided below, once it is known how the task ended. Failing
+    // to take it holds nothing up: the task then simply cannot be gone on from.
+    let last: { record: DirectoryBackupRecord; at: number; took_ms: number } | undefined;
+    // (Both paths can come here for the same ending: the one that finds the copy being taken, or the
+    // ending already settled while it was reading, leaves it to the other. Nothing is awaited from here to the mark.)
+    const still = this.#state();
+    const mine = TaskSandbox.#round(before);
+    if (this.#leaving === mine || !same(still)) return;
+    if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
+      const started = Date.now();
+      this.#leaving = mine;
+      try {
+        last = { record: await this.#backups.backup({ dir: WORKSPACE_DIRECTORY, name: `task ${before.id} (as it ended)` }), at: started, took_ms: Date.now() - started };
+      } catch (err) {
+        console.log(JSON.stringify({ event: "final_checkpoint_failed", task: before.id, error: String(err).slice(0, 300) }));
+      } finally {
+        // (Only its own mark: a later run may be leaving by now.)
+        if (this.#leaving === mine) this.#leaving = undefined;
+      }
+    }
+
     // Re-read: the other path may have settled this run while we were reading files.
     const state = this.#state();
-    if (!state || !ACTIVE.has(state.phase)) return;
+    if (!state || !same(state)) {
+      // Settled by the other path, stopped, or started again from a checkpoint, meanwhile: the copy just taken is nobody's. It is
+      // written down as one to remove before it is removed, so that a removal that fails is tried
+      // again when the task's records are cleared.
+      if (last) {
+        if (state) {
+          state.stale_checkpoints = [...(state.stale_checkpoints ?? []), last.record];
+          this.#save(state);
+        }
+        const removed = await this.#backups.delete(last.record).then(() => true).catch(() => false);
+        const later = this.#state();
+        if (removed && later) {
+          later.stale_checkpoints = (later.stale_checkpoints ?? []).filter((stale) => stale.id !== last.record.id);
+          this.#save(later);
+        }
+      }
+      return;
+    }
     const run = state.runs[state.runs.length - 1];
     run.ended_at = Date.now();
     run.detected_by = source;
@@ -1201,6 +1334,15 @@ export class TaskSandbox extends DurableObject<Env> {
       } else {
         state.phase = "succeeded";
       }
+    }
+    // The last copy becomes the task's checkpoint if it succeeded; otherwise it is put with those to be removed.
+    if (last) {
+      const previous = state.checkpoint?.record;
+      if (state.phase === "succeeded") {
+        if (previous) state.stale_checkpoints = [...(state.stale_checkpoints ?? []), previous];
+        state.checkpoint = { ...last, final: true };
+        state.checkpoints_taken += 1;
+      } else state.stale_checkpoints = [...(state.stale_checkpoints ?? []), last.record];
     }
     if (state.phase === "succeeded") {
       this.#emit(state, "result", { text: run.result?.text ?? "", usage: run.result?.usage, turns: run.result?.turns, recoveries: state.recoveries, model_calls: state.model_calls });

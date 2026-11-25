@@ -49,6 +49,10 @@ function bench(state: DurableObjectState) {
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
     /** Something that happens while the sandbox is being asked to stop. */
+    /** Tasks the sandbox has already taken, by id, as they stand there. */
+    took: {} as Record<string, { phase: string; error?: string }>,
+    /** What a task left for a later one to go on from, by task id; nothing for one that left nothing or whose leavings are gone. */
+    left: {} as Record<string, { record: unknown; cwd: string; repository?: string; until: number }>,
     /** What the sandbox says when asked whether it has a task: its state, that it has none, or no answer at all. */
     has: "none" as "there" | "none" | Error,
     asked: [] as string[],
@@ -73,6 +77,8 @@ function bench(state: DurableObjectState) {
         if (worker.cancelFails) throw new Error("connection reset");
         return (worker.cancelled.push(taskId), { ok: true });
       },
+      snapshot: async () => worker.left[taskId] ?? null,
+      status: async () => worker.took[taskId] ?? { error: "no such task" },
       claimed: async () => {
         worker.asked.push(taskId);
         if (worker.has instanceof Error) throw worker.has;
@@ -669,6 +675,95 @@ describe("tasks, by themselves", () => {
         settings.workers = ["sandbox"];
         const old = (await tasks.dispatch(RUN, SESSION_KEY, "call_5", null, "t", "b", { repository: null })) as { task_id: string };
         expect(kept(old.task_id).worker).toBe("sandbox");
+      });
+    });
+
+    it("goes on from an earlier piece of the same worker's work in the same conversation that ended well, and from no other", async () => {
+      await within(async ({ tasks, store, kept, settings, slots, worker, task, audited }) => {
+        // A piece of work that ended well, on a repository, and left its workspace behind.
+        const first = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "sandbox", "Fix", "fix it", { repository: "https://github.com/acme/app" })) as { task_id: string };
+        await tasks.event(first.task_id, 1, "result", { text: "fixed" });
+        worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app", until: Date.now() + 3_600_000 };
+
+        // The next piece goes on from it: a task of its own, started from what the first left, where the first worked.
+        const second = (await tasks.dispatch(RUN, SESSION_KEY, "call_2", "sandbox", "Tests", "add tests", { repository: null }, first.task_id)) as { task_id: string; status: string };
+        expect(second.status).toBe("running");
+        expect(second.task_id).not.toBe(first.task_id);
+        expect(worker.started.at(-1)).toMatchObject({ id: second.task_id, prompt: "add tests", seed: { from: first.task_id, record: { id: "kept" }, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" } });
+        expect((worker.started.at(-1) as any).repository).toBeUndefined();
+        // The first is as it ended; the second is credited and counted on its own.
+        expect(kept(first.task_id).status).toBe("succeeded");
+        expect(audited("task.dispatched").at(-1)).toMatchObject({ task_id: second.task_id, continue_from: first.task_id });
+        // The same repository named again is the same; another is other work, which the worker says.
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_3", "sandbox", "t", "b", { repository: "https://github.com/ACME/app.git" }, first.task_id)).toMatchObject({ status: "running" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_4", "sandbox", "t", "b", { repository: "https://github.com/acme/other" }, first.task_id)).rejects.toThrow("to go on with it leave repository null");
+        // What it left is no longer kept: said by the worker, nothing started in its place, the place given back.
+        delete worker.left[first.task_id];
+        const before = worker.started.length;
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_5", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("is no longer kept");
+        expect(worker.started).toHaveLength(before);
+        expect(slots.released.length).toBeGreaterThan(0);
+
+        // Not one that has not ended, or did not end well; not another conversation's; not one there is none of. Nothing is written for any of these.
+        const written = store.rows("SELECT 1 FROM tasks").length;
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_6", "sandbox", "t", "b", { repository: null }, second.task_id)).rejects.toThrow("has not ended yet");
+        task("t_failed", { status: "failed" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_7", "sandbox", "t", "b", { repository: null }, "t_failed")).rejects.toThrow("did not end well");
+        task("t_elsewhere", { status: "succeeded", session_key: "thread:other" });
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_8", "sandbox", "t", "b", { repository: null }, "t_elsewhere")).rejects.toThrow("there is no piece of work");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_9", "sandbox", "t", "b", { repository: null }, "no-such")).rejects.toThrow("there is no piece of work");
+        expect(store.rows("SELECT 1 FROM tasks").length).toBe(written + 2);
+
+        // Not another person's, in the same conversation: it is theirs alone to go on from.
+        worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", until: Date.now() + 3_600_000 };
+        store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_other_person", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("there is no piece of work");
+
+        // A start that was taken while the word of it was lost, made again after what the earlier task left is gone:
+        // the new task answers for itself. It is running, and is not said to have failed.
+        store.sql.exec("UPDATE tasks SET requested_by = (SELECT requested_by FROM tasks WHERE id = ?) WHERE id = ?", second.task_id, first.task_id);
+        worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", until: Date.now() + 3_600_000 };
+        worker.start = async () => {
+          throw new Error("connection reset");
+        };
+        const unanswered = (await tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)) as { task_id: string; status: string };
+        expect(unanswered.status).toBe("unconfirmed");
+        store.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", unanswered.task_id);
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", unanswered.task_id);
+        delete worker.left[first.task_id];
+        worker.took[unanswered.task_id] = { phase: "running" };
+        const begun = worker.started.length;
+        // (Made again saying it goes on from something else: not this call.)
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, second.task_id)).rejects.toThrow("first made for something else");
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).toMatchObject({ task_id: unanswered.task_id, status: "running" });
+        expect(worker.started).toHaveLength(begun);
+        // Made again by a run that is someone else's, or nobody's in particular: not this call, whether or not it has begun.
+        const alice = settings.deciders;
+        settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("first made for someone else");
+        settings.deciders = [];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("first made for someone else");
+        settings.deciders = alice;
+        // What it goes on from is kept with it.
+        expect(store.rows("SELECT from_id FROM task_follows WHERE task_id = ?", unanswered.task_id)).toEqual([{ from_id: first.task_id }]);
+        store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
+
+        // Work nobody in particular asked for is nobody's to go on from, also for a run that is nobody's in particular.
+        task("t_nobodys", { status: "succeeded" });
+        store.sql.exec("UPDATE tasks SET requested_by = NULL WHERE id = 't_nobodys'");
+        const one = settings.deciders;
+        settings.deciders = [];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_nobody", "sandbox", "t", "b", { repository: null }, "t_nobodys")).rejects.toThrow("there is no piece of work");
+        settings.deciders = one;
+
+        // A worker that does not say it goes on is never asked to.
+        const probe: Worker = { name: "probe", description: "", acts_as: "agent", start: async () => ({ state: "started" }) };
+        settings.others = [probe];
+        task("t_probe", { status: "succeeded" });
+        store.sql.exec("UPDATE tasks SET worker = 'probe' WHERE id = 't_probe'");
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_10", "probe", "t", "b", {}, "t_probe")).rejects.toThrow("cannot go on with an earlier piece of work");
+        // And one worker's work is not another's to go on from.
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_11", "sandbox", "t", "b", { repository: null }, "t_probe")).rejects.toThrow("there is no piece of work");
       });
     });
 

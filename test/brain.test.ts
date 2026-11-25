@@ -186,6 +186,39 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("lists work the sandbox finished here as something that can be gone on from, and starts the next piece from what it left", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const first = toolOutputs().find((each: any) => each.work_id).work_id;
+    model.replies([call("send_message", { text: "修好了。" })], [say("")]);
+    await stub.taskEvent(first, 1, "result", { text: "Fixed." });
+    await wake(stub);
+
+    // The next thing asked is more of the same: it is listed as finished work that can be gone on from, and handed over with its id.
+    model.replies([call("hand_over", { worker: "sandbox", title: "Add tests", brief: "add tests for the fix", continue_from: first, repository: null })], [say("")]);
+    await stub.ingest(message("now add tests for it"));
+    await wake(stub);
+    expect(modelCalls.at(-2).instructions).toContain(`- ${first} [sandbox] "Fix the build": done (what it left is kept for about a day`);
+    const second = toolOutputs().at(-1);
+    expect(second).toMatchObject({ status: "running" });
+    expect(second.work_id).not.toBe(first);
+    // The new sandbox was started from what the first left, where the first worked; the first is as it was.
+    const started = (await task(second.work_id).calls()).find((each: any) => each.method === "start").args;
+    expect(started.seed).toMatchObject({ from: first, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" });
+    expect(started.repository).toBeUndefined();
+    expect(started.prompt).toBe("add tests for the fix");
+    const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT id, status FROM tasks ORDER BY created_at").toArray());
+    expect(kept).toEqual([{ id: first, status: "succeeded" }, { id: second.work_id, status: "running" }]);
+
+    // Another repository is other work: refused by the worker, and said.
+    model.replies([call("hand_over", { worker: "sandbox", title: "Elsewhere", brief: "x", continue_from: first, repository: "https://github.com/acme/other" })], [say("")]);
+    await stub.ingest(message("and the same over there"));
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toContain("to go on with it leave repository null");
+  });
+
   it("says that it is not known whether work began when the sandbox did not answer, keeps saying so, and finds out by itself", async () => {
     const { stub } = brain();
     const rowsOf = (of: any, query: string, ...args: unknown[]): Promise<any[]> => runInDurableObject(of, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
@@ -239,8 +272,8 @@ describe("timers and memory", () => {
     expect(modelCalls.at(-4).instructions).toContain(`- ${id} [sandbox] "Fix the build": running`);
     const outputs = toolOutputs().slice(-3);
     expect(outputs[0]).toMatchObject({ status: "running" });
-    // The sandbox cannot go on with an earlier piece of work yet: said, and nothing started.
-    expect(outputs[1].error).toContain("cannot go on with an earlier piece of work");
+    // The sandbox goes on only from a piece of work that has ended: one still running has left nothing yet. Said, and nothing started.
+    expect(outputs[1].error).toContain("has not ended yet, so there is nothing of it to go on from");
     expect(outputs[2]).toMatchObject({ ok: true, status: "cancelled" });
     // It does not take the place of a request that waits: said before anything is started.
     model.replies([call("hand_over", { worker: "sandbox", title: "t", brief: "b", continue_from: null, repository: null, replaces: "req_1" })], [say("")]);

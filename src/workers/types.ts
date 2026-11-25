@@ -29,6 +29,12 @@ export interface Work {
    */
   accept_by?: number;
   /**
+   * The id of an earlier piece of work of this same worker's, in the same conversation, that
+   * ended well: this one goes on from what that one left. The Brain has checked that much; the
+   * worker says (by refusing) if what it left can no longer be had.
+   */
+  continue_from?: string;
+  /**
    * How far the tenant lets this piece of work go: how long it may run and how often it may ask
    * the model. Fixed as the work is handed over; a worker that has such bounds of its own goes
    * by these where they are given.
@@ -57,6 +63,12 @@ export interface Worker {
    * will not take (an option that is not what it should be, work it does not do from that place).
    */
   accepts?(options: Record<string, unknown>, scope: Scope): void;
+  /**
+   * For a worker the Brain starts: it can go on from an earlier piece of its own work that ended
+   * well (see `Work.continue_from`), for as long as it keeps what that left. Said to the model
+   * with the hand-over tool; a worker that does not say so is never asked to.
+   */
+  goes_on?: true;
   /** Starts a piece of work. The same `work.id` again is the same piece of work, not a second one. */
   start?(env: Env, work: Work): Promise<Started>;
   /**
