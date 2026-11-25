@@ -1101,7 +1101,8 @@ export class Runner {
   #picturesShown(runId: string): Promise<Item[]> {
     if (this.#shown?.run === runId) return this.#shown.parts;
     const wanted = this.#picturesFor(runId);
-    const FROM = { now: "of what is above", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs here" };
+    // An earlier one is said to be that: it came with a message already dealt with, and the model would otherwise take it for new and answer that message again.
+    const FROM = { now: "of what is above (what they just sent)", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it" };
     const parts = !wanted
       ? Promise.resolve([])
       : this.#b.pictures(wanted.connector, { data: wanted.data }, wanted.refs.map((each) => ({ message: each.message, key: each.key }))).then((got) => [
