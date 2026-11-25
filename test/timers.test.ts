@@ -106,15 +106,28 @@ describe("timers", () => {
     });
   });
 
-  it("ends a repeating timer after a day, and its last event says so even while an earlier one waits", async () => {
+  it("ends a repeating timer after it has come round fifty times, and its last event says so in place of one still waiting", async () => {
     await within((part, store) => {
-      timer(store, "forgotten", NOW - 1, { every_s: 300, note: "start the review when there is room", created: NOW - 23 * 3_600_000 });
+      // Every five minutes: fifty times is a little over four hours.
+      timer(store, "forgotten", NOW - 1, { every_s: 300, note: "start the review when there is room", created: NOW - 49 * 300_000 });
       part.fire(NOW);
       expect(timers(store).forgotten.status).toBe("active");
-      part.fire(NOW + 3_600_000);
+      part.fire(NOW + 300_000);
       expect(timers(store).forgotten.status).toBe("done");
-      expect(events(store).map((each) => each.text).at(-1)).toBe("start the review when there is room\n  (this repeating timer has run for a day and has now ended: set it again only if it is still needed)");
-      part.fire(NOW + 2 * 3_600_000);
+      const waiting = events(store).filter((each) => each.status === "pending");
+      expect(waiting.map((each) => each.text)).toEqual(["start the review when there is room\n  (this repeating timer has come round 50 times and has now ended: set it again only if it is still needed)"]);
+      part.fire(NOW + 2 * 300_000);
+      expect(events(store)).toHaveLength(2);
+    });
+  });
+
+  it("lets a daily or a weekly timer go on: set to fire first in a week and weekly after, it does not end at its first firing", async () => {
+    await within((part, store) => {
+      const WEEK = 7 * 24 * 3_600;
+      timer(store, "weekly", NOW, { every_s: WEEK, created: NOW - WEEK * 1_000 });
+      timer(store, "daily", NOW, { every_s: 24 * 3_600, created: NOW - 30 * 24 * 3_600_000 });
+      part.fire(NOW);
+      expect(timers(store)).toMatchObject({ weekly: { status: "active" }, daily: { status: "active" } });
       expect(events(store)).toHaveLength(2);
     });
   });
