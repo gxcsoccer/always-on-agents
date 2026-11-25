@@ -420,6 +420,8 @@ function someone() {
   return { openId, stub, event, says, sends, who, settle, quiet, cutOff, owed, requests, heard, cards, audit, due, grant };
 }
 
+/** What a person is told when the card they were shown did not go through. */
+const NOT_AUTHORISED = "授权没有完成，你要我做的事还没有做。还需要的话，请再跟我说一遍。";
 const link = (token: string, kind = "docx") => `https://example.feishu.cn/${kind}/${token}`;
 /** What the tools answered in the run a model call belongs to: everything after the last thing that was said to it. */
 const outputsIn = (asked: any): any[] => {
@@ -616,10 +618,11 @@ describe("reading a Feishu document as the person who asked", () => {
     await victim.says(`读一下 ${link("DocVictim000000000001")}`);
     expect((await consent(invitation(victim.openId), { openId: victim.openId, org: "org_other" })).status).toBe(403);
     expect((await (await victim.grant()).status()).authorised).toBe(false);
-    // Nothing of hers was read for any of it, and both requests are still waiting for her.
+    // Nothing of hers was read for any of it. Each request ended with the card it was shown, and she was told so for each card.
     await victim.settle();
     expect(feishu.reads).toEqual([]);
-    expect((await victim.requests()).map((each) => each.status)).toEqual(["waiting", "waiting"]);
+    expect((await victim.requests()).map((each) => each.status)).toEqual(["void", "void"]);
+    expect(victim.heard()).toEqual([NOT_AUTHORISED, NOT_AUTHORISED]);
   });
 
   it("accepts an invitation once, and not one it never sent, one that was declined, or one that is too old", async () => {
@@ -659,11 +662,13 @@ describe("reading a Feishu document as the person who asked", () => {
 
     // Used once, it works; used again, it does not.
     const good = await ask();
-    // She asked four times, and every one of those requests was waiting on her authorisation,
-    // whichever card it was first shown with: each is carried on and answered.
-    carriesOn("一", "二", "三", "四");
+    // She asked four times. The first ended when she declined its card, and she was told. The
+    // others were waiting on her authorisation, whichever card each was first shown with: each
+    // is carried on and answered.
+    carriesOn("二", "三", "四");
     await authorises(carol, good);
-    expect(carol.heard()).toEqual(["一", "二", "三", "四"]);
+    expect(carol.heard()).toEqual([NOT_AUTHORISED, "二", "三", "四"]);
+    expect((await carol.requests()).map((each) => each.status)).toEqual(["void", "done", "done", "done"]);
     expect((await consent(good, carol)).status).toBe(400);
     expect(feishu.tokens.size).toBe(1);
   });
@@ -1263,9 +1268,10 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(lines.filter((line) => line.includes("feishu_authorisation_refused")).map((line) => JSON.parse(line))).toEqual([{ feishu_authorisation_refused: "exchange_failed", app: APP_ID, status: 400, code: 20068, endpoint: "v3" }]);
     expect(feishu.tokens.size).toBe(issued);
     expect(await (await judy.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly" });
-    // The wiki page still waits for what she has not given; nothing carries it on.
+    // The wiki page's request ends with the card that did not go through, and she is told.
     await judy.settle();
-    expect((await judy.requests()).map((each) => each.status)).toEqual(["done", "waiting"]);
+    expect((await judy.requests()).map((each) => each.status)).toEqual(["done", "void"]);
+    expect(judy.heard().at(-1)).toBe(NOT_AUTHORISED);
   });
 
   it("exchanges at the newer endpoint unless the operator has switched that one app to the older", async () => {
@@ -2051,6 +2057,29 @@ describe("a request that waits and is carried on", () => {
       await sam.settle();
       expect(sam.heard(), how).toEqual(hears);
     }
+  });
+
+  it("ends a request whose card did not go through, says so once, and answers once when the person asks again and authorises", async () => {
+    const una = owner("DocUna000000000000001");
+    const first = await asksFor(una, "DocUna000000000000001");
+    // She goes through the card, and the exchange at Feishu fails.
+    const authorize = invitation(una.openId);
+    const back = new URL(authorize.searchParams.get("redirect_uri")!);
+    back.searchParams.set("state", authorize.searchParams.get("state")!);
+    back.searchParams.set("code", "a-code-feishu-never-gave");
+    expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
+    await una.settle();
+    // The request is over now, not when its time runs out, and she is told once.
+    expect(await una.requests()).toMatchObject([{ id: first, status: "void" }]);
+    expect(una.heard()).toEqual([NOT_AUTHORISED]);
+    // She asks again, as the page told her to, and authorises: one answer, for the new request.
+    const second = await asksFor(una, "DocUna000000000000001");
+    carriesOn("周五发布。");
+    await authorises(una);
+    expect(una.heard()).toEqual([NOT_AUTHORISED, "周五发布。"]);
+    expect(await una.requests()).toMatchObject([{ id: first, status: "void" }, { id: second, status: "done" }]);
+    expect(read()).toEqual(["DocUna000000000000001"]);
+    expect(model.remaining()).toBe(0);
   });
 
   it("wakes every request the authorisation covers, whichever card it was given with (F16)", async () => {
@@ -3313,12 +3342,12 @@ describe("the answer to an invitation made for one question", () => {
     const denied = someone();
     const first = await asked(denied);
     await consent(first.authorize, denied, "deny");
-    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toEqual({ state: "gone" });
+    expect(await first.grant.answered(first.nonce, DOCS, first.generation)).toMatchObject({ state: "gone", refused: true });
 
     const victim = someone();
     const second = await asked(victim);
     expect((await consent(second.authorize, someone())).status).toBe(403);
-    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toEqual({ state: "gone" });
+    expect(await second.grant.answered(second.nonce, DOCS, second.generation)).toMatchObject({ state: "gone", refused: true });
     expect((await second.grant.status()).authorised).toBe(false);
 
     const unlucky = someone();
@@ -3327,7 +3356,7 @@ describe("the answer to an invitation made for one question", () => {
     back.searchParams.set("state", third.authorize.searchParams.get("state")!);
     back.searchParams.set("code", "a-code-feishu-never-gave");
     expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
-    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toEqual({ state: "gone" });
+    expect(await third.grant.answered(third.nonce, DOCS, third.generation)).toMatchObject({ state: "gone", refused: true });
   });
 });
 

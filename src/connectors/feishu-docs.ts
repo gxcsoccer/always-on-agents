@@ -374,7 +374,8 @@ async function read(context: ToolContext, args: Record<string, unknown>): Promis
     if (!place) {
       const invitation = await grant.invite(who, redirect, needed, { generation, ...(refused ? { refused } : {}) });
       if (invitation === "superseded") return superseded;
-      return { waiting: { on: "authorisation", subject: name, condition: conditionOf(name, needed), generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
+      // It waits on the person being authorised, whichever card does it; and on the card it was shown not having failed.
+      return { waiting: { on: "authorisation", subject: name, condition: `invited|${name}|${invitation.nonce}|${[...needed].sort().join(" ")}`, generation: invitation.generation, until: invitation.expires_at, interaction: `${name}.${invitation.nonce}`, request: { document: canonical } } } satisfies Waiting;
     }
     // Where several people talk, the invitation is this question's alone: named by the message
     // that asked, as Feishu named it. It waits on that very invitation being answered by the
@@ -505,6 +506,13 @@ export async function authorisationHolds(env: Env, scope: Scope, condition: stri
     if (unasked(facts.info) || unasked(facts.member)) throw new Error("Feishu cannot be asked about the chat just now");
     return chatIs(facts, part[4]) === "internal" ? held : { state: "gone" };
   }
+  // A request in the person's own conversation, waiting to be authorised, by the card it was shown or another.
+  if (part[0] === "invited" && part.length === 4) {
+    const needed = scopesOf(part[3]);
+    if (!needed || !/^[0-9a-f]{64}$/.test(part[1]) || !/^[A-Za-z0-9_-]{20,100}$/.test(part[2])) return { state: "gone" };
+    return env.FEISHU_GRANTS.getByName(part[1]).invited(part[2], needed, generation);
+  }
+  // Something read there (and a request that began waiting before it waited on its own card).
   const found = /^([0-9a-f]{64}):([a-z_:. ]{1,200})$/.exec(condition);
   const needed = found ? scopesOf(found[2]) : undefined;
   if (!found || !needed) return { state: "gone" };
