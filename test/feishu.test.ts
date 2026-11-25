@@ -262,9 +262,13 @@ describe("fetching the message a group message was written in reply to", () => {
     expect(await look()).toMatchObject({ text: "[picture]", pictures: [{ key: "k" }] });
   });
 
-  it("gives nobody else's words: another member's, a bot's, the agent's own, someone from another organisation, or another message of a forwarded bundle", async () => {
+  it("gives another member's words as another member's, and nothing of a bot's, the agent's own, someone's from another organisation, or another message of a forwarded bundle", async () => {
+    // A colleague, in the same organisation: what the person points at by replying. Its words and what it links, marked as not theirs; no picture of it.
+    feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" } }));
+    expect(await look()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1", other: true });
+    feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" }, msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
+    expect(await look()).toEqual({ text: "[picture]", other: true });
     for (const sender of [
-      { id: "ou_bob", sender_type: "user", tenant_key: "t" },
       { id: "cli_other", id_type: "app_id", sender_type: "app", tenant_key: "t" },
       { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" },
       { id: "ou_alice", sender_type: "user", tenant_key: "elsewhere" },
@@ -361,10 +365,12 @@ describe("which documents a fetched message links", () => {
     // Only the message it replies to itself: where it started is not that.
     expect(await fetched({ root_id: "om_root" })).toEqual({ text: "说了啥？" });
     expect(await fetched({ parent_id: "om_answer", root_id: "om_root" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
-    // Someone else's message, or the app's own: nothing of what it says or links, only what it was written in reply to, so the chain can be followed past it.
-    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    // A colleague's message: its words and what it links, marked as another member's, and what it was written in reply to.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } })).toEqual({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001", other: true, documents: [expect.objectContaining({ token: "BobsDoc0000000001" })], replies_to: "feishu:message:om_answer" });
+    // The app's own, or someone's from another organisation: nothing of what it says or links, only what it was written in reply to, so the chain can be followed past it.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_eve", tenant_key: "elsewhere" }, body: { content: JSON.stringify({ text: "eve's words" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "app", id: "cli_test" } })).toEqual({ replies_to: "feishu:message:om_answer" });
-    expect(await fetched({ sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    expect(await fetched({ sender: { sender_type: "user", id: "ou_eve", tenant_key: "elsewhere" } })).toEqual({});
     // Their own, with nothing in it that can be read: no words, but the chain goes on from it all the same.
     expect(await fetched({ parent_id: "om_answer", body: { content: JSON.stringify({ text: "" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ parent_id: "om_answer", body: { content: "{not json" } })).toEqual({ replies_to: "feishu:message:om_answer" });
@@ -374,7 +380,8 @@ describe("which documents a fetched message links", () => {
     // Not out of another chat, not once recalled, and not inside a topic.
     expect(await fetched({ parent_id: "om_answer", chat_id: "oc_other" })).toEqual({});
     expect(await fetched({ parent_id: "om_answer", deleted: true })).toEqual({});
-    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({ text: "说了啥？", other: true });
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "app", id: "cli_other" } })).toEqual({});
   });
 
   it("goes by where a link leads, never by the words shown for it", async () => {

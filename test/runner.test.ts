@@ -367,10 +367,13 @@ describe("the run loop, by itself", () => {
       await within(async ({ runner, store, event, items, settings, log }) => {
         settings.quoted = { text: "fetched again" };
         const next = async () => (store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'"), store.sql.exec("DELETE FROM meta WHERE key = 'active_run'"), items((await runner.next())!)[0].content as string);
-        // Someone else's message that reached the agent: already in the conversation.
+        // Someone else's message that reached the agent: its words are theirs, so the connector is asked whether
+        // they may be shown; and they are shown as another member's, whatever the connector calls them.
         event("from bob", { source_id: "om_bob", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
         event("about that", { data: { replies_to: "feishu:message:om_bob" } });
-        expect(await next()).not.toContain("written as a reply");
+        expect(await next()).toContain("written as a reply to a message of another member here");
+        expect(log.filter((each) => each[0] === "quoted")).toHaveLength(1);
+        log.length = 0;
         // Their own, whose words are no longer kept: not brought back.
         event("old", { source_id: "om_old", status: "done" });
         store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");

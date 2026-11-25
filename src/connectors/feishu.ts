@@ -422,9 +422,13 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // itself: where the exchange started (`root_id`) is not that.
     const above = found.parent_id;
     const further = !found.thread_id && typeof above === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(above) ? { replies_to: `feishu:message:${above}` } : {};
-    // Someone else's, or the app's own: nothing it says or links, only where it points, so that
-    // what stands further up the chain of replies can still be found.
-    if (sender.sender_type !== "user" || sender.id !== asker.open_id || sender.tenant_key !== asker.tenant_key) return further;
+    // A bot's, the app's own, or someone's from another organisation: nothing it says or links,
+    // only where it points, so that what stands further up the chain of replies can still be found.
+    if (sender.sender_type !== "user" || sender.tenant_key !== asker.tenant_key || typeof sender.id !== "string") return further;
+    // Another member's, of the same organisation: given, and said to be theirs. By replying to it
+    // the person points at it, as they would at a document; what it says is for them to have
+    // looked at, and is not a request of theirs.
+    const other = sender.id !== asker.open_id;
     // Their own, with nothing that can be read in it: the chain still goes on from it.
     if (typeof found.body?.content !== "string") return further;
     let content: any;
@@ -444,7 +448,7 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // Nothing could be made of it: not something read.
     // When it was written, as Feishu says (milliseconds): what it links is something they linked then, not now.
     const at = Number(found.create_time);
-    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(documents.length > 0 ? { documents } : {}), ...(pictures.length > 0 ? { pictures } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
+    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(other ? { other: true as const } : {}), ...(documents.length > 0 ? { documents } : {}), ...(pictures.length > 0 && !other ? { pictures } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
   } catch {
     return {};
   }
