@@ -371,7 +371,9 @@ export class RunTools {
         // Said before anything is started: a worker the Brain starts does not take a waiting request's place.
         if (replaces !== null) throw new Error(`the worker "${name}" cannot take the place of a request that waits; if the person no longer wants that one, call it off first, then hand this over`);
         if (continueFrom !== null) throw new Error(`the worker "${name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
-        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, options)) as { task_id: string; status: string; note?: string };
+        // Only its own options go to it: another worker's, left null, are not its business nor part of its record.
+        const own = Object.fromEntries(Object.entries(options).filter(([key]) => key in (worker.options ?? {})));
+        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
       workStatus: async (workId) => {
