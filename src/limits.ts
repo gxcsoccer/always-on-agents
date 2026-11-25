@@ -21,8 +21,15 @@ export const DEFAULT_LIMITS: Limits = {
   tenant_sandboxes: 5,
 };
 
+/**
+ * Tokens set aside against the tenant's day before a call to the model, and corrected to what
+ * the call really used after it. A tenant's day that is smaller than this (and not nothing)
+ * could never begin a call, so it is not a figure the tenant's day can be set to.
+ */
+export const MODEL_CALL_RESERVE = 20_000;
+
 /** The most each may be set to: beyond these a figure is a mistake, not a limit. */
-const MOST: Limits = {
+export const MOST: Limits = {
   scope_daily_tokens: 1_000_000_000,
   tenant_daily_tokens: 10_000_000_000,
   scope_active_tasks: 50,
@@ -49,11 +56,17 @@ export function changed(kept: unknown, change: unknown): Partial<Limits> {
     if (!NAMES.includes(name as keyof Limits)) throw new Error(`${name} is not a limit; the limits are ${NAMES.join(", ")}`);
     if (figure === null) delete next[name as keyof Limits];
     else if (valid(name as keyof Limits, figure)) next[name as keyof Limits] = figure as number;
-    else throw new Error(`${name} must be a whole number from 0 to ${MOST[name as keyof Limits]}, or null for the default`);
+    else throw new Error(`${name} must be a whole number from 0 to ${MOST[name as keyof Limits]}${name === "tenant_daily_tokens" ? ` (and, unless it is 0, at least ${MODEL_CALL_RESERVE}: that much is set aside before every call to the model)` : ""}, or null for the default`);
   }
   return next;
 }
 
 function valid(name: keyof Limits, figure: unknown): boolean {
-  return typeof figure === "number" && Number.isInteger(figure) && figure >= 0 && figure <= MOST[name];
+  if (typeof figure !== "number" || !Number.isInteger(figure) || figure < 0 || figure > MOST[name]) return false;
+  return name !== "tenant_daily_tokens" || figure === 0 || figure >= MODEL_CALL_RESERVE;
+}
+
+/** The figures of a tenant's own that were set, as kept: those that are not there hold by default. */
+export function overridesFrom(kept: unknown): Partial<Limits> {
+  return changed(kept, {});
 }

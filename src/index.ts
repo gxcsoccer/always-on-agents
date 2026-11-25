@@ -6,7 +6,7 @@
 import { connector, connectors } from "./connectors";
 import type { Env } from "./env";
 import { registry } from "./registry";
-import { DEFAULT_LIMITS } from "./limits";
+import { DEFAULT_LIMITS, MODEL_CALL_RESERVE, MOST } from "./limits";
 
 export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
@@ -54,14 +54,19 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     return json(await registry(env).createTenant(String(id ?? ""), String(name ?? id ?? "")), 201);
   }
   // What a tenant may use: read, and set by figure (null: back to the default; not named: left as it is).
+  // With it: which of the figures were set for this tenant, the defaults, and the most each may be.
   if (path[0] === "tenants" && path[2] === "limits" && path.length === 3) {
-    if (method === "GET") return json({ limits: await registry(env).limits(path[1]), defaults: DEFAULT_LIMITS });
+    const told = (found: { limits: unknown; overrides: unknown }) => json({ ...found, defaults: DEFAULT_LIMITS, most: MOST, least_tenant_daily_tokens: MODEL_CALL_RESERVE });
+    if (method === "GET") {
+      const found = await registry(env).limits(path[1]);
+      return found ? told(found) : json({ error: "no such tenant" }, 404);
+    }
     if (method === "PUT" || method === "POST" || method === "PATCH") {
-      try {
-        return json({ limits: await registry(env).setLimits(path[1], await body()), defaults: DEFAULT_LIMITS });
-      } catch (err) {
-        return json({ error: String(err instanceof Error ? err.message : err) }, 400);
-      }
+      // Not what `body` makes of it: a body that cannot be read, or is not an object, is a mistake and changes nothing.
+      const change = (await request.json().catch(() => undefined)) as unknown;
+      if (change === undefined || change === null || typeof change !== "object" || Array.isArray(change)) return json({ error: "limits are given as a JSON object of figures" }, 400);
+      const made = await registry(env).setLimits(path[1], change);
+      return "error" in made ? json({ error: made.error }, made.missing ? 404 : 400) : told(made);
     }
   }
   if (path[0] === "tenants" && path[2] === "chat-repos" && method === "POST") {

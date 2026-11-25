@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "./env";
-import { type Limits, changed, limitsFrom } from "./limits";
+import { type Limits, changed, limitsFrom, overridesFrom } from "./limits";
 
 /** Which Doubao app a chat app's people are served with, and how a person is known to be the same on both sides. */
 export interface DoubaoApp {
@@ -300,18 +300,25 @@ export class Registry extends DurableObject<Env> {
    * share one provider key, so this is what stops one tenant from using up everyone's allowance.
    */
   /** What a tenant may use: its own figures where the operator set them, the defaults elsewhere. */
-  async limits(tenant: string): Promise<Limits> {
-    return this.#limits(tenant);
+  async limits(tenant: string): Promise<{ limits: Limits; overrides: Partial<Limits> } | null> {
+    if (this.ctx.storage.sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) return null;
+    return { limits: this.#limits(tenant), overrides: overridesFrom(this.#kept(tenant)) };
   }
 
   /** Sets some of a tenant's limits (null: back to the default) and says what holds then. See `changed`. */
-  async setLimits(tenant: string, change: unknown): Promise<Limits> {
+  async setLimits(tenant: string, change: unknown): Promise<{ limits: Limits; overrides: Partial<Limits> } | { error: string; missing?: true }> {
     const sql = this.ctx.storage.sql;
-    if (sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) throw new Error("no such tenant");
-    const next = changed(this.#kept(tenant), change);
+    if (sql.exec("SELECT 1 FROM tenants WHERE id = ?", tenant).toArray().length === 0) return { error: "no such tenant", missing: true };
+    let next: Partial<Limits>;
+    try {
+      next = changed(this.#kept(tenant), change);
+    } catch (err) {
+      // What was asked for is not a change that can be made: said as that, apart from anything going wrong here.
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
     if (Object.keys(next).length === 0) sql.exec("DELETE FROM tenant_limits WHERE tenant = ?", tenant);
     else sql.exec("INSERT INTO tenant_limits (tenant, limits, updated_at) VALUES (?, ?, ?) ON CONFLICT(tenant) DO UPDATE SET limits = excluded.limits, updated_at = excluded.updated_at", tenant, JSON.stringify(next), Date.now());
-    return this.#limits(tenant);
+    return { limits: this.#limits(tenant), overrides: next };
   }
 
   #kept(tenant: string): unknown {
@@ -342,7 +349,9 @@ export class Registry extends DurableObject<Env> {
     const used = sql.exec<{ tokens: number }>("SELECT tokens FROM tenant_usage WHERE tenant = ? AND day = ?", tenant, day).toArray()[0]?.tokens ?? 0;
     // Allowed if the total, including what was just added, is still within the budget.
     const limits = this.#limits(tenant);
-    return { allowed: used <= limits.tenant_daily_tokens, used, budget: limits.tenant_daily_tokens, day, limits };
+    // A reservation is taken if the day, with it, is still within the limit. Asked with nothing to
+    // add ("may another call begin?"), a day that is used up says no: also one whose limit is nothing.
+    return { allowed: add > 0 ? used <= limits.tenant_daily_tokens : used < limits.tenant_daily_tokens, used, budget: limits.tenant_daily_tokens, day, limits };
   }
 
   /** Corrects a reservation to what was actually used. May be negative; the total never goes below zero. */

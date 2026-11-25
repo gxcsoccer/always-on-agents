@@ -1748,19 +1748,26 @@ describe("records and limits", () => {
     await registry.createTenant(tenant, tenant);
     const admin = async (method: string, body?: unknown) => {
       const response = await (workerExports as any).default.fetch(new Request(`https://agent.test/v1/admin/tenants/${tenant}/limits`, { method, headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
-      return { status: response.status, ...((await response.json()) as { limits?: Record<string, number>; defaults?: Record<string, number>; error?: string }) };
+      return { status: response.status, ...((await response.json()) as { limits?: Record<string, number>; overrides?: Record<string, number>; defaults?: Record<string, number>; most?: Record<string, number>; error?: string }) };
     };
     // Nothing set: the defaults.
     const defaults = { scope_daily_tokens: 2_000_000, tenant_daily_tokens: 20_000_000, scope_active_tasks: 3, tenant_sandboxes: 5 };
-    expect(await admin("GET")).toMatchObject({ status: 200, limits: defaults, defaults });
+    expect(await admin("GET")).toMatchObject({ status: 200, limits: defaults, overrides: {}, defaults, most: { scope_active_tasks: 50 } });
     // Set by figure; those not named stay as they are.
     expect((await admin("PUT", { scope_active_tasks: 1, tenant_daily_tokens: 30_000_000 })).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000 });
     expect((await admin("PUT", { scope_daily_tokens: 900_000 })).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
-    // Not a limit, not a figure, out of range: refused, and nothing changes.
-    for (const bad of [{ scope_tokens: 5 }, { scope_active_tasks: "many" }, { scope_active_tasks: 1.5 }, { scope_active_tasks: -1 }, { tenant_sandboxes: 1_000_000 }]) expect((await admin("PUT", bad)).status).toBe(400);
+    // Which of them were set for this tenant is told apart from what holds by default.
+    expect((await admin("GET")).overrides).toEqual({ scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
+    // Not a limit, not a figure, out of range; a tenant's day too small for a single call to begin: refused as a mistake, and nothing changes.
+    for (const bad of [{ scope_tokens: 5 }, { scope_active_tasks: "many" }, { scope_active_tasks: 1.5 }, { scope_active_tasks: -1 }, { tenant_sandboxes: 1_000_000 }, { tenant_daily_tokens: 10_000 }, [], "text"]) expect((await admin("PUT", bad)).status).toBe(400);
+    const raw = (path: string, method: string, body?: string) => (workerExports as any).default.fetch(new Request(`https://agent.test/v1/admin/tenants/${path}/limits`, { method, headers: { authorization: "Bearer test-admin" }, ...(body === undefined ? {} : { body }) }));
+    // A body that cannot be read, or is nothing: a mistake too, not a change of nothing.
+    expect((await raw(tenant, "PUT", "{not json")).status).toBe(400);
+    expect((await raw(tenant, "PUT", "null")).status).toBe(400);
     expect((await admin("GET")).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
-    // A tenant there is none of cannot be given limits.
-    expect((await (workerExports as any).default.fetch(new Request("https://agent.test/v1/admin/tenants/no-such-tenant/limits", { method: "PUT", headers: { authorization: "Bearer test-admin" }, body: "{}" }))).status).toBe(400);
+    // A tenant there is none of: not found, to read or to set.
+    expect((await raw("no-such-tenant", "GET")).status).toBe(404);
+    expect((await raw("no-such-tenant", "PUT", "{}")).status).toBe(404);
 
     // The tenant's day: 25 million is within 30.
     expect((await registry.recordUsage(tenant, 25_000_000)).allowed).toBe(true);
@@ -1787,6 +1794,18 @@ describe("records and limits", () => {
     // No sandbox at all for the tenant: a place cannot be had.
     await admin("PUT", { tenant_sandboxes: 0 });
     expect(await registry.acquireTaskSlot(tenant, "t-x")).toBe(false);
+
+    // A day of nothing: no call may begin, asked with something to set aside or with nothing ("may another begin?").
+    const other = `${tenant}-zero`;
+    await registry.createTenant(other, other);
+    await registry.setLimits(other, { tenant_daily_tokens: 0 });
+    expect((await registry.recordUsage(other, 0)).allowed).toBe(false);
+    // A day of exactly one reservation: that one is taken; with the day used up, another may not begin.
+    await registry.setLimits(other, { tenant_daily_tokens: 20_000 });
+    expect((await registry.recordUsage(other, 0)).allowed).toBe(true);
+    expect((await registry.recordUsage(other, 20_000)).allowed).toBe(true);
+    expect((await registry.recordUsage(other, 0)).allowed).toBe(false);
+    expect((await registry.recordUsage(other, 1)).allowed).toBe(false);
   });
 
   it("pauses a scope when its tenant has used up the tenant's daily budget", async () => {
