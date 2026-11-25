@@ -272,14 +272,16 @@ describe("fetching the message a group message was written in reply to", () => {
   });
 
   it("gives another member's words as another member's, and nothing of a bot's, the agent's own, someone's from another organisation, or another message of a forwarded bundle", async () => {
-    // A colleague, in the same organisation: what the person points at by replying. Its words and what it links, marked as not theirs; no picture of it.
+    // A colleague, in the same organisation: what the person points at by replying. Its words and what it links, marked as not theirs.
     const pointedAt = () => quotedBy("t-app", app, "oc_chat", "om_parent", alice, undefined, true);
     feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" } }));
     expect(await pointedAt()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1", other: true });
     // Only where the event said it is the very message replied to: named only as where the exchange began, nothing of it.
     expect(await look()).toEqual({});
     feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" }, msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
-    expect(await pointedAt()).toEqual({ text: "[picture]", other: true });
+    // A picture of theirs is named too: what the person points at.
+    expect(await pointedAt()).toEqual({ text: "[picture]", other: true, pictures: [{ message: "om_parent", key: "k" }] });
+    expect(await look()).toEqual({});
     for (const sender of [
       { id: "cli_other", id_type: "app_id", sender_type: "app", tenant_key: "t" },
       { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" },
