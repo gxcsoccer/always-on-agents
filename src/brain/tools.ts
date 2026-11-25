@@ -111,7 +111,7 @@ export const TOOLS: ToolDefinition[] = [
   ),
   tool(
     "cancel_request",
-    "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If more than one request could be meant, the system asks the person which, itself; say nothing more about it then.",
+    "Call off a request of the person's that is still waiting or under way (they are listed for you under \"Requests that are waiting\"; a piece of work handed to a worker is called off with cancel_work). Use it when the person says they no longer want it; not because they went on to talk about something else. When they want something else instead of it, do not cancel first: make the new request with its `replaces` set to the old one's id. If more than one request could be meant, the system asks the person which, itself; say nothing more about it then.",
     { request_id: string, ask: { type: "string", description: "One short sentence, in the person's language, asking which of their requests they mean. It is sent, followed by the list of those requests, only if more than one could be meant." } },
   ),
 ];

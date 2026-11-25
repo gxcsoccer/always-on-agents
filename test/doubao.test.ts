@@ -629,6 +629,41 @@ describe("handing work to Doubao Work", () => {
     await cy.says("怎么样了？算了");
     expect(toolOutputs(modelCalls.at(-3))[0].state).toMatch(/^waiting_for_authorisation \(it was handed over already/);
     expect(toolOutputs(modelCalls.at(-2))[1]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
+
+    // A piece from before this was kept with the work: known to have been handed over only by what the person was told.
+    const old = someone();
+    await handsOver(old, "调研 B");
+    const was = (await rowsOf(old.stub, "SELECT id FROM continuations"))[0].id;
+    await rowsOf(old.stub, "UPDATE work SET handed = 0");
+    model.replies([call("cancel_work", { work_id: was })], [call("send_message", { text: "不等了" })], [say("")]);
+    await old.says("算了");
+    expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ cancelled: was, how: "no_longer_waited_for" });
+    // It is kept from then on, so it is still said once the notice it was read from is gone.
+    expect(await rowsOf(old.stub, "SELECT handed FROM work")).toEqual([{ handed: 1 }]);
+    await rowsOf(old.stub, "DELETE FROM outbox WHERE idem LIKE 'underway:%'");
+    model.replies([call("work_status", { work_id: was })], [call("cancel_work", { work_id: was })], [say("")]);
+    await old.says("取消了吗");
+    expect(toolOutputs(modelCalls.at(-2))[0].state).toMatch(/^cancelled \(no longer waited for here/);
+    expect(JSON.stringify(toolOutputs(modelCalls.at(-1))[1])).toContain("the worker may still finish it over there");
+  });
+
+  it("says the same of work that is called off under the name for requests: that it may still be finished over there", async () => {
+    await pair();
+    const cy = someone();
+    await handsOver(cy, "调研 A");
+    const id = (await rowsOf(cy.stub, "SELECT id FROM continuations"))[0].id;
+    for (const token of world.tokens.values()) token.good = false;
+    await cy.later();
+    // The model reaches for the tool that calls a request off: it is the same piece of work, and is told the same of it.
+    model.replies([call("cancel_request", { request_id: id, ask: "你是说取消刚才的调研吗？" })], [call("send_message", { text: "不等了" })], [say("")]);
+    await cy.says("算了");
+    expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
+    expect((await cy.requests()).map((each: any) => each.status)).toEqual(["cancelled"]);
+    // Asked to call it off once more, or how it stands: still that it is only no longer waited for here.
+    model.replies([call("cancel_request", { request_id: id, ask: "" })], [call("work_status", { work_id: id })], [say("")]);
+    await cy.says("取消了吗");
+    expect(JSON.stringify(toolOutputs(modelCalls.at(-2))[0])).toContain("the worker may still finish it over there");
+    expect(toolOutputs(modelCalls.at(-1))[1].state).toMatch(/^cancelled \(no longer waited for here/);
   });
 
   it("is there where several people talk: for the one who asked and as them, with the way in shown to them alone and the answer said to all", async () => {
