@@ -197,6 +197,15 @@ describe("turning a Feishu message into an event", () => {
     expect(normalize(app, envelope({ chat_type: "p2p", content: "not json" }))).toBeUndefined();
   });
 
+  it("says whether the message it names is the one replied to itself, or only where the exchange began", () => {
+    const mention = [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }];
+    const data = (over: Record<string, unknown>) => normalize(app, envelope({ chat_type: "group", mentions: mention, content: JSON.stringify({ text: "@_user_1 看看" }), ...over }))?.event.data as Record<string, unknown>;
+    expect(data({ parent_id: "om_parent", root_id: "om_root" })).toMatchObject({ replies_to: "feishu:message:om_parent", replied_directly: true });
+    expect(data({ root_id: "om_root" })).toMatchObject({ replies_to: "feishu:message:om_root" });
+    expect(data({ root_id: "om_root" }).replied_directly).toBeUndefined();
+    expect(data({ parent_id: "om_parent", thread_id: "omt_1" }).replied_directly).toBeUndefined();
+  });
+
   it("says so when a message is not text instead of dropping it", () => {
     expect(normalize(app, envelope({ chat_type: "p2p", message_type: "image", content: "{}" }))?.event.text).toContain("image");
     expect(normalize(app, envelope({ chat_type: "p2p", message_type: "file", content: "{}" }))?.event.text).toBe("[a file message, which I cannot read yet]");
@@ -262,9 +271,16 @@ describe("fetching the message a group message was written in reply to", () => {
     expect(await look()).toMatchObject({ text: "[picture]", pictures: [{ key: "k" }] });
   });
 
-  it("gives nobody else's words: another member's, a bot's, the agent's own, someone from another organisation, or another message of a forwarded bundle", async () => {
+  it("gives another member's words as another member's, and nothing of a bot's, the agent's own, someone's from another organisation, or another message of a forwarded bundle", async () => {
+    // A colleague, in the same organisation: what the person points at by replying. Its words and what it links, marked as not theirs; no picture of it.
+    const pointedAt = () => quotedBy("t-app", app, "oc_chat", "om_parent", alice, undefined, true);
+    feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" } }));
+    expect(await pointedAt()).toEqual({ text: "the notes https://x.feishu.cn/docx/Doc1", other: true });
+    // Only where the event said it is the very message replied to: named only as where the exchange began, nothing of it.
+    expect(await look()).toEqual({});
+    feishu(item({ sender: { id: "ou_bob", sender_type: "user", tenant_key: "t" }, msg_type: "image", body: { content: JSON.stringify({ image_key: "k" }) } }));
+    expect(await pointedAt()).toEqual({ text: "[picture]", other: true });
     for (const sender of [
-      { id: "ou_bob", sender_type: "user", tenant_key: "t" },
       { id: "cli_other", id_type: "app_id", sender_type: "app", tenant_key: "t" },
       { id: "cli_test", id_type: "app_id", sender_type: "app", tenant_key: "t" },
       { id: "ou_alice", sender_type: "user", tenant_key: "elsewhere" },
@@ -350,9 +366,9 @@ describe("which documents a fetched message links", () => {
   afterEach(() => vi.unstubAllGlobals());
   it("says what the fetched message was itself written in reply to, outside a topic", async () => {
     const item = (over: Record<string, unknown>) => ({ message_id: "om_p", chat_id: "oc_chat", msg_type: "text", sender: { sender_type: "user", id: "ou_alice", tenant_key: "t" }, body: { content: JSON.stringify({ text: "说了啥？" }) }, ...over });
-    const fetched = async (over: Record<string, unknown>) => {
+    const fetched = async (over: Record<string, unknown>, directly = false) => {
       vi.stubGlobal("fetch", async () => Response.json({ code: 0, data: { items: [item(over)] } }));
-      return quotedBy("t-app", app, "oc_chat", "om_p", { open_id: "ou_alice", tenant_key: "t" });
+      return quotedBy("t-app", app, "oc_chat", "om_p", { open_id: "ou_alice", tenant_key: "t" }, undefined, directly);
     };
     expect(await fetched({ parent_id: "om_answer" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
     expect(await fetched({})).toEqual({ text: "说了啥？" });
@@ -361,10 +377,14 @@ describe("which documents a fetched message links", () => {
     // Only the message it replies to itself: where it started is not that.
     expect(await fetched({ root_id: "om_root" })).toEqual({ text: "说了啥？" });
     expect(await fetched({ parent_id: "om_answer", root_id: "om_root" })).toEqual({ text: "说了啥？", replies_to: "feishu:message:om_answer" });
-    // Someone else's message, or the app's own: nothing of what it says or links, only what it was written in reply to, so the chain can be followed past it.
-    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    // A colleague's message: its words and what it links, marked as another member's, and what it was written in reply to.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" }, body: { content: JSON.stringify({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001" }) } }, true)).toEqual({ text: "bob's words https://x.feishu.cn/docx/BobsDoc0000000001", other: true, documents: [expect.objectContaining({ token: "BobsDoc0000000001" })], replies_to: "feishu:message:om_answer" });
+    // Not known to be the very message replied to: only where it points, as before.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({ replies_to: "feishu:message:om_answer" });
+    // The app's own, or someone's from another organisation: nothing of what it says or links, only what it was written in reply to, so the chain can be followed past it.
+    expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "user", id: "ou_eve", tenant_key: "elsewhere" }, body: { content: JSON.stringify({ text: "eve's words" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ parent_id: "om_answer", sender: { sender_type: "app", id: "cli_test" } })).toEqual({ replies_to: "feishu:message:om_answer" });
-    expect(await fetched({ sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    expect(await fetched({ sender: { sender_type: "user", id: "ou_eve", tenant_key: "elsewhere" } })).toEqual({});
     // Their own, with nothing in it that can be read: no words, but the chain goes on from it all the same.
     expect(await fetched({ parent_id: "om_answer", body: { content: JSON.stringify({ text: "" }) } })).toEqual({ replies_to: "feishu:message:om_answer" });
     expect(await fetched({ parent_id: "om_answer", body: { content: "{not json" } })).toEqual({ replies_to: "feishu:message:om_answer" });
@@ -374,7 +394,9 @@ describe("which documents a fetched message links", () => {
     // Not out of another chat, not once recalled, and not inside a topic.
     expect(await fetched({ parent_id: "om_answer", chat_id: "oc_other" })).toEqual({});
     expect(await fetched({ parent_id: "om_answer", deleted: true })).toEqual({});
-    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } })).toEqual({});
+    // A colleague's message that stands in a topic is of another conversation than a reply from outside it: nothing of it.
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "user", id: "ou_bob", tenant_key: "t" } }, true)).toEqual({});
+    expect(await fetched({ parent_id: "om_answer", thread_id: "omt_1", sender: { sender_type: "app", id: "cli_other" } })).toEqual({});
   });
 
   it("goes by where a link leads, never by the words shown for it", async () => {

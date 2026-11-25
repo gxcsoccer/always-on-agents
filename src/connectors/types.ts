@@ -552,9 +552,19 @@ export interface Picture {
   data: string;
 }
 
-/** A message another was written in reply to: the person's own words where they could be read and are theirs; empty when there was one that is not shown. */
+/**
+ * A message another was written in reply to: its words where they could be read and are the
+ * person's own, or another member's of the same organisation (`other`); empty when there was one
+ * that is not shown.
+ */
 export interface Quoted {
   text?: string;
+  /**
+   * Set where the words are not the person's own but another member's, of the same organisation,
+   * in the same conversation: what the person points at by replying to it. Shown to the model as
+   * material, never as a request; and only for the message replied to itself, not further up.
+   */
+  other?: true;
   /** What that message links, as the connector records it for any message (see a message's `data.documents`). */
   documents?: unknown[];
   /** The pictures in that message, as the connector records them for any message (see a message's `data.pictures`). */

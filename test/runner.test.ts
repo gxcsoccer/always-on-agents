@@ -363,14 +363,56 @@ describe("the run loop, by itself", () => {
       });
     });
 
+    it("keeps a reply to the very message apart from one that only stands under it, whichever arrives first", async () => {
+      for (const order of [["direct", "under"], ["under", "direct"]]) {
+        await within(async ({ runner, store, event, items, settings, log }) => {
+          // As a connector does: a colleague's words only where the event said this is the very message replied to.
+          settings.quoted = (asked: { data?: Record<string, unknown> }) => (asked.data?.replied_directly === true ? { text: "the colleague's plan", other: true } : {});
+          for (const kind of order) event(`asked ${kind}`, { data: { direct: true, origin: ORIGIN, replies_to: "feishu:message:om_plan", ...(kind === "direct" ? { replied_directly: true } : {}) } });
+          const seen: Record<string, string> = {};
+          for (let n = 0; n < 2; n++) {
+            store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'");
+            store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+            const content = items((await runner.next())!)[0].content as string;
+            // Each is a run of its own, read under its own binding.
+            expect(content.match(/asked (direct|under)/g)).toHaveLength(1);
+            seen[content.includes("asked direct") ? "direct" : "under"] = content;
+          }
+          expect(seen.direct).toContain("written as a reply to a message of another member here");
+          expect(seen.under).toContain("a message here that is not shown to you");
+          const kept = store.rows<{ text: string; data: string }>("SELECT text, data FROM inbox ORDER BY id");
+          expect(kept.map((each) => [each.text, JSON.parse(each.data).quoted])).toEqual(order.map((kind) => [`asked ${kind}`, kind === "direct" ? { text: "the colleague's plan", other: true } : {}]));
+          // Each was asked about on its own: what was found for one is not written to the other.
+          expect(log.filter((each) => each[0] === "quoted")).toHaveLength(2);
+        });
+      }
+    });
+
     it("does not ask about a message that is on record, whoever wrote it and whatever is left of it, nor about an answer to a question", async () => {
       await within(async ({ runner, store, event, items, settings, log }) => {
         settings.quoted = { text: "fetched again" };
         const next = async () => (store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'claimed'"), store.sql.exec("DELETE FROM meta WHERE key = 'active_run'"), items((await runner.next())!)[0].content as string);
-        // Someone else's message that reached the agent: already in the conversation.
+        // Someone else's message that reached the agent: its words are theirs, so the connector is asked whether
+        // they may be shown; and they are shown as another member's, whatever the connector calls them.
         event("from bob", { source_id: "om_bob", status: "done", principal: { kind: "human", id: "ou_2", explicit: true } });
         event("about that", { data: { replies_to: "feishu:message:om_bob" } });
-        expect(await next()).not.toContain("written as a reply");
+        expect(await next()).toContain("written as a reply to a message of another member here");
+        expect(log.filter((each) => each[0] === "quoted")).toHaveLength(1);
+        log.length = 0;
+        // Where the connector cannot give it (it has no such thing, or nothing came back): as before its words were
+        // ever asked for. It stands in the conversation already; it is not called a message that is not shown.
+        for (const none of [undefined, {}, { replies_to: "feishu:message:om_elsewhere" }]) {
+          settings.quoted = none;
+          event("about that again", { data: { replies_to: "feishu:message:om_bob" } });
+          expect(await next()).not.toContain("written as a reply");
+        }
+        // A colleague's pictures are never kept with the message, whatever the connector gives.
+        settings.quoted = { text: "[picture] look", other: true, pictures: [{ message: "om_bob", key: "k_bob" }] };
+        event("what is this", { data: { replies_to: "feishu:message:om_bob" } });
+        await next();
+        expect(JSON.stringify(store.rows("SELECT data FROM inbox ORDER BY id DESC LIMIT 1"))).not.toContain("k_bob");
+        settings.quoted = { text: "fetched again" };
+        log.length = 0;
         // Their own, whose words are no longer kept: not brought back.
         event("old", { source_id: "om_old", status: "done" });
         store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");
