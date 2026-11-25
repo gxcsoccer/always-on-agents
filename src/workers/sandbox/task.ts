@@ -253,6 +253,11 @@ export class TaskSandbox extends DurableObject<Env> {
   /** Reads what another task of this conversation's keeps, for a task that goes on from it. */
   readonly #backupsOf: (taskId: string) => DirectoryBackup;
   #checkpointing = false;
+  /**
+   * While the last copy of a finished agent's workspace is being taken (see #settle). The agent
+   * has ended in time; the copying is not held against the task's life, and is done once.
+   */
+  #leaving = false;
   #flushing = false;
 
   constructor(ctx: TaskCtx, env: Env) {
@@ -910,7 +915,7 @@ export class TaskSandbox extends DurableObject<Env> {
    */
   async #checkpoint(): Promise<void> {
     const before = this.#state();
-    if (!before || this.#checkpointing || !ACTIVE.has(before.phase) || !this.#container.running) return;
+    if (!before || this.#checkpointing || this.#leaving || !ACTIVE.has(before.phase) || !this.#container.running) return;
     if (before.checkpoint && Date.now() - before.checkpoint.at < CHECKPOINT_MIN_INTERVAL_MS) return;
     // If old checkpoints cannot be deleted, stop making new ones rather than pile them up: every
     // one that is made has to be remembered until it is gone.
@@ -1070,6 +1075,8 @@ export class TaskSandbox extends DurableObject<Env> {
       state.phase = "lost";
       state.error = "container stopped before the task finished";
       this.#emit(state, "lost", { error: state.error });
+    } else if (this.#leaving) {
+      // Its agent ended in time and what it left is being copied: that is finished by #settle, not ended here.
     } else if (alive && age > (state.phase === "idle" ? Math.min(MAX_IDLE_MS, lifetimeOf(state)) : lifetimeOf(state))) {
       expired = true;
       state.error = "exceeded the maximum lifetime";
@@ -1231,12 +1238,17 @@ export class TaskSandbox extends DurableObject<Env> {
     // before. Whether it is kept is decided below, once it is known how the task ended. Failing
     // to take it holds nothing up: the task then simply cannot be gone on from.
     let last: { record: DirectoryBackupRecord; at: number; took_ms: number } | undefined;
+    // (Both paths can come here for the same ending: the one that finds the copy being taken leaves it to the other.)
+    if (this.#leaving) return;
     if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
+      this.#leaving = true;
       try {
         last = { record: await this.#backups.backup({ dir: WORKSPACE_DIRECTORY, name: `task ${before.id} (as it ended)` }), at: started, took_ms: Date.now() - started };
       } catch (err) {
         console.log(JSON.stringify({ event: "final_checkpoint_failed", task: before.id, error: String(err).slice(0, 300) }));
+      } finally {
+        this.#leaving = false;
       }
     }
 

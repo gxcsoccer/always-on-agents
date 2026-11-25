@@ -143,10 +143,11 @@ export class Tasks implements Wakes {
    */
   leftToGoOnFrom(runId: string, sessionKey: string): { id: string; worker: string; title: string }[] {
     const people = [...new Set(this.#b.deciders(runId).map((p) => p.id))];
-    if (people.length !== 1) return [];
+    // Only of workers that go on, chosen before the latest few are taken: other workers' finished work does not crowd these out.
+    const names = this.#b.workers().filter((worker) => worker.goes_on === true).map((worker) => worker.name);
+    if (people.length !== 1 || names.length === 0) return [];
     return this.#s
-      .rows<{ id: string; worker: string; title: string }>("SELECT id, worker, title FROM tasks WHERE status = 'succeeded' AND session_key = ? AND requested_by = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?", sessionKey, people[0], Date.now() - GOES_ON_FOR_MS, MAX_FINISHED_LISTED)
-      .filter((each) => this.#b.workers().some((worker) => worker.name === each.worker && worker.goes_on === true))
+      .rows<{ id: string; worker: string; title: string }>(`SELECT id, worker, title FROM tasks WHERE status = 'succeeded' AND session_key = ? AND requested_by = ? AND updated_at > ? AND worker IN (${names.map(() => "?").join(", ")}) ORDER BY updated_at DESC LIMIT ?`, sessionKey, people[0], Date.now() - GOES_ON_FOR_MS, ...names, MAX_FINISHED_LISTED)
       .reverse();
   }
 

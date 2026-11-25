@@ -182,6 +182,26 @@ describe("a sandbox task stopped while its last copy was being taken", () => {
   });
 });
 
+describe("a sandbox task whose agent ended just inside its life", () => {
+  it("is not ended for its life while what it left is being copied, and the copy is taken once", async () => {
+    const { task, container, records } = fixture();
+    await task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 300_000 } });
+    ended(container, { code: "0", events: DONE });
+    backups.whileTaking = async () => {
+      backups.whileTaking = undefined;
+      // Its life runs out during the copying, and the watchdog comes round.
+      const state = records.get("state");
+      state.created_at = Date.now() - 301_000;
+      records.set("state", state);
+      await task.alarm();
+      expect(records.get("state").phase).toBe("running");
+    };
+    await task.alarm();
+    expect(records.get("state")).toMatchObject({ phase: "succeeded", checkpoint: { final: true } });
+    expect(backups.taken).toBe(1);
+  });
+});
+
 describe("a sandbox task, started and stopped", () => {
   it("turns away a start that arrives after it was stopped, or asked about and found absent", async () => {
     const stopped = fixture();
