@@ -174,7 +174,7 @@ describe("tasks, by themselves", () => {
         expect(JSON.parse(watch.data)).toEqual({ task_id: result.task_id });
         expect(watch.due_at).toBeGreaterThanOrEqual(before + (2 * 60 * 60 + 10 * 60) * 1_000);
         expect(slots.acquired).toEqual([`acme:${result.task_id}`]);
-        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName(), accept_by: expect.any(Number) }]);
+        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName(), accept_by: expect.any(Number), bounds: { lifetime_ms: 120 * 60_000, model_calls: 400 } }]);
         expect(audited("task.dispatched")).toEqual([{ actor: "alice", task_id: result.task_id, title: "Fix the build", repository: "https://github.com/acme/app" }]);
       });
     });
@@ -469,6 +469,19 @@ describe("tasks, by themselves", () => {
         expect(kept(id).status).toBe("lost");
         expect(spent).toEqual([1234]);
         expect(slots.usage).toEqual([["acme", 1234]]);
+      });
+    });
+
+    it("hands a task the bounds the tenant set, and sets its watchdog by how long it may run", async () => {
+      await within(async ({ tasks, store, worker }) => {
+        store.setMeta("limits", JSON.stringify({ task_minutes: 30, task_model_calls: 50 }));
+        const before = Date.now();
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        expect((worker.started[0] as any).bounds).toEqual({ lifetime_ms: 30 * 60_000, model_calls: 50 });
+        const due = store.rows<{ due_at: number }>("SELECT due_at FROM timers WHERE id = ?", `watch_${id}`)[0].due_at;
+        // Half an hour, and ten minutes for it to say how it ended.
+        expect(due - before).toBeGreaterThanOrEqual(40 * 60_000);
+        expect(due - before).toBeLessThan(41 * 60_000);
       });
     });
 

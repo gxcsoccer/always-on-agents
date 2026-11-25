@@ -15,7 +15,7 @@ import type { Worker } from "../workers";
 import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
-import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
+import { type Limits, MODEL_CALL_RESERVE, limitsFrom } from "../limits";
 import type { Outbox } from "./outbox";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
@@ -24,7 +24,7 @@ import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { workIs } from "./work";
 import { TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
 
-const MAX_STEPS_PER_RUN = 16;
+// (How many times a run may ask the model is the tenant's limit: see ../limits.)
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
 const MAX_RUN_ENTRIES = 5;
 const RUN_RETRY_DELAYS_MS = [5_000, 30_000, 120_000, 300_000];
@@ -545,7 +545,7 @@ export class Runner {
 
       const last = items.at(-1);
       const awaitingModel = last && (last.role === "user" || last.type === "function_call_output");
-      if (!awaitingModel || run.steps >= MAX_STEPS_PER_RUN) break;
+      if (!awaitingModel || run.steps >= this.#limits().run_steps) break;
 
       // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
       // The tenant's share is reserved before the call and trued up after it, so several scopes
@@ -942,6 +942,15 @@ export class Runner {
     this.#s.sql.exec("UPDATE items SET outside = 2 WHERE run_id = ? AND is_user = 0", run.id);
     this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
     this.#b.outbox.scrub("run_id = ?", run.id);
+  }
+
+  /** The tenant's limits as the registry last gave them to this scope; the defaults before it ever did. */
+  #limits(): Limits {
+    try {
+      return limitsFrom(JSON.parse(this.#s.meta("limits") ?? "null"));
+    } catch {
+      return limitsFrom(null);
+    }
   }
 
   /** Whether this run has been given text from outside by a connector's tool. */

@@ -73,7 +73,7 @@ export class Registry extends DurableObject<Env> {
         tenant TEXT NOT NULL, provider TEXT NOT NULL, external_id TEXT NOT NULL, user_id TEXT NOT NULL,
         PRIMARY KEY (tenant, provider, external_id)
       );
-      CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_slots (task_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, taken_at INTEGER NOT NULL, until INTEGER);
       CREATE TABLE IF NOT EXISTS chat_repos (tenant TEXT NOT NULL, chat TEXT NOT NULL, repo TEXT NOT NULL, PRIMARY KEY (tenant, chat));
       CREATE TABLE IF NOT EXISTS doubao_apps (
         chat_app_id TEXT PRIMARY KEY, chat_connector TEXT NOT NULL, tenant TEXT NOT NULL, app_id TEXT NOT NULL, app_secret TEXT NOT NULL,
@@ -88,6 +88,7 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
+    this.#addColumn("task_slots", "until INTEGER");
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
     this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
     this.#addColumn("feishu_apps", "oauth_offline INTEGER NOT NULL DEFAULT 0");
@@ -372,11 +373,16 @@ export class Registry extends DurableObject<Env> {
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */
   async acquireTaskSlot(tenant: string, taskId: string): Promise<boolean> {
     const sql = this.ctx.storage.sql;
-    sql.exec("DELETE FROM task_slots WHERE taken_at < ?", Date.now() - SLOT_TTL_MS);
+    const now = Date.now();
+    // Each place lapses at a time fixed when it was taken (one from before that was kept: after the fixed time).
+    sql.exec("DELETE FROM task_slots WHERE COALESCE(until, taken_at + ?) < ?", SLOT_TTL_MS, now);
     if (sql.exec("SELECT 1 FROM task_slots WHERE task_id = ?", taskId).toArray().length > 0) return true;
+    const limits = this.#limits(tenant);
     const used = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM task_slots WHERE tenant = ?", tenant).one().n;
-    if (used >= this.#limits(tenant).tenant_sandboxes) return false;
-    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at) VALUES (?, ?, ?)", taskId, tenant, Date.now());
+    if (used >= limits.tenant_sandboxes) return false;
+    // Held for longer than a task taken now can live: as long as it may run, and an hour more for it to be taken and to end.
+    // Fixed here, so that a limit changed later does not give away the place of a task still running under the old one.
+    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until) VALUES (?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, (limits.task_minutes + 60) * 60_000));
     return true;
   }
 

@@ -132,6 +132,37 @@ describe("a sandbox task, started and stopped", () => {
     expect(reported.filter((each) => each === "failed")).toHaveLength(1);
   });
 
+  it("goes by the bounds it was given when it started, and by its own where it was given none", async () => {
+    // How often it may ask the model. (Started with no Brain to report to, so nothing else is asked.)
+    const bounded = fixture();
+    expect((await bounded.task.start({ id: "fixture", prompt: "hello", bounds: { model_calls: 2 } })).phase).toBe("running");
+    expect([await bounded.task.countModelCall(), await bounded.task.countModelCall(), await bounded.task.countModelCall()]).toEqual([true, true, false]);
+    // The same start asked for again with other bounds: the same task, by the bounds it has.
+    await bounded.task.start({ id: "fixture", prompt: "hello", bounds: { model_calls: 99 } });
+    expect(await bounded.task.countModelCall()).toBe(false);
+    expect(((await bounded.task.status()) as { bounds?: unknown }).bounds).toEqual({ model_calls: 2 });
+
+    // How long it may live: past the time it was given it is ended, though well within the fixed two hours.
+    const brief = fixture();
+    await brief.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 10 * 60_000 } });
+    const state = brief.records.get("state");
+    state.created_at = Date.now() - 11 * 60_000;
+    brief.records.set("state", state);
+    await brief.task.alarm();
+    expect(await brief.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+
+    // Given none, or nothing that is a bound: its own.
+    const plain = fixture();
+    await plain.task.start({ id: "fixture", prompt: "hello", bounds: { lifetime_ms: -5, model_calls: 1.5 } as never });
+    expect(((await plain.task.status()) as { bounds?: unknown }).bounds).toBeUndefined();
+    // Eleven minutes old, it is not ended for its age: whatever its watchdog makes of it, that is not why.
+    const old = plain.records.get("state");
+    old.created_at = Date.now() - 11 * 60_000;
+    plain.records.set("state", old);
+    await plain.task.alarm();
+    expect(((await plain.task.status()) as { error?: string }).error).not.toBe("exceeded the maximum lifetime");
+  });
+
   it("does not go on to launch a task that was stopped while it was being set up", async () => {
     const { task, container, process } = fixture();
     const entered = Promise.withResolvers<void>();

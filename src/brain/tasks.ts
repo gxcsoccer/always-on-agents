@@ -23,7 +23,8 @@ import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, t
 
 // (How many tasks a scope may have under way is the tenant's limit: see ../limits. It is read
 // from what the registry last said, kept by the run loop before every call to the model.)
-const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
+/** How long after a task may have ended at the latest its watchdog says that it has not reported. */
+const TASK_WATCHDOG_GRACE_S = 10 * 60;
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
 /** How often a task whose start was not answered is asked about before it is given up as lost: about a quarter of an hour in all. */
@@ -162,7 +163,7 @@ export class Tasks implements Wakes {
       this.#s.sql.exec(
         "INSERT INTO timers (id, due_at, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         `watch_${id}`,
-        now + TASK_WATCHDOG_S * 1_000,
+        now + (this.#limits().task_minutes * 60 + TASK_WATCHDOG_GRACE_S) * 1_000,
         sessionKey,
         `Task ${id} "${title}" has not reported a result in time.`,
         JSON.stringify({ task_id: id }),
@@ -226,7 +227,9 @@ export class Tasks implements Wakes {
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
+    // How far the tenant lets a task go, as it stands now: the worker keeps what it is told at its first start.
+    const bounds = { lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls };
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
