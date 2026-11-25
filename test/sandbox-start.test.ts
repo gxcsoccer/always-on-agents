@@ -215,6 +215,32 @@ describe("a sandbox task started again from a checkpoint while its earlier run's
       records.set("state", state);
     };
     backups.deleteFails = true;
+    let later: Promise<unknown> | undefined;
+    const first = backups.whileTaking;
+    backups.whileTaking = async () => {
+      await first!();
+      // The new run ends well while the old one's copy is still being taken: its ending is its own, and is settled.
+      backups.whileTaking = undefined;
+      later = task.callback("exit", records.get("state").token, {});
+      await later;
+      expect(records.get("state")).toMatchObject({ phase: "succeeded", checkpoint: { final: true } });
+    };
+    await task.callback("exit", records.get("state").token, {});
+    expect(later).toBeDefined();
+    expect(records.get("state")).toMatchObject({ phase: "succeeded", checkpoint: { final: true }, stale_checkpoints: [{ id: "taken-2" }] });
+  });
+
+  it("is left running when the earlier ending comes back and nothing else has happened", async () => {
+    const { task, container, records } = fixture();
+    await task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    ended(container, { code: "0", events: DONE });
+    backups.whileTaking = async () => {
+      const state = records.get("state");
+      state.recoveries += 1;
+      state.runs.push({ kind: "resume", started_at: Date.now() });
+      records.set("state", state);
+    };
+    backups.deleteFails = true;
     await task.callback("exit", records.get("state").token, {});
     const now = records.get("state");
     expect(now.phase).toBe("running");

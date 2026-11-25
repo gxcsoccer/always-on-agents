@@ -257,7 +257,9 @@ export class TaskSandbox extends DurableObject<Env> {
    * While the last copy of a finished agent's workspace is being taken (see #settle). The agent
    * has ended in time; the copying is not held against the task's life, and is done once.
    */
-  #leaving = false;
+  #leaving: string | undefined;
+  /** Which run of the agent a task is on: its ending, and the copying of what it left, are that run's and no other's. */
+  static #round = (state: TaskState): string => `${state.runs.length}:${state.recoveries}`;
   #flushing = false;
 
   constructor(ctx: TaskCtx, env: Env) {
@@ -913,7 +915,7 @@ export class TaskSandbox extends DurableObject<Env> {
    */
   async #checkpoint(): Promise<void> {
     const before = this.#state();
-    if (!before || this.#checkpointing || this.#leaving || !ACTIVE.has(before.phase) || !this.#container.running) return;
+    if (!before || this.#checkpointing || this.#leaving === TaskSandbox.#round(before) || !ACTIVE.has(before.phase) || !this.#container.running) return;
     if (before.checkpoint && Date.now() - before.checkpoint.at < CHECKPOINT_MIN_INTERVAL_MS) return;
     // If old checkpoints cannot be deleted, stop making new ones rather than pile them up: every
     // one that is made has to be remembered until it is gone.
@@ -1005,7 +1007,10 @@ export class TaskSandbox extends DurableObject<Env> {
       if (!state) return;
       // Its life ran out while it was being brought back: ended for that, as it is wherever else
       // that is found, and the container made for it is not kept.
-      if (state.phase === "starting" && Date.now() - state.created_at > lifetimeOf(state)) {
+      // One that was stopped, or ended, while it was being brought back stands as that: the
+      // failing of what was being done to it changes nothing.
+      if (state.phase !== "starting") return;
+      if (Date.now() - state.created_at > lifetimeOf(state)) {
         state.phase = "failed";
         state.error = "exceeded the maximum lifetime";
         this.#emit(state, "failed", { error: state.error });
@@ -1084,7 +1089,7 @@ export class TaskSandbox extends DurableObject<Env> {
       state.phase = "lost";
       state.error = "container stopped before the task finished";
       this.#emit(state, "lost", { error: state.error });
-    } else if (this.#leaving) {
+    } else if (this.#leaving === TaskSandbox.#round(state)) {
       // Its agent ended in time and what it left is being copied: that is finished by #settle, not ended here.
     } else if (alive && age > (state.phase === "idle" ? Math.min(MAX_IDLE_MS, lifetimeOf(state)) : lifetimeOf(state))) {
       expired = true;
@@ -1260,16 +1265,18 @@ export class TaskSandbox extends DurableObject<Env> {
     // (Both paths can come here for the same ending: the one that finds the copy being taken, or the
     // ending already settled while it was reading, leaves it to the other. Nothing is awaited from here to the mark.)
     const still = this.#state();
-    if (this.#leaving || !same(still)) return;
+    const mine = TaskSandbox.#round(before);
+    if (this.#leaving === mine || !same(still)) return;
     if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
-      this.#leaving = true;
+      this.#leaving = mine;
       try {
         last = { record: await this.#backups.backup({ dir: WORKSPACE_DIRECTORY, name: `task ${before.id} (as it ended)` }), at: started, took_ms: Date.now() - started };
       } catch (err) {
         console.log(JSON.stringify({ event: "final_checkpoint_failed", task: before.id, error: String(err).slice(0, 300) }));
       } finally {
-        this.#leaving = false;
+        // (Only its own mark: a later run may be leaving by now.)
+        if (this.#leaving === mine) this.#leaving = undefined;
       }
     }
 
