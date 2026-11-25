@@ -24,7 +24,7 @@ import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { workIs } from "./work";
 import { TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
 
-const MAX_STEPS_PER_RUN = 16;
+// (How many times a run may ask the model is the tenant's limit: see ../limits.)
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
 const MAX_RUN_ENTRIES = 5;
 const RUN_RETRY_DELAYS_MS = [5_000, 30_000, 120_000, 300_000];
@@ -545,7 +545,7 @@ export class Runner {
 
       const last = items.at(-1);
       const awaitingModel = last && (last.role === "user" || last.type === "function_call_output");
-      if (!awaitingModel || run.steps >= MAX_STEPS_PER_RUN) break;
+      if (!awaitingModel) break;
 
       // Two limits: this scope's own, and the tenant's across all of its scopes and sandboxes.
       // The tenant's share is reserved before the call and trued up after it, so several scopes
@@ -561,6 +561,11 @@ export class Runner {
       // without asking it (how many tasks this scope may have under way).
       const limits = limitsFrom((tenant as { limits?: unknown }).limits);
       if (this.#s.meta("limits") !== JSON.stringify(limits)) this.#s.setMeta("limits", JSON.stringify(limits));
+      // How many times a run may ask the model, by the figure just had: one lowered or raised meanwhile holds from this very step.
+      if (run.steps >= limits.run_steps) {
+        await release();
+        break;
+      }
       if (!tenant.allowed || this.tokensToday() >= limits.scope_daily_tokens) {
         await release();
         if (!this.#stillActive(runId)) return;

@@ -1748,18 +1748,18 @@ describe("records and limits", () => {
     await registry.createTenant(tenant, tenant);
     const admin = async (method: string, body?: unknown) => {
       const response = await (workerExports as any).default.fetch(new Request(`https://agent.test/v1/admin/tenants/${tenant}/limits`, { method, headers: { authorization: "Bearer test-admin", "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
-      return { status: response.status, ...((await response.json()) as { limits?: Record<string, number>; overrides?: Record<string, number>; defaults?: Record<string, number>; most?: Record<string, number>; error?: string }) };
+      return { status: response.status, ...((await response.json()) as { limits?: Record<string, number>; overrides?: Record<string, number>; defaults?: Record<string, number>; least?: Record<string, number>; most?: Record<string, number>; error?: string }) };
     };
     // Nothing set: the defaults.
-    const defaults = { scope_daily_tokens: 2_000_000, tenant_daily_tokens: 20_000_000, scope_active_tasks: 3, tenant_sandboxes: 5 };
-    expect(await admin("GET")).toMatchObject({ status: 200, limits: defaults, overrides: {}, defaults, most: { scope_active_tasks: 50 } });
+    const defaults = { scope_daily_tokens: 2_000_000, tenant_daily_tokens: 20_000_000, scope_active_tasks: 3, tenant_sandboxes: 5, run_steps: 16, task_minutes: 120, task_model_calls: 400 };
+    expect(await admin("GET")).toMatchObject({ status: 200, limits: defaults, overrides: {}, defaults, least: { run_steps: 1, task_minutes: 5, task_model_calls: 1, scope_active_tasks: 0 }, most: { scope_active_tasks: 50, task_minutes: 480 } });
     // Set by figure; those not named stay as they are.
     expect((await admin("PUT", { scope_active_tasks: 1, tenant_daily_tokens: 30_000_000 })).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000 });
     expect((await admin("PUT", { scope_daily_tokens: 900_000 })).limits).toEqual({ ...defaults, scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
     // Which of them were set for this tenant is told apart from what holds by default.
     expect((await admin("GET")).overrides).toEqual({ scope_active_tasks: 1, tenant_daily_tokens: 30_000_000, scope_daily_tokens: 900_000 });
     // Not a limit, not a figure, out of range; a tenant's day too small for a single call to begin: refused as a mistake, and nothing changes.
-    for (const bad of [{ scope_tokens: 5 }, { scope_active_tasks: "many" }, { scope_active_tasks: 1.5 }, { scope_active_tasks: -1 }, { tenant_sandboxes: 1_000_000 }, { tenant_daily_tokens: 10_000 }, [], "text"]) expect((await admin("PUT", bad)).status).toBe(400);
+    for (const bad of [{ run_steps: 0 }, { task_minutes: 4 }, { task_minutes: 481 }, { task_model_calls: 0 }, { scope_tokens: 5 }, { scope_active_tasks: "many" }, { scope_active_tasks: 1.5 }, { scope_active_tasks: -1 }, { tenant_sandboxes: 1_000_000 }, { tenant_daily_tokens: 10_000 }, [], "text"]) expect((await admin("PUT", bad)).status).toBe(400);
     const raw = (path: string, method: string, body?: string) => (workerExports as any).default.fetch(new Request(`https://agent.test/v1/admin/tenants/${path}/limits`, { method, headers: { authorization: "Bearer test-admin" }, ...(body === undefined ? {} : { body }) }));
     // A body that cannot be read, or is nothing: a mistake too, not a change of nothing.
     expect((await raw(tenant, "PUT", "{not json")).status).toBe(400);
@@ -1805,6 +1805,31 @@ describe("records and limits", () => {
     // Back to the default by null; with nothing left set, as if never set.
     expect((await admin("PUT", { scope_daily_tokens: null, scope_active_tasks: null, tenant_daily_tokens: null })).limits).toEqual(defaults);
     expect((await registry.recordUsage(tenant, 0)).allowed).toBe(false);
+    // How far one run may go: with a single step, a run that would have gone on to a second is ended as it stands.
+    const third = `${tenant}-steps`;
+    await registry.createTenant(third, third);
+    await registry.setLimits(third, { run_steps: 1 });
+    const short = (env as any).BRAIN.getByName(`${third}:user:x`) as any;
+    const askedBefore = modelCalls.length;
+    model.replies([call("send_message", { text: "one" })], [call("send_message", { text: "two" })], [say("")]);
+    await short.ingest(message("go on"));
+    await wake(short);
+    expect(modelCalls.length - askedBefore).toBe(1);
+    expect((await short.inspect()).limits.run_steps).toBe(1);
+    expect((await short.inspect()).runs[0].status).not.toBe("running");
+    // A place is held until a time fixed as it is taken: as long as the task may run and an hour more, and never less than three hours.
+    const when = async (id: string) => (await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT taken_at, until FROM task_slots WHERE task_id = ?", id).toArray()))[0] as { taken_at: number; until: number };
+    expect(await registry.acquireTaskSlot(third, "t-long", 480 * 60_000)).toBe(true);
+    expect((await when("t-long")).until - (await when("t-long")).taken_at).toBe(540 * 60_000);
+    expect(await registry.acquireTaskSlot(third, "t-short", 5 * 60_000)).toBe(true);
+    expect((await when("t-short")).until - (await when("t-short")).taken_at).toBe(180 * 60_000);
+    // The tenant's limit lowered afterwards does not give away the place of the task taken under the longer time.
+    await registry.setLimits(third, { task_minutes: 5 });
+    await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE task_slots SET taken_at = taken_at - ?, until = until - ? WHERE task_id IN ('t-long', 't-short')", 200 * 60_000, 200 * 60_000));
+    expect(await registry.acquireTaskSlot(third, "t-new")).toBe(true);
+    expect(await when("t-long")).toBeDefined();
+    expect(await when("t-short")).toBeUndefined();
+
     // No sandbox at all for the tenant: a place cannot be had.
     await admin("PUT", { tenant_sandboxes: 0 });
     expect(await registry.acquireTaskSlot(tenant, "t-x")).toBe(false);

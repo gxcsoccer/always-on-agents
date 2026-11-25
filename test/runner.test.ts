@@ -40,6 +40,8 @@ function bench(state: DurableObjectState) {
   const settings = {
     /** What the connector says a replied-to message was: a value, or a function giving it. */
     quoted: undefined as any,
+    /** The tenant's limits as the registry gives them, by how often it has been asked (the first time: 1). */
+    limits: undefined as undefined | ((asked: number) => Record<string, number>),
     /** The pictures the connector can fetch, by key. */
     pictures: undefined as Record<string, { mime: string; data: string }> | undefined,
     carried: undefined as Partial<Continuation> | undefined,
@@ -82,7 +84,7 @@ function bench(state: DurableObjectState) {
     under: (target) => (target.address.message_id ? `${target.connector}:message:${target.address.message_id}` : undefined),
     registry: () =>
       ({
-        recordUsage: async (tenant: string, tokens: number) => (log.push(["recordUsage", tenant, tokens]), { allowed: settings.allowed, used: 0, budget: 0, day: "2026-11-23" }),
+        recordUsage: async (tenant: string, tokens: number) => (log.push(["recordUsage", tenant, tokens]), { limits: settings.limits?.(log.filter((each) => each[0] === "recordUsage").length), allowed: settings.allowed, used: 0, budget: 0, day: "2026-11-23" }),
         adjustUsage: async (tenant: string, delta: number, day: string) => void log.push(["adjustUsage", tenant, delta, day]),
       }) as never,
     respond: async (request) => {
@@ -870,6 +872,32 @@ describe("the run loop, by itself", () => {
         model.push(new ModelError("network", 0, false));
         await runner.execute(id);
         expect(run(id).status).toBe("running");
+      });
+    });
+
+    it("goes by how many times a run may ask the model as the registry says at each step: lowered or raised meanwhile, it holds from that very step", async () => {
+      await within(async ({ runner, model, run, event, settings, of, asked }) => {
+        // Three steps allowed at first; after the second call to the model, two.
+        settings.limits = (asked) => ({ run_steps: asked <= 2 ? 3 : 2 });
+        event("go on and on");
+        const id = (await runner.next())!;
+        for (let n = 0; n < 4; n++) model.push(answer([{ type: "function_call", call_id: `c${n}`, name: "list_timers", arguments: "{}" }]));
+        await runner.execute(id);
+        // Two calls were made; the third was not, and what had been set aside for it was given back.
+        expect(asked).toHaveLength(2);
+        expect(run(id).steps).toBe(2);
+        expect(run(id).status).not.toBe("running");
+        expect((of("adjustUsage").at(-1) as unknown[])[1]).toBe(-20_000);
+      });
+      await within(async ({ runner, model, run, event, settings, asked }) => {
+        // One step allowed at first; raised to three before the second would be asked for.
+        settings.limits = (asked) => ({ run_steps: asked <= 1 ? 1 : 3 });
+        event("go on");
+        const id = (await runner.next())!;
+        for (let n = 0; n < 4; n++) model.push(answer([{ type: "function_call", call_id: `c${n}`, name: "list_timers", arguments: "{}" }]));
+        await runner.execute(id);
+        expect(asked).toHaveLength(3);
+        expect(run(id).steps).toBe(3);
       });
     });
 

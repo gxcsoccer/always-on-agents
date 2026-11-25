@@ -18,12 +18,13 @@ import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
 import type { Revisions } from "./revisions";
-import { type Limits, limitsFrom } from "../limits";
+import { DEFAULT_LIMITS, type Limits, limitsFrom } from "../limits";
 import { type BrainStore, type InboxRow, type Row, type RunRow, TERMINAL_TASK, type Wakes } from "./store";
 
 // (How many tasks a scope may have under way is the tenant's limit: see ../limits. It is read
 // from what the registry last said, kept by the run loop before every call to the model.)
-const TASK_WATCHDOG_S = 2 * 60 * 60 + 10 * 60;
+/** How long after a task may have ended at the latest its watchdog says that it has not reported. */
+const TASK_WATCHDOG_GRACE_S = 10 * 60;
 /** How many times the worker is asked how a set-aside question ended before giving up on knowing. */
 const SETTLE_ATTEMPTS = 12;
 /** How often a task whose start was not answered is asked about before it is given up as lost: about a quarter of an hour in all. */
@@ -101,6 +102,22 @@ export class Tasks implements Wakes {
     this.#b = host;
   }
 
+  /**
+   * How far a task may go, as kept with it. One from before that was kept goes by what held for
+   * every task then (the defaults): its place with the tenant was taken for that long, whatever
+   * the limits have become since.
+   */
+  #boundsOf(task: Row): { lifetime_ms: number; model_calls: number } {
+    let kept: { lifetime_ms?: unknown; model_calls?: unknown } = {};
+    try {
+      kept = JSON.parse(this.#s.rows<{ bounds: string }>("SELECT bounds FROM task_bounds WHERE task_id = ?", task.id)[0]?.bounds ?? "{}") ?? {};
+    } catch {
+      kept = {};
+    }
+    const whole = (figure: unknown, otherwise: number) => (typeof figure === "number" && Number.isInteger(figure) && figure > 0 ? figure : otherwise);
+    return { lifetime_ms: whole(kept.lifetime_ms, DEFAULT_LIMITS.task_minutes * 60_000), model_calls: whole(kept.model_calls, DEFAULT_LIMITS.task_model_calls) };
+  }
+
   /** The tenant's limits as the registry last gave them to this scope; the defaults before it ever did. */
   #limits(): Limits {
     try {
@@ -157,12 +174,15 @@ export class Tasks implements Wakes {
           now,
           now,
         );
+        // How far it may go, by the tenant's limits as they stand at this moment: fixed here, for good.
+        this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
       });
       this.#s.sql.exec(
         "INSERT INTO timers (id, due_at, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         `watch_${id}`,
-        now + TASK_WATCHDOG_S * 1_000,
+        // After the latest moment it may still be running: taken as late as it may be, and run for as long as it may.
+        now + ACCEPT_WITHIN_MS + this.#limits().task_minutes * 60_000 + TASK_WATCHDOG_GRACE_S * 1_000,
         sessionKey,
         `Task ${id} "${title}" has not reported a result in time.`,
         JSON.stringify({ task_id: id }),
@@ -175,6 +195,9 @@ export class Tasks implements Wakes {
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
+    // How far this task may go, as it was fixed when it was written (one written before that was
+    // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
+    const bounds = this.#boundsOf(task);
     // Known here, before anything is asked of anyone: not something to find out about later.
     if (!worker.start) {
       this.#set(task.id, "failed", { result: JSON.stringify({ error: "this worker is not started by the Brain" }) });
@@ -183,7 +206,7 @@ export class Tasks implements Wakes {
 
     let slot: boolean | Error;
     try {
-      slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id);
+      slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id, bounds.lifetime_ms);
     } catch (err) {
       slot = err instanceof Error ? err : new Error(String(err));
     }
@@ -226,7 +249,7 @@ export class Tasks implements Wakes {
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.

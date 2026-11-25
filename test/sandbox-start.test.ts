@@ -22,9 +22,19 @@ vi.mock("@cloudflare/sandbox", () => ({
   },
   DirectoryBackup: class {
     async intercept() {}
+    async restore() {
+      await restoring.now?.();
+    }
+    async backup() {
+      return { id: "taken" };
+    }
+    async delete() {}
   },
   DirectoryBackupGateway: class {},
 }));
+
+/** Something that happens while a checkpoint is being restored, for the fixture that is restoring. */
+const restoring: { now?: () => Promise<void> } = {};
 
 function fixture() {
   const records = new Map<string, any>();
@@ -51,7 +61,18 @@ function fixture() {
   };
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
   const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
-  return { task: new TaskSandbox(ctx as never, env as never), container, reported, background, records, process };
+  restoring.now = undefined;
+  return {
+    task: new TaskSandbox(ctx as never, env as never),
+    container,
+    reported,
+    background,
+    records,
+    process,
+    set restoring(what: () => Promise<void>) {
+      restoring.now = what;
+    },
+  };
 }
 
 describe("a sandbox task, started and stopped", () => {
@@ -130,6 +151,72 @@ describe("a sandbox task, started and stopped", () => {
     expect((await pending).phase).toBe("failed");
     expect(((await task.status()) as { phase: string }).phase).toBe("failed");
     expect(reported.filter((each) => each === "failed")).toHaveLength(1);
+  });
+
+  it("goes by the bounds it was given when it started, and by its own where it was given none", async () => {
+    // How often it may ask the model. (Started with no Brain to report to, so nothing else is asked.)
+    const bounded = fixture();
+    expect((await bounded.task.start({ id: "fixture", prompt: "hello", bounds: { model_calls: 2 } })).phase).toBe("running");
+    expect([await bounded.task.countModelCall(), await bounded.task.countModelCall(), await bounded.task.countModelCall()]).toEqual([true, true, false]);
+    // The same start asked for again with other bounds: the same task, by the bounds it has.
+    await bounded.task.start({ id: "fixture", prompt: "hello", bounds: { model_calls: 99 } });
+    expect(await bounded.task.countModelCall()).toBe(false);
+    expect(((await bounded.task.status()) as { bounds?: unknown }).bounds).toEqual({ model_calls: 2 });
+
+    // How long it may live: past the time it was given it is ended, though well within the fixed two hours.
+    const brief = fixture();
+    await brief.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 10 * 60_000 } });
+    const state = brief.records.get("state");
+    state.created_at = Date.now() - 11 * 60_000;
+    brief.records.set("state", state);
+    await brief.task.alarm();
+    expect(await brief.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+
+    // Starting again after its container was lost, with its whole life already over: ended for that, however fresh this start is.
+    const again = fixture();
+    await again.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 5 * 60_000 } });
+    const starting = again.records.get("state");
+    starting.phase = "starting";
+    starting.created_at = Date.now() - 6 * 60_000;
+    starting.starting_since = Date.now() - 2 * 60_000;
+    again.records.set("state", starting);
+    await again.task.alarm();
+    expect(await again.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+    expect(await again.task.countModelCall()).toBe(false);
+
+    // Brought back from a checkpoint with a moment of its life left, and the bringing back takes longer than that:
+    // it is not started again, no recovery is reported, and no further call to the model is let through.
+    const late = fixture();
+    await late.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { lifetime_ms: 5 * 60_000 } });
+    const lost = late.records.get("state");
+    lost.created_at = Date.now() - (5 * 60_000 - 1_000);
+    lost.checkpoint = { record: { id: "cp" }, at: Date.now() - 60_000, took_ms: 10 };
+    late.records.set("state", lost);
+    late.container.running = false;
+    const launches: string[] = [];
+    late.container.exec = async (argv) => (argv[0] === "/bin/sh" && launches.push("agent"), late.process);
+    late.restoring = async () => {
+      const state = late.records.get("state");
+      state.created_at -= 2_000;
+      late.records.set("state", state);
+    };
+    await late.task.alarm();
+    await Promise.all(late.background);
+    expect(launches).toEqual([]);
+    expect(await late.task.status()).toMatchObject({ phase: "failed", error: "exceeded the maximum lifetime" });
+    expect(late.reported).not.toContain("recovered");
+    expect(await late.task.countModelCall()).toBe(false);
+
+    // Given none, or nothing that is a bound: its own.
+    const plain = fixture();
+    await plain.task.start({ id: "fixture", prompt: "hello", bounds: { lifetime_ms: -5, model_calls: 1.5 } as never });
+    expect(((await plain.task.status()) as { bounds?: unknown }).bounds).toBeUndefined();
+    // Eleven minutes old, it is not ended for its age: whatever its watchdog makes of it, that is not why.
+    const old = plain.records.get("state");
+    old.created_at = Date.now() - 11 * 60_000;
+    plain.records.set("state", old);
+    await plain.task.alarm();
+    expect(((await plain.task.status()) as { error?: string }).error).not.toBe("exceeded the maximum lifetime");
   });
 
   it("does not go on to launch a task that was stopped while it was being set up", async () => {
