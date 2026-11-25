@@ -360,6 +360,9 @@ export class TaskSandbox extends DurableObject<Env> {
         await this.#files.mkdir(SCRATCH_DIRECTORY);
       }
 
+      // Stopped, or ended by the watchdog, while it was being set up: it does not go on to run.
+      const still = this.#state();
+      if (still && still.phase !== "starting") return still;
       if (input.prompt === undefined) {
         state.phase = "idle";
         this.#save(state);
@@ -372,15 +375,20 @@ export class TaskSandbox extends DurableObject<Env> {
       this.#save(fresh);
       return fresh;
     } catch (err) {
-      state.phase = "failed";
-      state.error = String(err);
+      // As it stands now, not as it stood when this began: it may have been stopped, or ended by
+      // the watchdog, meanwhile (which is likely what made this throw). Then that stands.
+      const fresh = this.#state() ?? state;
+      if (fresh.phase !== "starting") return fresh;
+      fresh.phase = "failed";
+      fresh.error = String(err);
       // Said to whoever started it in answer to the call, and reported as well: the caller may no
       // longer be waiting for this answer (its connection broke, and it asked again and was told
       // only that the task was starting).
-      this.#emit(state, "failed", { error: state.error });
-      this.#save(state);
+      this.#emit(fresh, "failed", { error: fresh.error });
+      this.#save(fresh);
+      this.ctx.waitUntil(this.#flush());
       if (this.#container.running) await this.#container.destroy();
-      return state;
+      return fresh;
     }
   }
 
@@ -692,6 +700,9 @@ export class TaskSandbox extends DurableObject<Env> {
   /** Stops the task for good and discards its container. */
   async cancel(): Promise<{ ok: true }> {
     const state = this.#state();
+    // Nothing was ever started here: closed, so that a start still on its way is turned away
+    // when it arrives. Stopping what never began means it never will (see `claimed`).
+    if (!state) this.ctx.storage.kv.put("closed", true);
     if (this.#container.running) await this.#container.destroy();
     if (state && (ACTIVE.has(state.phase) || state.phase === "starting" || state.phase === "idle")) {
       const fresh = this.#state() ?? state;

@@ -38,6 +38,9 @@ function within<T>(call: Promise<T>): Promise<T> {
   return Promise.race([call, new Promise<never>((_resolve, reject) => (timer = setTimeout(() => reject(new Error("not answered in time")), CONFIRM_CALL_MS)))]).finally(() => clearTimeout(timer));
 }
 
+/** Why a task whose worker could never be asked is ended. */
+const NOT_KNOWN = "its sandbox could not be reached after it was started: it is not known whether it began, or what became of it";
+
 /** What is said of a task whose start was not answered, wherever its standing is told. */
 export const UNCONFIRMED_NOTE = "It is not known yet whether this began: the worker did not answer when it was started. It is being checked, and you will be told how it ends. Do not hand the same work over again; if the person asks, tell them it may or may not have started.";
 
@@ -105,6 +108,8 @@ export class Tasks implements Wakes {
     // The row is written before anything is started. A retry of this tool call finds it by op_id
     // and continues with the same task id, so a lost response can never start a second task.
     let task = this.#s.rows<Row>("SELECT * FROM tasks WHERE op_id = ?", callId)[0];
+    // The same call made again: an earlier attempt at it may have got as far as starting the worker.
+    const replayed = task !== undefined;
     if (!task) {
       // Something new is taken only by a worker this deployment lists. Nothing is written for one that is not.
       if (!this.#b.workerNamed(WORKER)) throw new Error("this deployment has no worker to hand this to");
@@ -148,11 +153,23 @@ export class Tasks implements Wakes {
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
     const worker = this.#b.workerOf(String(task.worker));
+    // Known here, before anything is asked of anyone: not something to find out about later.
+    if (!worker.start) {
+      this.#set(task.id, "failed", { result: JSON.stringify({ error: "this worker is not started by the Brain" }) });
+      throw new Error("this worker cannot be started from here");
+    }
 
     let slot: boolean;
     try {
       slot = await this.#b.registry().acquireTaskSlot(scope.tenant, task.id);
     } catch (err) {
+      // The same call made again, for a task an earlier attempt may already have started: whether
+      // it did is not known, and is found out rather than guessed.
+      if (replayed) {
+        this.#unconfirmed(task.id);
+        await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+        return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+      }
       // The reservation may have been made even though its reply was lost; give it back.
       await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
       // The task must not be left "dispatching": nothing would ever pick it up again.
@@ -165,13 +182,11 @@ export class Tasks implements Wakes {
     }
     // The same start, made again, is the same piece of work (it is named by the id written before
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
-    const start = async (): Promise<Started> => {
-      if (!worker.start) throw new Error("this worker is not started by the Brain");
-      return worker.start(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() });
-    };
-    const started = await start()
-      .catch(start)
-      .catch(() => undefined);
+    const start = () => worker.start!(this.#b.env, { id: task.id, brief, options: { repository: repository ?? null }, brain: this.#s.scopeName() }).catch(() => undefined);
+    const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
+    let started: Started | undefined = await start();
+    // Asked once more only if nothing was heard meanwhile.
+    if (!started && !heard()) started = await start();
     // Read again after the wait: the worker may have reported meanwhile, and what it reported is
     // what happened, whatever became of the answer to the call.
     const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
@@ -407,7 +422,9 @@ export class Tasks implements Wakes {
 
   /** Stops a task through the worker it was written for. */
   async #stop(task: Row): Promise<void> {
-    await this.#b.workerOf(String(task.worker)).cancel?.(this.#b.env, String(task.id));
+    // Only the worker's word that the work itself stopped counts: not that it cannot be stopped, nor that only the waiting ended.
+    const how = await this.#b.workerOf(String(task.worker)).cancel?.(this.#b.env, String(task.id));
+    if (how !== "stopped") throw new Error("the worker did not say that this stopped");
   }
 
   /** A terminal status is final: a late or repeated report cannot bring a task back. */
@@ -442,11 +459,19 @@ export class Tasks implements Wakes {
       if (!task) return { known: false, wake: false, terminal: false };
       // A repeat means the worker never saw our acknowledgement. The work after the commit (waking
       // up, releasing the slot) may not have happened either, so it is done again; both are idempotent.
-      if (this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length > 0) return { known: true, wake: true, terminal: TERMINAL_TASK.has(task.status) };
+      // (Whether there is a place to give back goes by what was reported, not by how the task stands here:
+      // one ended here as lost, whose worker then repeats a mere progress report, has not been said to have ended.)
+      const before = this.#s.rows<{ kind: string }>("SELECT kind FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq)[0];
+      if (before) return { known: true, wake: true, terminal: TERMINAL_TASK.has(task.status) && ["result", "failed", "lost"].includes(before.kind) };
       this.#s.sql.exec("INSERT INTO task_events (task_id, seq, kind, body, at) VALUES (?, ?, ?, ?, ?)", taskId, seq, kind, JSON.stringify(body), Date.now());
 
       const text = typeof body.message === "string" ? body.message : typeof body.text === "string" ? body.text : "";
       let applied = true;
+      // Any word from the worker shows that it began: one whose start was not answered is running from here on.
+      if (task.status === "unconfirmed" && (kind === "progress" || kind === "recovered")) {
+        this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'unconfirmed'", Date.now(), taskId);
+        this.#s.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", taskId);
+      }
       if (kind === "progress") {
         if (!TERMINAL_TASK.has(task.status)) this.#s.sql.exec("UPDATE tasks SET last_progress = ?, updated_at = ? WHERE id = ?", text.slice(0, 500), Date.now(), taskId);
         return { known: true, wake: false, terminal: false };
@@ -603,11 +628,11 @@ export class Tasks implements Wakes {
    * - The worker has it, or has reported on it: it began, and goes on as any task.
    * - The worker never took it, and by saying so has closed it against a start that is still
    *   on its way: it never began and never will. Failed, its place given back, and said.
-   * - The worker cannot be asked, to the last attempt: it is stopped if it can be. If the stop
-   *   is answered, nothing runs: ended, its place given back. If not, and it has reported
-   *   meanwhile, it began: it goes on as any task. Otherwise the waiting ends here: lost, said
-   *   as not known whether it began; its place with the tenant is not given back on a guess,
-   *   and lapses by its own time limit, which is longer than a sandbox can live.
+   * - The worker cannot be asked, to the last attempt: the waiting ends here. Lost, said as not
+   *   known whether it began. Nothing more is asked of a worker that does not answer (a stop
+   *   whose answer is lost settles nothing), and its place with the tenant is not given back
+   *   on a guess: it lapses by its own time limit, which is longer than a sandbox can live, or
+   *   is given back when the worker reports an ending after all.
    * No call to the worker is waited for longer than a fixed time.
    */
   async #confirm(): Promise<void> {
@@ -644,15 +669,7 @@ export class Tasks implements Wakes {
       if (standing === "none") {
         await this.#ended(task, "failed", "the sandbox never started: it has no record of this task", true);
       } else if (standing === "unreachable" && last) {
-        const stopped = await within(this.#stop(task)).then(
-          () => true,
-          () => false,
-        );
-        // Read again after the wait: what came meanwhile is what happened.
-        if (!waiting()) continue;
-        if (stopped) await this.#ended(task, "lost", reported() ? "the sandbox could not be reached; it had begun, and was stopped" : "the sandbox could not be reached: it was stopped, and it is not known whether it had begun", true);
-        else if (reported()) began();
-        else await this.#ended(task, "lost", "the sandbox could not be reached: it is not known whether this began, or what became of it", false);
+        await this.#ended(task, "lost", NOT_KNOWN, false);
       } else {
         this.#s.sql.exec("UPDATE unconfirmed SET attempts = attempts + 1, next_at = ? WHERE task_id = ?", Date.now() + CONFIRM_FIRST_MS * 2 ** (row.attempts + 1), row.task_id);
       }
@@ -728,5 +745,6 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   }
   if (kind === "result") return `${head} finished. The worker's own summary (unverified): ${clipResult(String(body.text ?? ""))}`;
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
-  return `${head} was lost: its sandbox stopped and could not be restored.`;
+  // The Brain's own finding says why; a worker's report of a lost task means its sandbox stopped under it.
+  return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: its sandbox stopped and could not be restored.`;
 }

@@ -44,7 +44,6 @@ function bench(state: DurableObjectState) {
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
     /** Something that happens while the sandbox is being asked to stop. */
-    duringCancel: undefined as undefined | (() => Promise<unknown>),
     /** What the sandbox says when asked whether it has a task: its state, that it has none, or no answer at all. */
     has: "none" as "there" | "none" | Error,
     asked: [] as string[],
@@ -66,7 +65,6 @@ function bench(state: DurableObjectState) {
     ({
       start: async (input: unknown) => (worker.started.push(input), worker.start(input)),
       cancel: async () => {
-        await worker.duringCancel?.();
         if (worker.cancelFails) throw new Error("connection reset");
         return (worker.cancelled.push(taskId), { ok: true });
       },
@@ -327,6 +325,8 @@ describe("tasks, by themselves", () => {
         const said = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string; status: string };
         expect(said.status).toBe("succeeded");
         expect(JSON.parse(kept(said.task_id).result)).toMatchObject({ summary: "done" });
+        // Heard from: it is not asked to start a second time.
+        expect(worker.started).toHaveLength(1);
         expect(worker.cancelled).toEqual([]);
         expect(slots.released).toEqual([said.task_id]);
       });
@@ -383,61 +383,70 @@ describe("tasks, by themselves", () => {
       });
     });
 
-    it("gives up a task whose worker cannot be asked after a bounded number of tries, and gives its place back only where it is certain that nothing runs", async () => {
-      const unreachable = async (store: BrainStore, tasks: Tasks, kept: (id: string) => any, id: string) => {
+    it("gives up a task whose worker cannot be asked after a bounded number of tries: lost, said as not known, its place kept until it is certain that nothing runs", async () => {
+      await within(async ({ tasks, store, kept, slots, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        worker.has = new Error("connection reset");
         for (let n = 0; n < 5; n++) {
           await later(store, tasks);
           expect(kept(id).status).toBe("unconfirmed");
           // Asked again later each time, further apart.
           expect(store.rows<{ attempts: number }>("SELECT attempts FROM unconfirmed")[0].attempts).toBe(n + 1);
         }
-      };
-      // The stop is not answered either: the waiting ends, said as not known; its place with the tenant is not given back on a guess.
-      await within(async ({ tasks, store, kept, slots, worker }) => {
-        worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        worker.has = new Error("connection reset");
-        worker.cancelFails = true;
-        await unreachable(store, tasks, kept, id);
         await later(store, tasks);
         expect(kept(id).status).toBe("lost");
-        expect(JSON.parse(kept(id).result).error).toContain("it is not known whether this began");
-        expect(slots.released).toEqual([]);
-        expect(store.rows<{ kind: string }>("SELECT kind FROM inbox WHERE source = 'worker'")).toEqual([{ kind: "worker.lost" }]);
+        expect(JSON.parse(kept(id).result).error).toContain("it is not known whether it began");
+        // Nothing more is asked of a worker that does not answer, and its place is not given back on a guess.
         expect(worker.asked).toHaveLength(6);
+        expect(worker.cancelled).toEqual([]);
+        expect(slots.released).toEqual([]);
         expect(tasks.nextWakeAt(0)).toBeNull();
+        // What is said in its conversation is that, not that a sandbox stopped.
+        const said = store.rows<{ kind: string; text: string }>("SELECT kind, text FROM inbox WHERE source = 'worker'");
+        expect(said.map((each) => each.kind)).toEqual(["worker.lost"]);
+        expect(said[0].text).toContain("it is not known whether it began");
+        expect(said[0].text).not.toContain("its sandbox stopped");
         // It no longer counts against the conversation's own places.
         expect(store.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input')")[0].n).toBe(0);
-        // A result that comes after all does not bring it back; but it shows that nothing runs any more, and the place is given back then.
-        await tasks.event(id, 1, "result", { status: "succeeded", summary: "late" });
+        // Word of progress that comes after all, also repeated, does not bring it back and gives no place back: it has not been said to have ended.
+        await tasks.event(id, 1, "progress", { message: "cloning" });
+        await tasks.event(id, 1, "progress", { message: "cloning" });
         expect(kept(id).status).toBe("lost");
-        expect(slots.released).toEqual([id]);
-      });
-      // The stop is answered: nothing runs, and the place is given back.
-      await within(async ({ tasks, store, kept, slots, worker }) => {
-        worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        worker.has = new Error("connection reset");
-        await unreachable(store, tasks, kept, id);
-        await later(store, tasks);
-        expect(kept(id).status).toBe("lost");
-        expect(JSON.parse(kept(id).result).error).toContain("it was stopped");
-        expect(worker.cancelled).toEqual([id]);
-        expect(slots.released).toEqual([id]);
-      });
-      // It reports while the stop is being asked for, and the stop is not answered: it began, and goes on.
-      await within(async ({ tasks, store, kept, slots, worker }) => {
-        worker.start = lost;
-        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
-        worker.has = new Error("connection reset");
-        worker.cancelFails = true;
-        await unreachable(store, tasks, kept, id);
-        worker.duringCancel = () => tasks.event(id, 1, "progress", { message: "cloning" });
-        await later(store, tasks);
-        expect(kept(id).status).toBe("running");
-        expect(kept(id).last_progress).toBe("cloning");
         expect(slots.released).toEqual([]);
+        // Its ending, when the worker reports that, shows that nothing runs any more: the place is given back then, also on a repeat.
+        await tasks.event(id, 2, "result", { status: "succeeded", summary: "late" });
+        expect(kept(id).status).toBe("lost");
+        expect(slots.released).toEqual([id]);
+        await tasks.event(id, 2, "result", { status: "succeeded", summary: "late" });
+        expect(slots.released).toEqual([id, id]);
+      });
+    });
+
+    it("takes any word from the worker as showing that it began: not confirmed no longer, at once", async () => {
+      await within(async ({ tasks, store, kept, worker }) => {
+        worker.start = lost;
+        const { task_id: id } = (await tasks.dispatch(RUN, SESSION_KEY, "call_1", "t", "b", null)) as { task_id: string };
+        expect(kept(id).status).toBe("unconfirmed");
+        await tasks.event(id, 1, "progress", { message: "cloning" });
+        expect(kept(id)).toMatchObject({ status: "running", last_progress: "cloning" });
         expect(store.rows("SELECT 1 FROM unconfirmed")).toEqual([]);
+        expect((await tasks.status(id)) as Record<string, unknown>).not.toHaveProperty("note");
+      });
+    });
+
+    it("finds out, rather than guesses, when the same call is made again and the place cannot be asked for", async () => {
+      await within(async ({ tasks, store, kept, slots, worker, task }) => {
+        // As after an interruption: the task was written, and its worker may have been started, by an earlier attempt at this call.
+        task("t_again", { status: "dispatching" });
+        store.sql.exec("UPDATE tasks SET op_id = 'call_again' WHERE id = 't_again'");
+        slots.acquire = async () => {
+          throw new Error("registry down");
+        };
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_again", "t", "b", null)).toMatchObject({ task_id: "t_again", status: "unconfirmed" });
+        expect(kept("t_again").status).toBe("unconfirmed");
+        expect(worker.started).toEqual([]);
+        expect(store.rows("SELECT task_id FROM unconfirmed")).toEqual([{ task_id: "t_again" }]);
       });
     });
 
