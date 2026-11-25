@@ -556,7 +556,7 @@ describe("the run loop, by itself", () => {
         await b.go();
         const again = b.asked[1].input;
         expect(again.filter((each: any) => Array.isArray(each.content) && each.content.some((part: any) => part.type === "input_image"))).toHaveLength(1);
-        expect(again.at(-1).content[2].text).toBe("[A picture of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it:]");
+        expect(again.at(-1).content[2].text).toBe("[A picture of an earlier message of theirs in this conversation, for context: use it if it helps with what they write now:]");
         expect(again.at(-1).content[3].image_url).toContain("BYTES-k1");
         expect(typeof again.find((each: any) => each.role === "user").content).toBe("string");
         void first;
@@ -659,7 +659,7 @@ describe("the run loop, by itself", () => {
         await b.go();
         expect(b.log.filter((each) => each[0] === "pictures").at(-1)).toEqual(["pictures", "feishu", ["c", "d", "e", "a"]]);
         const labels = b.asked[0].input.at(-1).content.map((each: any) => each.text).filter(Boolean).slice(2);
-        expect(labels).toEqual(["[A picture of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it:]", "[A picture of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it:]", "[A picture of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it:]", "[A picture of the message this was written in reply to:]"]);
+        expect(labels).toEqual(["[A picture of an earlier message of theirs in this conversation, for context: use it if it helps with what they write now:]", "[A picture of an earlier message of theirs in this conversation, for context: use it if it helps with what they write now:]", "[A picture of an earlier message of theirs in this conversation, for context: use it if it helps with what they write now:]", "[A picture of the message this was written in reply to:]"]);
 
         // A message brought here from another conversation carries no picture, as what the run acts on or as what came before.
         b.store.sql.exec("UPDATE inbox SET received_at = received_at - 3600000");

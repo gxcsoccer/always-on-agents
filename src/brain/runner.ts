@@ -1060,10 +1060,12 @@ export class Runner {
     const who = (row: InboxRow) => JSON.parse(row.principal) as Principal;
     // Written here, by a person: not something routed here from where it was written.
     const here = (row: InboxRow) => who(row).kind === "human" && dataOf(row).routed_from === undefined;
-    const events = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId).filter(here);
+    const started = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? AND kind = 'message' ORDER BY id", runId).filter((each) => who(each).kind === "human");
+    // Started by more than one person's messages, wherever each was written: nobody's pictures are shown, since each is its sender's alone.
+    if (started.some((each) => who(each).id !== who(started[0]).id)) return undefined;
+    const events = started.filter(here);
     const last = events.at(-1);
-    // Started by more than one person's messages: nobody's pictures are shown, since each is its sender's alone.
-    if (!last || events.some((each) => who(each).id !== who(last).id)) return undefined;
+    if (!last) return undefined;
     const origin = JSON.stringify(originOf(last));
     const same = (row: InboxRow) => row.source === last.source && JSON.stringify(originOf(row)) === origin;
     const named = (value: unknown): PictureRef[] => (Array.isArray(value) ? value.filter((each): each is PictureRef => typeof each?.message === "string" && typeof each?.key === "string").map((each) => ({ message: each.message, key: each.key })) : []);
@@ -1101,8 +1103,8 @@ export class Runner {
   #picturesShown(runId: string): Promise<Item[]> {
     if (this.#shown?.run === runId) return this.#shown.parts;
     const wanted = this.#picturesFor(runId);
-    // An earlier one is said to be that: it came with a message already dealt with, and the model would otherwise take it for new and answer that message again.
-    const FROM = { now: "of what is above (what they just sent)", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs here, which you have already dealt with; it is here again only in case what they write now is about it" };
+    // An earlier one is said to be that and no more: that its message was answered, or that it was seen then, is not known here.
+    const FROM = { now: "of what is above (what they just sent)", replied: "of the message this was written in reply to", earlier: "of an earlier message of theirs in this conversation, for context: use it if it helps with what they write now" };
     const parts = !wanted
       ? Promise.resolve([])
       : this.#b.pictures(wanted.connector, { data: wanted.data }, wanted.refs.map((each) => ({ message: each.message, key: each.key }))).then((got) => [
