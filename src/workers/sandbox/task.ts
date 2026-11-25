@@ -423,10 +423,8 @@ export class TaskSandbox extends DurableObject<Env> {
         this.#save(state);
         return state;
       }
-      // Getting ready took time (most of all bringing an earlier task's workspace in): a task whose
-      // life ran out meanwhile is not started. Ended below, as any start that fails.
-      const kept = this.#state() ?? state;
-      if (Date.now() - kept.created_at > lifetimeOf(kept)) throw new Error("exceeded the maximum lifetime");
+      // (Getting ready took time, most of all bringing an earlier task's workspace in: a task whose
+      // life ran out meanwhile is not started. See #launch; ended below, as any start that fails.)
       await this.#launch(state, input.seed ? "follow_up" : "first");
       // Re-read: the agent is running now and may already have reported.
       const fresh = this.#state() ?? state;
@@ -1181,7 +1179,11 @@ export class TaskSandbox extends DurableObject<Env> {
     if ((this.#state() ?? state).phase !== "starting") return;
     await this.#files.remove(EXIT_CODE_PATH, { force: true });
     await this.#files.remove(PID_PATH, { force: true });
-    if ((this.#state() ?? state).phase !== "starting") return;
+    // Looked at last of all, with nothing awaited between this and the process being started:
+    // still starting, and still within its life (getting here took time).
+    const kept = this.#state() ?? state;
+    if (kept.phase !== "starting") return;
+    if (Date.now() - kept.created_at > lifetimeOf(kept)) throw new Error("exceeded the maximum lifetime");
     await this.#container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", ...argv], {
       cwd: state.cwd,
       env: this.#agentEnv(state),
@@ -1238,8 +1240,10 @@ export class TaskSandbox extends DurableObject<Env> {
     // before. Whether it is kept is decided below, once it is known how the task ended. Failing
     // to take it holds nothing up: the task then simply cannot be gone on from.
     let last: { record: DirectoryBackupRecord; at: number; took_ms: number } | undefined;
-    // (Both paths can come here for the same ending: the one that finds the copy being taken leaves it to the other.)
-    if (this.#leaving) return;
+    // (Both paths can come here for the same ending: the one that finds the copy being taken, or the
+    // ending already settled while it was reading, leaves it to the other. Nothing is awaited from here to the mark.)
+    const still = this.#state();
+    if (this.#leaving || !still || !ACTIVE.has(still.phase)) return;
     if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
       this.#leaving = true;

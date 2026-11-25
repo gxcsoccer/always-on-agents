@@ -737,6 +737,13 @@ describe("tasks, by themselves", () => {
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, second.task_id)).rejects.toThrow("first made for something else");
         expect(await tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).toMatchObject({ task_id: unanswered.task_id, status: "running" });
         expect(worker.started).toHaveLength(begun);
+        // Made again by a run that is someone else's, or nobody's in particular: not this call, whether or not it has begun.
+        const alice = settings.deciders;
+        settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("first made for someone else");
+        settings.deciders = [];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("first made for someone else");
+        settings.deciders = alice;
         // What it goes on from is kept with it.
         expect(store.rows("SELECT from_id FROM task_follows WHERE task_id = ?", unanswered.task_id)).toEqual([{ from_id: first.task_id }]);
         store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
