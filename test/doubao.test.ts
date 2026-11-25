@@ -429,6 +429,20 @@ describe("handing work to Doubao Work", () => {
     model.replies([asks("C 接着做", idC)], [say("")]);
     await cy.says("C 接着做");
     expect(JSON.stringify(toolOutputs())).toContain("can no longer be gone on with");
+    expect(JSON.stringify(toolOutputs())).toContain("only if they then ask for that");
+    expect(world.writes).toHaveLength(sent);
+    // One done under an authorisation that is no longer the one in force: said as that, and the agent is not told to start it anew.
+    await runInDurableObject(await cy.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.ops[idA].generation = stored.ops[idA].generation + 1;
+      await state.storage.put("grant", stored);
+    });
+    model.replies([asks("A 接着做", idA)], [say("")]);
+    await cy.says("A 接着做");
+    const told = JSON.stringify(toolOutputs());
+    expect(told).toContain("it cannot be gone on with");
+    expect(told).toContain("only if they then ask for that");
+    expect(told).not.toContain("Hand this over as something new");
     expect(world.writes).toHaveLength(sent);
     const then2 = world.writes.length;
     // Somebody else names it: it is not theirs.
