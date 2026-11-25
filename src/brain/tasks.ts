@@ -43,7 +43,6 @@ export const ACCEPT_WITHIN_MS = 15 * 60_000;
 /** A call that is given up, as unanswered, once it has taken that long. What it answers later is not used. */
 function within<T>(call: Promise<T>, ms = CONFIRM_CALL_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  call.catch(() => undefined);
   return Promise.race([call, new Promise<never>((_resolve, reject) => (timer = setTimeout(() => reject(new Error("not answered in time")), ms)))]).finally(() => clearTimeout(timer));
 }
 
@@ -174,21 +173,29 @@ export class Tasks implements Wakes {
     } catch (err) {
       slot = err instanceof Error ? err : new Error(String(err));
     }
-    if (slot !== true) {
-      // The same call made again, for a task an earlier attempt may already have started. Read
-      // again after the wait: what the worker reported meanwhile is what happened. Otherwise
-      // whether it started is not known, and is found out rather than guessed.
-      if (replayed) {
-        const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
-        if (now.status !== "dispatching") return this.#told(now);
-        if (this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {
-          this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
-        } else {
-          this.#unconfirmed(task.id);
-          await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
-        }
+    // The same call made again, for a task an earlier attempt may already have started. Read again
+    // after the wait, whatever the registry said: what the worker reported meanwhile is what
+    // happened, and nothing more is asked of it.
+    if (replayed) {
+      const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
+      if (now.status !== "dispatching") {
+        // A place just taken for one that has ended is given straight back: also where the registry
+        // did not answer, since it may have taken one all the same.
+        if (slot !== false && TERMINAL_TASK.has(String(now.status))) await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
+        return this.#told(now);
+      }
+      if (this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {
+        this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), task.id);
         return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
       }
+      // No place, and no word of it: whether it started is not known, and is found out rather than guessed.
+      if (slot !== true) {
+        this.#unconfirmed(task.id);
+        await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+        return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+      }
+    }
+    if (slot !== true) {
       if (slot === false) {
         this.#set(task.id, "failed", { result: JSON.stringify({ error: "the tenant's sandbox limit is reached" }) });
         throw new Error("too many sandboxes are running for this tenant right now; try again later");
@@ -489,6 +496,14 @@ export class Tasks implements Wakes {
       this.#s.sql.exec("INSERT INTO task_events (task_id, seq, kind, body, at) VALUES (?, ?, ?, ?, ?)", taskId, seq, kind, JSON.stringify(body), Date.now());
 
       const text = typeof body.message === "string" ? body.message : typeof body.text === "string" ? body.text : "";
+      // What the worker spent counts against the same daily budget as the Brain's own calls.
+      // Anything that is not a positive number of tokens is nothing spent, here and in the registry.
+      const spend = () => {
+        const said = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);
+        const spent = Number.isFinite(said) && said > 0 ? said : 0;
+        if (spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
+        return spent;
+      };
       let applied = true;
       // Any word from the worker shows that it began: one whose start was not answered is running from here on.
       if (task.status === "unconfirmed" && (kind === "progress" || kind === "recovered")) {
@@ -563,17 +578,10 @@ export class Tasks implements Wakes {
         // its conversation, but what it spent was spent, and is counted, once (a repeat of this
         // report is caught above).
         const late = task.status === "lost" && kind !== "needs_input";
-        const used = late ? Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0) : 0;
-        const spent = Number.isFinite(used) && used > 0 ? used : 0;
-        if (spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
-        return { known: true, wake: false, terminal: late, spent };
+        return { known: true, wake: false, terminal: late, spent: late ? spend() : 0 };
       }
 
-      // What the worker spent counts against the same daily budget as the Brain's own calls.
-      const said = Number((body.usage as { total_tokens?: unknown } | undefined)?.total_tokens ?? 0);
-      // Anything that is not a positive number of tokens is nothing spent, here and in the registry.
-      const spent = Number.isFinite(said) && said > 0 ? said : 0;
-      if (spent > 0) this.#b.spend(Math.min(spent, 50_000_000));
+      const spent = spend();
       if (kind === "lost" || kind === "failed") this.#s.log(`task_${kind}`, { task: taskId, error: String(body.error ?? "").slice(0, 300) });
 
       this.#s.insertEvent({
