@@ -152,7 +152,8 @@ export class Tasks implements Wakes {
     // that names no worker is the tool from before there were several: it goes to the worker the
     // deployment says that tool was for, if it still offers that one, and to no other.
     const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : this.#b.firstWorker();
-    (task ? this.#b.workerOf(String(task.worker)) : offered)?.accepts?.(options, scope);
+    // (Only for something new: one already written was taken, and is not turned away by a check made again.)
+    if (!task) offered?.accepts?.(options, scope);
     // Going on from an earlier piece of work: it has to be this conversation's, this worker's, and
     // one that ended well; and the worker has to be one that goes on at all. Whoever asks, and
     // whatever was approved then, are this new piece's own: nothing of the earlier one's is carried.
@@ -211,7 +212,17 @@ export class Tasks implements Wakes {
     }
     // One that was written is one that was taken: it is carried through by the worker it was
     // written for, whether or not the deployment still lists that worker for new work.
-    const worker = this.#b.workerOf(String(task.worker));
+    let worker: Worker;
+    try {
+      worker = this.#b.workerOf(String(task.worker));
+    } catch {
+      // Written for a worker the deployment no longer has at all. Whether an earlier attempt at this
+      // call started it is not known and cannot be asked from here: it is kept as exactly that, and
+      // given up in its time (see settle), rather than left as it is for ever holding a place here.
+      this.#unconfirmed(task.id);
+      await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
+      return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
+    }
     // How far this task may go, as it was fixed when it was written (one written before that was
     // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
     const bounds = this.#boundsOf(task);
