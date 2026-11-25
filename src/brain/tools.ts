@@ -95,7 +95,7 @@ export const TOOLS: ToolDefinition[] = [
   tool("memory_delete", "Delete a memory file that is no longer true or useful.", { path: string }),
   tool(
     "set_timer",
-    "Wake yourself up later. When the timer fires you get an event containing the note, in this same conversation. Use it for follow-ups and recurring work. A repeating timer costs a run every time it fires: cancel it as soon as what it is for is done or no longer wanted. It ends by itself after it has come round fifty times; set it again if it is still needed then.",
+    "Wake yourself up later. When the timer fires you get an event containing the note, in this same conversation. Use it for follow-ups and recurring work. A repeating timer costs a run every time it fires: cancel it as soon as what it is for is done or no longer wanted. It ends by itself fifty rounds after its first; set it again if it is still needed then.",
     {
       delay_seconds: { type: "integer", description: "Seconds from now until it first fires." },
       note: { type: "string", description: "What you should do when it fires. Write it for a future you with no other context." },
