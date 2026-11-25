@@ -71,18 +71,44 @@ const cases: Case[] = [
   { name: "10 取消豆包那件", work: [{ ...W_A, state: "waiting_for_result (handed over; the worker is at it)" }], input: [said(3, "让豆包调研一下 magpie"), ...handed("doubao", "调研一下 magpie", "req_A", { waiting: true, request: "req_A", note: "handed over" }), said(0, "算了，那个调研不用做了")], want: (_c, all) => all.some((each) => each.name === "cancel_work" && each.work_id === "req_A") || `calls ${JSON.stringify(all)}` },
 ];
 
-const runs = Number(process.argv[2] ?? 2);
+// How often each case is run: the first argument that is a number (so that both `pnpm run eval 4`
+// and `pnpm run eval -- 4` say four). Anything else that is given is a mistake, not "no runs".
+const given = process.argv.slice(2).filter((each) => each !== "--");
+const runs = given.length === 0 ? 2 : Number(given[0]);
+if (given.length > 1 || !Number.isInteger(runs) || runs < 1 || runs > 50) {
+  console.error(`how often each case is run must be a whole number from 1 to 50; got ${JSON.stringify(given.join(" "))}`);
+  process.exit(2);
+}
+const chosen = cases.filter((c) => !process.env.ONLY || c.name.startsWith(process.env.ONLY + " "));
+if (chosen.length === 0) {
+  console.error(`no case's name begins with ${JSON.stringify(process.env.ONLY)}; the cases are: ${cases.map((c) => c.name.split(" ")[0]).join(", ")}`);
+  process.exit(2);
+}
+// The model as the deployment is set to use it: its address, and its name.
+const baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+const model = process.env.BRAIN_MODEL || "gpt-6-sol";
 let failed = 0;
-for (const each of cases.filter((c) => !process.env.ONLY || c.name.startsWith(process.env.ONLY + " "))) {
+let asked = 0;
+for (const each of chosen) {
   const results: string[] = [];
   for (let i = 0; i < runs; i++) {
+    asked++;
     const instructions = buildInstructions({ scope: { tenant: "acme", kind: each.chat ? "chat" : "user", id: each.chat ? "oc_1" : "ou_1" } as any, situation: "conversation", now, work: each.work, requests: [], guidance });
-    const response = await respond({ baseUrl: "https://api.openai.com/v1", apiKey: process.env.OPENAI_API_KEY!, model: process.env.BRAIN_MODEL ?? "gpt-6-sol", instructions, input: each.input, tools });
-    const calls = response.output.filter((item: any) => item.type === "function_call").map((item: any) => ({ name: item.name, ...JSON.parse(item.arguments || "{}") }));
-    const verdict = each.want(hand(calls), calls);
+    let calls: any[];
+    let verdict: string | true;
+    try {
+      const response = await respond({ baseUrl, apiKey: process.env.OPENAI_API_KEY!, model, instructions, input: each.input, tools });
+      calls = response.output.filter((item: any) => item.type === "function_call").map((item: any) => ({ name: item.name, ...JSON.parse(item.arguments || "{}") }));
+      verdict = each.want(hand(calls), calls);
+    } catch (err) {
+      // A call that failed, or arguments that are not JSON: this run is not as wanted, and the rest go on.
+      calls = [];
+      verdict = `could not be run: ${String(err).slice(0, 200)}`;
+    }
     if (verdict !== true) failed++;
     results.push(verdict === true ? `ok   ${calls.map((c: any) => (c.name === "hand_over" ? `hand_over(${c.worker}${c.continue_from ? `, from ${c.continue_from}` : ""}): ${JSON.stringify(c.brief)}` : c.name)).join(" | ")}` : `FAIL ${verdict} :: ${JSON.stringify(calls).slice(0, 300)}`);
   }
   console.log(`${each.name}\n${results.map((r) => `   ${r.slice(0, 400)}`).join("\n")}`);
 }
-console.log(failed === 0 ? "all as wanted" : `${failed} not as wanted`);
+console.log(`${chosen.length} case${chosen.length === 1 ? "" : "s"}, ${asked} run${asked === 1 ? "" : "s"} against ${model}: ${failed === 0 ? "all as wanted" : `${failed} not as wanted`}`);
+if (failed > 0) process.exitCode = 1;
