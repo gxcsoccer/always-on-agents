@@ -500,7 +500,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
   if (context.resuming && generation !== context.resuming.generation) return CHANGED;
   // Kept as it is first asked for. The same call made again (carried on, or after an interruption) is the same piece of work.
   const op = await grant.begin(who, context.callId, text, { carryOn, ...(from !== undefined ? { from } : {}) }, app.version, generation, scopeName(context.scope), scopeName({ tenant: app.tenant, kind: "user", id: context.person }));
-  if (op === "unnamed") return { error: "it was not said which piece of work this goes on with; nothing was sent. Name it (continue_from), or hand this over as something new" };
+  if (op === "unnamed") return { error: "it was not said which piece of work this goes on with; nothing was sent. Name it (continue_from) if it is plain which; if it is not, ask the person which" };
   if (op === "not_found") return { error: "that piece of work can no longer be gone on with (it is too old, it never reached Doubao, or the authorisation or set-up changed since); nothing was sent. Tell the person so; it is handed over as something new only if they then ask for that" };
   if (op === "full") return { error: "too many pieces of work with Doubao are under way for this person; nothing was sent. Try again when one has finished" };
   seen.op = op;
@@ -570,7 +570,7 @@ async function ask(context: ToolContext, args: Record<string, unknown>, seen: Se
     // And "taken" without saying what became of it is not a refusal.
     if (again || (sent.status >= 200 && sent.status < 300 && (sent.code === 0 || sent.code === undefined))) return await advance("lost"), { error: UNCERTAIN };
     await advance("failed");
-    return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; wait for it to finish, or hand it over as something new" : `Doubao did not take this (status ${sent.status}); nothing was started` };
+    return { error: sent.status === 409 && !op.fresh ? "that conversation with Doubao is still working on something else; this was not sent. Tell the person so; it is handed over as something new only if they then ask for it to be done apart" : `Doubao did not take this (status ${sent.status}); nothing was started` };
   }
   await advance("submitted", { session, message: mine.id });
   return reply();
