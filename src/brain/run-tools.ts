@@ -379,7 +379,7 @@ export class RunTools {
       cancelWork: async (callId, workId) => {
         const work = await this.#work(run, session.session_key, workId);
         if (work.task) return this.#b.tasks.cancel(session.session_key, workId);
-        if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : "It had already ended; there was nothing to stop." };
+        if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : work.state === "cancelled" && work.handed ? "It was already called off here: nothing of it will be brought back. It had been handed over, so the worker may still finish it over there: tell the person that, not that it was stopped." : "It had already ended; there was nothing to stop." };
         // The request that carries it is called off, as any request of the person's is.
         const off = callOff(callId, workId, "") as { cancelled?: string };
         if (off.cancelled !== workId) return off;
@@ -414,6 +414,8 @@ export function workersIn(acting: Parameters<typeof toolsIn>[0] | undefined, too
 
 /** How a piece of work done in a person's name stands, in words for the model: what it waits for while it is under way, or how it ended. */
 export function standingOf(state: string, waits?: "authorisation" | "result", handed = false): string {
+  // Called off here after it was handed over: this side stopped waiting, and what became of it over there is not known.
+  if (state === "cancelled" && handed) return "cancelled (no longer waited for here; it had been handed over, and the worker may still have finished it over there)";
   return state !== "open" ? state : waits === "authorisation" ? (handed ? "waiting_for_authorisation (it was handed over already, or may have been; the person has to authorise again before it can go on; they were shown how)" : "waiting_for_authorisation (not handed over yet: the person has to authorise it first; they were shown how)") : waits === "result" ? "waiting_for_result (handed over; the worker is at it)" : "under way";
 }
 

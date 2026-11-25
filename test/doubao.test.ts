@@ -643,6 +643,11 @@ describe("handing work to Doubao Work", () => {
     await cy.says("算了");
     expect(toolOutputs(modelCalls.at(-2))[0]).toMatchObject({ cancelled: id, how: "no_longer_waited_for" });
     expect((await cy.requests()).map((each: any) => each.status)).toEqual(["cancelled"]);
+    // Asked to call it off once more, or how it stands: still that it is only no longer waited for here.
+    model.replies([call("cancel_request", { request_id: id, ask: "" })], [call("work_status", { work_id: id })], [say("")]);
+    await cy.says("取消了吗");
+    expect(JSON.stringify(toolOutputs(modelCalls.at(-2))[0])).toContain("the worker may still finish it over there");
+    expect(toolOutputs(modelCalls.at(-1))[1].state).toMatch(/^cancelled \(no longer waited for here/);
   });
 
   it("is there where several people talk: for the one who asked and as them, with the way in shown to them alone and the answer said to all", async () => {
