@@ -21,18 +21,29 @@ vi.mock("@cloudflare/sandbox", () => ({
     async remove() {}
   },
   DirectoryBackup: class {
+    constructor(
+      _container: unknown,
+      _gateway: unknown,
+      private where: { prefix: string },
+    ) {}
     async intercept() {}
-    async restore() {
+    async restore(record: { id: string }, into: { dir: string }) {
+      backups.restored.push({ prefix: this.where.prefix, id: record.id, dir: into.dir });
       await restoring.now?.();
     }
     async backup() {
-      return { id: "taken" };
+      backups.taken += 1;
+      return { id: `taken-${backups.taken}` };
     }
-    async delete() {}
+    async delete(record: { id: string }) {
+      backups.deleted.push(record.id);
+    }
   },
   DirectoryBackupGateway: class {},
 }));
 
+/** What was asked of the store of checkpoints: copies taken, restored (from whose, which, to where) and removed. */
+const backups = { taken: 0, restored: [] as { prefix: string; id: string; dir: string }[], deleted: [] as string[] };
 /** Something that happens while a checkpoint is being restored, for the fixture that is restoring. */
 const restoring: { now?: () => Promise<void> } = {};
 
@@ -62,6 +73,7 @@ function fixture() {
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
   const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
   restoring.now = undefined;
+  Object.assign(backups, { taken: 0, restored: [], deleted: [] });
   return {
     task: new TaskSandbox(ctx as never, env as never),
     container,
@@ -74,6 +86,74 @@ function fixture() {
     },
   };
 }
+
+/** A container whose agent has ended as told: what the task reads of its files, and every command it was given. */
+function ended(container: { exec: (argv: string[]) => Promise<unknown> }, how: { code: string; events: object[] }) {
+  const commands: string[][] = [];
+  const out = (text: string | undefined) => ({ output: async () => ({ exitCode: text === undefined ? 1 : 0, stdout: new TextEncoder().encode(text ?? ""), stderr: new Uint8Array() }) });
+  container.exec = async (argv) => {
+    commands.push(argv);
+    if (argv[0] !== "tail") return out("");
+    const path = argv.at(-1)!;
+    return out(path.endsWith("/exit-code") ? how.code : path.endsWith("/events.jsonl") ? how.events.map((each) => JSON.stringify(each)).join("\n") : undefined);
+  };
+  return commands;
+}
+const DONE = [{ type: "session", id: "s1" }, { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] } }, { type: "agent_settled" }];
+
+describe("a sandbox task that a later one goes on from", () => {
+  it("keeps its workspace as it was when it ended well, and hands that out; one that did not end well keeps nothing to go on from", async () => {
+    const good = fixture();
+    await good.task.start({ id: "fixture", prompt: "hello", brain: "brain", repository: "https://github.com/acme/app" });
+    expect(await good.task.snapshot()).toBeNull();
+    ended(good.container, { code: "0", events: DONE });
+    await good.task.alarm();
+    expect(await good.task.status()).toMatchObject({ phase: "succeeded", checkpoint: { record: { id: "taken-1" }, final: true } });
+    expect(await good.task.snapshot()).toMatchObject({ record: { id: "taken-1" }, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" });
+    // Not handed out in its last minutes before it is removed.
+    const state = good.records.get("state");
+    state.finished_at = Date.now() - (24 * 60 * 60_000 - 60_000);
+    good.records.set("state", state);
+    expect(await good.task.snapshot()).toBeNull();
+
+    // The agent exited cleanly but its last word was an error: the copy taken is put with those to be removed, and nothing is handed out.
+    const bad = fixture();
+    await bad.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    ended(bad.container, { code: "0", events: [{ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "model failed", content: [] } }, { type: "agent_settled" }] });
+    await bad.task.alarm();
+    expect(await bad.task.status()).toMatchObject({ phase: "failed", stale_checkpoints: [{ id: "taken-1" }] });
+    expect((await bad.task.status() as any).checkpoint).toBeUndefined();
+    expect(await bad.task.snapshot()).toBeNull();
+
+    // One that exited with an error has no copy taken at all.
+    const failed = fixture();
+    await failed.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    ended(failed.container, { code: "1", events: [] });
+    await failed.task.alarm();
+    expect(await failed.task.status()).toMatchObject({ phase: "failed" });
+    expect(backups.taken).toBe(0);
+  });
+
+  it("starts from what an earlier task left: its workspace brought into this task's own container, nothing fetched, the agent's session carried on with what is asked now", async () => {
+    const { task, container } = fixture();
+    const commands = ended(container, { code: "0", events: DONE });
+    const started = await task.start({ id: "fixture", prompt: "add tests", brain: "brain", seed: { from: "earlier", record: { id: "kept", dir: "/workspace/job" } as never, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" } });
+    expect(started.phase).toBe("running");
+    expect(await task.status()).toMatchObject({ phase: "running", follows: "earlier", cwd: "/workspace/job/repo", repository: "https://github.com/acme/app", runs: [{ kind: "follow_up" }] });
+    // Read from the earlier task's own place, into this one's workspace.
+    expect(backups.restored).toEqual([{ prefix: "tasks/earlier/", id: "kept", dir: "/workspace/job" }]);
+    // Nothing is cloned; the agent is started on its earlier session, told that it goes on, with what is asked now.
+    const flat = commands.map((each) => each.join(" "));
+    expect(flat.some((each) => each.includes("git clone") || each.includes("git fetch"))).toBe(false);
+    const launch = flat.find((each) => each.includes("--continue"));
+    expect(launch).toBeDefined();
+    expect(launch).toContain("add tests");
+    expect(launch).toContain("Nothing that was approved then is approved now");
+    // And what it leaves in its turn is its own.
+    await task.alarm();
+    expect(await task.snapshot()).toMatchObject({ record: { id: "taken-1" }, cwd: "/workspace/job/repo" });
+  });
+});
 
 describe("a sandbox task, started and stopped", () => {
   it("turns away a start that arrives after it was stopped, or asked about and found absent", async () => {

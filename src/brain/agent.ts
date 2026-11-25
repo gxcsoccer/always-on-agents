@@ -115,6 +115,7 @@ export class BrainAgent extends DurableObject<Env> {
       toolsOf,
       guidance,
       workers,
+      leftToGoOnFrom: (runId, sessionKey) => this.#tasks.leftToGoOnFrom(runId, sessionKey),
       workStands: (work) => this.#workStands(work),
       registry: () => registry(this.env),
       respond,

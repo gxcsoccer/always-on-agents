@@ -76,6 +76,7 @@ function bench(state: DurableObjectState) {
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
     workers: () => settings.workers,
+    leftToGoOnFrom: () => [],
     guidance: () => "",
     workStands: async () => true,
     pictures: async (connector, _event, refs) => (log.push(["pictures", connector, refs.map((each) => each.key)]), refs.map((each) => (settings.pictures ?? {})[each.key] ?? null)),

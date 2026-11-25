@@ -37,10 +37,6 @@ export const QUOTED_WAIT_MS = 3_000;
 /** How far up the chain of replies a message stands in is followed. */
 export const MAX_CHAIN = 5;
 const MAX_EVENT_BYTES_PER_RUN = 120_000;
-/** For how long finished work of a worker that can go on from it is listed as such: a little under the day its worker keeps what it left. */
-const GOES_ON_FOR_MS = 23 * 60 * 60_000;
-/** How many pieces of finished work are listed that way: the latest. */
-const MAX_FINISHED_LISTED = 5;
 /** How many pictures a run is shown at most: the latest. */
 const MAX_PICTURES_SHOWN = 4;
 /** How long before a message the same person's pictures here still count as going with it. */
@@ -70,6 +66,8 @@ export interface RunnerHost {
   toolsOf(connector: string): ConnectorTool[];
   /** Every worker this deployment lists. */
   workers(): Worker[];
+  /** Finished work the person this run is for can go on from: see Tasks. */
+  leftToGoOnFrom(runId: string, sessionKey: string): { id: string; worker: string; title: string }[];
   /** The deployment's guidance on which worker a piece of work goes to. */
   guidance(): string;
   /** Whether a piece of work done in a person's name still stands under what it was done under: see BrainAgent. */
@@ -1291,9 +1289,8 @@ export class Runner {
       work: [
         ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status === "unconfirmed" ? "start not confirmed (it is not known yet whether it began; this is being checked and you will be told: do not hand the same work over again)" : each.status })),
         // Work that ended well in this conversation in the last day, of a worker that can go on from it: its files are kept that long.
-        ...(session ? this.#s.rows<{ id: string; worker: string; title: string }>("SELECT id, worker, title FROM tasks WHERE status = 'succeeded' AND session_key = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?", session.session_key, Date.now() - GOES_ON_FOR_MS, MAX_FINISHED_LISTED) : [])
-          .filter((each) => this.#b.workers().some((worker) => worker.name === each.worker && worker.goes_on === true))
-          .reverse()
+        // Listed for the person who asked for it and for nobody else: it is theirs to go on from.
+        ...(session ? this.#b.leftToGoOnFrom(runId, session.session_key) : [])
           .map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: "done (what it left is kept for about a day: more work on the same thing goes on from it, with its id in continue_from)" })),
         ...theirs.map((each) => {
           const record = this.#b.requests.record(each.id);

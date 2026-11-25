@@ -703,6 +703,11 @@ describe("tasks, by themselves", () => {
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_9", "sandbox", "t", "b", { repository: null }, "no-such")).rejects.toThrow("there is no piece of work");
         expect(store.rows("SELECT 1 FROM tasks").length).toBe(written + 2);
 
+        // Not another person's, in the same conversation: it is theirs alone to go on from.
+        worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", until: Date.now() + 3_600_000 };
+        store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_other_person", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("there is no piece of work");
+
         // A worker that does not say it goes on is never asked to.
         const probe: Worker = { name: "probe", description: "", acts_as: "agent", start: async () => ({ state: "started" }) };
         settings.others = [probe];

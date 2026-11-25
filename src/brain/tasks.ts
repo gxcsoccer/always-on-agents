@@ -87,6 +87,11 @@ export interface TasksHost {
   spend(tokens: number): void;
 }
 
+/** For how long finished work of a worker that can go on from it is listed as such: a little under the day its worker keeps what it left. */
+const GOES_ON_FOR_MS = 23 * 60 * 60_000;
+/** How many pieces of finished work are listed that way: the latest. */
+const MAX_FINISHED_LISTED = 5;
+
 /** What a task's last status is, as a piece of work. */
 export const taskEnd = (status: string): WorkEnd => ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown";
 
@@ -132,6 +137,20 @@ export class Tasks implements Wakes {
   }
 
   /**
+   * Work that ended well in this conversation in the last day, asked for by the one person this
+   * run is for, of a worker that can go on from it: the latest few, oldest first. It is theirs
+   * alone to go on from, so it is listed for nobody else.
+   */
+  leftToGoOnFrom(runId: string, sessionKey: string): { id: string; worker: string; title: string }[] {
+    const people = [...new Set(this.#b.deciders(runId).map((p) => p.id))];
+    if (people.length !== 1) return [];
+    return this.#s
+      .rows<{ id: string; worker: string; title: string }>("SELECT id, worker, title FROM tasks WHERE status = 'succeeded' AND session_key = ? AND requested_by = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?", sessionKey, people[0], Date.now() - GOES_ON_FOR_MS, MAX_FINISHED_LISTED)
+      .filter((each) => this.#b.workers().some((worker) => worker.name === each.worker && worker.goes_on === true))
+      .reverse();
+  }
+
+  /**
    * Hands a piece of work to a worker the Brain starts, and says how it then stands. `name` is
    * the worker it is for; null where the call does not say (a tool call from before there was
    * more than one): then the one worker this deployment has that is started this way. `options`
@@ -158,9 +177,12 @@ export class Tasks implements Wakes {
     // one that ended well; and the worker has to be one that goes on at all. Whoever asks, and
     // whatever was approved then, are this new piece's own: nothing of the earlier one's is carried.
     if (!task && from !== null) {
-      const earlier = this.#s.rows<Row>("SELECT worker, session_key, status FROM tasks WHERE id = ?", from)[0];
+      const earlier = this.#s.rows<Row>("SELECT worker, session_key, status, requested_by FROM tasks WHERE id = ?", from)[0];
+      // Whose it was: the one person who asked for it, and it is theirs alone to go on from. Being in the same conversation is not enough.
+      const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+      const asker = people.length === 1 ? people[0] : null;
       if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
-      if (!earlier || earlier.session_key !== sessionKey || earlier.worker !== offered.name) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
+      if (!earlier || earlier.session_key !== sessionKey || earlier.worker !== offered.name || (earlier.requested_by ?? null) !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
       if (earlier.status !== "succeeded") throw new Error(`that piece of work ${TERMINAL_TASK.has(String(earlier.status)) ? "did not end well" : "has not ended yet"}, so there is nothing of it to go on from; ${TERMINAL_TASK.has(String(earlier.status)) ? "hand this over as something new" : "wait for it, or hand this over as something new"}`);
     }
     if (!task) {
