@@ -620,6 +620,8 @@ export class Runner {
         }
       }
 
+      const offered = this.#toolsFor(runId);
+      this.#noteShape(runId, items, offered);
       let response;
       try {
         response = await this.#b.respond({
@@ -628,7 +630,7 @@ export class Runner {
           model: this.#b.env.BRAIN_MODEL,
           instructions,
           input: items,
-          tools: this.#toolsFor(runId),
+          tools: offered,
         });
       } catch (err) {
         await release();
@@ -1031,31 +1033,38 @@ export class Runner {
   }
 
   /**
-   * For the operator: the shape of what the model is shown for a run, as it would be put
-   * together now. For each of the last entries: whose it is, how long, and the label the system
-   * itself wrote at its head (the bracketed words: a time, or what kind of thing it is). For the
-   * turn the run was started by, also the notes the system wrote under it: only those it writes
-   * itself about replies, and each only up to where a person's words would begin. Never
-   * what a person or a document said. With it: which tools it would be offered, and whether it
-   * counts as someone waiting.
+   * For the operator: the shape of what the model was shown the last time it was asked in a
+   * run, noted at that moment (see #noteShape). Undefined where nothing was noted: a run from
+   * before this was kept, one that never reached the model, or one no longer among the latest.
    */
-  shapeOf(runId: string): { tools: string[]; waiting: boolean; acting: boolean; shown: { role: string; chars: number; label?: string; notes?: string[] }[] } | undefined {
-    const run = this.#s.rows<RunRow>("SELECT * FROM runs WHERE id = ?", runId)[0];
-    if (!run) return undefined;
-    const label = (text: string) => (text.startsWith("[") && text.includes("]") ? text.slice(0, text.indexOf("]") + 1).slice(0, 120) : undefined);
-    const shown = this.#transcript(run.session_id, runId)
-      .slice(-14)
-      .map((item) => {
-        const body = item as Record<string, unknown>;
-        const content = typeof body.content === "string" ? body.content : Array.isArray(body.content) ? (body.content as { text?: unknown }[]).map((each) => String(each?.text ?? "")).join("") : String(body.output ?? body.arguments ?? "");
-        const notes = body.role === "user" ? content.split("\n").filter((line) => /^  \((written as a reply to|that stands in a chain of replies)/.test(line)).map((line) => line.trim().split(":")[0].slice(0, 70)) : [];
-        return { role: String(body.role ?? body.type ?? "?") + (typeof body.name === "string" ? `:${body.name}` : ""), chars: content.length, ...(label(content) ? { label: label(content) } : {}), ...(notes.length > 0 ? { notes } : {}) };
-      });
+  shapeOf(runId: string): Shape | undefined {
+    const noted = this.#s.meta(`shape:${runId}`);
+    return noted ? (JSON.parse(noted) as Shape) : undefined;
+  }
+
+  /**
+   * Notes, as the model is about to be asked, the shape of what it is shown: for each of the
+   * last entries, whose it is, how long, and which of the system's own kinds of entry it is,
+   * by name from a fixed list; for a person's turn, how many of each of the system's own notes
+   * about replies stand under it. Never a word of what anyone or anything said. With it: the
+   * tools offered, whether someone counts as waiting, and whether the run acts for a person.
+   * Kept for the latest few runs.
+   */
+  #noteShape(runId: string, items: Item[], tools: ToolDefinition[]): void {
+    const shown = items.slice(-14).map((item) => {
+      const body = item as Record<string, unknown>;
+      const content = typeof body.content === "string" ? body.content : Array.isArray(body.content) ? (body.content as { text?: unknown }[]).map((each) => String(each?.text ?? "")).join("") : String(body.output ?? body.arguments ?? "");
+      const kind = SHAPE_KINDS.find(([, starts]) => starts.test(content))?.[0];
+      const notes = body.role === "user" ? Object.fromEntries(SHAPE_NOTES.map(([name, line]) => [name, content.split("\n").filter((each) => line.test(each)).length] as const).filter(([, count]) => count > 0)) : {};
+      return { role: String(body.role ?? body.type ?? "?"), chars: content.length, ...(kind ? { kind } : {}), ...(Object.keys(notes).length > 0 ? { notes } : {}) };
+    });
     const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
       const principal = JSON.parse(event.principal) as Principal;
       return principal.kind === "human" && principal.explicit === true;
     });
-    return { tools: this.#toolsFor(runId).map((each) => each.name), waiting, acting: this.actingFor(runId) !== undefined, shown };
+    const step = this.#s.rows<{ steps: number }>("SELECT steps FROM runs WHERE id = ?", runId)[0]?.steps ?? 0;
+    this.#s.setMeta(`shape:${runId}`, JSON.stringify({ step, at: Date.now(), tools: tools.map((each) => each.name), waiting, acting: this.actingFor(runId) !== undefined, entries: items.length, shown } satisfies Shape));
+    this.#s.sql.exec("DELETE FROM meta WHERE key LIKE 'shape:%' AND key NOT IN (SELECT 'shape:' || id FROM runs ORDER BY started_at DESC LIMIT 5)");
   }
 
   #toolsFor(runId: string): ToolDefinition[] {
@@ -1275,6 +1284,40 @@ function danglingCalls(items: Item[]): ToolCall[] {
 }
 
 /** One line per event, saying when it happened and who caused it, so the model can tell people from machines. */
+/** The shape of what the model was shown at one step of a run: see Runner.shapeOf. */
+export interface Shape {
+  step: number;
+  at: number;
+  tools: string[];
+  waiting: boolean;
+  acting: boolean;
+  /** How many entries it was shown in all; `shown` is the last of them. */
+  entries: number;
+  shown: { role: string; chars: number; kind?: string; notes?: Record<string, number> }[];
+}
+
+/** The system's own kinds of entry, by how they begin. */
+const SHAPE_KINDS: [string, RegExp][] = [
+  ["turn", /^\[\d{4}-\d\d-\d\dT[\d:.]+Z\] /],
+  ["earlier_own_kept", /^\[An earlier message of theirs that this leads back to, written at /],
+  ["earlier_own_fetched", /^\[An earlier message of theirs that this leads back to, which you were not sent:\]/],
+  ["earlier_own_gone", /^\[An earlier message of theirs that this leads back to is no longer kept\.\]/],
+  ["yours_up_the_chain", /^\[A message of yours further up the chain of replies/],
+  ["yours_replied_to", /^\[The message of yours they are replying to/],
+  ["chain_cut", /^\[The chain of replies goes further back than was followed\.\]/],
+  ["not_shown", /^\[A message here that this leads back to is not shown to you/],
+  ["cleared_turn", /^\[In this turn you used a tool that read text from outside\./],
+];
+
+/** The system's own notes under a person's turn about what it was written in reply to, by how they begin. */
+const SHAPE_NOTES: [string, RegExp][] = [
+  ["reply_to_own_quoted", /^  \(written as a reply to their own earlier message: /],
+  ["reply_to_yours", /^  \(written as a reply to the message you sent at /],
+  ["reply_to_not_shown", /^  \(written as a reply to a message here that is not shown to you/],
+  ["reply_to_own_fetched", /^  \(written as a reply to an earlier message of their own that you were not sent/],
+  ["in_a_chain", /^  \(that stands in a chain of replies/],
+];
+
 function renderEvent(event: InboxRow): string {
   const principal = JSON.parse(event.principal) as Principal;
   const who =

@@ -500,8 +500,8 @@ export class BrainAgent extends DurableObject<Env> {
       recent_shapes: this.#store.rows(
         "SELECT id, run_id, (SELECT group_concat(key) FROM json_each(inbox.data)) AS data_keys, json_type(data, '$.quoted') AS quoted, json_type(data, '$.quoted.text') AS quoted_text, json_type(data, '$.quoted.replies_to') AS quoted_above, json_array_length(data, '$.chain') AS chain FROM inbox WHERE kind = 'message' ORDER BY id DESC LIMIT 8",
       ),
-      // The shape of what the model is shown for the latest runs (see Runner.shapeOf): never what anyone said.
-      shapes: this.#store.rows<{ id: string }>("SELECT id FROM runs ORDER BY started_at DESC LIMIT 3").map((each) => ({ run: each.id, ...this.#runner.shapeOf(each.id) })),
+      // The shape of what the model was shown when it was last asked in each of the latest runs, noted then (see Runner.shapeOf): never what anyone said.
+      shapes: this.#store.rows<{ id: string }>("SELECT id FROM runs ORDER BY started_at DESC LIMIT 3").map((each) => ({ run: each.id, ...(this.#runner.shapeOf(each.id) ?? { noted: false }) })),
       runs: this.#store.rows("SELECT id, status, entries, steps, input_tokens, output_tokens, started_at, ended_at, error FROM runs ORDER BY started_at DESC LIMIT 10"),
       sessions: this.#store.rows("SELECT session_key, (SELECT COUNT(*) FROM items WHERE session_id = sessions.id) AS items FROM sessions"),
       memory: this.#store.rows("SELECT path, LENGTH(content) AS size FROM memory ORDER BY path"),
