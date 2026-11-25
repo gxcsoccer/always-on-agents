@@ -457,7 +457,7 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     // Nothing could be made of it: not something read.
     // When it was written, as Feishu says (milliseconds): what it links is something they linked then, not now.
     const at = Number(found.create_time);
-    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(other ? { other: true as const } : {}), ...(documents.length > 0 ? { documents } : {}), ...(pictures.length > 0 && !other ? { pictures } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
+    return text === "" ? further : { text: text.slice(0, MAX_QUOTED), ...(other ? { other: true as const } : {}), ...(documents.length > 0 ? { documents } : {}), ...(pictures.length > 0 ? { pictures } : {}), ...(Number.isFinite(at) && at > 0 ? { at } : {}), ...further };
   } catch {
     return {};
   }
