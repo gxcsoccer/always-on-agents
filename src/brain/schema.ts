@@ -326,6 +326,9 @@ export const MIGRATIONS: string[] = [
   // the task is written: its worker, its place with the tenant and its watchdog all go by this.
   // (A table of its own, so that this step can be gone through again without harm.)
   `CREATE TABLE IF NOT EXISTS task_bounds (task_id TEXT PRIMARY KEY, bounds TEXT NOT NULL);`,
+  // 34: the earlier task a task goes on from, written with the task once that was found to be
+  // allowed: a start made again goes by this, not by what the call says the second time.
+  `CREATE TABLE IF NOT EXISTS task_follows (task_id TEXT PRIMARY KEY, from_id TEXT NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

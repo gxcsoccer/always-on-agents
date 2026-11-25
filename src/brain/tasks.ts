@@ -182,7 +182,8 @@ export class Tasks implements Wakes {
       const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
       const asker = people.length === 1 ? people[0] : null;
       if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
-      if (!earlier || earlier.session_key !== sessionKey || earlier.worker !== offered.name || (earlier.requested_by ?? null) !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
+      // (Work nobody in particular asked for, or a run that is not one person's, has nobody whose it is: it is not gone on from.)
+      if (!earlier || asker === null || earlier.session_key !== sessionKey || earlier.worker !== offered.name || earlier.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
       if (earlier.status !== "succeeded") throw new Error(`that piece of work ${TERMINAL_TASK.has(String(earlier.status)) ? "did not end well" : "has not ended yet"}, so there is nothing of it to go on from; ${TERMINAL_TASK.has(String(earlier.status)) ? "hand this over as something new" : "wait for it, or hand this over as something new"}`);
     }
     if (!task) {
@@ -216,6 +217,7 @@ export class Tasks implements Wakes {
           now,
         );
         // How far it may go, by the tenant's limits as they stand at this moment: fixed here, for good.
+        if (from !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_follows (task_id, from_id) VALUES (?, ?)", id, from);
         this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
       });
@@ -297,9 +299,13 @@ export class Tasks implements Wakes {
     // anything was sent): so a start whose answer was lost is asked for once more, and is found.
     // The waiting has an end of its own, for both tries together: a call that neither answers nor
     // fails would otherwise leave the task as it is for ever. Past it the task is found out about.
+    // What it goes on from is what was written with it when that was found to be allowed: a call
+    // made again that says otherwise is not this call. (One written before this was kept goes on from nothing.)
+    const follows = this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null;
+    if (replayed && (task.session_key !== sessionKey || (from !== null && follows !== null && from !== follows))) throw new Error("this call was first made for something else; nothing further was started");
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(from !== null ? { continue_from: from } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.

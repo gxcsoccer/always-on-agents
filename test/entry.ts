@@ -22,6 +22,10 @@ export class FakeTask extends DurableObject {
     if (String((input as { prompt?: unknown })?.prompt ?? "").includes("(the start is not answered)")) throw new Error("connection lost");
     return { phase: "running" };
   }
+  /** As the real task: how it stands, or that there is none. */
+  async status() {
+    return this.ctx.storage.kv.get("started") === true ? { phase: "running" } : { error: "no such task" };
+  }
   /** As the real task: what it left for a later one to go on from, once it was started with a repository or without. */
   async snapshot() {
     const first = ((this.ctx.storage.kv.get("calls") as { method: string; args: any }[] | undefined) ?? []).find((each) => each.method === "start")?.args;

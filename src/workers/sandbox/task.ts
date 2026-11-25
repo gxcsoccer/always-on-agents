@@ -418,6 +418,10 @@ export class TaskSandbox extends DurableObject<Env> {
         this.#save(state);
         return state;
       }
+      // Getting ready took time (most of all bringing an earlier task's workspace in): a task whose
+      // life ran out meanwhile is not started. Ended below, as any start that fails.
+      const kept = this.#state() ?? state;
+      if (Date.now() - kept.created_at > lifetimeOf(kept)) throw new Error("exceeded the maximum lifetime");
       await this.#launch(state, input.seed ? "follow_up" : "first");
       // Re-read: the agent is running now and may already have reported.
       const fresh = this.#state() ?? state;
@@ -1239,8 +1243,21 @@ export class TaskSandbox extends DurableObject<Env> {
     // Re-read: the other path may have settled this run while we were reading files.
     const state = this.#state();
     if (!state || !ACTIVE.has(state.phase)) {
-      // Settled by the other path meanwhile: the copy just taken is nobody's, and is removed.
-      if (last) await this.#backups.delete(last.record).catch(() => undefined);
+      // Settled by the other path, or stopped, meanwhile: the copy just taken is nobody's. It is
+      // written down as one to remove before it is removed, so that a removal that fails is tried
+      // again when the task's records are cleared.
+      if (last) {
+        if (state) {
+          state.stale_checkpoints = [...(state.stale_checkpoints ?? []), last.record];
+          this.#save(state);
+        }
+        const removed = await this.#backups.delete(last.record).then(() => true).catch(() => false);
+        const later = this.#state();
+        if (removed && later) {
+          later.stale_checkpoints = (later.stale_checkpoints ?? []).filter((stale) => stale.id !== last.record.id);
+          this.#save(later);
+        }
+      }
       return;
     }
     const run = state.runs[state.runs.length - 1];

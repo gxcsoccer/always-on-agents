@@ -49,6 +49,8 @@ function bench(state: DurableObjectState) {
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
     /** Something that happens while the sandbox is being asked to stop. */
+    /** Tasks the sandbox has already taken, by id, as they stand there. */
+    took: {} as Record<string, { phase: string; error?: string }>,
     /** What a task left for a later one to go on from, by task id; nothing for one that left nothing or whose leavings are gone. */
     left: {} as Record<string, { record: unknown; cwd: string; repository?: string; until: number }>,
     /** What the sandbox says when asked whether it has a task: its state, that it has none, or no answer at all. */
@@ -76,6 +78,7 @@ function bench(state: DurableObjectState) {
         return (worker.cancelled.push(taskId), { ok: true });
       },
       snapshot: async () => worker.left[taskId] ?? null,
+      status: async () => worker.took[taskId] ?? { error: "no such task" },
       claimed: async () => {
         worker.asked.push(taskId);
         if (worker.has instanceof Error) throw worker.has;
@@ -707,6 +710,36 @@ describe("tasks, by themselves", () => {
         worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", until: Date.now() + 3_600_000 };
         store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_other_person", "sandbox", "t", "b", { repository: null }, first.task_id)).rejects.toThrow("there is no piece of work");
+
+        // A start that was taken while the word of it was lost, made again after what the earlier task left is gone:
+        // the new task answers for itself. It is running, and is not said to have failed.
+        store.sql.exec("UPDATE tasks SET requested_by = (SELECT requested_by FROM tasks WHERE id = ?) WHERE id = ?", second.task_id, first.task_id);
+        worker.left[first.task_id] = { record: { id: "kept" }, cwd: "/workspace/job/repo", until: Date.now() + 3_600_000 };
+        worker.start = async () => {
+          throw new Error("connection reset");
+        };
+        const unanswered = (await tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)) as { task_id: string; status: string };
+        expect(unanswered.status).toBe("unconfirmed");
+        store.sql.exec("DELETE FROM unconfirmed WHERE task_id = ?", unanswered.task_id);
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", unanswered.task_id);
+        delete worker.left[first.task_id];
+        worker.took[unanswered.task_id] = { phase: "running" };
+        const begun = worker.started.length;
+        // (Made again saying it goes on from something else: not this call.)
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, second.task_id)).rejects.toThrow("first made for something else");
+        expect(await tasks.dispatch(RUN, SESSION_KEY, "call_lost_word", "sandbox", "t", "b", { repository: null }, first.task_id)).toMatchObject({ task_id: unanswered.task_id, status: "running" });
+        expect(worker.started).toHaveLength(begun);
+        // What it goes on from is kept with it.
+        expect(store.rows("SELECT from_id FROM task_follows WHERE task_id = ?", unanswered.task_id)).toEqual([{ from_id: first.task_id }]);
+        store.sql.exec("UPDATE tasks SET requested_by = 'ou_someone_else' WHERE id = ?", first.task_id);
+
+        // Work nobody in particular asked for is nobody's to go on from, also for a run that is nobody's in particular.
+        task("t_nobodys", { status: "succeeded" });
+        store.sql.exec("UPDATE tasks SET requested_by = NULL WHERE id = 't_nobodys'");
+        const one = settings.deciders;
+        settings.deciders = [];
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_nobody", "sandbox", "t", "b", { repository: null }, "t_nobodys")).rejects.toThrow("there is no piece of work");
+        settings.deciders = one;
 
         // A worker that does not say it goes on is never asked to.
         const probe: Worker = { name: "probe", description: "", acts_as: "agent", start: async () => ({ state: "started" }) };

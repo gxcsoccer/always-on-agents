@@ -1,5 +1,5 @@
 /** The sandbox as a worker: a coding agent in a container of its own, one for each piece of work. */
-import type { Worker } from "../types";
+import type { Started, Worker } from "../types";
 
 export const sandboxWorker: Worker = {
   name: "sandbox",
@@ -20,16 +20,31 @@ export const sandboxWorker: Worker = {
     const repository = typeof work.options.repository === "string" ? work.options.repository : undefined;
     // Going on from an earlier task: what it left is asked of it, and handed to the new one.
     let seed: { from: string; record: unknown; cwd: string; repository?: string } | undefined;
+    const child = env.TASKS.getByName(work.id);
+    const told = (state: { phase: string; error?: string }): Started => (state.phase === "failed" || state.phase === "lost" ? { state: "refused", error: state.error ?? "unknown error" } : { state: "started" });
     if (work.continue_from !== undefined) {
+      // A start made again: one that was already taken answers for itself. What the earlier task
+      // still keeps matters only to a start that is the first.
+      const standing = await child.status();
+      if ("phase" in standing) return told(standing as { phase: string; error?: string });
       const left = await env.TASKS.getByName(work.continue_from).snapshot();
-      if (!left) return { state: "refused", error: "what that earlier piece of work left is no longer kept (it is kept for a day after it ends): hand this over as something new, and put what it needs to know in the brief" };
+      if (!left) {
+        // Not kept. Before saying that nothing was started, the new task's id is closed, so that an
+        // earlier attempt at this start still on its way cannot begin after this answer; if it
+        // has begun meanwhile, that is what happened.
+        if ((await child.claimed()) === "there") {
+          const now = await child.status();
+          if ("phase" in now) return told(now as { phase: string; error?: string });
+        }
+        return { state: "refused", error: "what that earlier piece of work left is no longer kept (it is kept for a day after it ends): hand this over as something new, and put what it needs to know in the brief" };
+      }
       // It works where the earlier one worked. Another repository is other work.
       const same = (url: string) => url.replace(/\.git$/, "").toLowerCase();
       if (repository !== undefined && (left.repository === undefined || same(repository) !== same(left.repository))) return { state: "refused", error: `that earlier piece of work was ${left.repository ? `on ${left.repository}` : "not on a repository"}: to go on with it leave repository null; for another repository hand this over as something new` };
       seed = { from: work.continue_from, record: left.record, cwd: left.cwd, ...(left.repository ? { repository: left.repository } : {}) };
     }
-    const started = await env.TASKS.getByName(work.id).start({ id: work.id, prompt: work.brief, repository: seed ? undefined : repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}), ...(seed ? { seed: seed as never } : {}) });
-    return started.phase === "failed" || started.phase === "lost" ? { state: "refused", error: started.error ?? "unknown error" } : { state: "started" };
+    const started = await child.start({ id: work.id, prompt: work.brief, repository: seed ? undefined : repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}), ...(seed ? { seed: seed as never } : {}) });
+    return told(started);
   },
   answer: (env, id, decision, reason, question, standing) => env.TASKS.getByName(id).answer(decision, reason, question, standing),
   decisionOn: (env, id, question) => env.TASKS.getByName(id).decisionOn(question),

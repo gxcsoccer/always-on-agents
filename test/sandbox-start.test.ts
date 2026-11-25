@@ -32,10 +32,12 @@ vi.mock("@cloudflare/sandbox", () => ({
       await restoring.now?.();
     }
     async backup() {
+      await backups.whileTaking?.();
       backups.taken += 1;
       return { id: `taken-${backups.taken}` };
     }
     async delete(record: { id: string }) {
+      if (backups.deleteFails) throw new Error("storage unavailable");
       backups.deleted.push(record.id);
     }
   },
@@ -43,7 +45,7 @@ vi.mock("@cloudflare/sandbox", () => ({
 }));
 
 /** What was asked of the store of checkpoints: copies taken, restored (from whose, which, to where) and removed. */
-const backups = { taken: 0, restored: [] as { prefix: string; id: string; dir: string }[], deleted: [] as string[] };
+const backups = { taken: 0, restored: [] as { prefix: string; id: string; dir: string }[], deleted: [] as string[], whileTaking: undefined as (() => Promise<void>) | undefined, deleteFails: false };
 /** Something that happens while a checkpoint is being restored, for the fixture that is restoring. */
 const restoring: { now?: () => Promise<void> } = {};
 
@@ -73,7 +75,7 @@ function fixture() {
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
   const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
   restoring.now = undefined;
-  Object.assign(backups, { taken: 0, restored: [], deleted: [] });
+  Object.assign(backups, { taken: 0, restored: [], deleted: [], whileTaking: undefined, deleteFails: false });
   return {
     task: new TaskSandbox(ctx as never, env as never),
     container,
@@ -149,9 +151,34 @@ describe("a sandbox task that a later one goes on from", () => {
     expect(launch).toBeDefined();
     expect(launch).toContain("add tests");
     expect(launch).toContain("Nothing that was approved then is approved now");
+    // Bringing the earlier workspace in used up this task's life: the agent is not started, and the task ends for that.
+    const slow = fixture();
+    const given = ended(slow.container, { code: "0", events: DONE });
+    slow.restoring = async () => {
+      const state = slow.records.get("state");
+      state.created_at -= 301_000;
+      slow.records.set("state", state);
+    };
+    expect(await slow.task.start({ id: "fixture", prompt: "x", brain: "brain", bounds: { lifetime_ms: 300_000 }, seed: { from: "earlier", record: { id: "kept" } as never, cwd: "/workspace/job/scratch" } })).toMatchObject({ phase: "failed", error: expect.stringContaining("exceeded the maximum lifetime") });
+    expect(given.some((each) => each.join(" ").includes("--continue"))).toBe(false);
+    Object.assign(backups, { taken: 0, restored: [], deleted: [] });
+
     // And what it leaves in its turn is its own.
     await task.alarm();
     expect(await task.snapshot()).toMatchObject({ record: { id: "taken-1" }, cwd: "/workspace/job/repo" });
+  });
+});
+
+describe("a sandbox task stopped while its last copy was being taken", () => {
+  it("writes the copy down as one to remove, and keeps it written down when removing it fails", async () => {
+    const { task, container, records } = fixture();
+    await task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    ended(container, { code: "0", events: DONE });
+    backups.whileTaking = async () => void (await task.cancel());
+    backups.deleteFails = true;
+    await task.alarm();
+    expect(records.get("state")).toMatchObject({ phase: "cancelled", stale_checkpoints: [{ id: "taken-1" }] });
+    expect(backups.deleted).toEqual([]);
   });
 });
 
