@@ -179,8 +179,9 @@ export class Tasks implements Wakes {
     if (replayed) {
       const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0];
       if (now.status !== "dispatching") {
-        // A place just taken for one that has ended is given straight back.
-        if (slot === true && TERMINAL_TASK.has(String(now.status))) await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
+        // A place just taken for one that has ended is given straight back: also where the registry
+        // did not answer, since it may have taken one all the same.
+        if (slot !== false && TERMINAL_TASK.has(String(now.status))) await this.#b.registry().releaseTaskSlot(task.id).catch(() => undefined);
         return this.#told(now);
       }
       if (this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0) {

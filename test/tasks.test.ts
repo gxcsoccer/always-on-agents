@@ -523,6 +523,8 @@ describe("tasks, by themselves", () => {
         };
         expect(await tasks.dispatch(RUN, SESSION_KEY, "call_done", "t", "b", null)).toMatchObject({ status: "succeeded" });
         expect(kept("t_done").status).toBe("succeeded");
+        // The registry gave no answer: it may have taken a place all the same, so one is given back.
+        expect(slots.released.filter((each) => each === "t_done").length).toBeGreaterThanOrEqual(2);
       });
       // The same where the place is had: one that has ended meanwhile is told as it ended, nothing more is asked of its worker, and the place just taken is given back.
       await within(async ({ tasks, store, kept, slots, worker, task }) => {
