@@ -202,6 +202,25 @@ describe("a run's tools", () => {
       });
     });
 
+    it("still lists a repeating timer after it has fired, and cancels it by its id; a task's watchdog is neither listed nor cancelled", async () => {
+      await within(({ tools, store }) => {
+        const now = 1_800_000_000_000;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        tools().setTimer("c1", 60, "poll", 300);
+        store.sql.exec("INSERT INTO timers (id, due_at, session_key, note, data, created_at) VALUES ('watch_t1', ?, 'dm', 'overdue', ?, ?)", now + 9_000_000, JSON.stringify({ task_id: "t1" }), now);
+        clock.mockReturnValue(now + 61_000);
+        new Timers(store).fire(now + 61_000);
+        expect((tools().listTimers() as { timers: { id: string }[] }).timers.map((each) => each.id)).toEqual(["tmr_c1"]);
+        expect(tools().cancelTimer("watch_t1")).toEqual({ ok: true, cancelled: false });
+        expect(tools().cancelTimer("tmr_c1")).toEqual({ ok: true, cancelled: true });
+        // The next time it would have come round, nothing is added.
+        store.sql.exec("UPDATE inbox SET status = 'done'");
+        new Timers(store).fire(now + 61_000 + 300_000);
+        expect(store.rows("SELECT 1 FROM inbox WHERE status = 'pending'")).toEqual([]);
+        expect(store.rows<{ id: string; status: string }>("SELECT id, status FROM timers ORDER BY id")).toEqual([{ id: "tmr_c1", status: "cancelled" }, { id: "watch_t1", status: "active" }]);
+      });
+    });
+
     it("tells a replayed call of a timer that has fired or been cancelled since that it will not fire, and sets none", async () => {
       await within(({ tools, store }) => {
         const now = 1_800_000_000_000;

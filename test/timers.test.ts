@@ -18,7 +18,7 @@ function within<T>(use: (timers: Timers, store: BrainStore) => T | Promise<T>): 
 }
 
 const NOW = 1_800_000_000_000;
-function timer(store: BrainStore, id: string, due: number, more: { every_s?: number; data?: Record<string, unknown>; status?: string; note?: string } = {}) {
+function timer(store: BrainStore, id: string, due: number, more: { every_s?: number; data?: Record<string, unknown>; status?: string; note?: string; created?: number } = {}) {
   store.sql.exec(
     "INSERT INTO timers (id, due_at, every_s, session_key, note, data, status, created_at) VALUES (?, ?, ?, 'dm', ?, ?, ?, ?)",
     id,
@@ -27,7 +27,7 @@ function timer(store: BrainStore, id: string, due: number, more: { every_s?: num
     more.note ?? `note of ${id}`,
     more.data ? JSON.stringify(more.data) : null,
     more.status ?? "active",
-    NOW - 60_000,
+    more.created ?? NOW - 60_000,
   );
 }
 const events = (store: BrainStore) => store.rows<Record<string, any>>("SELECT source, source_id, kind, session_key, principal, text, data, status FROM inbox ORDER BY id");
@@ -83,6 +83,76 @@ describe("timers", () => {
       part.fire(NOW);
       expect(events(store)).toHaveLength(1);
       expect(timers(store).minutely).toEqual({ status: "active", due_at: NOW + 60_000 });
+    });
+  });
+
+  it("keeps one event of a repeating timer waiting at a time, and says with each how to end it", async () => {
+    await within((part, store) => {
+      timer(store, "every5", NOW - 1, { every_s: 300, note: "look again" });
+      part.fire(NOW);
+      expect(events(store).map((each) => each.text)).toEqual(["look again\n  (a repeating timer, id every5: cancel it once what it is for is done or no longer wanted)"]);
+      // Not dealt with yet (the scope cannot run just now): it fires and moves on, and adds nothing.
+      for (let n = 1; n <= 5; n++) part.fire(NOW + n * 300_000);
+      expect(events(store)).toHaveLength(1);
+      expect(timers(store).every5).toEqual({ status: "active", due_at: NOW + 6 * 300_000 });
+      // Dealt with: the next firing is an event again.
+      store.sql.exec("UPDATE inbox SET status = 'done'");
+      part.fire(NOW + 6 * 300_000);
+      expect(events(store).filter((each) => each.status === "pending")).toHaveLength(1);
+      // A one-off timer is not held back by anything.
+      timer(store, "once", NOW + 7 * 300_000 - 1);
+      part.fire(NOW + 7 * 300_000);
+      expect(events(store).filter((each) => each.status === "pending").map((each) => JSON.parse(each.principal).id)).toEqual(["every5", "once"]);
+    });
+  });
+
+  it("ends a repeating timer fifty rounds after its first, and its last event says so in place of one still waiting", async () => {
+    await within((part, store) => {
+      // Every five minutes, set long ago to begin only now: the wait before its first round does not count.
+      timer(store, "poll", NOW, { every_s: 300, note: "start the review when there is room", created: NOW - 30 * 24 * 3_600_000 });
+      let delivered = 0;
+      for (let round = 0; round < 60; round++) {
+        part.fire(NOW + round * 300_000);
+        const waiting = events(store).filter((each) => each.status === "pending");
+        // Each is dealt with at once, but for the one before the last.
+        if (round !== 48) {
+          delivered += waiting.length;
+          store.sql.exec("UPDATE inbox SET status = 'done' WHERE status = 'pending'");
+        } else expect(waiting).toHaveLength(1);
+        if (round === 49) expect(waiting.map((each) => each.text)).toEqual(["start the review when there is room\n  (this repeating timer has run its 50 rounds and has now ended: set it again only if it is still needed)"]);
+      }
+      // Fifty rounds, of which the forty-ninth was still waiting when the last took its place.
+      expect(delivered).toBe(49);
+      expect(timers(store).poll.status).toBe("done");
+    });
+  });
+
+  it("lets a daily or a weekly timer go on, and one whose first round is far off does not end at it", async () => {
+    await within((part, store) => {
+      const WEEK = 7 * 24 * 3_600;
+      timer(store, "weekly", NOW, { every_s: WEEK, created: NOW - WEEK * 1_000 });
+      timer(store, "daily", NOW, { every_s: 24 * 3_600, created: NOW - 30 * 24 * 3_600_000 });
+      timer(store, "tomorrow", NOW, { every_s: 300, created: NOW - 24 * 3_600_000 });
+      part.fire(NOW);
+      expect(timers(store)).toMatchObject({ weekly: { status: "active" }, daily: { status: "active" }, tomorrow: { status: "active" } });
+      expect(events(store)).toHaveLength(3);
+      // Rounds slept through count: found again long after, it has run its course.
+      store.sql.exec("UPDATE inbox SET status = 'done'");
+      part.fire(NOW + 50 * 300_000);
+      expect(timers(store).tomorrow.status).toBe("done");
+    });
+  });
+
+  it("lets the latest stand for firings of one timer that piled up before, and leaves other timers' events alone", async () => {
+    await within((part, store) => {
+      const piled = (id: string, at: number) => store.insertEvent({ source: "timer", source_id: `${id}:${at}`, kind: "timer", session_key: "dm", principal: { kind: "timer", id, explicit: false }, text: "again", data: {} });
+      for (let n = 0; n < 40; n++) piled("tmr_a", NOW - n * 300_000);
+      piled("tmr_b", NOW - 1);
+      store.insertEvent({ source: "github", source_id: "pr-1", kind: "github.pull_request", session_key: "pr:1", principal: { kind: "service", id: "github", explicit: false }, text: "opened", data: {} });
+      part.fire(NOW);
+      const left = events(store).filter((each) => each.status === "pending");
+      expect(left.map((each) => (each.source === "timer" ? JSON.parse(each.principal).id : each.source)).sort()).toEqual(["github", "tmr_a", "tmr_b"]);
+      expect(events(store).filter((each) => each.status === "done")).toHaveLength(39);
     });
   });
 
