@@ -47,6 +47,8 @@ const feishu = {
   renewalFault: undefined as undefined | "no_answer" | "garbage" | "wider" | "null" | "no_lifetime" | "twice",
   /** Runs while a code is being exchanged. */
   duringExchange: undefined as undefined | (() => Promise<void>),
+  /** What the question "whose token is this" is answered with, once, in place of the truth. */
+  identityAnswer: undefined as undefined | (() => Response),
   /** Runs while a renewal is being answered. */
   duringRenewal: undefined as undefined | (() => Promise<void>),
   /** Every token exchange: which endpoint, for which app. */
@@ -124,6 +126,7 @@ function installFakeFeishu() {
   feishu.renewalFault = undefined;
   feishu.duringRenewal = undefined;
   feishu.duringExchange = undefined;
+  feishu.identityAnswer = undefined;
   feishu.sendAttempts = 0;
   feishu.wikiNotCovered = false;
   feishu.duringRead = undefined;
@@ -255,6 +258,11 @@ function installFakeFeishu() {
     }
     if (url.host !== "open.feishu.cn") throw new Error(`unexpected fetch to ${url.href}`);
     const user = feishu.tokens.get(bearer);
+    if (url.pathname.endsWith("/authen/v1/user_info") && feishu.identityAnswer) {
+      const answer = feishu.identityAnswer;
+      feishu.identityAnswer = undefined;
+      return answer();
+    }
     if (url.pathname.endsWith("/authen/v1/user_info")) return user?.good ? Response.json({ code: 0, data: { open_id: user.open_id, tenant_key: user.tenant_key } }) : Response.json({ code: 99991668 }, { status: 401 });
     // What a document is made of, looked up when it holds little text. Not a read of its content,
     // so it is counted apart; the same person's token and the same access apply.
@@ -420,6 +428,8 @@ function someone() {
   return { openId, stub, event, says, sends, who, settle, quiet, cutOff, owed, requests, heard, cards, audit, due, grant };
 }
 
+/** What a person is told when the card they were shown did not go through. */
+const NOT_AUTHORISED = "授权没有完成，你要我做的事还没有做。还需要的话，请再跟我说一遍。";
 const link = (token: string, kind = "docx") => `https://example.feishu.cn/${kind}/${token}`;
 /** What the tools answered in the run a model call belongs to: everything after the last thing that was said to it. */
 const outputsIn = (asked: any): any[] => {
@@ -616,10 +626,11 @@ describe("reading a Feishu document as the person who asked", () => {
     await victim.says(`读一下 ${link("DocVictim000000000001")}`);
     expect((await consent(invitation(victim.openId), { openId: victim.openId, org: "org_other" })).status).toBe(403);
     expect((await (await victim.grant()).status()).authorised).toBe(false);
-    // Nothing of hers was read for any of it, and both requests are still waiting for her.
+    // Nothing of hers was read for any of it. Each request ended with the card it was shown, and she was told so for each card.
     await victim.settle();
     expect(feishu.reads).toEqual([]);
-    expect((await victim.requests()).map((each) => each.status)).toEqual(["waiting", "waiting"]);
+    expect((await victim.requests()).map((each) => each.status)).toEqual(["void", "void"]);
+    expect(victim.heard()).toEqual([NOT_AUTHORISED, NOT_AUTHORISED]);
   });
 
   it("accepts an invitation once, and not one it never sent, one that was declined, or one that is too old", async () => {
@@ -659,11 +670,13 @@ describe("reading a Feishu document as the person who asked", () => {
 
     // Used once, it works; used again, it does not.
     const good = await ask();
-    // She asked four times, and every one of those requests was waiting on her authorisation,
-    // whichever card it was first shown with: each is carried on and answered.
-    carriesOn("一", "二", "三", "四");
+    // She asked four times. The first ended when she declined its card, and she was told. The
+    // others were waiting on her authorisation, whichever card each was first shown with: each
+    // is carried on and answered.
+    carriesOn("二", "三", "四");
     await authorises(carol, good);
-    expect(carol.heard()).toEqual(["一", "二", "三", "四"]);
+    expect(carol.heard()).toEqual([NOT_AUTHORISED, "二", "三", "四"]);
+    expect((await carol.requests()).map((each) => each.status)).toEqual(["void", "done", "done", "done"]);
     expect((await consent(good, carol)).status).toBe(400);
     expect(feishu.tokens.size).toBe(1);
   });
@@ -1263,9 +1276,10 @@ describe("reading a Feishu document as the person who asked", () => {
     expect(lines.filter((line) => line.includes("feishu_authorisation_refused")).map((line) => JSON.parse(line))).toEqual([{ feishu_authorisation_refused: "exchange_failed", app: APP_ID, status: 400, code: 20068, endpoint: "v3" }]);
     expect(feishu.tokens.size).toBe(issued);
     expect(await (await judy.grant()).status()).toMatchObject({ authorised: true, scope: "docx:document:readonly" });
-    // The wiki page still waits for what she has not given; nothing carries it on.
+    // The wiki page's request ends with the card that did not go through, and she is told.
     await judy.settle();
-    expect((await judy.requests()).map((each) => each.status)).toEqual(["done", "waiting"]);
+    expect((await judy.requests()).map((each) => each.status)).toEqual(["done", "void"]);
+    expect(judy.heard().at(-1)).toBe(NOT_AUTHORISED);
   });
 
   it("exchanges at the newer endpoint unless the operator has switched that one app to the older", async () => {
@@ -2051,6 +2065,74 @@ describe("a request that waits and is carried on", () => {
       await sam.settle();
       expect(sam.heard(), how).toEqual(hears);
     }
+  });
+
+  it("ends a request whose card did not go through, says so once, and answers once when the person asks again and authorises", async () => {
+    const una = owner("DocUna000000000000001");
+    const first = await asksFor(una, "DocUna000000000000001");
+    // She goes through the card, and the exchange at Feishu fails.
+    const authorize = invitation(una.openId);
+    const back = new URL(authorize.searchParams.get("redirect_uri")!);
+    back.searchParams.set("state", authorize.searchParams.get("state")!);
+    back.searchParams.set("code", "a-code-feishu-never-gave");
+    expect(((await (exports as any).default.fetch(new Request(back))) as Response).status).toBe(400);
+    await una.settle();
+    // The request is over now, not when its time runs out, and she is told once.
+    expect(await una.requests()).toMatchObject([{ id: first, status: "void" }]);
+    expect(una.heard()).toEqual([NOT_AUTHORISED]);
+    // She asks again, as the page told her to, and authorises: one answer, for the new request.
+    const second = await asksFor(una, "DocUna000000000000001");
+    carriesOn("周五发布。");
+    await authorises(una);
+    expect(una.heard()).toEqual([NOT_AUTHORISED, "周五发布。"]);
+    expect(await una.requests()).toMatchObject([{ id: first, status: "void" }, { id: second, status: "done" }]);
+    expect(read()).toEqual(["DocUna000000000000001"]);
+    expect(model.remaining()).toBe(0);
+  });
+
+  it("ends the request also when Feishu gives no answer at all to the exchange, and when the authorisation is taken away while it is exchanged", async () => {
+    // The connection breaks while the code is being exchanged.
+    const vera = owner("DocVera00000000000001");
+    const first = await asksFor(vera, "DocVera00000000000001");
+    feishu.duringExchange = async () => {
+      feishu.duringExchange = undefined;
+      throw new TypeError("network connection lost");
+    };
+    expect((await consent(invitation(vera.openId), vera)).status).toBe(400);
+    await vera.settle();
+    expect(await vera.requests()).toMatchObject([{ id: first, status: "void" }]);
+    expect(vera.heard()).toEqual([NOT_AUTHORISED]);
+    const second = await asksFor(vera, "DocVera00000000000001");
+    carriesOn("好了");
+    await authorises(vera);
+    expect(vera.heard()).toEqual([NOT_AUTHORISED, "好了"]);
+    expect(await vera.requests()).toMatchObject([{ id: first, status: "void" }, { id: second, status: "done" }]);
+    expect(read()).toEqual(["DocVera00000000000001"]);
+
+    // Feishu answers "whose token is this" with something that is no answer: over, like any other failure.
+    const xia = owner("DocXia000000000000001");
+    const lost = await asksFor(xia, "DocXia000000000000001");
+    feishu.identityAnswer = () => new Response("null", { headers: { "content-type": "application/json" } });
+    expect((await consent(invitation(xia.openId), xia)).status).toBe(400);
+    await xia.settle();
+    expect(await xia.requests()).toMatchObject([{ id: lost, status: "void" }]);
+    expect(xia.heard()).toEqual([NOT_AUTHORISED]);
+    expect((await (await xia.grant()).status()).authorised).toBe(false);
+
+    // Taken away while it is exchanged: nothing is kept, nothing is put on record under the new
+    // generation, and the request that waited is over at once.
+    const wade = owner("DocWade00000000000001");
+    const waited = await asksFor(wade, "DocWade00000000000001");
+    feishu.duringExchange = async () => {
+      feishu.duringExchange = undefined;
+      await (await wade.grant()).drop(wade.who);
+    };
+    expect((await consent(invitation(wade.openId), wade)).status).toBe(400);
+    await wade.settle();
+    expect(await wade.requests()).toMatchObject([{ id: waited, status: "void" }]);
+    expect((await (await wade.grant()).status()).authorised).toBe(false);
+    const kept = await runInDurableObject(await wade.grant(), (_i: unknown, state: DurableObjectState) => state.storage.get<any>("grant"));
+    expect(kept.outcomes).toBeUndefined();
   });
 
   it("wakes every request the authorisation covers, whichever card it was given with (F16)", async () => {

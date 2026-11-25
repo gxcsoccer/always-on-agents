@@ -147,7 +147,7 @@ describe("an invitation made for one question", () => {
     const p = await someone();
     const nonce = await p.asks("om_1");
     await p.inside((grant) => grant.redeem(nonce));
-    await p.inside((grant) => grant.fail(nonce));
+    await p.inside((grant) => grant.fail(nonce, { generation: 1, brain: "acme:chat:oc_1" }));
     expect(await p.answered(nonce)).toEqual({ state: "gone" });
     expect(await p.inside((grant) => grant.install(1, TOKEN, nonce))).toBe(false);
     expect((await p.stored()).grant).toBeUndefined();

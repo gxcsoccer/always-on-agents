@@ -72,6 +72,8 @@ interface Outcome {
   state: "done" | "void";
   at: number;
   scope: string[];
+  /** The person went through it and it did not go through (turned down, or the exchange failed): what waits on it is over, and they are told. */
+  failed?: true;
 }
 
 /** Word a Brain has not yet heard: which Brain, and of what. */
@@ -264,7 +266,7 @@ export class FeishuGrant extends DurableObject<Env> {
    * Takes an invitation out of the record, once: what came back from Feishu names it by its nonce.
    * Returns nothing for one that is unknown, used, expired, or from before the grant was dropped.
    */
-  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number; ask: boolean } | null> {
+  async redeem(nonce: string): Promise<{ who: Who; verifier: string; redirect: string; scope: string[]; generation: number; ask: boolean; brain?: string } | null> {
     const stored = await this.#load();
     if (!stored) return null;
     const now = Date.now();
@@ -277,7 +279,7 @@ export class FeishuGrant extends DurableObject<Env> {
     else if (found && !found.ask) stored.pending = stored.pending.filter((each) => each !== found);
     void this.ctx.storage.put("grant", stored);
     if (!found || !claimed) return null;
-    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation, ask: found.ask !== undefined };
+    return { who: stored.who, verifier: found.verifier, redirect: found.redirect, scope: found.scope, generation: stored.generation, ask: found.ask !== undefined, ...(found.ask ? { brain: found.ask.brain } : {}) };
   }
 
   /**
@@ -335,14 +337,40 @@ export class FeishuGrant extends DurableObject<Env> {
     return true;
   }
 
-  /** An answer that came back for an invitation made for a question was turned down, or was not the person's: it is over. */
-  async fail(nonce: string): Promise<void> {
+  /**
+   * An answer that came back for an invitation was turned down, could not be exchanged, or was
+   * not the person's: that invitation is over, and so is whatever waits on it. `taken` is what
+   * `redeem` handed out for it: the generation it was redeemed in, and the Brain a question's
+   * invitation was asked in. The Brain it was shown in is told, so that what waits there ends
+   * now and not when its time runs out. If the grant was taken away meanwhile, nothing is put
+   * on record (what waited is over with the generation) and that Brain is still told.
+   */
+  async fail(nonce: string, taken: { generation: number; brain?: string }): Promise<void> {
     const stored = await this.#load();
-    const found = stored?.pending.find((each) => each.nonce === nonce);
-    if (!stored || !found?.ask) return;
-    this.#record(stored, found, "void", Date.now());
-    stored.pending = stored.pending.filter((each) => each !== found);
+    if (!stored || (stored.outcomes ?? []).some((each) => each.nonce === nonce)) return;
+    const now = Date.now();
+    if (stored.generation === taken.generation) {
+      const found = stored.pending.find((each) => each.nonce === nonce);
+      // One made for a question is still on record, as being exchanged; any other was taken out when it was redeemed.
+      if (found && !found.ask) return;
+      stored.outcomes = [...(stored.outcomes ?? []), { nonce, state: "void", at: now, scope: found?.scope ?? [], failed: true }];
+      stored.pending = stored.pending.filter((each) => each !== found);
+    }
+    this.#owe(stored, taken.brain ?? "", `failed:${nonce}`);
     void this.ctx.storage.put("grant", stored);
+    void this.ctx.storage.setAlarm(now);
+  }
+
+  /**
+   * Whether what a request shown one invitation waits on holds: the person is authorised for
+   * `scope`, by that invitation or any other way. Over, and said to be refused, once they went
+   * through that very invitation and it did not go through: the request ends there, and is not
+   * carried on by an authorisation they give for asking again.
+   */
+  async invited(nonce: string, scope: string[], generation: number): Promise<{ state: "holds"; since: number } | { state: "not_yet" } | { state: "gone"; refused?: true }> {
+    const stored = await this.#load();
+    if ((stored?.outcomes ?? []).some((each) => each.nonce === nonce && each.failed)) return { state: "gone", refused: true };
+    return this.covers(scope, generation);
   }
 
   /**
@@ -359,6 +387,7 @@ export class FeishuGrant extends DurableObject<Env> {
     if (this.#settle(stored, now)) void this.ctx.storage.put("grant", stored);
     if (stored.pending.some((each) => each.nonce === nonce && each.ask)) return { state: "not_yet" };
     const outcome = (stored.outcomes ?? []).find((each) => each.nonce === nonce);
+    // Not said to be refused, though it may have been: the card was for one person's eyes, and what ends here ends without a word where everyone reads.
     if (outcome?.state !== "done") return { state: "gone" };
     const grant = stored.grant;
     // Only for what this invitation asked the person for: what they allowed some other way since is not its doing.
