@@ -22,6 +22,8 @@
   // Secrets (wrangler secret put / .dev.vars): OPENAI_API_KEY, ADMIN_KEY,
   // optional GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN; for reading people's Feishu documents:
   // PUBLIC_ORIGIN (https://your.domain) and GRANTS_KEY (32+ random characters)
+  // Which version is running: shown for a long connection, so that after a deploy it can be seen when it has taken the new code.
+  "version_metadata": { "binding": "VERSION" },
   "r2_buckets": [{ "binding": "CHECKPOINTS", "bucket_name": "always-on-agent-checkpoints" }],
   "durable_objects": {
     "bindings": [

@@ -10,6 +10,8 @@ export interface Env {
   TASKS: DurableObjectNamespace<TaskSandbox>;
   REGISTRY: DurableObjectNamespace<Registry>;
   FEISHU_LINKS: DurableObjectNamespace<FeishuLink>;
+  /** Which version of the Worker this code is, where the platform says: see wrangler.jsonc. */
+  VERSION?: { id: string };
   FEISHU_GRANTS: DurableObjectNamespace<FeishuGrant>;
   DOUBAO_GRANTS: DurableObjectNamespace<DoubaoGrant>;
   CHECKPOINTS: R2Bucket;

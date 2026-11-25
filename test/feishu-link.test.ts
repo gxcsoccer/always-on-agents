@@ -66,6 +66,8 @@ describe("the Feishu long connection", () => {
     expect(ping).toMatchObject({ method: CONTROL, service: 7 });
     expect(headerOf(ping, "type")).toBe("ping");
     expect(await link.status()).toMatchObject({ connected: true, connects: 1 });
+    // Which version it runs is shown where the platform says, and as unknown where it does not.
+    expect(await link.status()).toHaveProperty("version");
 
     // An event arrives as a binary frame; it reaches the person's own conversation and is acknowledged.
     await feishu.send(feishu.data("event", message(appId, "om_1", "hello over the link")));
