@@ -85,7 +85,9 @@ export class FeishuLink extends DurableObject<Env> {
   }
 
   async status(): Promise<Record<string, unknown>> {
-    return { app_id: this.ctx.storage.kv.get("app_id") ?? null, connected: this.#open(), ping_every_ms: this.#pingEveryMs, in_flight: this.#inFlight, ...this.#stats() };
+    // Which version of the Worker this object is running, where the platform says: after a deploy
+    // an object that is busy takes the new code up to some minutes later, and this shows when it has.
+    return { app_id: this.ctx.storage.kv.get("app_id") ?? null, version: this.env.VERSION?.id ?? null, connected: this.#open(), ping_every_ms: this.#pingEveryMs, in_flight: this.#inFlight, ...this.#stats() };
   }
 
   async alarm(): Promise<void> {
