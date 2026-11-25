@@ -35,7 +35,7 @@ const NOT_COVERED = 99991679;
 export const readDocument: ConnectorTool = {
   name: "feishu_read_document",
   description:
-    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, and the same on ….larkoffice.com; as plain text in their message). Only a document the person linked themselves can be read: in this request, or in their own messages here over the last day. For a follow-up, answer from what you already said if that is enough; read again only when more is needed. If you are not sure which document they mean, ask them.",
+    "Read a Feishu document as the person you are talking to, with their own access. `document` is the document's link as the person wrote it (https://….feishu.cn/docx/… or …/wiki/…, and the same on ….larkoffice.com; as plain text in their message). Only a document the person pointed at can be read: one they linked themselves, in this request or in their own messages here over the last day; or one linked in a colleague's message that this very request was written in reply to. For a follow-up, answer from what you already said if that is enough; read again only when more is needed. If you are not sure which document they mean, ask them.",
   effect: "read",
   // Also where several people talk, for the one who asked: only in a chat that is the
   // organisation's own, with the bot in it, through an app whose operator turned this on (see `read`).
@@ -65,8 +65,10 @@ const LATELY_MS = 24 * 3_600_000;
  * pointed at something old does not make the old thing recent.
  */
 function linkedLately(message: { data: Record<string, unknown> }): DocumentRef[] {
-  const at = (message.data.quoted as { at?: unknown } | undefined)?.at;
-  return [...ownDocuments(message), ...(typeof at === "number" && Date.now() - at <= LATELY_MS ? quotedDocuments(message) : [])];
+  const quoted = message.data.quoted as { at?: unknown; other?: unknown } | undefined;
+  const at = quoted?.at;
+  // What a colleague linked, in a message the person once replied to, is what that one reply pointed at: it is not something they linked lately.
+  return [...ownDocuments(message), ...(quoted?.other !== true && typeof at === "number" && Date.now() - at <= LATELY_MS ? quotedDocuments(message) : [])];
 }
 
 const whole = <T extends DocumentRef>(each: T | undefined): each is T => Boolean(each) && (each!.kind === "docx" || each!.kind === "wiki") && typeof each!.token === "string" && /^[A-Za-z0-9]{10,64}$/.test(each!.token);
@@ -77,7 +79,8 @@ function ownDocuments(message: { data: Record<string, unknown> }): DocumentRef[]
 }
 
 /**
- * The documents linked by the person's own earlier message this one was written in reply to,
+ * The documents linked by the message this one was written in reply to (the person's own
+ * earlier one, or a colleague's that the connector gave as what the reply points at),
  * where that had to be fetched (a group sends the agent only what mentions it): each with the
  * link as written there, where the connector kept it. Not this message's own: what it points at.
  */
@@ -97,7 +100,8 @@ function fetchedDocuments(documents: unknown): (DocumentRef & { link?: string })
  * The documents the chain of replies these messages stand in leads back to, of the person's own
  * linking: in the message replied to and in everything further up that the Brain followed.
  * Their own words the connector fetched (kept with the message), and their own earlier messages
- * on record here (`recent` holds only theirs). Nothing of anyone else's, and nothing an answer
+ * on record here (`recent` holds only theirs). Of anyone else's, only what a colleague linked in
+ * the very message replied to, which the connector kept with this one; and nothing an answer
  * of the agent's says. Good for this request alone: it is read off the request's own messages.
  */
 function ledBackTo(context: ToolContext): (DocumentRef & { link?: string; message?: { text: string; data: Record<string, unknown> } })[] {

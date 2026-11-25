@@ -358,8 +358,9 @@ export class Runner {
    * The chain of replies a message stands in, from the message it replies to upwards: at most
    * MAX_CHAIN messages. Each is looked for in the Brain's own records first (a message that
    * reached it here, an answer of its own as it was delivered here); only one there is no record
-   * of is asked of the connector, which gives the person's own words or, for anyone else's,
-   * nothing but where it points. What is on record is kept as a name only; what was fetched is
+   * of is asked of the connector, which gives the person's own words; a colleague's, marked as
+   * such, for the message replied to itself (also where it is on record here); or, for anyone
+   * else's, nothing but where it points. What is on record is kept as a name only; what was fetched is
    * kept with the message that led to it. Ends where a message replies to nothing, where the
    * same message comes round again, or where time runs out (`partial`).
    */
@@ -387,6 +388,14 @@ export class Runner {
         if (level > 1) chain.push({ subject });
       } else {
         const found: Quoted | "late" | undefined = await Promise.race([this.#b.quoted(event.source, { principal, data: { ...data, replies_to: subject }, signal }), late]).catch((): Quoted => ({}));
+        // One that is on record here (a colleague's, asked about so that its words might be shown)
+        // and could not be had from the connector, for whatever reason: it is treated as it was
+        // before its words were ever asked for. It stands in the conversation already, and the
+        // chain goes on from it by the Brain's own record.
+        if (here && (found === "late" || found === undefined || typeof found.text !== "string")) {
+          subject = here.next;
+          continue;
+        }
         if (found === "late") {
           // Not back in time: for the message replied to itself, as one that could not be read.
           if (level === 1) quoted = {};
@@ -399,7 +408,7 @@ export class Runner {
         // (One on record here as another person's is theirs whatever the connector calls it.)
         const others = found.other === true || here?.other === true;
         const own = typeof found.text === "string" && (!others || level === 1);
-        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(Array.isArray(found.pictures) && found.pictures.length > 0 ? { pictures: found.pictures } : {}), ...(typeof found.at === "number" ? { at: found.at } : {}) } : {};
+        const kept = own ? { text: found.text, ...(Array.isArray(found.documents) && found.documents.length > 0 ? { documents: found.documents } : {}), ...(Array.isArray(found.pictures) && found.pictures.length > 0 && !others ? { pictures: found.pictures } : {}), ...(typeof found.at === "number" ? { at: found.at } : {}) } : {};
         next = typeof found.replies_to === "string" ? found.replies_to : undefined;
         if (level === 1) quoted = { ...kept, ...(own && others ? { other: true } : {}), ...(own && next ? { replies_to: next } : {}) };
         else chain.push({ subject, ...(own ? kept : { hidden: true }) });
@@ -422,7 +431,8 @@ export class Runner {
       const above = arrived.session_key === event.session_key ? (JSON.parse(arrived.data ?? "{}") as { replies_to?: unknown }).replies_to : undefined;
       // Another person's message: on record here, but its words are theirs, and are asked of the connector as any other member's are.
       const by = JSON.parse(arrived.principal) as Principal;
-      const other = by.kind === "human" && by.id !== (JSON.parse(event.principal) as Principal).id;
+      // (Only one filed under this very conversation: one known to belong to another is where this ends, as before.)
+      const other = arrived.session_key === event.session_key && by.kind === "human" && by.id !== (JSON.parse(event.principal) as Principal).id;
       return { ...(typeof above === "string" ? { next: above } : {}), ...(other ? { other: true as const } : {}) };
     }
     // The agent's own answer, delivered in this conversation: known by what it said, whatever
@@ -1087,7 +1097,9 @@ export class Runner {
       const data = dataOf(event);
       now.push(...named(data.pictures));
       // The message it was written in reply to: fetched for it, or on record here as the same person's.
-      replied.push(...named((data.quoted as { pictures?: unknown } | undefined)?.pictures));
+      // (Never a colleague's: only the person's own pictures are shown, whatever a connector kept with the message.)
+      const quoted = data.quoted as { pictures?: unknown; other?: unknown } | undefined;
+      if (quoted?.other !== true) replied.push(...named(quoted?.pictures));
       const parent = typeof data.replies_to === "string" && data.replies_to.startsWith(`${event.source}:message:`) ? data.replies_to.slice(`${event.source}:message:`.length) : undefined;
       const kept = parent ? this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE kind = 'message' AND source = ? AND source_id = ? AND session_key = ?", event.source, parent, event.session_key)[0] : undefined;
       if (kept && here(kept) && same(kept) && who(kept).id === who(event).id) replied.push(...named(dataOf(kept).pictures));

@@ -337,6 +337,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // When they wrote it, by Feishu's clock: it can reach here later than things that happened after.
         ...(Number.isFinite(Number(message.create_time)) && Number(message.create_time) > 0 ? { written_at: Number(message.create_time) } : {}),
         ...(!message.thread_id && typeof (message.parent_id || message.root_id) === "string" ? { replies_to: `feishu:message:${message.parent_id || message.root_id}` } : {}),
+        // Said by Feishu to be the message this was written in reply to itself, not only where the exchange began.
+        ...(!message.thread_id && typeof message.parent_id === "string" && message.parent_id !== "" ? { replied_directly: true } : {}),
       },
       reply_to: {
         connector: "feishu",
@@ -388,24 +390,27 @@ export async function quotedFeishu(env: Env, scope: Scope, event: { principal: {
   if (!app || app.tenant !== scope.tenant) return {};
   const who = { open_id: event.principal.id, tenant_key: origin.tenant_key };
   const bearer = await tenantAccessToken(env, app.app_id, event.signal);
-  const found = await quotedBy(bearer, app, scope.id, parent, who, event.signal);
+  // Whether the message named is the one this was written in reply to itself, as the event said.
+  const directly = event.data?.replied_directly === true;
+  const found = await quotedBy(bearer, app, scope.id, parent, who, event.signal, directly);
   if (found !== "lapsed") return found;
   // The app's token lapsed before its time: forgotten, and the message asked for once more.
   await forgetTenantAccessToken(env, app.app_id, bearer);
   if (event.signal?.aborted) return {};
-  const again = await quotedBy(await tenantAccessToken(env, app.app_id, event.signal), app, scope.id, parent, who, event.signal);
+  const again = await quotedBy(await tenantAccessToken(env, app.app_id, event.signal), app, scope.id, parent, who, event.signal, directly);
   return again === "lapsed" ? {} : again;
 }
 
 /**
  * That one message, asked of Feishu as the app (which has to be in the group and allowed to read
- * its messages). Its words are given only when it is beyond doubt the asker's own: the very
- * message, in the same chat, written by that person of that organisation. Anyone else's (another
- * member's, a bot's, someone from outside) is not handed on: the agent takes requests from the
- * people who address it, and what others wrote does not ride in on a reply. Whatever is not
- * given is still reported as there, so the model knows something was pointed at.
+ * its messages). Its words are given as the asker's own only when that is beyond doubt: the very
+ * message, in the same chat, written by that person of that organisation. Another member's of
+ * the same organisation are given too, marked as such (`other`), where `directly` says the event
+ * named this as the very message replied to and it does not stand in a topic: the person points
+ * at it by replying. A bot's, or someone's from outside the organisation, is not handed on.
+ * Whatever is not given is still reported as there, so the model knows something was pointed at.
  */
-export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }, signal?: AbortSignal): Promise<Quoted | "lapsed"> {
+export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, messageId: string, asker: { open_id: string; tenant_key: string }, signal?: AbortSignal, directly = false): Promise<Quoted | "lapsed"> {
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(messageId)) return {};
   try {
     const response = await fetch(`${API}/im/v1/messages/${messageId}?user_id_type=open_id`, { headers: { authorization: `Bearer ${bearer}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_000)]) : AbortSignal.timeout(2_000) });
@@ -424,11 +429,15 @@ export async function quotedBy(bearer: string, app: FeishuApp, chatId: string, m
     const further = !found.thread_id && typeof above === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(above) ? { replies_to: `feishu:message:${above}` } : {};
     // A bot's, the app's own, or someone's from another organisation: nothing it says or links,
     // only where it points, so that what stands further up the chain of replies can still be found.
-    if (sender.sender_type !== "user" || sender.tenant_key !== asker.tenant_key || typeof sender.id !== "string") return further;
+    if (sender.sender_type !== "user" || typeof sender.id !== "string" || sender.id === "" || typeof sender.tenant_key !== "string" || sender.tenant_key === "" || sender.tenant_key !== asker.tenant_key) return further;
     // Another member's, of the same organisation: given, and said to be theirs. By replying to it
     // the person points at it, as they would at a document; what it says is for them to have
     // looked at, and is not a request of theirs.
     const other = sender.id !== asker.open_id;
+    // Only where it is certain that this is the very message replied to, in the same conversation:
+    // the event named it as its parent (not merely as where the exchange began), and it does not
+    // stand in a topic, which is a conversation of its own that a reply from outside it is not part of.
+    if (other && (!directly || found.thread_id)) return further;
     // Their own, with nothing that can be read in it: the chain still goes on from it.
     if (typeof found.body?.content !== "string") return further;
     let content: any;

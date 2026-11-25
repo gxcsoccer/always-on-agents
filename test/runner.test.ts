@@ -374,6 +374,20 @@ describe("the run loop, by itself", () => {
         expect(await next()).toContain("written as a reply to a message of another member here");
         expect(log.filter((each) => each[0] === "quoted")).toHaveLength(1);
         log.length = 0;
+        // Where the connector cannot give it (it has no such thing, or nothing came back): as before its words were
+        // ever asked for. It stands in the conversation already; it is not called a message that is not shown.
+        for (const none of [undefined, {}, { replies_to: "feishu:message:om_elsewhere" }]) {
+          settings.quoted = none;
+          event("about that again", { data: { replies_to: "feishu:message:om_bob" } });
+          expect(await next()).not.toContain("written as a reply");
+        }
+        // A colleague's pictures are never kept with the message, whatever the connector gives.
+        settings.quoted = { text: "[picture] look", other: true, pictures: [{ message: "om_bob", key: "k_bob" }] };
+        event("what is this", { data: { replies_to: "feishu:message:om_bob" } });
+        await next();
+        expect(JSON.stringify(store.rows("SELECT data FROM inbox ORDER BY id DESC LIMIT 1"))).not.toContain("k_bob");
+        settings.quoted = { text: "fetched again" };
+        log.length = 0;
         // Their own, whose words are no longer kept: not brought back.
         event("old", { source_id: "om_old", status: "done" });
         store.sql.exec("UPDATE inbox SET text = NULL, data = NULL WHERE source_id = 'om_old'");
