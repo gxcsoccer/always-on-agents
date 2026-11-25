@@ -95,6 +95,9 @@ const MAX_FINISHED_LISTED = 5;
 /** What a task's last status is, as a piece of work. */
 export const taskEnd = (status: string): WorkEnd => ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown";
 
+/** Of what a call gave, the options that are this worker's own. */
+const own = (worker: Worker, options: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.entries(options).filter(([key]) => key in (worker.options ?? {})));
+
 export class Tasks implements Wakes {
   readonly #s: BrainStore;
   readonly #r: Revisions;
@@ -167,6 +170,8 @@ export class Tasks implements Wakes {
     const replayed = task !== undefined;
     // One that was written and has got past being started is told as it stands, before anything else is
     // looked at: also where its worker has since been taken out of the deployment altogether.
+    // (A call is the call it was only in the conversation it was made in: looked at before anything is told or taken.)
+    if (task && task.session_key !== sessionKey) throw new Error("this call was first made in another conversation; nothing further was started");
     if (task && task.status !== "dispatching") return this.#told(task);
     // What is asked of it is the worker's to look at, before anything is written or started. A call
     // that names no worker is the tool from before there were several: it goes to the worker the
@@ -188,6 +193,8 @@ export class Tasks implements Wakes {
     if (!task) {
       // Something new is taken only by a worker this deployment lists, and one that is started from here. Nothing is written for any other.
       if (!offered?.start) throw new Error("this deployment has no worker to hand this to");
+      // Only its own options are its business, and part of its record: the same on the first call and on every repeat.
+      options = own(offered, options);
       // (Only for something new: one already written was taken, and is not turned away by a check made again.)
       offered.accepts?.(options, scope);
       const WORKER = offered.name;
@@ -248,6 +255,7 @@ export class Tasks implements Wakes {
       await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
       return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
     }
+    options = own(worker, options);
     // How far this task may go, as it was fixed when it was written (one written before that was
     // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
     const bounds = this.#boundsOf(task);
