@@ -292,7 +292,6 @@ describe("GitHub's API over the proxy", () => {
     for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "issues/comments/55", "pulls", "pulls/3", "pulls/3/comments", "pulls/comments", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
     // Its files, who works on it, what it is: only by right. As anyone would see them.
     for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
-    // Nor the record of what was changed on an issue, nor a listing narrowed by anything but the plain ways.
     // Nor anything else under them: only what is named. Nor a listing narrowed by anything but the plain ways.
     for (const path of ["issues/7/timeline", "issues/7/events", "issues/events", "issues/7/issue-field-values", "issues/7/labels", "issues/7/reactions", "issues/7/comments/9", "pulls/3/files", "pulls/3/reviews", "pulls/3/commits", "issues/x", "issues?state=open&field=priority", "pulls?custom=1"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBeNull();
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
@@ -306,8 +305,22 @@ describe("GitHub's API over the proxy", () => {
     answers.push(() => Response.json({ total_count: 1, incomplete_results: false, items: [{ number: 7, repository_url: "https://api.github.com/repos/acme/demo", issue_field_values: [{ value: "secret" }] }] }));
     expect(JSON.stringify(await (await send("https://api.github.com/search/issues?q=dst")).json())).not.toContain("secret");
     // An answer that is not a description that can be gone through is not passed on as it is.
+    const noted = await proxyFor({ repository: "acme/demo", unlent: true });
     answers.push(() => new Response("raw", { headers: { "content-type": "text/plain" } }));
-    expect((await send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    expect((await noted.send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    expect(await noted.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
+    // Asked for in another form than a description (a pull request as its diff): read as a stranger would, and passed on as it is.
+    for (const accept of ["application/vnd.github.diff", "application/vnd.github.patch", "text/html", "application/vnd.github+json, application/vnd.github.diff"]) {
+      answers.push(() => new Response("diff --git a/x b/x", { headers: { "content-type": "application/vnd.github.diff" } }));
+      const answer = await send("https://api.github.com/repos/acme/demo/pulls/3", { headers: { accept } });
+      expect(forwarded.at(-1)!.headers.get("authorization"), accept).toBeNull();
+      expect(await answer.text()).toBe("diff --git a/x b/x");
+    }
+    for (const accept of ["application/vnd.github+json", "application/json", "*/*", "application/vnd.github.raw+json; charset=utf-8", "application/vnd.github.v3+json"]) {
+      answers.push(() => Response.json({ number: 3 }, json));
+      await send("https://api.github.com/repos/acme/demo/pulls/3", { headers: { accept } });
+      expect(forwarded.at(-1)!.headers.get("authorization"), accept).toBe("Bearer test-public-token");
+    }
     // Lent one by right, it is that one for everything, and what it is given is passed on whole.
     const lent = await proxyFor({ repository: "acme/demo" });
     await lent.send(issues);
@@ -316,7 +329,7 @@ describe("GitHub's API over the proxy", () => {
     expect(JSON.stringify(await (await lent.send("https://api.github.com/repos/acme/demo/issues/7/timeline")).json())).toContain("theirs to see");
     // Turned away as the installation: asked again as a stranger, and that is the answer the task gets.
     const refused = await proxyFor({ repository: "acme/demo", unlent: true });
-    for (const status of [403, 404, 401]) {
+    for (const status of [403, 401, 422]) {
       const before = forwarded.length;
       answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status, headers: { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990" } }));
       answers.push(() => Response.json({ message: "Not Found" }, { status: 404, headers: { "x-ratelimit-limit": "60", "x-ratelimit-remaining": "59" } }));
@@ -326,6 +339,15 @@ describe("GitHub's API over the proxy", () => {
       expect(await answer.text()).not.toContain("integration");
       expect(forwarded.slice(before).map((each) => each.headers.get("authorization"))).toEqual(["Bearer test-public-token", null]);
     }
+    // What a stranger then gets is passed on as a stranger's: whatever it is, with nothing taken out of it.
+    answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    answers.push(() => new Response("as it is", { headers: { "content-type": "text/plain" } }));
+    expect(await (await refused.send(issues)).text()).toBe("as it is");
+    // Not there, said to the credential: that is what a stranger is told too, and it is not asked again.
+    const once404 = forwarded.length;
+    answers.push(() => Response.json({ message: "Not Found" }, { status: 404, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send("https://api.github.com/repos/acme/demo/issues/999999")).status).toBe(404);
+    expect(forwarded).toHaveLength(once404 + 1);
     // Told to slow down is told as that, and not asked again: by the allowance being used up, by a time to wait, or only in words (with allowance left and no time named).
     const before = forwarded.length;
     answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));

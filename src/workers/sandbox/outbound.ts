@@ -210,7 +210,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       const plain = "search" in api ? SEARCHED_BY : LISTED_BY;
       // (And only to read the thing itself: asked for by its headers alone, a refusal comes with
       // no words to tell why, so that is asked as a stranger from the start.)
-      const open = request.method === "GET" && ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
+      // (And asked for as a description, not in another form of it: a pull request as its diff
+      // is not something that can be gone through here, and is read as a stranger would.)
+      const described = (request.headers.get("accept") ?? "").split(",").map((each) => each.split(";")[0].trim().toLowerCase()).filter(Boolean).every((type) => /^(?:\*\/\*|application\/json|application\/vnd\.github(?:\.[\w.-]+)?\+json)$/.test(type));
+      const open = request.method === "GET" && described && ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
       token = await this.#task.githubReadToken();
       if (token === undefined && open) {
         token = await this.#task.githubPublicToken();
@@ -238,7 +241,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // stranger, and that answer is the one given. How GitHub turns an installation away says
       // things a stranger is not told (that something not public is there). Being told to slow
       // down is not that, and is passed on as it is.
-      if (optional && [401, 403, 404, 422].includes(answer.status)) {
+      // (Not "not found": no such credential is given for a repository that is not public, so
+      // that is what a stranger would be told too, and asking again could only turn it into
+      // being told to slow down.)
+      if (optional && [401, 403, 422].includes(answer.status)) {
         // (GitHub also says "slow down" with a 403 that has allowance left and names no time to
         // wait: then it is in the words of the answer, which are read for it.)
         // (Where the words cannot be read, why it was turned away is not known: it is left at
@@ -247,6 +253,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
         const slowed = answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after") || said === undefined || said === "" || /rate limit|abuse detection/i.test(said);
         if (slowed) answer = new Response(said ?? "", { status: answer.status, headers: answer.headers });
         else {
+          // From here on it is a stranger's read, and what comes back is passed on as one.
+          optional = false;
           headers.delete("authorization");
           answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
         }
@@ -294,10 +302,14 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
         await this.#task.noteGithubRead(kind, answer.status, {});
         return passed(answer, JSON.stringify(withoutFields(listed)));
       }
+      // (Anything else read with that credential is not a description that can be gone through: not passed on, and counted as that.)
+      if (optional && answer.ok && request.method === "GET") {
+        await answer.body?.cancel();
+        await this.#task.noteGithubRead(kind, 502, {});
+        return new Response("GitHub's answer is not one that can be passed on here\n", { status: 502 });
+      }
       // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
       await this.#task.noteGithubRead(kind, answer.status, {});
-      // (Anything else read with that credential is not a description that can be gone through: not passed on.)
-      if (optional && answer.ok && request.method === "GET") return new Response("GitHub's answer is not one that can be passed on here\n", { status: 502 });
       return passed(answer, answer.body);
     }
     const found = (await answer.json().catch(() => undefined)) as { items?: unknown; incomplete_results?: unknown; total_count?: unknown } | undefined;
