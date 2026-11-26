@@ -20,9 +20,10 @@ const API = "https://api.github.com";
  * back to a broader credential. The deployment-wide GITHUB_TOKEN is used only when no App is
  * configured at all, which is the local-development setup.
  */
-export async function githubTokenFor(env: Env, tenant: string, repo: string): Promise<{ token: string; expires_at: number } | undefined> {
+export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ token: string; expires_at: number } | undefined> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
-  if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
+  // One that can only read is never the deployment's own token, which can do whatever it was made for.
+  if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN && to === "write" ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return undefined;
 
   const jwt = await appJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
@@ -31,7 +32,8 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string): Pr
       method: "POST",
       headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent", "content-type": "application/json" },
       // Narrowed to the one repository and to what the agent does: read and push code, comment.
-      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { contents: "write", pull_requests: "write", issues: "write" } }),
+      // Or, asked for to read with: the same three, to read only.
+      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { contents: to, pull_requests: to, issues: to } }),
     });
     // 422 means this installation does not cover a repository of that name; another one might.
     if (response.status === 422 || response.status === 404) continue;

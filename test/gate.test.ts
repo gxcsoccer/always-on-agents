@@ -167,4 +167,20 @@ describe("the repository credential a task is lent", () => {
     await registry().linkChatRepo("lend", "oc_room", null);
     expect(await running.githubToken()).toBeUndefined();
   });
+
+  it("lends no credential to read GitHub's API with where there is no App: the deployment's own token can do more than read", async () => {
+    await registry().createTenant("lend3", "lend3");
+    const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
+    expect(await stub.githubToken()).toBe("test-github-token");
+    expect(await stub.githubReadToken()).toBeUndefined();
+  });
+
+  it("keeps count of what the proxy saw of its reads of GitHub's API", async () => {
+    const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
+    await stub.noteGithubRead(200, false);
+    await stub.noteGithubRead(200, true);
+    await stub.noteGithubRead(403, false);
+    const reads = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_reads);
+    expect(reads).toEqual({ by_status: { "200": 2, "403": 1 }, incomplete: 1 });
+  });
 });

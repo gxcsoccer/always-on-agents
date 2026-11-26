@@ -56,6 +56,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const upstream = new URL(this.env.OPENAI_BASE_URL);
     if (url.origin === upstream.origin) return this.#model(request, url, upstream);
     if (url.origin === "https://github.com") return this.#github(request, url);
+    if (url.origin === "https://api.github.com") return this.#githubApi(request, url);
     return this.#refuse(request, url, `${url.hostname} is not reachable from this sandbox`);
   }
 
@@ -153,6 +154,49 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
   }
 
   /**
+   * Reading GitHub's API: the repository this task was started on, and the search of its issues.
+   * Never a write. The credential is one that can only read, lent by the same rule as the one for
+   * git, and with none the read is anonymous: nothing is seen here that was not given to the task.
+   */
+  async #githubApi(request: Request, url: URL): Promise<Response> {
+    const api = classifyApi(url, request.method);
+    if (!api) return this.#refuse(request, url, "only reading the repository this task was started on is allowed on api.github.com");
+    const own = await this.#task.repository();
+    if (!own || ("repo" in api && api.repo.toLowerCase() !== own)) return this.#refuse(request, url, "only the repository this task was started on can be read on api.github.com");
+
+    const target = new URL(url);
+    if ("search" in api) {
+      // Wherever the query says to look, it is this repository: what it names is taken out and
+      // this one put in. A query can still be written so that this does not hold it (it has
+      // "or", "not" and brackets), so what comes back is gone through as well, below.
+      const asked = (url.searchParams.get("q") ?? "").replace(/-?\b(?:repo|org|user):\S*/gi, " ").replace(/\s+/g, " ").trim();
+      target.searchParams.set("q", `repo:${own} ${asked}`.trim());
+    }
+    const token = await this.#task.githubReadToken();
+    const headers = new Headers(request.headers);
+    // Whatever the guest sent as a credential goes no further.
+    headers.delete("authorization");
+    headers.delete("cookie");
+    if (token) headers.set("authorization", `Bearer ${token}`);
+    if (!headers.has("user-agent")) headers.set("user-agent", "always-on-agent");
+    // Manual: a redirect is handed back as it is, and following it is the guest's own request.
+    const answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+    if (!("search" in api) || !answer.ok) {
+      await this.#task.noteGithubRead(answer.status, false);
+      return passed(answer, answer.body);
+    }
+    const found = (await answer.json().catch(() => undefined)) as { items?: { repository_url?: string }[]; incomplete_results?: boolean } | undefined;
+    if (!found || !Array.isArray(found.items)) {
+      // Not passed on as a list of nothing: "none found" is what an issue gets opened on.
+      await this.#task.noteGithubRead(502, true);
+      return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
+    }
+    const items = found.items.filter((each) => typeof each.repository_url === "string" && each.repository_url.toLowerCase() === `https://api.github.com/repos/${own}`);
+    await this.#task.noteGithubRead(answer.status, found.incomplete_results === true);
+    return passed(answer, JSON.stringify({ ...found, items }));
+  }
+
+  /**
    * Holds the request while the task waits for a reviewer. The guest just sees a slow response.
    * Each held request has its own id, made here. The answer is given for that id and can only be
    * collected by this request: an identical push sent in parallel, or later, has to be asked for
@@ -177,6 +221,33 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     await this.#task.observe("blocked_request", { method: request.method, host: url.hostname, path: url.pathname, why: message });
     return new Response(`${message}\n`, { status: 403 });
   }
+}
+
+/** GitHub's answer for the guest: what it says, and of its headers what a reader needs (how to go on, how much is left). */
+function passed(answer: Response, body: BodyInit | null): Response {
+  const headers = new Headers();
+  for (const name of ["content-type", "link", "location", "etag", "last-modified", "retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-resource", "x-github-media-type"]) {
+    const value = answer.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  return new Response(body, { status: answer.status, headers });
+}
+
+/**
+ * Recognises a read of GitHub's API that a sandbox may make: anything under one repository, or
+ * the search of issues. Nothing that is not a read; nothing whose path is written so as to mean
+ * another place than it says (an encoded dot or slash, an empty part).
+ */
+export function classifyApi(url: URL, method: string): { repo: string } | { search: true } | undefined {
+  if (method !== "GET" && method !== "HEAD") return undefined;
+  const path = url.pathname;
+  if (path === "/search/issues") return { search: true };
+  if (/%(?:2e|2f|5c)/i.test(path) || path.includes("//") || path.includes("\\")) return undefined;
+  const match = path.match(/^\/repos\/([\w.-]+)\/([\w.-]+)(?:\/.*)?$/);
+  if (!match) return undefined;
+  const [, owner, name] = match;
+  if (/^\.+$/.test(owner) || /^\.+$/.test(name)) return undefined;
+  return { repo: `${owner}/${name}` };
 }
 
 /** Recognises git's smart-HTTP requests and whether they belong to a push. */
