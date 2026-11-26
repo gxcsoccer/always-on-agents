@@ -9,18 +9,19 @@
  * `explicit`. Everything else — a push, a CI result, a PR being opened — merely happened, and must
  * never be treated as that person's instruction or consent.
  */
+import { MENTION, prose } from "./markdown";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 export const githubConnector: Connector = {
   name: "github",
   // Also plugged into the chat connector: what a person there can have done on GitHub in their own name.
   serves: ["feishu"],
-  tools: [githubCreateIssue, githubDisconnect],
+  tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
   offers: grantOffers,
   invitation: grantInvitation,
@@ -126,34 +127,12 @@ export function commentableLines(files: { filename?: string; patch?: string }[],
  * command someone copies must be the command that was written, and nothing in code notifies
  * anyone. In prose, a mention is put in a code span, where it is plainly visible and inert. A
  * suggestion block becomes an ordinary code block.
+ *
+ * `allowed`: names (in lower case) whose mention is left as it is: the ones a person wrote
+ * themselves, where the text goes out in their name.
  */
-export function inert(text: string): string {
-  const out: string[] = [];
-  let fence: { char: string; length: number } | undefined;
-  let prose: string[] = [];
-  const flush = () => {
-    if (prose.length === 0) return;
-    // Code spans may run over several lines; everything between them is prose.
-    out.push(prose.join("\n").replace(/(`+)[\s\S]*?\1|(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (match, span, name) => (span ? match : `\`@${name}\``)));
-    prose = [];
-  };
-  for (const line of text.split("\n")) {
-    const opener = /^([ \t>]*)(`{3,}|~{3,})(.*)$/.exec(line);
-    if (fence) {
-      if (opener && opener[2][0] === fence.char && opener[2].length >= fence.length && opener[3].trim() === "") fence = undefined;
-      out.push(line);
-    } else if (opener) {
-      flush();
-      fence = { char: opener[2][0], length: opener[2].length };
-      out.push(/^\s*suggestion\b/i.test(opener[3]) ? `${opener[1]}${opener[2]}text` : line);
-    } else if (/^( {4}|\t)/.test(line)) {
-      // Indented far enough to be a code block.
-      flush();
-      out.push(line);
-    } else prose.push(line);
-  }
-  flush();
-  return out.join("\n");
+export function inert(text: string, allowed?: ReadonlySet<string>): string {
+  return prose(text, (passage) => passage.replace(MENTION, (match, span, name) => (span || allowed?.has(String(name).toLowerCase()) ? match : `\`@${name}\``)));
 }
 
 /** A path shown literally, whatever characters it holds, spaces included. */

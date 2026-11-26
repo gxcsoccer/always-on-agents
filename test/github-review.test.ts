@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { commentableLines, githubConnector, inert, isOurs } from "../src/connectors/github";
+import { mentionsOf } from "../src/connectors/markdown";
 import { DeliveryDeferred } from "../src/connectors/types";
 import type { CodeReview } from "../src/connectors/types";
 import type { Env } from "../src/env";
@@ -232,6 +233,26 @@ describe("a code review on GitHub", () => {
     // A path is shown as it is, whatever it contains.
     expect(body).toContain("`` odd`name  two spaces.ts:3 ``");
     expect(inert("    @indented code stays")).toBe("    @indented code stays");
+    // An indented line is code only where Markdown reads it so: after a blank line, and not under a list item.
+    expect(inert("text\n\n    @code block\n\n    @still code\n\nand @after")).toBe("text\n\n    @code block\n\n    @still code\n\nand `@after`");
+    expect(inert("a paragraph\n    @going on")).toBe("a paragraph\n    `@going` on");
+    expect(inert("- item\n\n    @under the item\n1. one\n    @under one")).toBe("- item\n\n    `@under` the item\n1. one\n    `@under` one");
+    expect(inert("- item\n\nafter the list\n\n    @code again")).toBe("- item\n\nafter the list\n\n    @code again");
+    // What looks like a fence and is not one, as Markdown reads it, hides nothing: indented too far to open one, or of backticks with a backtick after it.
+    expect(inert("a paragraph\n    ```\n@not in code")).toBe("a paragraph\n    ```\n`@not` in code");
+    expect(inert("```js`x\n@not in code")).toBe("```js`x\n`@not` in code");
+    expect(inert("~~~js`x\n@in code\n~~~\n@after")).toBe("~~~js`x\n@in code\n~~~\n`@after`");
+    expect(inert("   ```\n@in code\n   ```\n@after")).toBe("   ```\n@in code\n   ```\n`@after`");
+    expect(inert(">    ```\n> @in quoted code\n> ```\n\n@after")).toBe(">    ```\n> @in quoted code\n> ```\n\n`@after`");
+    // Names left as they are: the ones given, however they are cased.
+    expect(inert("cc @Ann and @bob", new Set(["ann"]))).toBe("cc @Ann and `@bob`");
+    // What a writer mentions themselves: not in code, nor in what they quote.
+    // A quotation goes on over the lines that follow it, with or without the mark, until a blank line; then it is the writer again.
+    expect([...mentionsOf("> @first said\nand @second agreed\n> @third too\n\nthanks @Mine")]).toEqual(["mine"]);
+    // A block of code opened inside a quotation ends with the quotation: what follows is prose, and notifies.
+    expect(inert("> ```\n> @in quoted code\n@after the quotation")).toBe("> ```\n> @in quoted code\n`@after` the quotation");
+    expect(inert("> ```\n> @in quoted code\n> ```\n> and @quoted prose")).toBe("> ```\n> @in quoted code\n> ```\n> and `@quoted` prose");
+    expect([...mentionsOf("thanks @Ann\n> @quoted said so\n`@in-span` and\n```\n@fenced\n```\n\n    @indented\n\n- cc @acme/Team")]).toEqual(["ann", "acme/team"]);
   });
 
   it("shows paths literally in a review posted as a comment too", async () => {
