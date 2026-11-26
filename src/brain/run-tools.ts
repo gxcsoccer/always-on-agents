@@ -106,7 +106,11 @@ export class RunTools {
    * was an index has its row made now; one that never waited has only its row.
    */
   async #work(run: RunRow, sessionKey: string, id: string): Promise<{ task: true } | { task: false; worker: string; state: string; standing: string; waits?: "authorisation" | "result"; handed: boolean }> {
-    if (this.#s.rows("SELECT 1 FROM tasks WHERE id = ?", id).length > 0) return { task: true };
+    // A task is its conversation's: one of another conversation in the same scope is not there to be asked about or stopped from here.
+    const task = this.#s.rows<{ session_key: string }>("SELECT session_key FROM tasks WHERE id = ?", id)[0];
+    // (Said in the same words as for an id that is nobody's: which of the two it is, is not told.)
+    if (task && task.session_key !== sessionKey) throw new Error(`there is no piece of work ${id} here`);
+    if (task) return { task: true };
     const record = this.#b.requests.record(id);
     if (record) this.#b.requests.indexed(id);
     const row = this.#s.rows<{ worker: string; state: string; session_key: string; person: string | null; condition: string | null; generation: number | null; handed: number }>("SELECT worker, state, session_key, person, condition, generation, handed FROM work WHERE id = ?", id)[0];
@@ -379,7 +383,7 @@ export class RunTools {
       workStatus: async (workId) => {
         const work = await this.#work(run, session.session_key, workId);
         // Work done in a person's name: how it stands, and nothing of what it brought back.
-        return work.task ? this.#b.tasks.status(workId) : { work_id: workId, worker: work.worker, state: work.standing };
+        return work.task ? this.#b.tasks.status(workId, session.session_key) : { work_id: workId, worker: work.worker, state: work.standing };
       },
       cancelWork: async (callId, workId) => {
         const work = await this.#work(run, session.session_key, workId);
@@ -399,7 +403,7 @@ export class RunTools {
         // The tool from before there was more than one worker: for the one this deployment starts, with what was then its one option.
         return this.#b.tasks.dispatch(run, session.session_key, callId, null, title, brief, { repository });
       },
-      taskStatus: (taskId) => this.#b.tasks.status(taskId),
+      taskStatus: (taskId) => this.#b.tasks.status(taskId, session.session_key),
       answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),
       cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
     };

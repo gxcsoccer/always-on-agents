@@ -215,6 +215,27 @@ describe("timers and memory", () => {
     expect(modelCalls.some((each: any) => JSON.stringify(each.input).includes("could not be confirmed to have reached it before it ended"))).toBe(true);
   });
 
+  it("lists work under way for the conversation it was handed over in, and for no other in the same scope", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: null })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const id = toolOutputs().find((each: any) => each.work_id).work_id;
+    expect(modelCalls.at(-1).instructions).toContain(`- ${id} [sandbox] "Fix the build": running`);
+    // Another conversation of the same scope: the task is not listed there, and cannot be asked about by its id.
+    model.replies([call("work_status", { work_id: id })], [say("")]);
+    await stub.ingest(message("anything going on?", { session_key: "thread:elsewhere", source_id: "elsewhere-1" }));
+    await wake(stub);
+    expect(modelCalls.at(-2).instructions).not.toContain(id);
+    const elsewhere = toolOutputs().at(-1).error as string;
+    expect(elsewhere).toBe(`there is no piece of work ${id} here`);
+    // And an id that is nobody's is answered in the very same words: which of the two it is, is not told.
+    model.replies([call("work_status", { work_id: "00000000-0000-4000-8000-000000000000" })], [say("")]);
+    await stub.ingest(message("and this one?", { session_key: "thread:elsewhere", source_id: "elsewhere-2" }));
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBe(elsewhere.replace(id, "00000000-0000-4000-8000-000000000000"));
+  });
+
   it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {
     const { stub } = brain();
     model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
