@@ -2,6 +2,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
+import { fromTheirs } from "../src/connectors/github-app";
+
 /** A task that is running, as the real object would have stored it. */
 async function runningTask() {
   const stub = (env as any).GATE_TASKS.getByName(crypto.randomUUID()) as any;
@@ -166,5 +168,69 @@ describe("the repository credential a task is lent", () => {
     expect(await running.githubToken()).toBe("test-github-token");
     await registry().linkChatRepo("lend", "oc_room", null);
     expect(await running.githubToken()).toBeUndefined();
+  });
+
+  it("lends no credential to read GitHub's API with where there is no App: the deployment's own token can do more than read", async () => {
+    await registry().createTenant("lend3", "lend3");
+    const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
+    expect(await stub.githubToken()).toBe("test-github-token");
+    expect(await stub.githubReadToken()).toBeUndefined();
+  });
+
+  it("keeps count of what the proxy saw of its reads of GitHub's API, searches apart from the rest", async () => {
+    const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
+    await stub.noteGithubRead("search", 200, { read: true, more: true });
+    await stub.noteGithubRead("search", 200, { read: true, none: true });
+    await stub.noteGithubRead("search", 200, { read: true, incomplete: true });
+    await stub.noteGithubRead("search", 200, {});
+    await stub.noteGithubRead("search", 0, { incomplete: true });
+    await stub.noteGithubRead("other", 403, {});
+    // Pages of two searches, told apart: one read to its end, one not.
+    await stub.noteGithubRead("search", 200, { read: true, more: true, of: "a", page: 1 });
+    await stub.noteGithubRead("search", 200, { read: true, of: "a", page: 2 });
+    await stub.noteGithubRead("search", 200, { read: true, more: true, incomplete: true, of: "b", page: 1 });
+    // Turned away by the proxy itself; found more than GitHub gives; more pages read than are kept track of.
+    await stub.noteGithubRead("search", 400, { rejected: true });
+    await stub.noteGithubRead("search", 200, { read: true, cut: true, of: "c", page: 1 });
+    for (let page = 1; page <= 201; page++) await stub.noteGithubRead("search", 200, { read: true, more: page < 201, of: "d", page });
+    const reads = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_reads);
+    expect(reads.search.by_status).toEqual({ "200": 209, failed: 1, rejected: 1 });
+    expect(reads.search.each.a).toEqual({ pages: [1, 2], last: true, incomplete: false });
+    expect(reads.search.each.b).toEqual({ pages: [1], last: false, incomplete: true });
+    expect(reads.search.each.c).toEqual({ pages: [1], last: true, incomplete: false, cut: true });
+    expect(reads.search.each.d).toMatchObject({ last: true, incomplete: false, unsure: true });
+    expect(reads.search.each.d.pages).toHaveLength(200);
+    expect(reads.other).toEqual({ by_status: { "403": 1 } });
+  });
+
+  it("no longer lends what was issued from an installation that has since been given to another tenant", async () => {
+    await registry().createTenant("lend4", "lend4");
+    await registry().createTenant("lend5", "lend5");
+    await registry().linkGithubInstallation("777", "lend4");
+    const stub = await taskFrom("lend4:repo:acme/demo", "https://github.com/acme/demo");
+    // As it would be kept after being issued through that installation, good for a long while yet.
+    const keep = (which: string, token: string) =>
+      runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+        const task = state.storage.kv.get("state") as any;
+        state.storage.kv.put("state", { ...task, [which]: { token, expires_at: Date.now() + 3_600_000, source: "token", installation: "777" } });
+      });
+    await keep("github_token", "issued-earlier");
+    expect(await stub.githubToken()).toBe("issued-earlier");
+    await registry().linkGithubInstallation("777", "lend5");
+    // (What it falls back to here is this test deployment's own token; the one issued earlier is not lent.)
+    expect(await stub.githubToken()).not.toBe("issued-earlier");
+    await keep("github_read_token", "read-issued-earlier");
+    expect(await stub.githubReadToken()).toBeUndefined();
+    await registry().linkGithubInstallation("777", "lend4");
+    await keep("github_read_token", "read-issued-earlier");
+    expect(await stub.githubReadToken()).toBe("read-issued-earlier");
+    // One kept as issued through an App with no word of which installation (an earlier version kept them so) is not known to be theirs still.
+    const tenantOf = async (installation: string) => (installation === "777" ? "lend4" : null);
+    expect(await fromTheirs("app:1", undefined, "lend4", tenantOf)).toBe(false);
+    expect(await fromTheirs("app:1", "777", "lend4", tenantOf)).toBe(true);
+    expect(await fromTheirs("app:1", "777", "lend5", tenantOf)).toBe(false);
+    expect(await fromTheirs("app:1", "778", "lend4", tenantOf)).toBe(false);
+    // The deployment's own token, of local development, comes from none.
+    expect(await fromTheirs("token", undefined, "lend4", tenantOf)).toBe(true);
   });
 });

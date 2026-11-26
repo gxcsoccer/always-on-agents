@@ -56,6 +56,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const upstream = new URL(this.env.OPENAI_BASE_URL);
     if (url.origin === upstream.origin) return this.#model(request, url, upstream);
     if (url.origin === "https://github.com") return this.#github(request, url);
+    if (url.origin === "https://api.github.com") return this.#githubApi(request, url);
     return this.#refuse(request, url, `${url.hostname} is not reachable from this sandbox`);
   }
 
@@ -153,6 +154,123 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
   }
 
   /**
+   * Reading GitHub's API: the repository this task was started on, and the search of its issues.
+   * Never a write. The credential is one that can only read, lent by the same rule as the one for
+   * git, and with none the read is anonymous: nothing is seen here that was not given to the task.
+   */
+  async #githubApi(request: Request, url: URL): Promise<Response> {
+    const api = classifyApi(url, request.method);
+    if (!api) return this.#refuse(request, url, "only reading the repository this task was started on is allowed on api.github.com");
+    const own = await this.#task.repository();
+    if (!own || ("repo" in api && api.repo.toLowerCase() !== own)) return this.#refuse(request, url, "only the repository this task was started on can be read on api.github.com");
+
+    const kind = "search" in api ? "search" : "other";
+    const target = new URL(url);
+    if ("search" in api) {
+      // Wherever the query says to look, it is this repository: what it names is taken out and
+      // this one put in, over the whole of what is left (in brackets where that has "or", "not"
+      // or brackets of its own). What comes back is gone through as well, below.
+      // What is in quotes is the text being looked for, kept as it is: a bracket or a "repo:" there is not the query's own.
+      const parts = (url.searchParams.get("q") ?? "").split(/("[^"]*")/);
+      const asked = parts
+        // (Spaces are tidied outside the quotes only: inside, two spaces are part of a name.)
+        .map((part, at) => (at % 2 === 1 ? part : part.replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ").replace(/\s+/g, " ")))
+        .join("")
+        .trim();
+      // Its shape, with each quoted text as one plain word.
+      const shape = asked.replace(/"[^"]*"/g, "w");
+      // What is left may no longer be a query: an "or" with nothing on one side of it, empty brackets.
+      if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(shape) || !balanced(shape)) {
+        // Turned away here, before anything was asked of GitHub: told apart from what GitHub itself refuses.
+        await this.#task.noteGithubRead(kind, 400, { rejected: true });
+        return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched. Text to look for that has brackets in it goes in double quotes\n", { status: 400 });
+      }
+      // Already in brackets as a whole (a next page of a search made here): not wrapped again.
+      const whole = /\b(?:OR|AND|NOT)\b|[()]/.test(shape) && !enclosed(shape) ? `(${asked})` : asked;
+      target.searchParams.set("q", `repo:${own} ${whole}`.trim());
+      // Brackets and "or" mean what they say only where this is asked for; without it GitHub
+      // answers such a query with nothing found and calls that complete. Always, whatever the guest sent.
+      target.searchParams.set("advanced_search", "true");
+    }
+    let token: string | undefined;
+    try {
+      token = await this.#task.githubReadToken();
+    } catch {
+      await this.#task.noteGithubRead(kind, 0, {});
+      return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });
+    }
+    // Lending took a moment, and no credential is also what a task that has ended is given.
+    if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+    // Made here, not passed on: what a reader needs to say, and nothing that steers the request elsewhere or overrides how it is made.
+    const headers = new Headers();
+    for (const name of ["accept", "if-none-match", "if-modified-since", "x-github-api-version"]) {
+      const value = request.headers.get(name);
+      if (value !== null) headers.set(name, value);
+    }
+    headers.set("user-agent", "always-on-agent");
+    if (token) headers.set("authorization", `Bearer ${token}`);
+    let answer: Response;
+    try {
+      // Manual: a redirect is not followed on the guest's behalf.
+      answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+    } catch {
+      await this.#task.noteGithubRead(kind, 0, {});
+      return new Response("GitHub could not be reached; nothing was read\n", { status: 502 });
+    }
+    // Sent somewhere else for it: an address made for whoever holds it (an archive, a file), good
+    // for a while without any credential. It is not handed into the sandbox.
+    const elsewhere = answer.status >= 300 && answer.status < 400 && !sameOrigin(answer.headers.get("location"), url);
+    if (elsewhere) {
+      await this.#task.noteGithubRead(kind, answer.status, {});
+      return new Response("GitHub answers this with a download address somewhere else, which is not passed into this sandbox; use git for the files of the repository\n", { status: 403 });
+    }
+    if (!("search" in api) || !answer.ok || request.method === "HEAD") {
+      // A file or a directory of the repository comes with an address to download it from, which
+      // for a private one works for a while for whoever holds it. Read with a credential, it is
+      // taken out; the content itself, which the task was given anyway, stays.
+      // Only where it is that description (JSON) that was asked for: asked for as the file itself, the bytes are passed on as they are, whatever they hold.
+      if (token && answer.ok && request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/(?:contents|readme|license)(?:\/|$)/i.test(url.pathname) && /^application\/json\b/i.test(answer.headers.get("content-type") ?? "")) {
+        let listed: unknown;
+        try {
+          // (Reading it can fail too, part of the way through: the same as not being able to read it.)
+          listed = JSON.parse(await answer.text());
+        } catch {
+          // Counted as what the guest is told: not as a read that went well.
+          await this.#task.noteGithubRead(kind, 502, {});
+          return new Response("GitHub's answer could not be read\n", { status: 502 });
+        }
+        await this.#task.noteGithubRead(kind, answer.status, {});
+        return passed(answer, JSON.stringify(withoutDownloads(listed)));
+      }
+      // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
+      await this.#task.noteGithubRead(kind, answer.status, {});
+      return passed(answer, answer.body);
+    }
+    const found = (await answer.json().catch(() => undefined)) as { items?: unknown; incomplete_results?: unknown; total_count?: unknown } | undefined;
+    const rows = found && Array.isArray(found.items) ? (found.items as { repository_url?: unknown }[]) : undefined;
+    if (!found || !rows || rows.some((each) => typeof each?.repository_url !== "string")) {
+      // Not passed on as a list of nothing, nor with rows quietly left out: "none found" is what an issue gets opened on.
+      await this.#task.noteGithubRead(kind, 502, {});
+      return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
+    }
+    const items = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
+    // Something of another repository came back: the query was not held to this one after all, so
+    // neither the count nor the pages are of this repository alone. Said as not complete; the
+    // count is left out rather than made up.
+    const mixed = items.length !== rows.length;
+    const incomplete = mixed || found.incomplete_results !== false;
+    // What this page was: read; whether there is more after it; and whether the search found nothing at all, which only its
+    // first page can say, by GitHub's own count of none (a page past the last is empty too, of a search that found plenty).
+    const more = /rel="next"/.test(answer.headers.get("link") ?? "");
+    const first = (url.searchParams.get("page") ?? "1") === "1";
+    // Which search it was a page of: the same query, sorted and cut into pages the same way. So that it can be told, of each search, whether it was read to its end.
+    const of = ["q", "sort", "order", "per_page"].map((name) => target.searchParams.get(name) ?? "").join("\n");
+    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0, of, page: Number(url.searchParams.get("page") ?? "1") || 1, cut: typeof found.total_count === "number" && found.total_count > SEARCH_GIVES_AT_MOST });
+    const { total_count: total, ...rest } = found;
+    return passed(answer, JSON.stringify({ ...rest, ...(mixed ? {} : { total_count: total }), incomplete_results: incomplete, items }));
+  }
+
+  /**
    * Holds the request while the task waits for a reviewer. The guest just sees a slow response.
    * Each held request has its own id, made here. The answer is given for that id and can only be
    * collected by this request: an identical push sent in parallel, or later, has to be asked for
@@ -177,6 +295,76 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     await this.#task.observe("blocked_request", { method: request.method, host: url.hostname, path: url.pathname, why: message });
     return new Response(`${message}\n`, { status: 403 });
   }
+}
+
+/** GitHub gives no more than this many results of one search, however many it found: past that, reading every page it gives is not reading them all. */
+const SEARCH_GIVES_AT_MOST = 1_000;
+
+/** GitHub's answer for the guest: what it says, and of its headers what a reader needs (how to go on, how much is left). */
+function passed(answer: Response, body: BodyInit | null): Response {
+  const headers = new Headers();
+  for (const name of ["content-type", "link", "location", "etag", "last-modified", "retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-resource", "x-github-media-type"]) {
+    const value = answer.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  return new Response(body, { status: answer.status, headers });
+}
+
+/** A description of a file, a directory or a licence, with every address it could be downloaded from taken out, however deep it is listed. */
+function withoutDownloads(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutDownloads);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, each]) => [key, key === "download_url" ? null : withoutDownloads(each)]));
+}
+
+/** Whether every bracket in a query is closed, and none closed that was not opened. */
+function balanced(query: string): boolean {
+  let depth = 0;
+  for (const each of query) {
+    if (each === "(") depth += 1;
+    else if (each === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/** Whether a query is one pair of brackets around everything in it. */
+function enclosed(query: string): boolean {
+  if (!query.startsWith("(") || !query.endsWith(")")) return false;
+  let depth = 0;
+  for (let at = 0; at < query.length; at += 1) {
+    if (query[at] === "(") depth += 1;
+    else if (query[at] === ")" && --depth === 0) return at === query.length - 1;
+  }
+  return false;
+}
+
+function sameOrigin(location: string | null, from: URL): boolean {
+  if (location === null) return true;
+  try {
+    return new URL(location, from).origin === from.origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Recognises a read of GitHub's API that a sandbox may make: anything under one repository, or
+ * the search of issues. Nothing that is not a read; nothing whose path is written so as to mean
+ * another place than it says (an encoded dot or slash, an empty part), or that names another
+ * repository to read from.
+ */
+export function classifyApi(url: URL, method: string): { repo: string } | { search: true } | undefined {
+  if (method !== "GET" && method !== "HEAD") return undefined;
+  const path = url.pathname;
+  if (path === "/search/issues") return { search: true };
+  if (/%(?:2e|2f|5c)/i.test(path) || path.includes("//") || path.includes("\\")) return undefined;
+  const match = path.match(/^\/repos\/([\w.-]+)\/([\w.-]+)(?:\/.*)?$/);
+  if (!match) return undefined;
+  const [, owner, name] = match;
+  if (/^\.+$/.test(owner) || /^\.+$/.test(name)) return undefined;
+  // A comparison can name the other side in another repository (owner:branch): that is a read of that one.
+  if (/^\/repos\/[^/]+\/[^/]+\/compare\//i.test(path) && (path.includes(":") || /%3a/i.test(path))) return undefined;
+  return { repo: `${owner}/${name}` };
 }
 
 /** Recognises git's smart-HTTP requests and whether they belong to a push. */

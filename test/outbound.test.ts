@@ -1,18 +1,21 @@
 import { exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { classifyGit, describePush, isLocalItem, parseReceivePack } from "../src/workers/sandbox/outbound";
+import { classifyApi, classifyGit, describePush, isLocalItem, parseReceivePack } from "../src/workers/sandbox/outbound";
 import { task } from "./helpers";
 
 /** What the proxy let through to the outside world. */
-let forwarded: { url: string; method: string; headers: Headers; body: string }[] = [];
+let forwarded: { url: string; method: string; headers: Headers; body: string; redirect?: string }[] = [];
+/** What the outside world says next, in order; "upstream ok" once these run out. */
+let answers: (() => Response)[] = [];
 
 beforeEach(() => {
   forwarded = [];
+  answers = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input as RequestInfo, init);
-    forwarded.push({ url: request.url, method: request.method, headers: request.headers, body: await request.text() });
-    return new Response("upstream ok");
+    forwarded.push({ url: request.url, method: request.method, headers: request.headers, body: await request.text(), redirect: request.redirect });
+    return answers.shift()?.() ?? new Response("upstream ok");
   });
 });
 
@@ -245,6 +248,262 @@ describe("git over the proxy", () => {
     expect((await push(unreadable.send, "acme/demo", "garbage")).status).toBe(403);
     expect(await unreadable.recorded("authorize")).toHaveLength(0);
     expect(forwarded).toHaveLength(0);
+  });
+});
+
+describe("GitHub's API over the proxy", () => {
+  const issues = "https://api.github.com/repos/acme/demo/issues?state=all&per_page=100";
+  const search = (q: string, more = "") => `https://api.github.com/search/issues?q=${encodeURIComponent(q)}${more}`;
+  const found = (repo: string, number: number) => ({ number, title: `t${number}`, repository_url: `https://api.github.com/repos/${repo}` });
+
+  it("recognises reads of one repository and the search of issues, and nothing else", () => {
+    const api = (path: string, method = "GET") => classifyApi(new URL(`https://api.github.com${path}`), method);
+    expect(api("/repos/acme/demo")).toEqual({ repo: "acme/demo" });
+    expect(api("/repos/Acme/Demo/issues/7/comments", "HEAD")).toEqual({ repo: "Acme/Demo" });
+    expect(api("/repos/acme/demo/compare/main...topic")).toEqual({ repo: "acme/demo" });
+    expect(api("/search/issues")).toEqual({ search: true });
+    for (const method of ["POST", "PATCH", "PUT", "DELETE", "OPTIONS"]) expect(api("/repos/acme/demo/issues", method)).toBeUndefined();
+    for (const path of ["/", "/user", "/graphql", "/repos/acme", "/repos/../demo/issues", "/repos/acme/../issues", "/repos/acme/demo%2f..%2fsecret/issues", "/repos/acme/demo/contents/a%2e%2e/b", "/repos/acme/demo//issues", "/search/code", "/search/issues/x", "/app/installations/1/access_tokens", "/orgs/acme/repos"])
+      expect(api(path), path).toBeUndefined();
+    // The other side of a comparison named in another repository is a read of that one.
+    for (const path of ["/repos/acme/demo/compare/main...someone:topic", "/repos/acme/demo/compare/main...someone%3Atopic", "/repos/acme/demo/compare/someone:demo:main...topic", "/repos/acme/demo/Compare/main...someone:topic"]) expect(api(path), path).toBeUndefined();
+  });
+
+  it("reads the task's own repository with a credential that can only read, and with headers made here", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    expect(await (await send(issues, { headers: { authorization: "Bearer guessed", cookie: "session=1", accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "if-none-match": '"abc"', "x-http-method-override": "POST", "x-forwarded-host": "evil.example", "user-agent": "curl/8" } })).text()).toBe("upstream ok");
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toMatchObject({ url: issues, method: "GET", redirect: "manual" });
+    expect(Object.fromEntries(forwarded[0].headers)).toEqual({ authorization: "Bearer test-read-token", accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "if-none-match": '"abc"', "user-agent": "always-on-agent" });
+    expect(await recorded("noteGithubRead")).toEqual([{ kind: "other", status: 200 }]);
+  });
+
+  it("reads it with no credential at all where the task is lent none", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true });
+    await send(issues, { headers: { authorization: "Bearer guessed" } });
+    expect(forwarded[0].headers.get("authorization")).toBeNull();
+  });
+
+  it("writes nothing, and reads no other repository nor anything else there", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    expect((await send("https://api.github.com/repos/acme/demo/issues", { method: "POST", body: "{}" })).status).toBe(403);
+    expect((await send("https://api.github.com/repos/acme/demo/issues/1/comments", { method: "POST", body: "{}" })).status).toBe(403);
+    expect((await send("https://api.github.com/graphql", { method: "POST", body: "{}" })).status).toBe(403);
+    expect((await send("https://api.github.com/repos/acme/other/issues")).status).toBe(403);
+    expect((await send("https://api.github.com/user")).status).toBe(403);
+    expect((await send("https://api.github.com:8443/repos/acme/demo/issues")).status).toBe(403);
+    expect((await send("http://api.github.com/repos/acme/demo/issues")).status).toBe(403);
+    expect((await send("https://api.github.com/repos/acme/demo/compare/main...someone:topic")).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+    expect(await recorded("observe")).toHaveLength(8);
+    // A task with no repository reads none.
+    const bare = await proxyFor({});
+    expect((await bare.send(issues)).status).toBe(403);
+    expect((await bare.send(search("bug"))).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+
+  it("lets nothing through once the task has ended, also when it ends while a credential is asked for", async () => {
+    const ended = await proxyFor({ repository: "acme/demo", ended: true });
+    expect((await ended.send(issues)).status).toBe(403);
+    // No credential is what a task that is lent none gets, and what one that has ended gets: the second is not read for anonymously.
+    const ending = await proxyFor({ repository: "acme/demo", endsWhileLending: true });
+    expect((await ending.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
+  });
+
+  it("does not pass on an address somewhere else that it is answered with", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    // An archive of a private repository: an address good for a while for whoever holds it.
+    answers.push(() => new Response(null, { status: 302, headers: { location: "https://codeload.github.com/acme/demo/legacy.tar.gz/main?token=SIGNED" } }));
+    const answer = await send("https://api.github.com/repos/acme/demo/tarball/main", { redirect: "manual" });
+    expect(answer.status).toBe(403);
+    expect(answer.headers.get("location")).toBeNull();
+    expect(await answer.text()).not.toContain("SIGNED");
+    // One to another place on the API itself (a repository that was renamed) is handed back for the guest to ask again.
+    answers.push(() => new Response(null, { status: 301, headers: { location: "https://api.github.com/repositories/42/issues" } }));
+    const moved = await send(issues, { redirect: "manual" });
+    expect(moved.status).toBe(301);
+    expect(moved.headers.get("location")).toBe("https://api.github.com/repositories/42/issues");
+    // Which is then not a path it may read.
+    expect((await send("https://api.github.com/repositories/42/issues")).status).toBe(403);
+    expect(forwarded).toHaveLength(2);
+    expect(await recorded("noteGithubRead")).toEqual([
+      { kind: "other", status: 302 },
+      { kind: "other", status: 301 },
+    ]);
+  });
+
+  it("takes out of a file or a directory read with a credential the address it could be downloaded from", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo" });
+    const signed = "https://raw.githubusercontent.com/acme/demo/main/a.txt?token=SIGNED";
+    const json = { headers: { "content-type": "application/json; charset=utf-8" } };
+    answers.push(() => Response.json({ name: "a.txt", content: "aGk=", download_url: signed }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt?ref=main")).json()).toEqual({ name: "a.txt", content: "aGk=", download_url: null });
+    answers.push(() => Response.json([{ name: "a.txt", download_url: signed }, { name: "dir", download_url: null }], json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/")).json()).toEqual([{ name: "a.txt", download_url: null }, { name: "dir", download_url: null }]);
+    answers.push(() => Response.json({ name: "README.md", download_url: signed }, json));
+    expect(JSON.stringify(await (await send("https://api.github.com/repos/acme/demo/readme")).json())).not.toContain("SIGNED");
+    // Asked for as the file itself: that is its content, passed on.
+    answers.push(() => new Response("hi", { headers: { "content-type": "application/vnd.github.raw" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw" } })).text()).toBe("hi");
+    // A directory asked for as an object lists its files inside it; a licence has one too.
+    answers.push(() => Response.json({ type: "dir", download_url: null, entries: [{ name: "a.txt", download_url: signed, _links: { self: "x" } }] }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/", { headers: { accept: "application/vnd.github.object+json" } })).json()).toEqual({ type: "dir", download_url: null, entries: [{ name: "a.txt", download_url: null, _links: { self: "x" } }] });
+    answers.push(() => Response.json({ name: "LICENSE", download_url: signed, license: { key: "mit" } }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/license")).json()).toEqual({ name: "LICENSE", download_url: null, license: { key: "mit" } });
+    // The file itself, under GitHub's own name for "raw": plain text, and a file that is JSON with such a field of its own. Bytes, as they are.
+    answers.push(() => new Response("hello, world\n", { headers: { "content-type": "application/vnd.github.raw+json; charset=utf-8" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe("hello, world\n");
+    answers.push(() => new Response('{"download_url":"kept, it is the file\'s own"}', { headers: { "content-type": "application/vnd.github.raw+json; charset=utf-8" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/b.json", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe('{"download_url":"kept, it is the file\'s own"}');
+    // A description that cannot be read is told as that, and counted as that: not as a read that went well.
+    const broken = await proxyFor({ repository: "acme/demo" });
+    answers.push(() => new Response("{not json", json));
+    expect((await broken.send("https://api.github.com/repos/acme/demo/contents/a.txt")).status).toBe(502);
+    expect(await broken.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
+    // Nor one that breaks off while it is being read.
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => (controller.enqueue(new TextEncoder().encode('{"name":')), controller.error(new Error("reset"))) }), json));
+    expect((await broken.send("https://api.github.com/repos/acme/demo/contents/a.txt")).status).toBe(502);
+    expect(await broken.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }, { kind: "other", status: 502 }]);
+    // Read with no credential it is what anyone is told.
+    const open = await proxyFor({ repository: "acme/demo", unlent: true });
+    answers.push(() => Response.json({ name: "a.txt", download_url: "https://raw.githubusercontent.com/acme/demo/main/a.txt" }, json));
+    expect(((await (await open.send("https://api.github.com/repos/acme/demo/contents/a.txt")).json()) as { download_url: string }).download_url).toContain("raw.githubusercontent.com");
+  });
+
+  it("searches issues in the task's repository only, whatever the query names", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    const sent = async (q: string, more = "&per_page=50&sort=updated") => {
+      answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+      await send(search(q, more));
+      return new URL(forwarded.at(-1)!.url).searchParams;
+    };
+    expect((await sent("time zone is:issue")).get("q")).toBe("repo:acme/demo time zone is:issue");
+    expect((await sent("time zone repo:acme/secret ORG:acme -user:someone is:issue")).get("q")).toBe("repo:acme/demo time zone is:issue");
+    // "or", "not" and brackets: the repository is said of the whole of it.
+    expect((await sent("dst OR timezone")).get("q")).toBe("repo:acme/demo (dst OR timezone)");
+    expect((await sent("(dst OR timezone) is:open NOT reminder")).get("q")).toBe("repo:acme/demo ((dst OR timezone) is:open NOT reminder)");
+    expect((await sent("(dst) OR (timezone)")).get("q")).toBe("repo:acme/demo ((dst) OR (timezone))");
+    // The next page of such a search, as GitHub gives its address: the same query again, not wrapped once more.
+    expect((await sent("repo:acme/demo (dst OR timezone)", "&page=2")).get("q")).toBe("repo:acme/demo (dst OR timezone)");
+    expect((await sent("")).get("q")).toBe("repo:acme/demo");
+    // Text in quotes is what is looked for, as it is: its brackets and its "repo:" are not the query's.
+    expect((await sent('"panic("')).get("q")).toBe('repo:acme/demo "panic("');
+    expect((await sent('"repo:acme/secret is mentioned" dst')).get("q")).toBe('repo:acme/demo "repo:acme/secret is mentioned" dst');
+    expect((await sent('is:issue   label:"good  first issue"  repo:x/y')).get("q")).toBe('repo:acme/demo is:issue label:"good  first issue"');
+    expect((await sent('"a) OR (b" OR timezone repo:x/y')).get("q")).toBe('repo:acme/demo ("a) OR (b" OR timezone)');
+    const last = await sent("dst", "&per_page=50&sort=updated&advanced_search=false");
+    expect(last.get("per_page")).toBe("50");
+    expect(last.get("sort")).toBe("updated");
+    // Brackets and "or" mean what they say only where this is asked for: always, whatever the guest sent.
+    expect(last.getAll("advanced_search")).toEqual(["true"]);
+    for (const each of forwarded) expect(new URL(each.url).searchParams.get("advanced_search")).toBe("true");
+    expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+
+    // What is no longer a query once the places it names are taken out is not sent as one.
+    const before = forwarded.length;
+    for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone", "panic("]) expect((await send(search(q))).status, q).toBe(400);
+    expect(forwarded).toHaveLength(before);
+    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400, rejected: true }));
+  });
+
+  it("passes a search on whole where all of it is the repository's, page after page", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [found("acme/demo", 1), found("Acme/Demo", 2)] }, { headers: { link: '<https://api.github.com/search/issues?page=2>; rel="next"', "x-ratelimit-remaining": "9", "set-cookie": "a=b" } }));
+    const first = await send(search("dst"));
+    expect(await first.json()).toEqual({ total_count: 3, incomplete_results: false, items: [found("acme/demo", 1), found("Acme/Demo", 2)] });
+    expect(first.headers.get("link")).toContain('rel="next"');
+    expect(first.headers.get("x-ratelimit-remaining")).toBe("9");
+    expect(first.headers.get("set-cookie")).toBeNull();
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [found("acme/demo", 3)] }));
+    expect(((await (await send(search("dst", "&page=2"))).json()) as { items: unknown[] }).items).toHaveLength(1);
+    // A page past the last: empty, of a search that found three. Not "none found".
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [] }));
+    expect(((await (await send(search("dst", "&page=3"))).json()) as { items: unknown[] }).items).toHaveLength(0);
+    // The same said of a first page: GitHub's count is not none, so neither is this.
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [] }));
+    await send(search("dst"));
+    // And a later page of a search that did find nothing says nothing either.
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    await send(search("nothing like it", "&page=2"));
+    // More found than GitHub gives of one search: said of that search, so that reading its pages is not taken for reading them all.
+    answers.push(() => Response.json({ total_count: 1_500, incomplete_results: false, items: [found("acme/demo", 9)] }));
+    await send(search("common word"));
+    expect((await recorded("searchPage")).at(-1)).toMatchObject({ page: 1, cut: true });
+    // None at all, known to be all there is: the first page, counted none by GitHub.
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    expect(await (await send(search("nothing like it"))).json()).toEqual({ total_count: 0, incomplete_results: false, items: [] });
+    // Which search each page was of, and which page: the same search for the pages of "dst", another for the other words.
+    const pages = await recorded("searchPage");
+    expect(pages.map((each: any) => [each.of.split("\n")[0], each.page, each.more])).toEqual([["repo:acme/demo dst", 1, true], ["repo:acme/demo dst", 2, false], ["repo:acme/demo dst", 3, false], ["repo:acme/demo dst", 1, false], ["repo:acme/demo nothing like it", 2, false], ["repo:acme/demo common word", 1, false], ["repo:acme/demo nothing like it", 1, false]]);
+    // The first page, with more after it; the last; and one that was all there is and held nothing.
+    expect(await recorded("noteGithubRead")).toEqual([
+      { kind: "search", status: 200, read: true, more: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true, none: true },
+    ]);
+  });
+
+  it("says a search is not complete where something of another repository came back, and gives no count", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    answers.push(() => Response.json({ total_count: 40, incomplete_results: false, items: [found("acme/demo", 1), found("acme/secret", 2)] }));
+    expect(await (await send(search("dst"))).json()).toEqual({ incomplete_results: true, items: [found("acme/demo", 1)] });
+    // A page with nothing of this repository on it, others of it perhaps to come: not "none".
+    answers.push(() => Response.json({ total_count: 40, incomplete_results: false, items: [found("acme/secret", 2), found("other/thing", 3)] }));
+    expect(await (await send(search("dst"))).json()).toEqual({ incomplete_results: true, items: [] });
+    // GitHub's own word that it was cut short, or no word at all.
+    answers.push(() => Response.json({ total_count: 1, incomplete_results: true, items: [found("acme/demo", 1)] }));
+    expect(((await (await send(search("dst"))).json()) as { incomplete_results: boolean }).incomplete_results).toBe(true);
+    answers.push(() => Response.json({ total_count: 1, items: [found("acme/demo", 1)] }));
+    expect(((await (await send(search("dst"))).json()) as { incomplete_results: boolean }).incomplete_results).toBe(true);
+    // None of these says "looked and found none", the empty page least of all.
+    expect(await recorded("noteGithubRead")).toEqual(Array(4).fill({ kind: "search", status: 200, read: true, incomplete: true }));
+  });
+
+  it("says how a read went when it did not go well, never as nothing found", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo", unlent: true });
+    answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
+    const limited = await send(search("dst"));
+    expect(limited.status).toBe(403);
+    expect(((await limited.json()) as { message: string }).message).toContain("rate limit");
+    // An answer to a search that cannot be read, or whose rows do not say where they are from.
+    answers.push(() => new Response("not json", { status: 200 }));
+    expect((await send(search("dst"))).status).toBe(502);
+    answers.push(() => Response.json({ total_count: 1, incomplete_results: false, items: [{ number: 1 }] }));
+    expect((await send(search("dst"))).status).toBe(502);
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false }));
+    expect((await send(search("dst"))).status).toBe(502);
+    // Asked for the headers alone: there is nothing to read, and that is not a fault.
+    answers.push(() => new Response(null, { status: 200, headers: { link: '<x>; rel="next"' } }));
+    expect((await send(search("dst"), { method: "HEAD" })).status).toBe(200);
+    answers.push(() => new Response("gone", { status: 404 }));
+    expect((await send("https://api.github.com/repos/acme/demo/issues/999")).status).toBe(404);
+    // GitHub not reached at all.
+    answers.push(() => {
+      throw new Error("network");
+    });
+    expect((await send(search("dst"))).status).toBe(502);
+    expect(await recorded("noteGithubRead")).toEqual([
+      { kind: "search", status: 403 },
+      { kind: "search", status: 502 },
+      { kind: "search", status: 502 },
+      { kind: "search", status: 502 },
+      // Answered, and nothing of it read.
+      { kind: "search", status: 200 },
+      { kind: "other", status: 404 },
+      { kind: "search", status: 0 },
+    ]);
+    // Nor a credential had: nothing is read, and that is counted.
+    const failing = await proxyFor({ repository: "acme/demo", lendingFails: true });
+    const before = forwarded.length;
+    expect((await failing.send(search("dst"))).status).toBe(502);
+    expect(forwarded).toHaveLength(before);
+    expect(await failing.recorded("noteGithubRead")).toEqual([{ kind: "search", status: 0 }]);
   });
 });
 
