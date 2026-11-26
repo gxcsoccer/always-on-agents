@@ -61,6 +61,13 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "- 项\n\n      **标题：**正文",
     "- 一\n    - **嵌套：**内容",
     "\t**标题：**正文",
+    // A fence on the line of a list item's mark, or of a quotation's; a link whose address or title holds a closing bracket.
+    "- ~~~text\n  **标题：**正文\n  ~~~",
+    "- ```\n  **标题：**正文\n  ```",
+    "1. > ~~~\n   > **标题：**正文\n   > ~~~",
+    "[文档](<guide)/**标题：**正文>)",
+    "[文档](/guide \"题)**标题：**正文\")",
+    "[文档](/guide '题)**标题：**正文')，**后面：**也不动",
     "[r]: /guide/**标题：**正文",
     "[r]: </guide/**标题：**正文> \"**题：**文\"",
     "见[**标题：**正文][r]",

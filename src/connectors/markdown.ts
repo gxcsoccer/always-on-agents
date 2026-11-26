@@ -119,7 +119,9 @@ export function emphasised(text: string): string {
     lines = [];
   };
   for (const line of text.split("\n")) {
-    const fenced = /^(?: {0,3}> ?)* {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    // A fence wherever one may stand: at the start of a line, or after the marks of quotations and of list items on it,
+    // however far in. (Taken more widely than Markdown takes it: what is between two of them is left as it is.)
+    const fenced = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)])(?=\s|$))*\s*(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
       if (fenced && fenced[1][0] === fence.char && fenced[1].length >= fence.length && fenced[2].trim() === "") fence = undefined;
       out.push(line);
@@ -143,8 +145,9 @@ function paragraph(text: string): string {
   const seen = text
     .replace(/\\[^\n]/g, hide)
     .replace(/(`+)(?:(?!\1(?!`))[\s\S])*?\1(?!`)/g, hide)
-    // A link or a picture with where it leads, brackets within its words and within its address one deep; the box of a task; a tag; a bare address.
-    .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()]|\([^()]*\))*\)/g, hide)
+    // A link or a picture with where it leads, where its ends are plain: brackets within its words one deep, and an address
+    // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
+    .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
     .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
     .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|https?:\/\/\S+/g, hide);
   // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
