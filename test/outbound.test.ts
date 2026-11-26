@@ -292,10 +292,27 @@ describe("GitHub's API over the proxy", () => {
     for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "pulls", "pulls/3/files", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
     // Its files, who works on it, what it is: only by right. As anyone would see them.
     for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
-    // Lent one by right, it is that one for everything.
+    // Nor the record of what was changed on an issue, nor a listing narrowed by anything but the plain ways.
+    for (const path of ["issues/7/timeline", "issues/7/events", "issues/events", "issues?state=open&field=priority", "pulls?custom=1"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBeNull();
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    expect(await read("https://api.github.com/search/issues?q=dst&fields=x")).toBeNull();
+    // What only some may see of an issue is taken out of what is read that way, in a listing, in one issue and in a search.
+    const json = { headers: { "content-type": "application/json; charset=utf-8" } };
+    answers.push(() => Response.json([{ number: 7, title: "t", issue_field_values: [{ name: "priority", value: "secret" }], user: { login: "a" } }], json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/issues?state=all")).json()).toEqual([{ number: 7, title: "t", user: { login: "a" } }]);
+    answers.push(() => Response.json({ number: 7, issue_field_values: [{ value: "secret" }], sub: { issue_fields: 1, kept: 2 } }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/issues/7")).json()).toEqual({ number: 7, sub: { kept: 2 } });
+    answers.push(() => Response.json({ total_count: 1, incomplete_results: false, items: [{ number: 7, repository_url: "https://api.github.com/repos/acme/demo", issue_field_values: [{ value: "secret" }] }] }));
+    expect(JSON.stringify(await (await send("https://api.github.com/search/issues?q=dst")).json())).not.toContain("secret");
+    // An answer that is not a description that can be gone through is not passed on as it is.
+    answers.push(() => new Response("raw", { headers: { "content-type": "text/plain" } }));
+    expect((await send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    // Lent one by right, it is that one for everything, and what it is given is passed on whole.
     const lent = await proxyFor({ repository: "acme/demo" });
     await lent.send(issues);
     expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+    answers.push(() => Response.json([{ number: 7, issue_field_values: [{ value: "theirs to see" }] }], json));
+    expect(JSON.stringify(await (await lent.send("https://api.github.com/repos/acme/demo/issues/7/timeline")).json())).toContain("theirs to see");
     // Turned away as the installation: asked again as a stranger, and that is the answer the task gets.
     const refused = await proxyFor({ repository: "acme/demo", unlent: true });
     for (const status of [403, 404, 401]) {

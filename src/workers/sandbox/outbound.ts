@@ -202,7 +202,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // allowed nothing, which GitHub answers for what is public and for nothing else. Anything
       // else there (its files, who works on it, the repository's own description, which even
       // that one would be given of a private repository) only by right.
-      const open = "search" in api || /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname);
+      // Not the record of what was changed on an issue (its timeline, its events): that tells of
+      // fields that only some may see. Nor a listing asked for by anything but the plain ways of
+      // listing, which are the same for everyone: what else it can be narrowed by depends on who asks.
+      const plain = "search" in api ? SEARCHED_BY : LISTED_BY;
+      const open = ("search" in api || (/^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname) && !/\/(?:timeline|events)(?:\/|$)/i.test(url.pathname))) && [...url.searchParams.keys()].every((name) => plain.has(name));
       token = await this.#task.githubReadToken();
       if (token === undefined && open) {
         token = await this.#task.githubPublicToken();
@@ -265,8 +269,24 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
         await this.#task.noteGithubRead(kind, answer.status, {});
         return passed(answer, JSON.stringify(withoutDownloads(listed)));
       }
+      // Read with the credential the task has no right to: what only some may see of an issue
+      // (the values of its fields) is taken out of the answer, whether or not GitHub would have
+      // given it. An answer that cannot be gone through is not passed on as it is.
+      if (optional && answer.ok && request.method === "GET" && /json/i.test(answer.headers.get("content-type") ?? "")) {
+        let listed: unknown;
+        try {
+          listed = JSON.parse(await answer.text());
+        } catch {
+          await this.#task.noteGithubRead(kind, 502, {});
+          return new Response("GitHub's answer could not be read\n", { status: 502 });
+        }
+        await this.#task.noteGithubRead(kind, answer.status, {});
+        return passed(answer, JSON.stringify(withoutFields(listed)));
+      }
       // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
       await this.#task.noteGithubRead(kind, answer.status, {});
+      // (Anything else read with that credential is not a description that can be gone through: not passed on.)
+      if (optional && answer.ok && request.method === "GET") return new Response("GitHub's answer is not one that can be passed on here\n", { status: 502 });
       return passed(answer, answer.body);
     }
     const found = (await answer.json().catch(() => undefined)) as { items?: unknown; incomplete_results?: unknown; total_count?: unknown } | undefined;
@@ -276,7 +296,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       await this.#task.noteGithubRead(kind, 502, {});
       return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
     }
-    const items = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
+    const mine = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
+    const items = optional ? (withoutFields(mine) as typeof mine) : mine;
     // Something of another repository came back: the query was not held to this one after all, so
     // neither the count nor the pages are of this repository alone. Said as not complete; the
     // count is left out rather than made up.
@@ -331,6 +352,17 @@ function passed(answer: Response, body: BodyInit | null): Response {
     if (value !== null) headers.set(name, value);
   }
   return new Response(body, { status: answer.status, headers });
+}
+
+/** The ways of listing issues and pull requests, and of searching them, that are the same whoever asks. */
+const LISTED_BY = new Set(["state", "labels", "sort", "direction", "since", "per_page", "page", "milestone", "assignee", "creator", "mentioned", "head", "base"]);
+const SEARCHED_BY = new Set(["q", "sort", "order", "per_page", "page", "advanced_search"]);
+
+/** What GitHub says of issues, with the values of their fields taken out, however deep they are listed: those can be for some to see and not for others. */
+function withoutFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutFields);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !/^issue_field/i.test(key)).map(([key, each]) => [key, withoutFields(each)]));
 }
 
 /** A description of a file, a directory or a licence, with every address it could be downloaded from taken out, however deep it is listed. */
