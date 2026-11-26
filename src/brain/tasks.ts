@@ -656,7 +656,17 @@ export class Tasks implements Wakes {
     const asker = people.length === 1 ? people[0] : null;
     if (task && task.session_key === sessionKey && asker === null) throw new Error("something can be added to work under way only in answer to the one person whose work it is, and this step was not started by a message of theirs alone; nothing was added");
     if (!task || task.session_key !== sessionKey || task.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(taskId)} of this person's here to add anything to; nothing was added`);
-    const closed = { ok: false, work_id: taskId, state: "closed", note: "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did." };
+    // (What can be done instead depends on how it stands: only work that ended well can be gone on from.)
+    const closedAs = (status: unknown) => ({
+      ok: false,
+      work_id: taskId,
+      state: "closed",
+      note:
+        TERMINAL_TASK.has(String(status)) && status !== "succeeded"
+          ? "It takes nothing more: it has ended, and not well, so there is nothing of it to go on from either. Nothing was added. Tell the person so; whether to have this done as something new is theirs to say."
+          : "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did.",
+    });
+    const stands = () => this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status;
     // What became of this very call, if it was made before: known here, whatever has become of the work or its worker since.
     const kept = this.#s.rows<{ task_id: string; state: string }>("SELECT task_id, state FROM task_notes WHERE call_id = ?", callId)[0];
     if (kept && kept.task_id !== taskId) throw new Error("this call was first made for another piece of work; nothing was added");
@@ -666,13 +676,13 @@ export class Tasks implements Wakes {
         if (state === "taken" && this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length === 0) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
       });
     };
-    if (kept?.state === "closed") return closed;
+    if (kept?.state === "closed") return closedAs(stands());
     if (kept?.state !== "taken") {
       if (!kept) {
         // Something new is added only to work that is at it.
         if (task.status === "queued") throw new Error("that piece of work has not begun yet (it waits for another to end), so there is nothing at work to tell. If what they want of it has changed, call it off and hand it over again as they now want it");
         if (task.status === "dispatching" || task.status === "unconfirmed") throw new Error("it is not known yet that this piece of work has begun, so nothing can be added to it at this moment; try again shortly");
-        if (TERMINAL_TASK.has(String(task.status))) return closed;
+        if (TERMINAL_TASK.has(String(task.status))) return closedAs(stands());
       }
       let worker: Worker;
       try {
@@ -691,7 +701,7 @@ export class Tasks implements Wakes {
           throw new Error("this was sent to the work once and the answer never came; the work has ended, and whether it was taken cannot be found out just now. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess");
         }
         settle(fate === "taken" ? "taken" : "closed");
-        if (fate !== "taken") return closed;
+        if (fate !== "taken") return closedAs(stands());
       } else {
         if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
         // Written down before it is sent: an answer that is lost leaves this, and the call made again goes by it.
@@ -701,7 +711,7 @@ export class Tasks implements Wakes {
           answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
         } catch {
           // Sent, and no answer: it may have been taken. Said as exactly that; the record stays as sent, and this same call made again finds out.
-          throw new Error("this was sent to the work and no answer came back: it may or may not have been taken. Do not send it again as something new, and do not hand it over as another piece of work, on a guess. Tell the person it was passed on but could not be confirmed; if it did not reach the work, that will be said when the work ends");
+          throw new Error("this was sent to the work and no answer came back: it may or may not have been taken. Do not send it again as something new, and do not hand it over as another piece of work, on a guess. Tell the person that you tried to pass it on and could not confirm that it arrived");
         }
         if (answer.state === "refused") {
           // Not taken, for a reason of its own: nothing is owed an answer later.
@@ -709,7 +719,7 @@ export class Tasks implements Wakes {
           throw new Error(`nothing was added: ${answer.error}`);
         }
         settle(answer.state);
-        if (answer.state === "closed") return closed;
+        if (answer.state === "closed") return closedAs(stands());
       }
     }
     // Read again after the wait.

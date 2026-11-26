@@ -861,6 +861,15 @@ describe("tasks, by themselves", () => {
           await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer");
           expect(worker.fates).toHaveLength(1);
 
+          // (Nothing is promised about being told later: a note the work never had cannot be reported by it as unread.)
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_tx", (await tasks.dispatch(RUN, SESSION_KEY, "call_x", "sandbox", "X", "x", { repository: null }) as { task_id: string }).task_id, "y")).rejects.toThrow(/could not confirm that it arrived$/);
+          // To work that did not end well, nothing is added and nothing is said of going on from it.
+          const lost = (await tasks.dispatch(RUN, SESSION_KEY, "call_l", "sandbox", "L", "l", { repository: null })) as { task_id: string };
+          await tasks.event(lost.task_id, 1, "failed", { error: "boom" });
+          const refused = (await tasks.tell(RUN, SESSION_KEY, "call_tl", lost.task_id, "y")) as { state: string; note: string };
+          expect(refused.state).toBe("closed");
+          expect(refused.note).toContain("nothing of it to go on from");
+          expect(refused.note).not.toContain("hand it over to go on from it");
           // One the worker never had: nothing was added, said as that.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("may or may not have been taken");
