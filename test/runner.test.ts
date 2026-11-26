@@ -233,7 +233,7 @@ describe("the run loop, by itself", () => {
       expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4", "approve CD34", "deny CD34", "deny EF56", "a5", "aside", "a6"]]);
     });
 
-    it("takes the result of a task that something was to follow in a person's name alone, and after what that person has said since", async () => {
+    it("takes the result of a task that something was to follow in a person's name alone, after what that person has said since, and passes over nobody else's turn for it", async () => {
       const runs = await within(async ({ runner, store, event, settings }) => {
         settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
         const task = (id: string, then: boolean) => {
@@ -259,7 +259,8 @@ describe("the run loop, by itself", () => {
         }
         return taken;
       });
-      expect(runs).toEqual([["do not post it after all"], ["result of t1"], ["result of t2"], ["result of t3", ""]]);
+      // Those two wait for her words; nothing else is passed over for them, and they are done after, each alone.
+      expect(runs).toEqual([["result of t3", ""], ["do not post it after all"], ["result of t1"], ["result of t2"]]);
     });
 
     it("takes a burst as several runs, by count and by size", async () => {

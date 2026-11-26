@@ -32,7 +32,7 @@ import { Tasks } from "./tasks";
 import { Marks } from "./marks";
 import { Timers } from "./timers";
 import { type Continuation, Requests } from "./requests";
-import { RunTools } from "./run-tools";
+import { RunTools, unheard } from "./run-tools";
 import { Runner } from "./runner";
 import { limitsFrom } from "../limits";
 
@@ -112,6 +112,7 @@ export class BrainAgent extends DurableObject<Env> {
       },
       outside: this.#outside,
       isDecider: (principal, source) => this.#isDecider(principal, source),
+      stillStands: (event) => this.#revisions.stillStands(event),
       toolsOf,
       guidance,
       workers,
@@ -381,6 +382,9 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("DELETE FROM task_queued WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_releases WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_notes WHERE task_id NOT IN (SELECT id FROM tasks)");
+      // What was to follow a task goes with the task; what a request had done, once none of its tasks is left and nothing of it waits.
+      this.#store.sql.exec("DELETE FROM task_then WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM request_acts WHERE request NOT IN (SELECT request FROM task_then) AND ('then:' || request) NOT IN (SELECT id FROM continuations WHERE status IN ('waiting', 'resuming'))");
       // The index of work is kept as long as what it points at: work that has ended, for the same time.
       this.#store.sql.exec("DELETE FROM work WHERE state != 'open' AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM audit WHERE at < ?", now - RETAIN_AUDIT_MS);
@@ -409,6 +413,25 @@ export class BrainAgent extends DurableObject<Env> {
   // Kept in ./requests. What is here is only what the wake cycle and the connectors call.
 
   /** Called by a connector when something changed for one of its subjects: see Requests.conditionReported. */
+  /**
+   * Asked by whatever is about to do something in a person's name for a call made here, at the
+   * last moment before it does: whether that is still wanted. Not, where what was to follow a
+   * task has been taken back, the request it waited as has ended, or the person has said
+   * something since in that conversation that has not been taken up (it may be "do not"). A call
+   * nothing is kept of here was made in the run of the person's own message, and stands.
+   */
+  async stillWanted(call: string): Promise<boolean> {
+    if (call.startsWith("then:")) {
+      const of = this.#store.rows<{ session_key: string; requested_by: string | null; withdrawn: number }>("SELECT t.session_key, t.requested_by, n.withdrawn FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.request = ?", call.slice("then:".length));
+      if (of.length === 0 || of.some((each) => each.withdrawn !== 0)) return false;
+      if (of.some((each) => each.requested_by !== null && unheard(this.#store, each.session_key, each.requested_by))) return false;
+    }
+    const kept = this.#store.rows<{ person: string | null; status: string; session_key: string }>("SELECT c.person, c.status, s.session_key FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", call)[0];
+    if (!kept) return true;
+    if (kept.status !== "resuming") return false;
+    return !(kept.person && unheard(this.#store, kept.session_key, kept.person));
+  }
+
   async conditionReported(connector: string, subject: string, event: string): Promise<{ ok: true }> {
     return this.#requests.conditionReported(connector, subject, event);
   }

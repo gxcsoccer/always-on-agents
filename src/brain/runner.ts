@@ -56,6 +56,9 @@ const RECENT_REQUEST_MS = 24 * 3_600_000;
 const MAX_RECENT_REQUESTS = 50;
 
 /** What the run loop needs from the Brain it is part of. */
+/** How long after a piece of work has ended what was to follow it in a person's name may still be done. */
+const FOLLOWS_WITHIN_MS = 60 * 60_000;
+
 export interface RunnerHost {
   readonly env: Env;
   /** Calls in this invocation whose result came from a connector's tool, until they are recorded. */
@@ -64,6 +67,8 @@ export interface RunnerHost {
   isDecider(principal: Principal, source: string): boolean;
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
+  /** Whether a message still says what it said when it came (see Revisions). */
+  stillStands(event: InboxRow): boolean;
   /** Every worker this deployment lists. */
   workers(): Worker[];
   /** Finished work the person this run is for can go on from: see Tasks. */
@@ -828,7 +833,7 @@ export class Runner {
    * nobody (see actingFor): nothing else that goes by who a run is for is opened by this.
    * Everything is taken from the Brain's own rows; nothing a worker reported says who or what.
    */
-  following(runId: string): { acting: NonNullable<ReturnType<Runner["actingFor"]>>; tools: string[]; request: string; task: string; made: InboxRow[] } | undefined {
+  following(runId: string): { acting: NonNullable<ReturnType<Runner["actingFor"]>>; tools: string[]; request: string; task: string; made: InboxRow[]; on?: string; until: number; seen?: Record<string, unknown> } | undefined {
     if (this.#b.requests.continuationOf(runId)) return undefined;
     const events = this.#b.requests.basis(runId);
     const then = events.length === 1 ? this.#thenOf(events[0]) : undefined;
@@ -838,22 +843,37 @@ export class Runner {
     if (made.length === 0 || made.length !== kept.said.length || made.some((each) => each.text === null)) return undefined;
     const acting = this.actingOn(made, kept.recent);
     if (!acting) return undefined;
+    // Where what was written can be changed afterwards and that is told: every message this rests on still says what it said.
+    const earlier = kept.recent.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${kept.recent.map(() => "?").join(",")})`, ...kept.recent);
+    if (![...made, ...earlier].every((each) => this.#b.stillStands(each))) return undefined;
     const tools = (JSON.parse(then.tools) as string[]).filter((name) => thenable(acting, this.#b.toolsOf).includes(name));
-    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made } : undefined;
+    // What the worker's host counted of the work, as it came with the result (the event is the Brain's own row).
+    const data = JSON.parse(events[0].data ?? "{}") as { github_reads?: unknown };
+    const seen = data.github_reads && typeof data.github_reads === "object" ? { github_reads: data.github_reads } : undefined;
+    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(then.repository ? { on: then.repository } : {}), until: events[0].received_at + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}) } : undefined;
   }
 
   /** What was to follow the task an event is the good end of, if anything was and it has not been taken back. */
-  #thenOf(event: InboxRow): { task_id: string; request: string; tools: string; events: string; requested_by: string } | undefined {
+  #thenOf(event: InboxRow): { task_id: string; request: string; tools: string; events: string; requested_by: string; repository: string | null } | undefined {
     if (event.source !== "worker" || event.kind !== "worker.result") return undefined;
     // (Whose task: as the Brain wrote it on the event when it took the report in.)
     const task = (JSON.parse(event.principal) as Principal).id;
-    return this.#s.rows<{ task_id: string; request: string; tools: string; events: string; requested_by: string }>("SELECT n.task_id, n.request, n.tools, n.events, t.requested_by FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.task_id = ? AND n.withdrawn = 0 AND t.status = 'succeeded' AND t.session_key = ? AND t.requested_by IS NOT NULL", task, event.session_key)[0];
+    return this.#s.rows<{ task_id: string; request: string; tools: string; events: string; requested_by: string; repository: string | null }>("SELECT n.task_id, n.request, n.tools, n.events, n.repository, t.requested_by FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.task_id = ? AND n.withdrawn = 0 AND t.status = 'succeeded' AND t.session_key = ? AND t.requested_by IS NOT NULL", task, event.session_key)[0];
   }
 
-  /** The earliest thing the person a task was for has said, in that conversation, that is not yet taken up: where the event is the result of a task something was to follow. */
-  #saidSince(event: InboxRow): InboxRow | undefined {
+  /**
+   * Whether an event is something to be done for a person who has said something since, in that
+   * conversation, that is not yet taken up: the result of a task something was to follow in their
+   * name, or a request of theirs that can be carried on. It waits for their words (they may be
+   * saying not to); everything else goes on in its turn meanwhile.
+   */
+  #waitsForWords(event: InboxRow): boolean {
     const then = this.#thenOf(event);
-    return then ? unheard(this.#s, event.session_key, then.requested_by) : undefined;
+    if (then) return unheard(this.#s, event.session_key, then.requested_by) !== undefined;
+    if (event.kind !== "request.ready") return false;
+    const request = (JSON.parse(event.data ?? "{}") as { request?: unknown }).request;
+    const person = typeof request === "string" ? this.#s.rows<{ person: string | null }>("SELECT person FROM continuations WHERE id = ?", request)[0]?.person : undefined;
+    return typeof person === "string" && unheard(this.#s, event.session_key, person) !== undefined;
   }
 
   /**
@@ -1366,11 +1386,11 @@ export class Runner {
     for (;;) {
       const active = this.activeRun();
       if (active) return active.retry_at && active.retry_at > Date.now() ? undefined : active.id;
-      const oldest = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT 1")[0];
-      if (!oldest) return undefined;
-      // What the person has said since comes before the result of a task that something was to
-      // follow in their name: they may be saying not to, and that has to be heard first.
-      const first = this.#saidSince(oldest) ?? oldest;
+      // In the order things came, but for what is to be done for a person who has said something
+      // since: that waits until their words are taken up (which are themselves in this line, so
+      // it does not wait for ever), and nobody else's turn is passed over for it.
+      const first = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT ?", MAX_EVENTS_PER_RUN * 4).find((each) => !this.#waitsForWords(each));
+      if (!first) return undefined;
       if (first.kind !== "request.ready") {
         // The very messages looked at are the ones taken up: what arrives meanwhile waits its turn.
         const batch = this.#batch(first);

@@ -215,6 +215,12 @@ export interface ConnectorTool {
    * that says so answers for what that takes: what it reads there is said in front of the others.
    */
   shared?: boolean;
+  /**
+   * That this tool may be named, when work is handed over, as what is to be done in the person's
+   * name once the work has ended well. Only for a tool that does its one thing once for a call id,
+   * however often it is called with it, and says so again rather than doing it again.
+   */
+  follows?: boolean;
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
@@ -295,7 +301,15 @@ export interface ToolContext {
    * what the person wrote. `said` and `recent` are still the person's own messages, the ones
    * the request was made in.
    */
-  after?: { work: string };
+  after?: {
+    work: string;
+    /** What the work was given to work on (for the sandbox: the repository), as the Brain gave it; none where it was given none. */
+    on?: string;
+    /** When what follows the work is no longer to be done: counted from when the work ended, however often the call is made. */
+    until: number;
+    /** What the worker's host itself counted of what the work did (not what the worker says of it), as it came with the result. */
+    seen?: Record<string, unknown>;
+  };
   /**
    * To be called by a tool for each of the person's messages its action actually rests on: the
    * one in `said` that names the thing, or the one in `recent` (by its index there) when the

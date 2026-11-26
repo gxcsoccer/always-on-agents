@@ -173,7 +173,7 @@ export class Tasks implements Wakes {
    * more than one): then the worker the deployment names for that tool (`firstWorker`), while it is offered. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
-  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }): Promise<unknown> {
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] }; on?: string }): Promise<unknown> {
     const scope = this.#s.scope();
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
@@ -275,7 +275,7 @@ export class Tasks implements Wakes {
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
         // What the person's request said was to be done for them after it, and the messages it
         // was made in: kept with the task from the start, under the run that hands it over.
-        if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events) VALUES (?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events));
+        if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events, repository) VALUES (?, ?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events), then.on ?? null);
       });
       // (One that waits is watched from when it is let through to be started, not while it waits.)
       if (!waits) this.#watch(id, sessionKey, title, now, this.#limits().task_minutes * 60_000);

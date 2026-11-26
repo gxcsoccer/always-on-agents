@@ -345,8 +345,11 @@ export const MIGRATIONS: string[] = [
   // (`events`: { said, recent }, inbox ids, as a request that waits keeps them). `request` is
   // the run that handed the task over: every task of that run is of the one request. And the
   // one thing a request has had done in the person's name, claimed before it is done.
-  `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, withdrawn INTEGER NOT NULL DEFAULT 0);
-   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, args TEXT NOT NULL, at INTEGER NOT NULL);`,
+  // `repository`: what the task was given to work on, as the Brain gave it. Of the one thing
+  // done: which tool and a digest of what it was called with (never the words themselves), and,
+  // once it has an end, what was said of it (`result`), so that it is said again and not done again.
+  `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, repository TEXT, withdrawn INTEGER NOT NULL DEFAULT 0);
+   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, digest TEXT NOT NULL, result TEXT, at INTEGER NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

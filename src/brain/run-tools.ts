@@ -35,7 +35,7 @@ export interface RunToolsHost {
   /** Whether this run may still use a tool, given what it has read. */
   mayUse(runId: string, name: string): boolean;
   /** What a run started by a task's result may do in a person's name, as their request said when it handed the task over: see Runner.following. */
-  following(runId: string): { acting: Acting; tools: string[]; request: string; task: string; made: InboxRow[] } | undefined;
+  following(runId: string): { acting: Acting; tools: string[]; request: string; task: string; made: InboxRow[]; on?: string; until: number; seen?: Record<string, unknown> } | undefined;
   /** Who may be changing the standing instructions in this run; throws if nobody may. */
   instructionEditors(runId: string): string[];
   /** A connector's tools. */
@@ -228,11 +228,15 @@ export class RunTools {
         // here, before it is done, so that two results of its tasks cannot each do one.
         const receipt = after !== undefined && found.effect === "act";
         if (after) {
+          if (Date.now() > after.until) throw new Error("what was to follow this work was not done in time, and is not done now; nothing was sent. The person can ask again");
           if (unheard(this.#s, String(session.session_key), acting.person)) throw new Error("the person has written since, and that is taken up first; nothing was done in their name. If they still want it, it is done when they say so");
-          const wanted = JSON.stringify(given);
-          const held = this.#s.rows<{ tool: string; args: string }>("SELECT tool, args FROM request_acts WHERE request = ?", after.request)[0];
-          if (held && (held.tool !== name || held.args !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
-          if (!held) this.#s.sql.exec("INSERT INTO request_acts (request, tool, args, at) VALUES (?, ?, ?, ?)", after.request, name, wanted, Date.now());
+          // Which call it is: by a digest, so that none of what is to be written is kept here beside it.
+          const wanted = await digestOf([name, given]);
+          const held = this.#s.rows<{ tool: string; digest: string; result: string | null }>("SELECT tool, digest, result FROM request_acts WHERE request = ?", after.request)[0];
+          if (held && (held.tool !== name || held.digest !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
+          // The very call again, and it has had its end: said again as it was said, and not done again, whatever the tool still keeps of it.
+          if (held?.result != null) return JSON.parse(held.result) as unknown;
+          if (!held) this.#s.sql.exec("INSERT INTO request_acts (request, tool, digest, at) VALUES (?, ?, ?, ?)", after.request, name, wanted, Date.now());
         }
         // Whatever comes back is from outside, including an error that quotes something. (Not what
         // comes back from something done, after a task: that says what was done, to be told to
@@ -248,7 +252,7 @@ export class RunTools {
           // it turns out to be a request already kept, or cannot be kept).
           let standing: "open" | WorkEnd | undefined;
           const work = handsTo ? { work: (as: "open" | WorkEnd) => void (standing = as) } : {};
-          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}), ...(after ? { after: { work: after.task } } : {}) }, given);
+          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}), ...(after ? { after: { work: after.task, until: after.until, ...(after.on ? { on: after.on } : {}), ...(after.seen ? { seen: after.seen } : {}) } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
@@ -281,9 +285,8 @@ export class RunTools {
           // Said by the tool of a call it kept nothing of: nothing was done and nothing begun. The
           // claim is given back, where nothing waits under it either, so that a call put right can
           // be made. (By what is kept, on both sides; not by what an error says.)
-          if (after && typeof result === "object" && result !== null && (result as { untouched?: unknown }).untouched === true && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", key).length === 0) {
-            this.#s.sql.exec("DELETE FROM request_acts WHERE request = ?", after.request);
-          }
+          const released = after !== undefined && typeof result === "object" && result !== null && (result as { untouched?: unknown }).untouched === true && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", key).length === 0;
+          if (released) this.#s.sql.exec("DELETE FROM request_acts WHERE request = ?", after!.request);
           if (typeof result === "object" && result !== null && "untouched" in result) delete (result as { untouched?: unknown }).untouched;
           if (!isWaiting(result)) {
             if (handsTo && standing) workIs(this.#s, { id: key, worker: handsTo, sessionKey: String(session.session_key), person: acting.person }, standing);
@@ -302,8 +305,11 @@ export class RunTools {
               this.#b.outbox.enqueue(`direct:${key}`, run.session_id, null, String(aside!.text).slice(0, MAX_MESSAGE_TEXT), undefined, undefined, { target: JSON.stringify(to) });
               // For them alone: its words are not kept once it has been delivered, like anything else said from what was brought in from outside.
               this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", `direct:${key}`);
+              if (after && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(rest), after.request);
               return rest;
             }
+            // What became of the one thing a request had done, kept as it was said: for the same call made again.
+            if (after && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(result), after.request);
             return result;
           }
           // Nothing was read. The answer the model gets is written here, not by the tool.
@@ -426,7 +432,7 @@ export class RunTools {
         const may = acting ? thenable(acting, this.#b.toolsOf) : [];
         const unknown = then.filter((each) => !may.includes(each));
         if (unknown.length > 0) throw new Error(`${unknown.join(", ")} cannot be named to follow this work: ${may.length > 0 ? `only ${may.join(", ")} can here` : "nothing can be done in a person's name from this run"}; nothing was handed over`);
-        const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds } } : undefined;
+        const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds }, ...(typeof own.repository === "string" ? { on: own.repository } : {}) } : undefined;
         const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom, following)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
@@ -492,7 +498,11 @@ export function standingOf(state: string, waits?: "authorisation" | "result", ha
 
 /** What a run that acts for a person may name, when it hands work over, as to be done in their name once the work has ended well: the things it may do in their name itself. */
 export function thenable(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): string[] {
-  return toolsIn(acting, toolsOf).filter((each) => each.effect === "act" && each.hands_to === undefined).map((each) => each.name);
+  return toolsIn(acting, toolsOf).filter((each) => each.effect === "act" && each.follows === true && each.hands_to === undefined).map((each) => each.name);
+}
+
+async function digestOf(value: unknown): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value))))].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** The earliest thing a person has said in a conversation that has not been taken up yet. */
