@@ -1913,7 +1913,20 @@ describe("records and limits", () => {
     expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT lease FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([{ lease: "L2" }]);
     await registry.releaseTaskSlot("t-lease", "L2");
     expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    // An asking for a taking that was given back, arriving late: takes nothing, whether or not a place has been taken since.
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L2")).toBe(false);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(true);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L1")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(true);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT lease FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([{ lease: "L3" }]);
+    await registry.releaseTaskSlot("t-lease", "L3");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L4")).toBe(true);
+    await registry.releaseTaskSlot("t-lease");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3b")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L3b");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L5")).toBe(true);
     await registry.releaseTaskSlot("t-lease");
     expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
 
