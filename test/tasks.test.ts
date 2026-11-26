@@ -1008,6 +1008,52 @@ describe("tasks, by themselves", () => {
         }
       });
 
+      it("writes down that a place is owed back before anything else can go wrong, and does not let a piece through on a place that is on its way out", async () => {
+        await within(async ({ tasks, kept, store, worker, slots, host }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // What A left is not kept, so B's start is refused; and the Brain fails right after ending B (the wake-up throws).
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          const wake = host.wakeBy;
+          host.wakeBy = async () => {
+            throw new Error("the Brain was replaced");
+          };
+          await tasks.settle().catch(() => undefined);
+          host.wakeBy = wake;
+          expect(kept(b.task_id).status).toBe("failed");
+          // Nothing was given back yet, but it is owed, and is given back on the next pass.
+          expect(slots.released).not.toContain(b.task_id);
+          expect(store.rows("SELECT task_id FROM task_releases")).toEqual([{ task_id: b.task_id }]);
+          store.sql.exec("UPDATE task_releases SET next_at = 0");
+          await tasks.settle();
+          expect(slots.released).toContain(b.task_id);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+
+          // A place was granted and the answer lost; then there is no room here; then it is called off while it waits: the place is given back.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("dispatching");
+          slots.acquire = async () => true;
+          const others = ["x1", "x2"].map((id) => `t_${id}`);
+          for (const id of others) store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, 'running', 0, 0)", id, id, SESSION_KEY);
+          store.setMeta("limits", JSON.stringify({ scope_active_tasks: 2 }));
+          due(store);
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("queued");
+          expect(slots.released).toContain(d.task_id);
+          const begun = worker.started.length;
+          await tasks.cancel(SESSION_KEY, d.task_id);
+          expect(worker.started).toHaveLength(begun);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+        });
+      });
+
       it("does not wait on a place being given back either: that is written down, tried within the pass's time, and tried again by its id", async () => {
         await within(async ({ tasks, kept, store, worker, slots }) => {
           const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
