@@ -185,8 +185,12 @@ describe("the repository credential a task is lent", () => {
     await stub.noteGithubRead("search", 200, {});
     await stub.noteGithubRead("search", 0, { incomplete: true });
     await stub.noteGithubRead("other", 403, {});
+    // Pages of two searches, told apart: one read to its end, one not.
+    await stub.noteGithubRead("search", 200, { read: true, more: true, of: "a", page: 1 });
+    await stub.noteGithubRead("search", 200, { read: true, of: "a", page: 2 });
+    await stub.noteGithubRead("search", 200, { read: true, more: true, incomplete: true, of: "b", page: 1 });
     const reads = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_reads);
-    expect(reads).toEqual({ search: { by_status: { "200": 4, failed: 1 }, read: 3, more: 1, none: 1, incomplete: 2 }, other: { by_status: { "403": 1 } } });
+    expect(reads).toEqual({ search: { by_status: { "200": 7, failed: 1 }, read: 6, more: 3, none: 1, incomplete: 3, each: { a: { pages: [1, 2], last: true, incomplete: false }, b: { pages: [1], last: false, incomplete: true } } }, other: { by_status: { "403": 1 } } });
   });
 
   it("no longer lends what was issued from an installation that has since been given to another tenant", async () => {
