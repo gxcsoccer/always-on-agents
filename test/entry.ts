@@ -91,16 +91,19 @@ export class FakeTask extends DurableObject {
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
   }
   /** As the real task: a credential that can only read, lent where the other is; none where the test says the task is not lent one. A test can have the lending fail, or the task end while it is asked. */
-  async githubReadToken(open = false) {
-    const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; noPublicToken?: boolean };
+  async githubReadToken() {
+    const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean };
     if (policy.lendingFails) throw new Error("GitHub refused to issue a token: 500");
     if (policy.endsWhileLending) {
       this.ctx.storage.kv.put("policy", { ...policy, ended: true });
       return undefined;
     }
-    if (!(policy.repository ?? "")) return undefined;
-    // Lent none by right: for what anyone may read, one that is allowed nothing, as the real task; none where the test says such a one cannot be had.
-    return !policy.unlent ? "test-read-token" : open && !policy.noPublicToken ? "test-public-token" : undefined;
+    return (policy.repository ?? "") && !policy.unlent ? "test-read-token" : undefined;
+  }
+  /** As the real task: one that is allowed nothing, for what anyone may read; none where the test says such a one cannot be had. */
+  async githubPublicToken() {
+    const policy = this.#policy() as { repository?: string; noPublicToken?: boolean };
+    return (policy.repository ?? "") && !policy.noPublicToken ? "test-public-token" : undefined;
   }
   async noteGithubRead(kind: string, status: number, seen: Record<string, unknown>) {
     // (Which search a page was of, and which page, are kept apart for the tests that ask about them.)

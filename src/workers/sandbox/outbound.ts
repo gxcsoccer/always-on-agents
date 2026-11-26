@@ -193,6 +193,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       target.searchParams.set("advanced_search", "true");
     }
     let token: string | undefined;
+    // Read with the credential that is allowed nothing, which the task has no right to: where
+    // that is turned away, what the task is told is what a stranger would be.
+    let optional = false;
     try {
       // What anyone may read of a public repository (its issues and pull requests, and the search
       // of them) is read with a credential also where the task is lent none by right: one that is
@@ -200,7 +203,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // else there (its files, who works on it, the repository's own description, which even
       // that one would be given of a private repository) only by right.
       const open = "search" in api || /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname);
-      token = await this.#task.githubReadToken(open);
+      token = await this.#task.githubReadToken();
+      if (token === undefined && open) {
+        token = await this.#task.githubPublicToken();
+        optional = token !== undefined;
+      }
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
       return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });
@@ -219,6 +226,16 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     try {
       // Manual: a redirect is not followed on the guest's behalf.
       answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+      // Turned away as the installation (not there for it, not allowed it): asked again as a
+      // stranger, and that answer is the one given. How GitHub turns an installation away says
+      // things a stranger is not told (that something not public is there). Being told to slow
+      // down is not that, and is passed on as it is.
+      const slowed = answer.status === 429 || answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after");
+      if (optional && [401, 403, 404, 422].includes(answer.status) && !slowed) {
+        await answer.body?.cancel();
+        headers.delete("authorization");
+        answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+      }
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
       return new Response("GitHub could not be reached; nothing was read\n", { status: 502 });

@@ -748,7 +748,7 @@ export class TaskSandbox extends DurableObject<Env> {
 
   /** The same, for reading GitHub's API: lent by the same rule, and it can only read. None without an App: there is no token of the deployment's that only reads. */
   /**
-   * `open`: for a read of what anyone may read of a public repository (its issues, pull requests,
+   * Beside it, for a read of what anyone may read of a public repository (its issues, pull requests,
    * their comments, the search of them), where the task is not lent a credential by right. There
    * it is lent one that is allowed nothing: GitHub answers it for what is public, counted as the
    * installation's own and not against an address many strangers share, and gives it nothing of
@@ -756,9 +756,12 @@ export class TaskSandbox extends DurableObject<Env> {
    * public, now or a minute ago. Where such a one cannot be had, none: the read is anonymous, as
    * it would have been.
    */
-  async githubReadToken(open = false): Promise<string | undefined> {
-    const by = await this.#lend("read");
-    if (by !== undefined || !open) return by;
+  async githubReadToken(): Promise<string | undefined> {
+    return this.#lend("read");
+  }
+
+  /** The one that is allowed nothing (see above), for a task that is lent none by right. */
+  async githubPublicToken(): Promise<string | undefined> {
     // (Only while the task is at work and is somebody's: at any other time nothing is lent, and that says nothing of the repository.)
     const lending = () => {
       const state = this.#state();

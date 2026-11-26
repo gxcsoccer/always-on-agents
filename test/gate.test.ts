@@ -176,9 +176,9 @@ describe("the repository credential a task is lent", () => {
     expect(await stub.githubToken()).toBe("test-github-token");
     expect(await stub.githubReadToken()).toBeUndefined();
     // Nor one that is allowed nothing, for what anyone may read: there is no App to issue it. Read with none, then; not a failure.
-    expect(await stub.githubReadToken(true)).toBeUndefined();
+    expect(await stub.githubPublicToken()).toBeUndefined();
     const elsewhere = await taskFrom("lend3:chat:oc_not_linked", "https://github.com/acme/demo");
-    expect(await elsewhere.githubReadToken(true)).toBeUndefined();
+    expect(await elsewhere.githubPublicToken()).toBeUndefined();
     // That none was to be had is kept for a while, so that it is not asked for with every read; and not kept of a read that is by right alone.
     const noted = () => runInDurableObject(elsewhere, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none);
     expect(await noted()).toMatchObject({ repo: "acme/demo" });
@@ -243,18 +243,18 @@ describe("the repository credential a task is lent", () => {
         state.storage.kv.put("state", { ...task, github_public_token: { token: "public-issued-earlier", expires_at: Date.now() + 3_600_000, source: "token", installation: "777" } });
       });
     await keepPublic();
-    expect(await open.githubReadToken(true)).toBe("public-issued-earlier");
+    expect(await open.githubPublicToken()).toBe("public-issued-earlier");
     expect(await open.githubReadToken()).toBeUndefined();
     expect(await open.githubToken()).toBeUndefined();
     await registry().linkGithubInstallation("777", "lend5");
-    expect(await open.githubReadToken(true)).toBeUndefined();
+    expect(await open.githubPublicToken()).toBeUndefined();
     await registry().linkGithubInstallation("777", "lend4");
     // A task that is not at work is lent nothing, and that is not taken for there being none to be had.
     await runInDurableObject(open, (_instance: unknown, state: DurableObjectState) => {
       const task = state.storage.kv.get("state") as any;
       state.storage.kv.put("state", { ...task, phase: "idle", github_public_none: undefined, github_public_token: undefined });
     });
-    expect(await open.githubReadToken(true)).toBeUndefined();
+    expect(await open.githubPublicToken()).toBeUndefined();
     expect(await runInDurableObject(open, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none)).toBeUndefined();
     // One kept as issued through an App with no word of which installation (an earlier version kept them so) is not known to be theirs still.
     const tenantOf = async (installation: string) => (installation === "777" ? "lend4" : null);

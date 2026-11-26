@@ -296,6 +296,27 @@ describe("GitHub's API over the proxy", () => {
     const lent = await proxyFor({ repository: "acme/demo" });
     await lent.send(issues);
     expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+    // Turned away as the installation: asked again as a stranger, and that is the answer the task gets.
+    const refused = await proxyFor({ repository: "acme/demo", unlent: true });
+    for (const status of [403, 404, 401]) {
+      const before = forwarded.length;
+      answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status, headers: { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990" } }));
+      answers.push(() => Response.json({ message: "Not Found" }, { status: 404, headers: { "x-ratelimit-limit": "60", "x-ratelimit-remaining": "59" } }));
+      const answer = await refused.send(issues);
+      expect(answer.status).toBe(404);
+      expect(answer.headers.get("x-ratelimit-limit")).toBe("60");
+      expect(await answer.text()).not.toContain("integration");
+      expect(forwarded.slice(before).map((each) => each.headers.get("authorization"))).toEqual(["Bearer test-public-token", null]);
+    }
+    // Told to slow down is told as that, and not asked again.
+    const before = forwarded.length;
+    answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(before + 1);
+    // By right, a refusal is what it is: nothing is asked a second time.
+    answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403 }));
+    expect((await lent.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(before + 2);
     // Such a one cannot be had: read with none, as it would have been. Not a failure.
     const none = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     expect((await none.send(issues)).status).toBe(200);
@@ -484,7 +505,7 @@ describe("GitHub's API over the proxy", () => {
   });
 
   it("says how a read went when it did not go well, never as nothing found", async () => {
-    const { send, recorded } = await proxyFor({ repository: "acme/demo", unlent: true });
+    const { send, recorded } = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
     const limited = await send(search("dst"));
     expect(limited.status).toBe(403);
