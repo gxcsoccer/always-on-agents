@@ -416,6 +416,18 @@ describe("a sandbox task that is told something while it is at work", () => {
     expect(it.bodies.at(-1).notes_not_read.map((note: any) => note.id)).toEqual(["a", "b"]);
   });
 
+  it("says what became of a note while its record is kept, and that it cannot say once the record is gone: never that a note it took was not added", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    await it.task.tell({ id: "a", text: "A" });
+    expect(await it.task.told("a")).toBe("taken");
+    expect(await it.task.told("never")).toBe("none");
+    // Its record is cleared away, as it is a day after it ended.
+    it.records.delete("state");
+    await expect(it.task.told("a")).rejects.toThrow("no longer kept");
+    await expect(it.task.told("never")).rejects.toThrow("no longer kept");
+  });
+
   it("gives the process a run of its own each time it is started, before it is started", async () => {
     const it = fixture();
     const given: (string | undefined)[] = [];

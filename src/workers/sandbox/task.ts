@@ -513,11 +513,19 @@ export class TaskSandbox extends DurableObject<Env> {
     return { state: "taken" };
   }
 
-  /** What became of a note, by its id; changes nothing. */
+  /**
+   * What became of a note, by its id; changes nothing. `none` only while the task's own record is
+   * still kept and has no trace of it: once the record has been cleared away (a day after the task
+   * ended) nothing can be said, and that is what is said, by throwing.
+   */
   async told(noteId: string): Promise<"taken" | "closed" | "none"> {
     const state = this.#state();
-    if (state?.notes?.some((each) => each.id === noteId)) return "taken";
-    return state?.notes_refused?.includes(noteId) ? "closed" : "none";
+    if (!state) throw new Error("the record of this task is no longer kept");
+    if (state.notes?.some((each) => each.id === noteId)) return "taken";
+    // (The list of those turned away keeps only the latest: one that may have dropped off it is not said never to have come.)
+    if (state.notes_refused?.includes(noteId)) return "closed";
+    if ((state.notes_refused?.length ?? 0) >= 50) throw new Error("the record of what was turned away is not complete");
+    return "none";
   }
 
   /** Called through Outbound when the container reports or asks. The reply goes back to the container. */

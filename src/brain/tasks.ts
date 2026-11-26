@@ -680,7 +680,6 @@ export class Tasks implements Wakes {
       } catch {
         throw new Error(kept ? "this was sent to the work once and the answer never came; its worker is no longer part of this deployment, so whether it was taken cannot be found out. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess" : "the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
       }
-      if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
       const ended = TERMINAL_TASK.has(String(this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status));
       if (kept && ended) {
         // Sent once, the answer lost, and the work has ended since: nothing is given now. What became of it is asked.
@@ -694,6 +693,7 @@ export class Tasks implements Wakes {
         settle(fate === "taken" ? "taken" : "closed");
         if (fate !== "taken") return closed;
       } else {
+        if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
         // Written down before it is sent: an answer that is lost leaves this, and the call made again goes by it.
         if (!kept) this.#s.sql.exec("INSERT INTO task_notes (call_id, task_id, state, at) VALUES (?, ?, 'sent', ?)", callId, taskId, Date.now());
         const answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
