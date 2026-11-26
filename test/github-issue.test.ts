@@ -940,6 +940,15 @@ describe("commenting on GitHub as the person who asked", () => {
     model.replies([comments(PUBLIC, 7, written)], ...done("好了"));
     await alone.says("", colleague, [[{ tag: "text", text: `在 ${PUBLIC}#7 评论：谢谢 @octo-cat 和 ` }, { tag: "at", user_id: "@_user_1" }, { tag: "text", text: " 的排查" }], [{ tag: "code_block", text: "@in-span\n@quoted-one" }]]);
     expect(world.commentWrites[1].body.body).toMatch(sent);
+    // The same words give the same names whichever way they are written: a line that goes on from the one before (indented), and a quotation over two lines.
+    const twoLines = ["谢谢 @octo-cat 的排查，", "    另外也请 @second-one 看一下", "> @quoted-one 之前说过", "这一行接着上面的引用，@stranger 也在里面"];
+    const plain = normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_plain", chat_id: "oc_x", chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: twoLines.join("\n") }) } } })!.event;
+    const rich = normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_rich", chat_id: "oc_x", chat_type: "p2p", message_type: "post", content: JSON.stringify({ title: "", content: twoLines.map((text) => [{ tag: "text", text }]) }) } } })!.event;
+    expect(plain.data?.handles).toEqual(["octo-cat", "second-one"]);
+    expect(rich.data?.handles).toEqual(plain.data?.handles);
+    // A title is the writer's too, and apart from what follows it.
+    const titled = normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_titled", chat_id: "oc_x", chat_type: "p2p", message_type: "post", content: JSON.stringify({ title: "请 @in-title 看", content: [[{ tag: "text", text: "> @quoted-one 之前说过" }]] }) } } })!.event;
+    expect(titled.data?.handles).toEqual(["in-title"]);
     // Nothing typed out as a mention: nobody is notified.
     model.replies([comments(PUBLIC, 7, "谢谢 @octo-cat。")], ...done("好了"));
     await alone.says(`在 ${PUBLIC}#7 评论：谢谢 octo-cat`);
