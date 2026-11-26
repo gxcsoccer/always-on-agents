@@ -653,7 +653,7 @@ describe("whose GitHub account it is", () => {
     const ann = someone();
     const alone = ann.at();
     // The account was noted as hers, and nothing more came of it.
-    expect(await registry().claimGithubPerson(TENANT, "9100", await grantName(ann.who), ann.openId)).toBe("new");
+    expect(await registry().claimGithubPerson(TENANT, "9100", await grantName(ann.who))).toBe("new");
     model.replies([opens(PUBLIC)], [say("")]);
     await alone.says(`在 ${PUBLIC} 提个 issue：重连后消息重复`);
     expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(403);
