@@ -87,6 +87,11 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     // Within a block of code, a line that only looks like the fence that would end it: a list item's, one further in, a shorter one, one of the other kind.
     "~~~md\n- ~~~\n**标题：**正文\n~~~",
     "~~~md\n    ~~~\n**标题：**正文\n~~~",
+    "  ~~~md\n    ~~~\n**标题：**正文\n  ~~~",
+    "   ~~~md\n    ~~~\n**标题：**正文\n~~~",
+    "-   ~~~\n  ~~~\n    **标题：**正文\n    ~~~",
+    "- ~~~\n      ~~~\n  **标题：**正文\n  ~~~",
+    "> ~~~\n>      ~~~\n> **标题：**正文\n> ~~~",
     "````md\n```\n**标题：**正文\n````",
     "~~~md\n```\n**标题：**正文\n~~~",
     "~~~md\n> ~~~\n**标题：**正文\n~~~",

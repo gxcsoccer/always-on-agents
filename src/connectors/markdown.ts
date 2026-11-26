@@ -136,10 +136,13 @@ export function emphasised(text: string): string {
     const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*)(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
     if (fenced && !(fenced[3][0] === "`" && fenced[4].includes("`"))) {
       flush();
-      // Where its container begins: just past the last mark before it (a quotation's mark may have no space after it).
+      // Where what its container holds begins, and so where a fence that ends it may stand: there, or up to three spaces
+      // further in. At the start of a line, that is the start. After a list item's mark, past the spaces after it (one to
+      // four; more than that, and one). After a quotation's mark, past it and the one space that may follow.
       const marks = fenced[1];
-      const within = marks === "" ? 0 : marks.length + 1 - (marks.endsWith(">") ? 1 : 0);
-      fence = { char: fenced[3][0], length: fenced[3].length, quotes: marks.split(">").length - 1, from: Math.min(within, marks.length + fenced[2].length), to: Math.max(within, marks.length + fenced[2].length) + 3 };
+      const spaces = fenced[2].length;
+      const [from, to] = marks === "" ? [0, 3] : marks.endsWith(">") ? [marks.length, marks.length + 4] : [marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1), marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1) + 3];
+      fence = { char: fenced[3][0], length: fenced[3].length, quotes: marks.split(">").length - 1, from, to };
       out.push(line);
     } else if (line.trim() === "") {
       flush();
