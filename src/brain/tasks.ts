@@ -51,6 +51,8 @@ const QUEUED_AGAIN_MS = 15_000;
 const QUEUED_PAST_MS = 5 * 60_000;
 /** How long a waiting piece whose turn has come goes on asking for a place. */
 const QUEUED_PLACE_MS = 60 * 60_000;
+/** How long one pass of bringing waiting pieces on may take in all: the Brain's conversations wait behind it. */
+const ADVANCE_BUDGET_MS = 8_000;
 /** What is said of a piece of work that waits for another to end. */
 const queuedNote = (after: string) => `This waits for ${after} to end. It starts by itself, from what that one leaves, when that has ended well; if that does not end well it is not started, and you are told. Tell the person it comes after that piece; do not hand it over again.`;
 
@@ -224,7 +226,8 @@ export class Tasks implements Wakes {
           if (next) tail = next;
         }
         if (tail !== from) throw new Error(`something already waits behind that piece of work; to have this done after it too, put it at the end of the line (continue_from: ${JSON.stringify(tail)}). Nothing was written`);
-        if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued' AND session_key = ?", sessionKey)[0].n >= MAX_QUEUED) throw new Error(`${MAX_QUEUED} pieces of work are already waiting here behind others; wait for one to begin, or call one off`);
+        // (Counted with those whose turn has come but which have not been let through yet: they still wait.)
+        if (this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM task_queued q JOIN tasks t ON t.id = q.task_id WHERE q.started_at IS NULL AND t.status IN ('queued', 'dispatching') AND t.session_key = ?", sessionKey)[0].n >= MAX_QUEUED) throw new Error(`${MAX_QUEUED} pieces of work are already waiting here behind others; wait for one to begin, or call one off`);
         waits = true;
       }
     }
@@ -414,10 +417,14 @@ export class Tasks implements Wakes {
    */
   async #advance(): Promise<void> {
     const scope = this.#s.scope();
+    // One pass has a time of its own for everything it waits on: what is not got to is looked at on the next.
+    const until = Date.now() + ADVANCE_BUDGET_MS;
+    const left = () => Math.max(0, until - Date.now());
     // (Oldest first, so that what ends here is seen by what waits behind it in the same pass.)
-    const waiting = this.#s.rows<{ task_id: string; options: string; started_at: number | null; attempts: number }>("SELECT q.* FROM task_queued q JOIN tasks t ON t.id = q.task_id WHERE q.next_at <= ? ORDER BY t.created_at LIMIT 20", Date.now());
+    const waiting = this.#s.rows<{ task_id: string; options: string }>("SELECT q.task_id, q.options FROM task_queued q JOIN tasks t ON t.id = q.task_id WHERE q.next_at <= ? ORDER BY t.created_at LIMIT 20", Date.now());
     for (const row of waiting) {
       const read = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", row.task_id)[0];
+      const let_through = () => this.#s.rows<{ started_at: number | null }>("SELECT started_at FROM task_queued WHERE task_id = ?", row.task_id)[0]?.started_at ?? null;
       const done = () => this.#s.sql.exec("DELETE FROM task_queued WHERE task_id = ?", row.task_id);
       const later = (ms: number) => this.#s.sql.exec("UPDATE task_queued SET attempts = attempts + 1, next_at = ? WHERE task_id = ?", Date.now() + ms, row.task_id);
       let task = read();
@@ -426,27 +433,25 @@ export class Tasks implements Wakes {
         continue;
       }
       const from = String(this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", row.task_id)[0]?.from_id ?? "");
-      let started = row.started_at;
+      const before = this.#s.rows<Row>("SELECT status, updated_at FROM tasks WHERE id = ?", from)[0];
       if (task.status === "queued") {
-        const before = this.#s.rows<Row>("SELECT status, updated_at FROM tasks WHERE id = ?", from)[0];
         if (!before || (TERMINAL_TASK.has(String(before.status)) && before.status !== "succeeded")) {
           done();
           await this.#ended(task, "failed", `the piece of work it was to go on from (${from}) ${before ? `did not end well (${before.status})` : "is not there any more"}, so this was not started`, false);
           continue;
         }
         if (before.status !== "succeeded") {
-          const until = this.#queuedUntil(from);
-          if (until !== undefined && Date.now() > until) {
+          const limit = this.#queuedUntil(from);
+          if (limit !== undefined && Date.now() > limit) {
             done();
             await this.#ended(task, "failed", `it waited for ${from} to end, and that has not ended in the longest time it could have run; this was not started`, false);
-          } else this.#s.sql.exec("UPDATE task_queued SET next_at = ? WHERE task_id = ?", until ?? Date.now() + QUEUED_PLACE_MS, row.task_id);
+          } else this.#s.sql.exec("UPDATE task_queued SET next_at = ? WHERE task_id = ?", limit ?? Date.now() + QUEUED_PLACE_MS, row.task_id);
           continue;
         }
         // Its turn. Whether there is room is looked at now, not when it was written.
         const most = this.#limits().scope_active_tasks;
         const none = most === 0 || this.#limits().tenant_sandboxes === 0;
-        const waited = Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS;
-        if (none || waited) {
+        if (none || Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS) {
           done();
           await this.#ended(task, "failed", none ? "tasks cannot be handed to a worker here at present: the limit set for this place is none" : "its turn came, and no place came free for it in an hour; this was not started", false);
           continue;
@@ -457,36 +462,52 @@ export class Tasks implements Wakes {
         }
         // Taken out of waiting before anything is asked of anyone: if that does not take, it was called off meanwhile.
         this.#s.sql.exec("UPDATE tasks SET status = 'dispatching', updated_at = ? WHERE id = ? AND status = 'queued'", Date.now(), row.task_id);
-        if (read()?.status !== "dispatching") continue;
+        task = read();
+        if (task?.status !== "dispatching") continue;
+      }
+      // Out of waiting, and not yet let through: whether it has a place is not known from anything
+      // kept here (the Brain may have been replaced while a place was being asked for). Asked for, by
+      // its own id, as often as it takes: a place already taken for it is simply found.
+      if (let_through() === null) {
+        if (left() === 0) break;
         const bounds = this.#boundsOf(task);
-        let place: boolean;
+        let place: boolean | undefined;
         try {
-          place = await this.#b.registry().acquireTaskSlot(scope.tenant, row.task_id, bounds.lifetime_ms);
+          place = await within(this.#b.registry().acquireTaskSlot(scope.tenant, row.task_id, bounds.lifetime_ms), Math.min(left(), CONFIRM_CALL_MS));
         } catch {
-          // Not known whether a place was taken: given back in case, and asked for again later.
-          await this.#b.registry().releaseTaskSlot(row.task_id).catch(() => undefined);
-          place = false;
+          // Not known whether one was taken: asked for again, by the same id, on a later pass.
+          place = undefined;
         }
         task = read();
         if (!task || task.status !== "dispatching") {
-          // Called off while the place was being asked for: the place is given back, and nothing is started.
-          if (place) await this.#b.registry().releaseTaskSlot(row.task_id).catch(() => undefined);
+          // Called off, or ended, while the place was being asked for: the place is given back, and nothing is started.
+          if (place !== false) await this.#b.registry().releaseTaskSlot(row.task_id).catch(() => undefined);
           done();
           continue;
         }
-        if (!place) {
-          // No place just now. It was promised: it goes back to waiting, and asks again.
-          this.#s.sql.exec("UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), row.task_id);
+        if (place !== true) {
+          // An hour after its turn came, with still no place: given up, and anything that was taken given back.
+          if (before && Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS) {
+            done();
+            await this.#ended(task, "failed", "its turn came, and no place came free for it in an hour; this was not started", true);
+            continue;
+          }
+          // No place just now (it was promised: back to waiting), or no answer (as it is, and asked again).
+          if (place === false) this.#s.sql.exec("UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), row.task_id);
           later(QUEUED_AGAIN_MS);
           continue;
         }
-        // Let through: from this moment, once, runs the time by which its worker may take it, and its watchdog.
-        started = Date.now();
-        this.#s.sql.exec("UPDATE task_queued SET started_at = ? WHERE task_id = ? AND started_at IS NULL", started, row.task_id);
-        this.#watch(row.task_id, String(task.session_key), String(task.title), started, bounds.lifetime_ms);
+        // Let through: from this moment, once, runs the time by which its worker may take it, and its watchdog;
+        // and what waits behind it now has an end to its waiting, and looks at it.
+        this.#s.transaction(() => {
+          const now = Date.now();
+          this.#s.sql.exec("UPDATE task_queued SET started_at = ? WHERE task_id = ? AND started_at IS NULL", now, row.task_id);
+          this.#watch(row.task_id, String(task!.session_key), String(task!.title), now, bounds.lifetime_ms);
+          this.#behind(row.task_id);
+        });
       }
       // Being started (now, or by an earlier pass whose asking was not answered, or which the Brain did not live to see answered).
-      started ??= Number(task.updated_at);
+      const started = Number(let_through());
       const heard = () => this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", row.task_id).length > 0;
       let worker: Worker | undefined;
       try {
@@ -501,9 +522,10 @@ export class Tasks implements Wakes {
         await this.#b.wakeBy(Date.now() + CONFIRM_FIRST_MS);
         continue;
       }
+      if (left() === 0) break;
       let answer: Started | undefined;
       try {
-        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }));
+        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
       } catch {
         answer = undefined;
       }
@@ -520,6 +542,8 @@ export class Tasks implements Wakes {
         done();
       } else later(QUEUED_AGAIN_MS);
     }
+    // What this pass did not get to is due still: looked at again soon, after the conversations have had their turn.
+    if (left() === 0 && this.#s.rows("SELECT 1 FROM task_queued WHERE next_at <= ? LIMIT 1", Date.now()).length > 0) await this.#b.wakeBy(Date.now() + 1_000);
   }
 
   /** Keeps a task as one whose start was not answered, to be asked about. */
