@@ -295,6 +295,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
+  const people = [...new Set((Array.isArray(mentions) ? mentions : []).filter((each: any) => (typeof each?.id === "string" ? each.id : each?.id?.open_id) !== app.bot_open_id).map((each: any) => token(each?.name)))].slice(0, 50);
+
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
   const thread: string | undefined = message.thread_id || undefined;
@@ -326,6 +328,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // Which documents this message links to, for a tool that reads what the person pointed at.
         ...(documents.length ? { documents } : {}),
         ...(pictures.length ? { pictures } : {}),
+        // The people of this chat the message mentions, as their names stand in its text (see `token`).
+        // They are people here: a tool that acts somewhere else must not take such a name for one there.
+        ...(people.length ? { people } : {}),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,

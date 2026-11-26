@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { commentableLines, githubConnector, inert, isOurs } from "../src/connectors/github";
+import { commentableLines, githubConnector, inert, isOurs, mentionsOf } from "../src/connectors/github";
 import { DeliveryDeferred } from "../src/connectors/types";
 import type { CodeReview } from "../src/connectors/types";
 import type { Env } from "../src/env";
@@ -232,6 +232,15 @@ describe("a code review on GitHub", () => {
     // A path is shown as it is, whatever it contains.
     expect(body).toContain("`` odd`name  two spaces.ts:3 ``");
     expect(inert("    @indented code stays")).toBe("    @indented code stays");
+    // An indented line is code only where Markdown reads it so: after a blank line, and not under a list item.
+    expect(inert("text\n\n    @code block\n\n    @still code\n\nand @after")).toBe("text\n\n    @code block\n\n    @still code\n\nand `@after`");
+    expect(inert("a paragraph\n    @going on")).toBe("a paragraph\n    `@going` on");
+    expect(inert("- item\n\n    @under the item\n1. one\n    @under one")).toBe("- item\n\n    `@under` the item\n1. one\n    `@under` one");
+    expect(inert("- item\n\nafter the list\n\n    @code again")).toBe("- item\n\nafter the list\n\n    @code again");
+    // Names left as they are: the ones given, however they are cased.
+    expect(inert("cc @Ann and @bob", new Set(["ann"]))).toBe("cc @Ann and `@bob`");
+    // What a writer mentions themselves: not in code, nor in what they quote.
+    expect([...mentionsOf("thanks @Ann\n> @quoted said so\n`@in-span` and\n```\n@fenced\n```\n\n    @indented\n\n- cc @acme/Team")]).toEqual(["ann", "acme/team"]);
   });
 
   it("shows paths literally in a review posted as a comment too", async () => {

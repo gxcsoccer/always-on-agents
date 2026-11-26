@@ -206,7 +206,7 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
   /** Where they talk to the agent: alone (their own chat), or in a chat several people share. */
   const at = (chatId?: string) => {
     const stub = (env as any).BRAIN.getByName(scopeName(chatId ? { tenant, kind: "chat", id: chatId } : { tenant, kind: "user", id: openId })) as any;
-    const event = (text: string) =>
+    const event = (text: string, mentions: unknown[] = []) =>
       normalize(app, {
         schema: "2.0",
         header: { event_type: "im.message.receive_v1", tenant_key: org, app_id: app.app_id },
@@ -214,11 +214,11 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
           sender: { sender_type: "user", tenant_key: org, sender_id: { open_id: openId } },
           message: chatId
             ? { message_id: `om_${chatId}_${openId}_${++n}`, chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }] }
-            : { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", message_type: "text", content: JSON.stringify({ text }) },
+            : { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", message_type: "text", content: JSON.stringify({ text }), ...(mentions.length ? { mentions } : {}) },
         },
       })!.event;
-    const says = async (text: string) => {
-      await stub.ingest(event(text));
+    const says = async (text: string, mentions: unknown[] = []) => {
+      await stub.ingest(event(text, mentions));
       await rest(stub);
     };
     /** Lets what is due happen: the grant telling the Brain, the Brain carrying on. */
@@ -721,6 +721,8 @@ describe("commenting on GitHub as the person who asked", () => {
     expect(world.commentWrites).toEqual([]);
     expect(toolOutputs()).toEqual([{ waiting: true, request: expect.any(String), note: expect.any(String) }]);
     expect(JSON.stringify(alone.cards()[0])).not.toContain("提醒的时区不对");
+    // The card says what it is for: a comment, and where, as she named it. Not an issue.
+    expect(JSON.stringify(alone.cards()[0])).toContain("要以你的名义在 acme/site#7 下发表评论，需要你先授权");
 
     model.replies(...done("评论好了"));
     expect((await consent(linkOn(alone.cards()[0]), ann.account)).status).toBe(200);
@@ -798,13 +800,52 @@ describe("commenting on GitHub as the person who asked", () => {
     expect(toolOutputs()[0].error).not.toContain("nothing was posted");
   });
 
-  it("notifies only those the person mentioned themselves, in a comment as in an issue", async () => {
+  it("comments only on the one the person pointed at in the repository they named it in", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    for (const repo of [PUBLIC, PRIVATE]) for (const number of [7, 9]) reported(repo, number, `${repo} ${number}`);
+    const asked = async (text: string, repo: string, number: number) => {
+      model.replies([comments(repo, number)], ...done("好"));
+      await alone.says(text);
+      return toolOutputs()[0];
+    };
+    const both = `${PUBLIC}#7 和 ${PRIVATE}#9 是两件事，评论一下：我这边也遇到了`;
+    // Two repositories, each with its own number: never one's name with the other's number.
+    expect((await asked(both, PUBLIC, 9)).error).toContain("has not said themselves which");
+    expect((await asked(both, PRIVATE, 7)).error).toContain("has not said themselves which");
+    expect(world.commentWrites).toEqual([]);
+    expect(await asked(both, PRIVATE, 9)).toMatchObject({ posted: true, repo: "acme/core", number: 9 });
+    // A number by itself where two repositories are named: not plain which, so nothing.
+    expect((await asked(`对比一下 ${PUBLIC} 和 ${PRIVATE}，在 #7 评论：我这边也遇到了`, PUBLIC, 7)).error).toContain("more than one repository");
+    expect(world.commentWrites).toHaveLength(1);
+  });
+
+  it("takes a number by itself as of the repository the same message names, whatever was said of another before", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    for (const number of [7, 9]) reported(PUBLIC, number, `site ${number}`);
+    reported(PRIVATE, 9, "core 9");
+    // Something else, a moment ago.
+    model.replies([say("")]);
+    await alone.says(`${PRIVATE}#9 是另一件事，先不管`);
+    // The number she wrote of the other repository is not this one's.
+    model.replies([comments(PUBLIC, 9)], ...done("好"));
+    await alone.says(`在 ${PUBLIC} 的 #7 评论：我这边也遇到了`);
+    expect(toolOutputs()[0].error).toContain("has not said themselves which");
+    expect(world.commentWrites).toEqual([]);
+    model.replies([comments(PUBLIC, 7)], ...done("好"));
+    await alone.says(`在 ${PUBLIC} 的 #7 评论：我这边也遇到了`);
+    expect(world.commentWrites).toEqual([expect.objectContaining({ repo: PUBLIC, number: 7 })]);
+  });
+
+  it("notifies only those the person mentioned themselves in what they asked, in a comment as in an issue", async () => {
     const ann = someone();
     const alone = await authorised(ann);
     reported(PUBLIC, 7, "提醒的时区不对");
-    model.replies([comments(PUBLIC, 7, "谢谢 @Octo-Cat 的排查，另外 cc @stranger 和 @acme/everyone。\n\n```\n@in-code stays\n```")], ...done("好了"));
-    await alone.says(`在 ${PUBLIC}#7 评论：谢谢 @octo-cat 的排查`);
-    expect(world.commentWrites[0].body.body).toMatch(/^谢谢 @Octo-Cat 的排查，另外 cc `@stranger` 和 `@acme\/everyone`。\n\n```\n@in-code stays\n```\n\n<!--/);
+    // She writes one name out; mentions a colleague of the chat, who is a person there and not an account on GitHub; and shows a name in code.
+    model.replies([comments(PUBLIC, 7, "谢谢 @Octo-Cat 的排查，另外 cc @stranger、@colleague、@in-span 和 @acme/everyone。\n\n- 复现步骤\n    续行里的 @list-one\n\n```\n@in-code stays\n```")], ...done("好了"));
+    await alone.says(`在 ${PUBLIC}#7 评论：谢谢 @octo-cat 和 @_user_1 的排查，写法见 \`@in-span\``, [{ key: "@_user_1", id: { open_id: "ou_colleague" }, name: "colleague" }]);
+    expect(world.commentWrites[0].body.body).toMatch(/^谢谢 @Octo-Cat 的排查，另外 cc `@stranger`、`@colleague`、`@in-span` 和 `@acme\/everyone`。\n\n- 复现步骤\n    续行里的 `@list-one`\n\n```\n@in-code stays\n```\n\n<!--/);
     model.replies([opens(PUBLIC, "时区", "@stranger 说过这个。")], ...done("好了"));
     await alone.says(`在 ${PUBLIC} 提个 issue：时区`);
     expect(world.writes.at(-1)!.body.body).toMatch(/^`@stranger` 说过这个。\n\n<!--/);
@@ -822,12 +863,83 @@ describe("commenting on GitHub as the person who asked", () => {
     expect(JSON.stringify(toolOutputs())).not.toContain("issuecomment");
     expect(here.heard().join("\n")).not.toContain("只有里面的人知道的事");
     expect(ann.directly("text").map((each) => each.text)).toEqual([`acme/core#7 只有里面的人知道的事\n${issue.html_url}#issuecomment-9001`]);
+    // Why one could not be posted says whether what it was to be on is there: that too is hers alone.
+    model.replies([comments(PRIVATE, 99)], ...done("没发成，原因私下发你"));
+    await here.says(`在 ${PRIVATE}#99 评论：我这边也遇到了`);
+    expect(toolOutputs()).toEqual([{ error: expect.stringContaining("Why is being sent to the person directly") }]);
+    expect(JSON.stringify(toolOutputs())).not.toContain("no issue or pull request");
+    expect(ann.directly("text").at(-1)!.text).toContain("acme/core#99: there is no issue or pull request of that number");
+    world.locked.add(`${PRIVATE}#7`);
+    model.replies([comments(PRIVATE, 7)], ...done("没发成，原因私下发你"));
+    await here.says(`在 ${PRIVATE}#7 评论：我这边也遇到了`);
+    expect(toolOutputs()).toEqual([{ error: expect.stringContaining("Why is being sent to the person directly") }]);
+    expect(ann.directly("text").at(-1)!.text).toContain("did not let the person comment there");
+    world.locked.clear();
+    // In a public repository it is said where she asked, as the comment's link is.
+    const open = reported(PUBLIC, 7, "提醒的时区不对");
+    model.replies([comments(PUBLIC, 98)], ...done("没有这一条"));
+    await here.says(`在 ${PUBLIC}#98 评论：我这边也遇到了`);
+    expect(toolOutputs()[0].error).toContain("no issue or pull request of that number");
+    const sentBefore = ann.directly("text").length;
+    // Made private while it was being posted: by the time anything is said of it, the others may not see it.
+    world.duringWrite = () => void (world.repos.get(PUBLIC)!.private = true);
+    model.replies([comments(PUBLIC, 7)], ...done("评论好了，链接私下发你"));
+    await here.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
+    world.duringWrite = undefined;
+    expect(world.commentWrites.at(-1)).toMatchObject({ repo: PUBLIC, number: 7 });
+    expect(JSON.stringify(toolOutputs())).not.toContain("issuecomment");
+    expect(JSON.stringify(toolOutputs())).not.toContain("提醒的时区不对");
+    expect(ann.directly("text").slice(sentBefore).map((each) => each.text)).toEqual([expect.stringContaining(`${open.html_url}#issuecomment-`)]);
+    world.repos.get(PUBLIC)!.private = false;
     // Where the chat is outside the organisation's own, nothing is posted at all.
+    const before = world.commentWrites.length;
     world.external.add("oc_guests");
     const guests = ann.at("oc_guests");
     model.replies([comments(PRIVATE, 7)], [say("")]);
     await guests.says(`在 ${PRIVATE}#7 评论：我这边也遇到了`);
     expect(toolOutputs()[0].error).toContain("nothing was posted");
+    expect(world.commentWrites).toHaveLength(before);
+  });
+
+  it("still finds an issue that was sent under the mark as it used to be written, and sends neither kind again", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const replay = async (asked: any) => {
+      model.replies([asked], ...done("好"));
+      await alone.says(`在 ${PUBLIC}#1 评论，或者提个 issue：升级前发的`);
+      return toolOutputs()[0];
+    };
+    // Taken by GitHub, the answer lost, and not to be looked for: not known.
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    const issue = call("github_create_issue", { repo: PUBLIC, title: "升级前发的", body: "" }, "call_before_upgrade");
+    expect((await replay(issue)).error).toContain("could not be confirmed whether the issue was created");
+    // As it would be there had it been sent by the earlier version: the same mark, without what it now begins with.
+    const sent = world.issues.at(-1)!;
+    expect(sent.body).toContain("<!-- always-on-agent:request:");
+    sent.body = sent.body.replace("always-on-agent:", "");
+    world.listingDown = false;
+    expect(await replay(issue)).toMatchObject({ created: true, url: sent.html_url });
+    // Not there at all (someone removed it): still not known, and still not sent again.
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    const other = call("github_create_issue", { repo: PUBLIC, title: "找不到的", body: "" }, "call_not_found");
+    await replay(other);
+    world.issues.pop();
+    world.listingDown = false;
+    expect((await replay(other)).error).toContain("could not be confirmed whether the issue was created");
+    expect(world.writes.filter((each) => ["升级前发的", "找不到的"].includes(each.body.title))).toHaveLength(2);
+    // A comment made again by the same call is looked for, never posted again; and only by the mark as it is now.
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    const comment = call("github_comment", { repo: PUBLIC, number: 1, body: "重放的评论。" }, "call_comment_again");
+    expect((await replay(comment)).error).toContain("could not be confirmed whether the comment was posted");
+    world.listingDown = false;
+    const posted = world.comments.at(-1)!;
+    posted.body = posted.body.replace("always-on-agent:", "");
+    expect((await replay(comment)).error).toContain("could not be confirmed whether the comment was posted");
+    posted.body = posted.body.replace("<!-- request:", "<!-- always-on-agent:request:");
+    expect(await replay(comment)).toMatchObject({ posted: true, url: posted.html_url });
     expect(world.commentWrites).toHaveLength(1);
   });
 

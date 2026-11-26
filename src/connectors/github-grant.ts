@@ -20,7 +20,7 @@ import { registry } from "../registry";
 import { chatFactsFor } from "./feishu-api";
 import { chatIs } from "./feishu-docs";
 import { challengeOf, grantsKey, lifetime, open, random, seal } from "./feishu-grant";
-import { inert } from "./github";
+import { inert, mentionsOf } from "./github";
 import { githubTokenFor } from "./github-app";
 import type { ConnectorTool, Holds, Invitation, ToolContext, Waiting } from "./types";
 
@@ -85,7 +85,7 @@ const ENDED: Op["stage"][] = ["posted", "lost", "failed"];
 interface Stored {
   who: Who;
   generation: number;
-  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat" }; held?: Held }[];
+  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat"; action?: string }; held?: Held }[];
   /** `refresh`: absent where the App's tokens do not run out. `account`: whose it is on GitHub, by number. */
   grant?: { access: string; refresh?: string; version: string; expires_at: number; refresh_expires_at?: number; since: number; account: number; login: string };
   /** The GitHub account that is this person's in the tenant, by number: from when they first authorised as it until they give it up, whatever becomes of the tokens meanwhile. */
@@ -116,7 +116,7 @@ export class GithubGrant extends DurableObject<Env> {
   #posting = new Map<string, Promise<Op | "unauthorised" | "later" | undefined>>();
 
   /** Makes an invitation for this person to authorise, for one request. */
-  async invite(who: Who, redirect: string, generation: number, what: { brain: string; call: string; text: string; where: "private" | "chat" }): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
+  async invite(who: Who, redirect: string, generation: number, what: { brain: string; call: string; text: string; where: "private" | "chat"; action?: string }): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [] };
     if (!same(stored.who, who)) throw new Error("this authorisation belongs to someone else");
     if (stored.generation !== generation || (stored.grant && this.#usable(stored.grant))) return "superseded";
@@ -126,7 +126,7 @@ export class GithubGrant extends DurableObject<Env> {
     let pending = stored.pending.find((each) => !each.state && each.redirect === redirect && each.expires_at - now > 3 * 60_000 && each.brain === what.brain && each.call === what.call);
     if (!pending) {
       if (stored.pending.length >= MAX_INVITATIONS) return "full";
-      pending = { nonce: random(32), verifier: random(48), redirect, expires_at: now + INVITATION_TTL_MS, brain: what.brain, call: what.call, what: { text: what.text.slice(0, 80), where: what.where } };
+      pending = { nonce: random(32), verifier: random(48), redirect, expires_at: now + INVITATION_TTL_MS, brain: what.brain, call: what.call, what: { text: what.text.slice(0, 80), where: what.where, ...(what.action ? { action: what.action.slice(0, 160) } : {}) } };
       stored.pending = [...stored.pending, pending];
     }
     void this.ctx.storage.put("grant", stored);
@@ -143,7 +143,8 @@ export class GithubGrant extends DurableObject<Env> {
     const url = `${AUTHORIZE}?${new URLSearchParams({ client_id: this.env.GITHUB_CLIENT_ID, redirect_uri: pending.redirect, state: `${name}.${pending.nonce}`, code_challenge: await challengeOf(pending.verifier), code_challenge_method: "S256" })}`;
     return {
       title: "需要你的 GitHub 授权",
-      text: `要以你的名义在 GitHub 上建 issue，需要你先授权。\n\n授权是给这个 GitHub 应用的：它在 GitHub 上被允许做的事，在你有权限的仓库里都能以你的身份做，不只是建 issue。我只用它来做你明确要求的这件事。${about}`,
+      // What it is for, in the words of what was asked: an issue, or a comment and where (as the person themselves named it).
+      text: `要以你的名义${pending.what?.action ?? "在 GitHub 上建 issue"}，需要你先授权。\n\n授权是给这个 GitHub 应用的：它在 GitHub 上被允许做的事，在你有权限的仓库里都能以你的身份做，不只是建 issue 或评论。我只用它来做你明确要求的这件事。${about}`,
       action: { label: "去授权", url },
       note: "链接 10 分钟内有效。请只由你本人打开，不要转给别人：谁打开并确认，就是把谁的 GitHub 账号交给你在这里使用。授权完成后我会接着处理，你不用再发一遍。之后随时可以让我取消，或在 GitHub 的 Settings → Applications 里撤销。",
     };
@@ -417,7 +418,9 @@ export class GithubGrant extends DurableObject<Env> {
       const listed = await github(held.token, `/repos/${op.repo}/issues?${new URLSearchParams({ creator: held.login, state: "all", since: new Date(op.created_at - 60_000).toISOString(), per_page: "100" })}`);
       if (!listed.ok) return undefined;
       const issues = (await listed.json()) as { number?: unknown; html_url?: unknown; body?: unknown; user?: { id?: unknown }; pull_request?: unknown; repository_url?: unknown }[];
-      const found = (Array.isArray(issues) ? issues : []).find((each) => !each.pull_request && each.user?.id === held.account && typeof each.body === "string" && each.body.trimEnd().endsWith(mark));
+      // (Also by the mark as it was written before it began as the agent's own marks do: an issue sent under that one is the same issue.)
+      const marks = [mark, mark.replace("always-on-agent:", "")];
+      const found = (Array.isArray(issues) ? issues : []).find((each) => !each.pull_request && each.user?.id === held.account && typeof each.body === "string" && marks.some((one) => (each.body as string).trimEnd().endsWith(one)));
       return found && typeof found.number === "number" && typeof found.html_url === "string" ? { number: found.number, url: found.html_url } : undefined;
     } catch {
       return undefined;
@@ -643,9 +646,24 @@ function receipt(op: Op, name = op.repo): { open: Record<string, unknown>; alone
   };
 }
 
-/** The names a person mentioned themselves (@name, @org/team), in lower case: the only ones a text sent in their name may notify. */
-function mentioned(texts: string[]): Set<string> {
-  return new Set(texts.flatMap((text) => [...text.matchAll(/(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g)].map((found) => found[1].toLowerCase())));
+/** Every repository a text names whole: by its address on GitHub (the first two parts of the path), or as owner/name standing by itself, never part of some other address or path. In lower case. */
+function reposIn(text: string): string[] {
+  const addresses = [...text.matchAll(/https?:\/\/(?:www\.)?github\.com\/([\w.-]+\/[\w.-]+)/gi)].map((found) => found[1]);
+  const bare = [...text.replace(/https?:\/\/\S+/gi, " ").matchAll(/(?<![\w.\/-])([\w.-]+\/[\w.-]+)(?![\w\/-])/g)].map((found) => found[1]);
+  return [...addresses, ...bare].map((found) => found.replace(/(\.git|[.\/])+$/i, "").toLowerCase());
+}
+
+/**
+ * The issues and pull requests a text points at. With their repository: by address
+ * (…/issues/12, …/pull/12) or as owner/name#12. Or by number alone (#12), which says nothing of
+ * where.
+ */
+function targetsIn(text: string): { whole: { repo: string; number: number }[]; bare: number[] } {
+  const addressed = [...text.matchAll(/https?:\/\/(?:www\.)?github\.com\/([\w.-]+\/[\w.-]+)\/(?:issues|pull)\/(\d+)(?!\d)/gi)];
+  const rest = text.replace(/https?:\/\/\S+/gi, " ");
+  const short = [...rest.matchAll(/(?<![\w.\/-])([\w.-]+\/[\w.-]+)#(\d+)(?!\d)/g)];
+  const alone = [...rest.replace(/[\w.-]+\/[\w.-]+#\d+/g, " ").matchAll(/(?<![\w\/])#(\d+)(?!\d)/g)];
+  return { whole: [...addressed, ...short].map((found) => ({ repo: found[1].toLowerCase(), number: Number(found[2]) })), bare: alone.map((found) => Number(found[1])) };
 }
 
 async function attempt(kind: Kind, context: ToolContext, args: Record<string, unknown>, seen: { op?: () => Promise<Op | undefined> }): Promise<unknown> {
@@ -678,28 +696,58 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
     if (kind === "comment" && !written) return { error: "a comment has to say something; nothing was posted" };
     if (written.length > MAX_BODY) return { error: `the body is too long: at most ${MAX_BODY} characters` };
     const own = [...context.said, ...context.recent];
-    const relied = (index: number) => (index < context.said.length ? context.relied?.("said", index) : context.relied?.("recent", index - context.said.length));
-    // Which repository is the person's to say, not the model's: named whole in their own words (owner/name, or its address on GitHub).
-    const whole = (found: string) => found.replace(/(\.git|[.\/])+$/i, "").toLowerCase() === repo;
-    const names = (text: string) => {
-      // Its address on GitHub (the first two parts of the path), or owner/name standing by itself: never part of some other address or path.
-      const addresses = [...text.matchAll(/https?:\/\/(?:www\.)?github\.com\/([\w.-]+\/[\w.-]+)/gi)].map((found) => found[1]);
-      const bare = [...text.replace(/https?:\/\/\S+/gi, " ").matchAll(/(?<![\w.\/-])([\w.-]+\/[\w.-]+)(?![\w\/-])/g)].map((found) => found[1]);
-      return [...addresses, ...bare].some(whole);
+    // The messages this request comes to rest on, beside the ones it was made in.
+    const rests = new Set<number>();
+    const relied = (index: number) => {
+      rests.add(index);
+      if (index < context.said.length) context.relied?.("said", index);
+      else context.relied?.("recent", index - context.said.length);
     };
-    // The message that named it is part of what this request rests on.
-    const named = own.findIndex((each) => names(each.text));
+    // Which repository is the person's to say, not the model's: named whole in their own words (owner/name, or its address on GitHub).
+    const named = own.findIndex((each) => reposIn(each.text).includes(repo));
     if (named < 0) return { error: `the person has not named that repository themselves; ${none}. Ask them which repository they mean (as owner/name)` };
-    relied(named);
-    if (kind === "comment") {
-      // So with which one is commented on: its number as they wrote it (#12, or the address of the issue or pull request), not any number that happens to be there.
-      const points = (text: string) => new RegExp(`#${number}(?!\\d)|/(?:issues|pull)/${number}(?!\\d)`).test(text);
-      const pointed = own.findIndex((each) => points(each.text));
-      if (pointed < 0) return { error: `the person has not said themselves which issue or pull request (as #${number}, or by its address); nothing was posted. Ask them which one they mean` };
-      relied(pointed);
+    if (kind === "issue") relied(named);
+    else {
+      // So with which one is commented on, and the two go together: the one they pointed at in
+      // that repository (its address, or owner/name#12). A number by itself (#12) is of the
+      // repository only where they have named no other; never one repository's name with a
+      // number they wrote of another.
+      // Which repository a number by itself is of: the one the same message names, if it names
+      // one; if it names none, the only one they have named at all.
+      const everywhere = [...new Set(own.flatMap((each) => reposIn(each.text)))];
+      const of = (text: string) => {
+        const here = [...new Set(reposIn(text))];
+        return here.length === 1 ? here[0] : here.length === 0 && everywhere.length === 1 ? everywhere[0] : undefined;
+      };
+      // What they say now comes first: only where that points at nothing of this number is what they said shortly before looked at.
+      let settled = false;
+      for (const [from, to] of [[0, context.said.length], [context.said.length, own.length]]) {
+        const among = own.map((each, index) => ({ index, text: each.text })).slice(from, to);
+        const pointed = among.find((each) => targetsIn(each.text).whole.some((at) => at.repo === repo && at.number === number));
+        const loose = among.filter((each) => targetsIn(each.text).bare.includes(number));
+        const mine = loose.find((each) => of(each.text) === repo);
+        if (pointed) relied(pointed.index);
+        else if (mine) (relied(named), relied(mine.index));
+        else if (loose.some((each) => of(each.text) === undefined)) return { error: `the person named more than one repository, and it is not plain which of them #${number} is in; nothing was posted. Ask them which one they mean (as owner/name#${number}, or by its address)` };
+        else continue;
+        settled = true;
+        break;
+      }
+      if (!settled) return { error: `the person has not said themselves which issue or pull request in that repository (as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
     }
-    // In their name, a mention notifies someone only where they wrote it so themselves.
-    const body = inert(written, mentioned(own.map((each) => each.text)));
+    // In their name, a mention notifies someone only where they wrote it so themselves: in what
+    // they asked this time, or in an earlier message of theirs that this rests on. Not in code,
+    // nor in what they quoted (where the chat keeps a quotation apart as lines of its own: one that flattens a message to a line does not, and there a name in it counts as theirs).
+    // (A name the chat put there for one of its own people, whom they mentioned in the chat, is a person of the chat, not an account on GitHub.)
+    const theirs = new Set(
+      own
+        .filter((_, index) => index < context.said.length || rests.has(index))
+        .flatMap((each) => {
+          const here = new Set((Array.isArray(each.data.people) ? each.data.people : []).map((name) => String(name).replace(/^@/, "").toLowerCase()));
+          return [...mentionsOf(each.text)].filter((name) => !here.has(name));
+        }),
+    );
+    const body = inert(written, theirs);
     if (body.length > MAX_BODY) return { error: `the body is too long: at most ${MAX_BODY} characters` };
     fresh = kind === "comment" ? { title: "", body, kind, number } : { title, body, kind: undefined, number: undefined };
   }
@@ -733,17 +781,32 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
   if (done === "unauthorised") {
     if (Date.now() >= op.deadline) return { error: why(kind, "late") };
     const about = kind === "comment" ? `${op.repo}#${op.number}` : op.title;
-    const invitation = await grant.invite(who, redirect, standing.generation, { brain: scopeName(scope), call: context.callId, text: context.said.map((each) => each.text.trim()).filter(Boolean).join(" ") || about, where: scope.kind === "chat" ? "chat" : "private" });
+    const invitation = await grant.invite(who, redirect, standing.generation, { brain: scopeName(scope), call: context.callId, text: context.said.map((each) => each.text.trim()).filter(Boolean).join(" ") || about, where: scope.kind === "chat" ? "chat" : "private", ...(kind === "comment" ? { action: `在 ${op.repo}#${op.number} 下发表评论` } : {}) });
     if (invitation === "superseded") return { error: `the person's GitHub authorisation changed just now; ${none}. They can ask again` };
     if (invitation === "full") return { error: `too many authorisations were begun and not finished in the last hour; ${none}. They can ask again later` };
     return { waiting: { on: "authorisation", subject: name, condition: `github|auth|${name}|${invitation.nonce}`, generation: invitation.generation, until: Math.min(invitation.expires_at, op.deadline), interaction: `github.${name}.${invitation.nonce}`, ...(scope.kind === "chat" ? { privately: true as const } : {}), request: kind === "comment" ? { repo: op.repo, number: op.number } : { repo: op.repo, title: op.title } } } satisfies Waiting;
   }
   if (done.stage === "lost") return { error: uncertain(kind) };
+  // Where several people talk, what tells of a repository the others may not be able to see is
+  // the person's alone: unless this chat is set up to work on that repository. As things are now,
+  // asked again after the sending (a repository can be made private meanwhile); where it cannot
+  // be told, it is taken as one they may not see.
+  const hidden = async () => {
+    if (scope.kind !== "chat") return false;
+    const now = await repositoryOf(env, scope.tenant, repo);
+    const open = typeof now === "object" && now.id === op.repo_id && !now.private;
+    return !open && (await registry(env).chatRepo(scope.tenant, scope.id)) !== repo;
+  };
   const made = done.stage === "posted" ? receipt(done, repository.name) : undefined;
-  if (!made) return { error: why(kind, done.why ?? "") ?? `the ${kind} was not ${kind === "issue" ? "created" : "posted"}` };
-  // Where several people talk, a link into a repository the others may not be able to see is the
-  // person's alone: unless this chat is set up to work on that repository. As things are now.
-  if (scope.kind === "chat" && repository.private && (await registry(env).chatRepo(scope.tenant, scope.id)) !== repo) {
+  if (!made) {
+    const reason = why(kind, done.why ?? "") ?? `the ${kind} was not ${kind === "issue" ? "created" : "posted"}`;
+    // Why a comment could not be posted says whether what it was to be on is there.
+    if (kind === "comment" && (done.why === "no_target" || done.why === "no_comment") && (await hidden())) {
+      return { error: "the comment was not posted. Why is being sent to the person directly and is not given here: say that, and nothing more about it", direct: { text: `${op.repo}#${op.number}: ${reason}` } };
+    }
+    return { error: reason };
+  }
+  if (await hidden()) {
     return { ...made.alone, note: `The ${kind} was ${kind === "issue" ? "created" : "posted"} as the person. The repository is not public and this chat is not set up for it, so its link is being sent to them directly and is not given here: say that, and nothing more about it.` };
   }
   return made.open;
