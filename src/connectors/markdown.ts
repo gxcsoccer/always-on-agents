@@ -111,44 +111,39 @@ const HIDDEN = "";
  */
 export function emphasised(text: string): string {
   // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
+  const all = text.split("\n");
   const out: string[] = [];
-  // The block of code that is open: its fence, how many quotations it stands in, and what a line that ends it looks like before its fence.
-  let fence: { char: string; length: number; quotes: number; before: RegExp | undefined } | undefined;
+  // The block of code that is open: its fence.
+  let fence: { char: string; length: number } | undefined;
   let lines: string[] = [];
   const flush = () => {
     if (lines.length > 0) out.push(paragraph(lines.join("\n")));
     lines = [];
   };
-  for (const line of text.split("\n")) {
-    // A block of code opened inside a quotation ends where the quotation does, closed or not: what follows a blank line after it is prose again.
-    if (fence && fence.quotes > 0 && line.trim() === "") fence = undefined;
+  for (let n = 0; n < all.length; n++) {
+    const line = all[n];
     if (fence) {
-      // What ends it is told narrowly, from the line itself: a fence of its kind and no shorter, with nothing after it, and
-      // before it only what its container puts there and up to three spaces. A line of the code that only looks like one
-      // (a list item's, or further in) does not end it. One left open leaves what follows as it is.
-      const closing = /^([ >]*)(`{3,}|~{3,})[ \t]*$/.exec(line);
-      if (closing && closing[2][0] === fence.char && closing[2].length >= fence.length && fence.before?.test(closing[1])) fence = undefined;
+      // Opened at the very start of a line, it is in nothing: what ends it is a fence of its kind and no shorter, with
+      // nothing after it, no more than three spaces in.
+      const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (closing && closing[1][0] === fence.char && closing[1].length >= fence.length) fence = undefined;
       out.push(line);
       continue;
     }
-    // What opens one is told widely: a fence at the start of a line, or after the marks of quotations and of list items on
-    // it, however far in. (More widely than Markdown takes it: what is then left as it is would at worst have been mended.)
-    const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*)(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
-    if (fenced && !(fenced[3][0] === "`" && fenced[4].includes("`"))) {
+    // A fence anywhere on a line's way in: at its start, after spaces, after the marks of quotations and of list items.
+    const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*\s*)(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenced && !(fenced[2][0] === "`" && fenced[3].includes("`"))) {
       flush();
-      // What stands before a fence that ends it. At the start of a line: up to three spaces. In quotations and nothing else:
-      // each one's mark (up to three spaces before it, one space after it or none), wherever on the line it stands, and then up
-      // to three spaces. Under a list item and nothing else: as far in as what the item holds begins (past its mark and the one
-      // to four spaces after it; more than that, and one), and up to three spaces more. In both at once it cannot be told:
-      // nothing ends it but the end of the quotation.
-      const marks = fenced[1];
-      const quotes = marks.split(">").length - 1;
-      const listed = /[-*+]|\d/.test(marks);
-      const spaces = fenced[2].length;
-      const within = marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1);
-      const before = marks === "" ? /^ {0,3}$/ : !listed ? new RegExp(`^(?: {0,3}> ?){${quotes}} {0,3}$`) : quotes === 0 ? new RegExp(`^ {${within},${within + 3}}$`) : undefined;
-      fence = { char: fenced[3][0], length: fenced[3].length, quotes, before };
+      // Only one at the very start of a line is known to be in nothing, and so known to end where it seems to. Any other
+      // (further in, in a quotation, under a list item) ends where what it is in says, which is not worked out here: from
+      // it on, the text is left as it is. So it is from a line that begins as markup of another kind may (within which a
+      // fence is no fence).
+      if (fenced[1] !== "") return [...out, ...all.slice(n)].join("\n");
+      fence = { char: fenced[2][0], length: fenced[2].length };
       out.push(line);
+    } else if (/^ {0,3}</.test(line)) {
+      flush();
+      return [...out, ...all.slice(n)].join("\n");
     } else if (line.trim() === "") {
       flush();
       out.push(line);

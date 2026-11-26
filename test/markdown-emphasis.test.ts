@@ -16,15 +16,12 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     ["| **状态：**好 | 别的 |", "| **状态**：好 | 别的 |"],
     ["- 一\n  - **嵌套：**内容", "- 一\n  - **嵌套**：内容"],
     ["- [ ] **待办：**写测试", "- [ ] **待办**：写测试"],
+    // Before and after a block of code that begins at the very start of a line, and ends within three spaces of it.
+    ["**前：**文\n\n```ts\nconst a = '**代码：**不动';\n  ```\n\n**后：**文", "**前**：文\n\n```ts\nconst a = '**代码：**不动';\n  ```\n\n**后**：文"],
+    ["1. **步骤：**做\n\n~~~\n**代码：**不动\n~~~\n\n2. **结论：**好", "1. **步骤**：做\n\n~~~\n**代码：**不动\n~~~\n\n2. **结论**：好"],
+    // Up to a fence that is in something, or further in: what comes before it is mended, and nothing from it on.
+    ["**前：**文\n\n- ```\n  code\n  ```\n\n**后：**文", "**前**：文\n\n- ```\n  code\n  ```\n\n**后：**文"],
     ["请看 https://example.com/a?b=1 ，**结论：**通过。", "请看 https://example.com/a?b=1 ，**结论**：通过。"],
-    // In a quotation, a fence four spaces past its mark ends the block (one of them is the mark's own); five do not (see below).
-    ["  > ~~~md\n>    ~~~\n> **标题：**正文", "  > ~~~md\n>    ~~~\n> **标题**：正文"],
-    // A fence closed as it was opened, in a quotation written without a space or in a list item; what follows is prose.
-    [">~~~text\n>**代码：**不动\n>~~~\n\n**结论：**通过", ">~~~text\n>**代码：**不动\n>~~~\n\n**结论**：通过"],
-    ["- ```\n  **代码：**不动\n  ```\n- **结论：**通过", "- ```\n  **代码：**不动\n  ```\n- **结论**：通过"],
-    ["  ~~~\n**代码：**不动\n ~~~\n**结论：**通过", "  ~~~\n**代码：**不动\n ~~~\n**结论**：通过"],
-    // A quotation's block of code that nothing closes ends with the quotation.
-    ["> ```\n> code\n\n**结论：**通过", "> ```\n> code\n\n**结论**：通过"],
     ["**提示：**字😀", "**提示**：字😀"],
     ["😀字**（注）**", "😀字（**注**）"],
     ["**见[文[档]](https://example.com/a_(b))：**正文", "**见[文[档]](https://example.com/a_(b))**：正文"],
@@ -104,6 +101,17 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "https://example.com/文档/**标题：**正文",
     "请看 https://example.com/a?b=1，**结论：**通过。",
     "www.example.com/文档/**标题：**正文",
+    // From a fence that is in something, or further in, nothing is touched, whether or not it seems to end.
+    "1. 示例\n\n    ```\n    第一段\n    ```\n\n```\n**标题：**正文\n```",
+    "- 项\n\n   ```\n   code\n```\n**标题：**正文\n```",
+    ">~~~text\n>code\n>~~~\n\n**结论：**通过",
+    "- ```\n  code\n  ```\n- **结论：**通过",
+    "  ~~~\ncode\n ~~~\n**结论：**通过",
+    "  > ~~~md\n>    ~~~\n> **标题：**正文",
+    "> ```\n> code\n\n**结论：**通过",
+    // Nor from a line that begins as markup of another kind may, within which a fence is no fence.
+    "<pre>\n```\n</pre>\n**标题：**正文\n```",
+    "<details>\n**标题：**正文",
     "[r]: /guide/**标题：**正文",
     "[r]: </guide/**标题：**正文> \"**题：**文\"",
     "见[**标题：**正文][r]",
