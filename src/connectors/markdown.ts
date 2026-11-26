@@ -47,7 +47,12 @@ export function prose(text: string, change: (passage: string) => string): string
   let before: "start" | "blank" | "code" | "prose" = "start";
   let listed = false;
   for (const line of text.split("\n")) {
-    const opener = /^([ \t>]*)(`{3,}|~{3,})(.*)$/.exec(line);
+    // A fence as Markdown reads one: indented by no more than three spaces (after the marks of a
+    // quotation, if it is in one), and, where it is of backticks, with no backtick in what
+    // follows it on the line. Anything else that looks like one is prose, and what comes after
+    // it is prose: read as a fence it would hide a mention that notifies.
+    const fenced = /^((?: {0,3}> ?)* {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+    const opener = fenced && !(fenced[2][0] === "`" && fenced[3].includes("`")) ? fenced : null;
     // A block of code opened inside a quotation ends where the quotation does, closed or not: what follows is prose again.
     if (fence?.quoted && !/^\s*>/.test(line)) fence = undefined;
     if (fence) {

@@ -565,7 +565,8 @@ function linkedIn(post: any): (DocumentRef & { link: string })[] {
 /** What the writer of a rich-text message typed as words, line by line: not its code blocks, not the people it mentions, not its links. */
 function typed(post: any): string {
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
-  return ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map((each: any) => (each?.tag === "text" || each?.tag === "md" ? String(each.text ?? "") : " ")).join("") : "")).join("\n");
+  // (Its title is theirs too, on a line of its own.)
+  return [String((body as any)?.title ?? ""), ...((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map((each: any) => (each?.tag === "text" || each?.tag === "md" ? String(each.text ?? "") : " ")).join("") : ""))].join("\n\n");
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */

@@ -355,7 +355,10 @@ export class GithubGrant extends DurableObject<Env> {
         return end("failed", { why: "unreachable" });
       }
       if (at.status === 401) return await this.#refused(held.version), "unauthorised";
-      if (at.status === 404 || at.status === 410 || at.status === 301) return end("failed", { why: "no_target" });
+      // Not there, gone, or answered with somewhere else (moved to another repository): not this one to comment on.
+      if (at.status === 404 || at.status === 410 || (at.status >= 300 && at.status < 400)) return end("failed", { why: "no_target" });
+      // There, and not theirs to see (the organisation asks for a sign-in the token has not had, say).
+      if (at.status === 403) return end("failed", { why: "no_comment" });
       const it = at.ok ? ((await at.json().catch(() => null)) as { title?: unknown; html_url?: unknown } | null) : null;
       if (!it || typeof it.title !== "string" || typeof it.html_url !== "string") return end("failed", { why: "unreachable" });
       op.target = { title: it.title, url: it.html_url };

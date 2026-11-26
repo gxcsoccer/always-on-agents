@@ -238,6 +238,12 @@ describe("a code review on GitHub", () => {
     expect(inert("a paragraph\n    @going on")).toBe("a paragraph\n    `@going` on");
     expect(inert("- item\n\n    @under the item\n1. one\n    @under one")).toBe("- item\n\n    `@under` the item\n1. one\n    `@under` one");
     expect(inert("- item\n\nafter the list\n\n    @code again")).toBe("- item\n\nafter the list\n\n    @code again");
+    // What looks like a fence and is not one, as Markdown reads it, hides nothing: indented too far to open one, or of backticks with a backtick after it.
+    expect(inert("a paragraph\n    ```\n@not in code")).toBe("a paragraph\n    ```\n`@not` in code");
+    expect(inert("```js`x\n@not in code")).toBe("```js`x\n`@not` in code");
+    expect(inert("~~~js`x\n@in code\n~~~\n@after")).toBe("~~~js`x\n@in code\n~~~\n`@after`");
+    expect(inert("   ```\n@in code\n   ```\n@after")).toBe("   ```\n@in code\n   ```\n`@after`");
+    expect(inert(">    ```\n> @in quoted code\n> ```\n\n@after")).toBe(">    ```\n> @in quoted code\n> ```\n\n`@after`");
     // Names left as they are: the ones given, however they are cased.
     expect(inert("cc @Ann and @bob", new Set(["ann"]))).toBe("cc @Ann and `@bob`");
     // What a writer mentions themselves: not in code, nor in what they quote.
