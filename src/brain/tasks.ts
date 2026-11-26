@@ -149,7 +149,7 @@ export class Tasks implements Wakes {
 
   /** When the earliest set-aside question, or task whose start was not answered, is to be asked about again. */
   nextWakeAt(_now: number): number | null {
-    return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM (SELECT next_at FROM unsettled UNION ALL SELECT next_at FROM unconfirmed UNION ALL SELECT next_at FROM task_queued)")[0]?.next_at ?? null;
+    return this.#s.rows<{ next_at: number | null }>("SELECT MIN(next_at) AS next_at FROM (SELECT next_at FROM unsettled UNION ALL SELECT next_at FROM unconfirmed UNION ALL SELECT next_at FROM task_queued UNION ALL SELECT next_at FROM task_releases)")[0]?.next_at ?? null;
   }
 
   /**
@@ -420,6 +420,19 @@ export class Tasks implements Wakes {
     // One pass has a time of its own for everything it waits on: what is not got to is looked at on the next.
     const until = Date.now() + ADVANCE_BUDGET_MS;
     const left = () => Math.max(0, until - Date.now());
+    // Giving a place back is written down first and then tried, for no longer than this pass has left;
+    // one not known to have been given back is tried again by its id on a later pass.
+    const giveBack = async (taskId: string) => {
+      this.#s.sql.exec("INSERT OR REPLACE INTO task_releases (task_id, next_at) VALUES (?, ?)", taskId, Date.now() + QUEUED_AGAIN_MS);
+      if (left() === 0) return;
+      try {
+        await within(this.#b.registry().releaseTaskSlot(taskId), Math.min(left(), CONFIRM_CALL_MS));
+        this.#s.sql.exec("DELETE FROM task_releases WHERE task_id = ?", taskId);
+      } catch {
+        // Tried again later.
+      }
+    };
+    for (const owed of this.#s.rows<{ task_id: string }>("SELECT task_id FROM task_releases WHERE next_at <= ? LIMIT 20", Date.now())) await giveBack(owed.task_id);
     // (Oldest first, so that what ends here is seen by what waits behind it in the same pass.)
     const waiting = this.#s.rows<{ task_id: string; options: string }>("SELECT q.task_id, q.options FROM task_queued q JOIN tasks t ON t.id = q.task_id WHERE q.next_at <= ? ORDER BY t.created_at LIMIT 20", Date.now());
     for (const row of waiting) {
@@ -434,6 +447,16 @@ export class Tasks implements Wakes {
       }
       const from = String(this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", row.task_id)[0]?.from_id ?? "");
       const before = this.#s.rows<Row>("SELECT status, updated_at FROM tasks WHERE id = ?", from)[0];
+      // Whether one whose turn has come may be let through now: looked at the same way before it is
+      // taken out of waiting, before a place is asked for, and again when the answer about the place
+      // is back (also after the Brain was replaced in between). Itself is not counted among those at it.
+      const turn = (): "go" | "wait" | { not: string } => {
+        const most = this.#limits().scope_active_tasks;
+        if (most === 0 || this.#limits().tenant_sandboxes === 0) return { not: "tasks cannot be handed to a worker here at present: the limit set for this place is none" };
+        if (before && Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS) return { not: "its turn came, and no place came free for it in an hour; this was not started" };
+        const others = this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input') AND id != ?", row.task_id)[0].n;
+        return others >= most ? "wait" : "go";
+      };
       if (task.status === "queued") {
         if (!before || (TERMINAL_TASK.has(String(before.status)) && before.status !== "succeeded")) {
           done();
@@ -449,14 +472,13 @@ export class Tasks implements Wakes {
           continue;
         }
         // Its turn. Whether there is room is looked at now, not when it was written.
-        const most = this.#limits().scope_active_tasks;
-        const none = most === 0 || this.#limits().tenant_sandboxes === 0;
-        if (none || Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS) {
+        const may = turn();
+        if (typeof may === "object") {
           done();
-          await this.#ended(task, "failed", none ? "tasks cannot be handed to a worker here at present: the limit set for this place is none" : "its turn came, and no place came free for it in an hour; this was not started", false);
+          await this.#ended(task, "failed", may.not, false);
           continue;
         }
-        if (this.#active() >= most) {
+        if (may === "wait") {
           later(QUEUED_AGAIN_MS);
           continue;
         }
@@ -469,6 +491,20 @@ export class Tasks implements Wakes {
       // kept here (the Brain may have been replaced while a place was being asked for). Asked for, by
       // its own id, as often as it takes: a place already taken for it is simply found.
       if (let_through() === null) {
+        // (It may have been taken out of waiting by an earlier pass, or before the Brain was replaced: what held then is looked at again.)
+        const first = turn();
+        if (typeof first === "object") {
+          done();
+          await this.#ended(task, "failed", first.not, false);
+          // A place may have been taken for it by an asking whose answer never came.
+          await giveBack(row.task_id);
+          continue;
+        }
+        if (first === "wait") {
+          this.#s.sql.exec("UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), row.task_id);
+          later(QUEUED_AGAIN_MS);
+          continue;
+        }
         if (left() === 0) break;
         const bounds = this.#boundsOf(task);
         let place: boolean | undefined;
@@ -481,17 +517,19 @@ export class Tasks implements Wakes {
         task = read();
         if (!task || task.status !== "dispatching") {
           // Called off, or ended, while the place was being asked for: the place is given back, and nothing is started.
-          if (place !== false) await this.#b.registry().releaseTaskSlot(row.task_id).catch(() => undefined);
+          if (place !== false) await giveBack(row.task_id);
           done();
           continue;
         }
+        // Asked again now that the answer is back: the limits may have changed, or its hour run out, meanwhile.
+        const still = turn();
+        if (typeof still === "object") {
+          done();
+          await this.#ended(task, "failed", still.not, false);
+          if (place !== false) await giveBack(row.task_id);
+          continue;
+        }
         if (place !== true) {
-          // An hour after its turn came, with still no place: given up, and anything that was taken given back.
-          if (before && Date.now() - Number(before.updated_at) > QUEUED_PLACE_MS) {
-            done();
-            await this.#ended(task, "failed", "its turn came, and no place came free for it in an hour; this was not started", true);
-            continue;
-          }
           // No place just now (it was promised: back to waiting), or no answer (as it is, and asked again).
           if (place === false) this.#s.sql.exec("UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), row.task_id);
           later(QUEUED_AGAIN_MS);
@@ -536,7 +574,8 @@ export class Tasks implements Wakes {
       }
       if (answer?.state === "refused") {
         done();
-        await this.#ended(task, "failed", `the worker did not start: ${answer.error}`, true);
+        await this.#ended(task, "failed", `the worker did not start: ${answer.error}`, false);
+        await giveBack(row.task_id);
       } else if (answer || heard()) {
         this.#s.sql.exec("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND status = 'dispatching'", Date.now(), row.task_id);
         done();
@@ -544,6 +583,8 @@ export class Tasks implements Wakes {
     }
     // What this pass did not get to is due still: looked at again soon, after the conversations have had their turn.
     if (left() === 0 && this.#s.rows("SELECT 1 FROM task_queued WHERE next_at <= ? LIMIT 1", Date.now()).length > 0) await this.#b.wakeBy(Date.now() + 1_000);
+    const owed = this.#s.rows<{ next_at: number }>("SELECT MIN(next_at) AS next_at FROM task_releases")[0]?.next_at;
+    if (owed) await this.#b.wakeBy(Number(owed));
   }
 
   /** Keeps a task as one whose start was not answered, to be asked about. */
