@@ -392,6 +392,8 @@ export class Registry extends DurableObject<Env> {
     if (held) {
       // The same taking asked for again, or a place from before takings were named: this taking's. One held under another lease stays that one's.
       if (lease !== undefined && held.lease === null) sql.exec("UPDATE task_slots SET lease = ? WHERE task_id = ?", lease, taskId);
+      // Held under another lease: that taking has the place, not this one. (Said as no, so that whoever asked does not take the place for its own.)
+      if (lease !== undefined && held.lease !== null && held.lease !== lease) return false;
       return true;
     }
     const limits = this.#limits(tenant);
