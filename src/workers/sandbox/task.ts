@@ -122,6 +122,18 @@ export interface TaskState {
   checkpoint?: { record: DirectoryBackupRecord; at: number; took_ms: number; final?: true };
   /** The earlier task this one goes on from, where it does. */
   follows?: string;
+  /**
+   * What its person said to it while it was at work, each by the id it was given with. Kept until
+   * the task has ended. `held`: the agent's session was seen to hold it (by the session's own
+   * word, when it fetched): until then it is taken, not read.
+   */
+  notes?: { id: string; text: string; at: number; held?: true }[];
+  /** Ids of notes that came when no more were being taken: told so then, and told the same if asked again. */
+  notes_refused?: string[];
+  /** Which process of the agent is the task's now: set before that process is started, and given to it. Fetches of notes by any other are not answered. */
+  run?: string;
+  /** The process for which no more notes are taken: it had none left to fetch at its last fetch, or has exited. */
+  notes_closed?: string;
   checkpoints_taken: number;
   /** Earlier checkpoints whose deletion failed. Deleted with the task. */
   stale_checkpoints?: DirectoryBackupRecord[];
@@ -242,6 +254,9 @@ After each meaningful step, run the shell command: report progress "<one sentenc
 Some commands pause until a person approves them; that is expected, just wait. A git push in particular is held until someone approves it, which can take up to an hour: run it with a timeout of at least 3600 seconds, and never treat the wait as a failure, cancel it, or retry it while it is waiting.
 If a command is denied, do not retry it or work around it; say so in your final answer.`;
 
+/** How many notes a task keeps, and how long each may be. Past that a note is turned away, said as that: none is dropped to make room. */
+const MAX_NOTES = 20;
+const MAX_NOTE_LENGTH = 4_000;
 const FOLLOW_UP_PROMPT = `You are going on from a task that finished earlier, in a fresh sandbox. Its files and your record of what you did there are already here, as they were when it ended; look at the current state of the directory if you need to. Nothing that was approved then is approved now. What is asked of you now:`;
 const RESUME_PROMPT = `The sandbox you were working in was replaced. Your files and this conversation were restored from a checkpoint, so the last few things you did before the interruption may be missing. Look at the current state of the directory, work out which steps are actually done, and continue the original task from there. Do not redo steps that are already done.`;
 
@@ -472,6 +487,31 @@ export class TaskSandbox extends DurableObject<Env> {
     return { ...state, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined };
   }
 
+  /**
+   * Takes something its person says to it while it is at work, to be brought into the agent's
+   * session at its next step. The same id again is told what it was told the first time. `closed`:
+   * no more are taken for this run of the agent (it has ended, or has made its last fetch).
+   * Taken is not read: see `notes`.
+   */
+  async tell(note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" }> {
+    const state = this.#state();
+    if (!state) return { state: "closed" };
+    if (state.notes?.some((each) => each.id === note.id)) return { state: "taken" };
+    if (state.notes_refused?.includes(note.id)) return { state: "closed" };
+    // Also while it is being brought back after its container was lost: the process that comes fetches it.
+    const open = (ACTIVE.has(state.phase) || state.phase === "starting") && (state.notes_closed === undefined || state.notes_closed !== state.run);
+    if (!open) {
+      state.notes_refused = [...(state.notes_refused ?? []), note.id].slice(-50);
+      this.#save(state);
+      return { state: "closed" };
+    }
+    if (note.text.length > MAX_NOTE_LENGTH) throw new Error(`that is too long to add to work under way (${MAX_NOTE_LENGTH} characters at most)`);
+    if ((state.notes?.length ?? 0) >= MAX_NOTES) throw new Error(`${MAX_NOTES} things have already been added to this piece of work; put anything more after it instead`);
+    state.notes = [...(state.notes ?? []), { id: note.id, text: note.text, at: Date.now() }];
+    this.#save(state);
+    return { state: "taken" };
+  }
+
   /** Called through Outbound when the container reports or asks. The reply goes back to the container. */
   async callback(kind: string, token: string, body: unknown): Promise<{ ok: boolean; decision?: string; reason?: string }> {
     const state = this.#state();
@@ -479,6 +519,37 @@ export class TaskSandbox extends DurableObject<Env> {
     const request = (body ?? {}) as { tool_use_id?: string; tool_name?: string; command?: string };
     // Ids come from the guest; only well-formed ones are used as keys.
     const callId = /^[\w|.:-]{1,200}$/.test(request.tool_use_id ?? "") ? (request.tool_use_id as string) : undefined;
+
+    // The agent's process fetches what its person said meanwhile (see `tell`). Nothing is used up by
+    // fetching: it says which notes its session holds, and is given those taken that are not among
+    // them. Not recorded in the inbox: it comes at every step.
+    if (kind === "notes") {
+      const asked = (body ?? {}) as { run?: unknown; have?: unknown; final?: unknown };
+      // Only the process that is the task's now: one left over from before a recovery is given nothing and closes nothing.
+      if (!state.run || asked.run !== state.run || !(ACTIVE.has(state.phase) || state.phase === "starting")) return { ok: false };
+      const have = new Set(Array.isArray(asked.have) ? asked.have.filter((id): id is string => typeof id === "string").slice(0, 200) : []);
+      let changed = false;
+      for (const note of state.notes ?? []) {
+        if (have.has(note.id) && !note.held) {
+          note.held = true;
+          changed = true;
+        }
+      }
+      let missing = (state.notes ?? []).filter((note) => !have.has(note.id));
+      if (asked.final === true) {
+        // At its last fetch, with nothing left for another step (its calls to the model used up, or its
+        // life over): nothing is handed out. A task that has done its work is not made to fail by a step it cannot take.
+        const spent = (state.model_calls ?? 0) >= (state.bounds?.model_calls ?? MAX_MODEL_CALLS_PER_TASK) || Date.now() - state.created_at > lifetimeOf(state);
+        if (spent) missing = [];
+        // Nothing to give: from here no more are taken for this process (those that come are told so, and can be put after it instead).
+        if (missing.length === 0) {
+          state.notes_closed = state.run;
+          changed = true;
+        }
+      }
+      if (changed) this.#save(state);
+      return { ok: true, notes: missing.map((note) => ({ id: note.id, text: note.text })) } as never;
+    }
 
     // The gate polls for its answer. Not recorded in the inbox: it would be one entry every two seconds.
     // It asks by its own call id; the answer is filed under the question id we made for that call.
@@ -796,7 +867,10 @@ export class TaskSandbox extends DurableObject<Env> {
   #emit(state: TaskState, kind: WorkerEventKind, body: Record<string, unknown>): void {
     if (!state.brain) return;
     state.out_seq += 1;
-    state.out.push({ seq: state.out_seq, kind, body });
+    // However it ends, what was said to it and was not seen to have reached its session is told with the
+    // ending: taken is not read, and what was not read is never passed over in silence.
+    const unread = kind === "result" || kind === "failed" || kind === "lost" ? (state.notes ?? []).filter((note) => !note.held).map((note) => ({ id: note.id, text: note.text.slice(0, 500) })) : [];
+    state.out.push({ seq: state.out_seq, kind, body: unread.length > 0 ? { ...body, notes_not_read: unread } : body });
   }
 
   /** Delivers queued reports in order. A failure leaves them queued; the next alarm tries again. */
@@ -1153,6 +1227,8 @@ export class TaskSandbox extends DurableObject<Env> {
       PI_TELEMETRY: "0",
       TASK_ID: state.id,
       TASK_PASS: state.token,
+      // Which process this is, for the fetching of notes (see `run`).
+      TASK_RUN: state.run ?? "",
       TASK_DIRECTORY,
       GATE_WAIT_SECONDS: String(MAX_WAIT_FOR_ANSWER_S),
       ...(this.env.GATE_HOLD_PATTERN ? { GATE_HOLD_PATTERN: this.env.GATE_HOLD_PATTERN } : {}),
@@ -1201,6 +1277,12 @@ export class TaskSandbox extends DurableObject<Env> {
     const kept = this.#state() ?? state;
     if (kept.phase !== "starting") return;
     if (Date.now() - kept.created_at > lifetimeOf(kept)) throw new Error("exceeded the maximum lifetime");
+    // The process about to be started is the task's process from here on: named before it exists, so
+    // that nothing it asks can be taken for another's, and notes are taken for it again.
+    kept.run = crypto.randomUUID();
+    kept.notes_closed = undefined;
+    this.#save(kept);
+    state.run = kept.run;
     await this.#container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", ...argv], {
       cwd: state.cwd,
       env: this.#agentEnv(state),
@@ -1267,7 +1349,13 @@ export class TaskSandbox extends DurableObject<Env> {
     // ending already settled while it was reading, leaves it to the other. Nothing is awaited from here to the mark.)
     const still = this.#state();
     const mine = TaskSandbox.#round(before);
-    if (this.#leaving === mine || !same(still)) return;
+    if (this.#leaving === mine || !still || !same(still)) return;
+    // Its process has exited: nothing said from here on can reach it. Closed now, before the copy is
+    // taken, so that what comes during the copying is told so (and can be put after it) rather than taken and never read.
+    if (still.notes_closed !== still.run) {
+      still.notes_closed = still.run;
+      this.#save(still);
+    }
     if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
       this.#leaving = mine;

@@ -46,6 +46,7 @@ export const sandboxWorker: Worker = {
     const started = await child.start({ id: work.id, prompt: work.brief, repository: seed ? undefined : repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}), ...(seed ? { seed: seed as never } : {}) });
     return told(started);
   },
+  tell: (env, id, note) => env.TASKS.getByName(id).tell(note),
   answer: (env, id, decision, reason, question, standing) => env.TASKS.getByName(id).answer(decision, reason, question, standing),
   decisionOn: (env, id, question) => env.TASKS.getByName(id).decisionOn(question),
   async standing(env, id) {

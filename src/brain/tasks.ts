@@ -560,6 +560,42 @@ export class Tasks implements Wakes {
     return { task_id: String(task.id), status: String(task.status), ...(task.status === "unconfirmed" ? { note: UNCONFIRMED_NOTE } : {}), ...(after ? { note: queuedNote(after) } : {}) };
   }
 
+  /**
+   * Tells a piece of work under way something more its person says. Only theirs to do, in a step
+   * that is theirs alone, in the conversation it was handed over in: the same as going on from it.
+   * That is a check of who is speaking; it gives the work nothing it could not do before.
+   *
+   * The worker is asked by the id of this call, and answers the same if asked again: so a call
+   * made again is told what became of it the first time, whatever has become of the work since.
+   */
+  async tell(run: RunRow, sessionKey: string, callId: string, taskId: string, message: string): Promise<unknown> {
+    const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+    const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+    const asker = people.length === 1 ? people[0] : null;
+    if (task && task.session_key === sessionKey && asker === null) throw new Error("something can be added to work under way only in answer to the one person whose work it is, and this step was not started by a message of theirs alone; nothing was added");
+    if (!task || task.session_key !== sessionKey || task.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(taskId)} of this person's here to add anything to; nothing was added`);
+    if (task.status === "queued") throw new Error("that piece of work has not begun yet (it waits for another to end), so there is nothing at work to tell. If what they want of it has changed, call it off and hand it over again as they now want it");
+    if (task.status === "dispatching" || task.status === "unconfirmed") throw new Error("it is not known yet that this piece of work has begun, so nothing can be added to it at this moment; try again shortly");
+    let worker: Worker;
+    try {
+      worker = this.#b.workerOf(String(task.worker));
+    } catch {
+      throw new Error("the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
+    }
+    if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
+    const answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+    if (answer.state === "closed") return { ok: false, work_id: taskId, state: "closed", note: "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did." };
+    if (this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length === 0) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
+    // Read again after the wait.
+    const now = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
+    return {
+      ok: true,
+      work_id: taskId,
+      state: "taken",
+      note: `It has this and will see it when the step it is on is done; it is not read yet. Tell the person it was passed on, not that it was done. If it ends without having read it, you will be told.${now?.status === "needs_input" ? " It is waiting for an approval just now: this does not take back what it is waiting to do. If they want that not done, the approval is to be refused, or the work called off." : ""}`,
+    };
+  }
+
   async status(taskId: string): Promise<unknown> {
     const task = this.#s.rows<Row>("SELECT id, title, status, pending, last_progress, result, created_at, updated_at FROM tasks WHERE id = ?", taskId)[0];
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
