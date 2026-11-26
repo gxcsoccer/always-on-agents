@@ -241,7 +241,8 @@ function paragraph(text: string): string {
   const seen = hidden(text);
   // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
   // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
-  if (/[`\[\]]/.test(seen)) return text;
+  // So with a tilde: where it strikes words through, its marks are paired along with these.
+  if (/[`\[\]~]/.test(seen)) return text;
   // The marks, taken two by two over the paragraph. An odd number of them, or any other asterisk in it, or an underscore
   // that could be a mark (emphasis within emphasis, or beside it), and it is not plainly this case. (An underscore within
   // a word, as in a name written with them, is no mark.)

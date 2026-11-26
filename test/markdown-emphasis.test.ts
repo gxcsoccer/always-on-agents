@@ -125,6 +125,8 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "mailto:a@example.com?subject=**标题：**正文",
     // Emphasis that runs over lines and holds: the marks on one line belong to two of them.
     "**第一段\n尾**（旁注）**新段\n结束**",
+    // Words struck through in the same paragraph: their marks are paired along with these.
+    "~~旧的~~ **标题：**正文",
     // Mending one would undo emphasis that holds between other marks.
     "正文**：注**后文**尾**",
     "[r]: /guide/**标题：**正文",
