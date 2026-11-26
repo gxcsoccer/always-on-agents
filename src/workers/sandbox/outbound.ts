@@ -181,7 +181,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       const shape = asked.replace(/"[^"]*"/g, "w");
       // What is left may no longer be a query: an "or" with nothing on one side of it, empty brackets.
       if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(shape) || !balanced(shape)) {
-        await this.#task.noteGithubRead(kind, 400, { incomplete: true });
+        await this.#task.noteGithubRead(kind, 400, {});
         return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched. Text to look for that has brackets in it goes in double quotes\n", { status: 400 });
       }
       // Already in brackets as a whole (a next page of a search made here): not wrapped again.
@@ -195,7 +195,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     try {
       token = await this.#task.githubReadToken();
     } catch {
-      await this.#task.noteGithubRead(kind, 0, { incomplete: true });
+      await this.#task.noteGithubRead(kind, 0, {});
       return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });
     }
     // Lending took a moment, and no credential is also what a task that has ended is given.
@@ -213,19 +213,17 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // Manual: a redirect is not followed on the guest's behalf.
       answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
     } catch {
-      await this.#task.noteGithubRead(kind, 0, { incomplete: true });
+      await this.#task.noteGithubRead(kind, 0, {});
       return new Response("GitHub could not be reached; nothing was read\n", { status: 502 });
     }
     // Sent somewhere else for it: an address made for whoever holds it (an archive, a file), good
     // for a while without any credential. It is not handed into the sandbox.
     const elsewhere = answer.status >= 300 && answer.status < 400 && !sameOrigin(answer.headers.get("location"), url);
     if (elsewhere) {
-      await this.#task.noteGithubRead(kind, answer.status, { incomplete: true });
+      await this.#task.noteGithubRead(kind, answer.status, {});
       return new Response("GitHub answers this with a download address somewhere else, which is not passed into this sandbox; use git for the files of the repository\n", { status: 403 });
     }
     if (!("search" in api) || !answer.ok || request.method === "HEAD") {
-      // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
-      await this.#task.noteGithubRead(kind, answer.status, {});
       // A file or a directory of the repository comes with an address to download it from, which
       // for a private one works for a while for whoever holds it. Read with a credential, it is
       // taken out; the content itself, which the task was given anyway, stays.
@@ -236,17 +234,22 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
         try {
           listed = JSON.parse(text);
         } catch {
+          // Counted as what the guest is told: not as a read that went well.
+          await this.#task.noteGithubRead(kind, 502, {});
           return new Response("GitHub's answer could not be read\n", { status: 502 });
         }
+        await this.#task.noteGithubRead(kind, answer.status, {});
         return passed(answer, JSON.stringify(withoutDownloads(listed)));
       }
+      // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
+      await this.#task.noteGithubRead(kind, answer.status, {});
       return passed(answer, answer.body);
     }
     const found = (await answer.json().catch(() => undefined)) as { items?: unknown; incomplete_results?: unknown; total_count?: unknown } | undefined;
     const rows = found && Array.isArray(found.items) ? (found.items as { repository_url?: unknown }[]) : undefined;
     if (!found || !rows || rows.some((each) => typeof each?.repository_url !== "string")) {
       // Not passed on as a list of nothing, nor with rows quietly left out: "none found" is what an issue gets opened on.
-      await this.#task.noteGithubRead(kind, 502, { incomplete: true });
+      await this.#task.noteGithubRead(kind, 502, {});
       return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
     }
     const items = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
@@ -354,7 +357,7 @@ export function classifyApi(url: URL, method: string): { repo: string } | { sear
   const [, owner, name] = match;
   if (/^\.+$/.test(owner) || /^\.+$/.test(name)) return undefined;
   // A comparison can name the other side in another repository (owner:branch): that is a read of that one.
-  if (/^\/repos\/[^/]+\/[^/]+\/compare\//.test(path) && (path.includes(":") || /%3a/i.test(path))) return undefined;
+  if (/^\/repos\/[^/]+\/[^/]+\/compare\//i.test(path) && (path.includes(":") || /%3a/i.test(path))) return undefined;
   return { repo: `${owner}/${name}` };
 }
 
