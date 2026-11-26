@@ -1952,7 +1952,15 @@ describe("records and limits", () => {
     await registry.releaseTaskSlot("t-lease", "L3");
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(false);
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L4")).toBe(true);
+    // Given back by the task's id alone, as when it ends or is stopped: that taking is over as well, and another can still be had.
     await registry.releaseTaskSlot("t-lease");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L4")).toBe(false);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    // One taken without a lease is given back as before, and leaves nothing behind.
+    expect(await registry.acquireTaskSlot(fourth, "t-plain")).toBe(true);
+    await registry.releaseTaskSlot("t-plain");
+    expect(await registry.acquireTaskSlot(fourth, "t-plain")).toBe(true);
+    await registry.releaseTaskSlot("t-plain");
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3b")).toBe(true);
     await registry.releaseTaskSlot("t-lease", "L3b");
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L5")).toBe(true);

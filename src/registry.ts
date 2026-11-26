@@ -406,12 +406,19 @@ export class Registry extends DurableObject<Env> {
   }
 
   async releaseTaskSlot(taskId: string, lease?: string): Promise<void> {
-    if (lease === undefined) this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ?", taskId);
-    // Of one taking only: a place taken since, under another lease, is left.
-    else {
-      this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ? AND lease = ?", taskId, lease);
-      this.ctx.storage.sql.exec("INSERT OR REPLACE INTO leases_returned (lease, at) VALUES (?, ?)", lease, Date.now());
+    const sql = this.ctx.storage.sql;
+    const over = (which: string) => sql.exec("INSERT OR REPLACE INTO leases_returned (lease, at) VALUES (?, ?)", which, Date.now());
+    if (lease === undefined) {
+      // Whatever place the task has (it has ended, or was stopped). The taking it was is over too:
+      // an asking for that taking that arrives after this takes nothing for a task that is done.
+      const held = sql.exec<{ lease: string | null }>("SELECT lease FROM task_slots WHERE task_id = ?", taskId).toArray()[0];
+      if (held?.lease) over(held.lease);
+      sql.exec("DELETE FROM task_slots WHERE task_id = ?", taskId);
+      return;
     }
+    // Of one taking only: a place taken since, under another lease, is left.
+    sql.exec("DELETE FROM task_slots WHERE task_id = ? AND lease = ?", taskId, lease);
+    over(lease);
   }
 
   #requireTenant(tenant: string) {
