@@ -189,8 +189,18 @@ describe("the repository credential a task is lent", () => {
     await stub.noteGithubRead("search", 200, { read: true, more: true, of: "a", page: 1 });
     await stub.noteGithubRead("search", 200, { read: true, of: "a", page: 2 });
     await stub.noteGithubRead("search", 200, { read: true, more: true, incomplete: true, of: "b", page: 1 });
+    // Turned away by the proxy itself; found more than GitHub gives; more pages read than are kept track of.
+    await stub.noteGithubRead("search", 400, { rejected: true });
+    await stub.noteGithubRead("search", 200, { read: true, cut: true, of: "c", page: 1 });
+    for (let page = 1; page <= 201; page++) await stub.noteGithubRead("search", 200, { read: true, more: page < 201, of: "d", page });
     const reads = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_reads);
-    expect(reads).toEqual({ search: { by_status: { "200": 7, failed: 1 }, read: 6, more: 3, none: 1, incomplete: 3, each: { a: { pages: [1, 2], last: true, incomplete: false }, b: { pages: [1], last: false, incomplete: true } } }, other: { by_status: { "403": 1 } } });
+    expect(reads.search.by_status).toEqual({ "200": 209, failed: 1, rejected: 1 });
+    expect(reads.search.each.a).toEqual({ pages: [1, 2], last: true, incomplete: false });
+    expect(reads.search.each.b).toEqual({ pages: [1], last: false, incomplete: true });
+    expect(reads.search.each.c).toEqual({ pages: [1], last: true, incomplete: false, cut: true });
+    expect(reads.search.each.d).toMatchObject({ last: true, incomplete: false, unsure: true });
+    expect(reads.search.each.d.pages).toHaveLength(200);
+    expect(reads.other).toEqual({ by_status: { "403": 1 } });
   });
 
   it("no longer lends what was issued from an installation that has since been given to another tenant", async () => {

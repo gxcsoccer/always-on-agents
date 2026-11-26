@@ -129,7 +129,8 @@ export interface TaskState {
       none: number;
       incomplete: number;
       /** Each search by itself (the same query, sorted and paged the same way): which of its pages were read, whether one of them was its last, whether any was not complete. No more than a few dozen are told apart; `others` says there were more. */
-      each?: Record<string, { pages: number[]; last: boolean; incomplete: boolean }>;
+      /** `cut`: GitHub found more than it gives, so its pages are not all there is. `unsure`: more pages were read than are kept track of, so it cannot be told that none was left out. */
+      each?: Record<string, { pages: number[]; last: boolean; incomplete: boolean; cut?: true; unsure?: true }>;
       others?: true;
     };
     other: { by_status: Record<string, number> };
@@ -271,6 +272,7 @@ printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
 const MAX_SEARCHES_TOLD_APART = 40;
+const MAX_PAGES_KEPT = 200;
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
 Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Aim for under 6,000 characters, most important first: beyond ${MAX_RESULT_TEXT.toLocaleString("en-US")} it is cut off.
@@ -745,11 +747,12 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
-  async noteGithubRead(kind: "search" | "other", status: number, seen: { incomplete?: boolean; read?: boolean; more?: boolean; none?: boolean; of?: string; page?: number }): Promise<void> {
+  async noteGithubRead(kind: "search" | "other", status: number, seen: { incomplete?: boolean; read?: boolean; more?: boolean; none?: boolean; of?: string; page?: number; cut?: boolean; rejected?: boolean }): Promise<void> {
     const state = this.#state();
     if (!state) return;
     const reads = state.github_reads ?? { search: { by_status: {}, read: 0, more: 0, none: 0, incomplete: 0 }, other: { by_status: {} } };
-    const key = status === 0 ? "failed" : String(status);
+    // ("rejected": turned away by the proxy itself as not a query, and never asked of GitHub.)
+    const key = seen.rejected ? "rejected" : status === 0 ? "failed" : String(status);
     reads[kind].by_status[key] = (reads[kind].by_status[key] ?? 0) + 1;
     if (kind === "search") for (const each of ["incomplete", "read", "more", "none"] as const) if (seen[each]) reads.search[each] += 1;
     if (kind === "search" && seen.read && seen.of !== undefined) {
@@ -757,7 +760,11 @@ export class TaskSandbox extends DurableObject<Env> {
       if (!(seen.of in each) && Object.keys(each).length >= MAX_SEARCHES_TOLD_APART) reads.search.others = true;
       else {
         const one = (each[seen.of] ??= { pages: [], last: false, incomplete: false });
-        if (!one.pages.includes(seen.page ?? 1) && one.pages.length < 200) one.pages.push(seen.page ?? 1);
+        if (!one.pages.includes(seen.page ?? 1)) {
+          if (one.pages.length < MAX_PAGES_KEPT) one.pages.push(seen.page ?? 1);
+          else one.unsure = true;
+        }
+        if (seen.cut) one.cut = true;
         if (!seen.more) one.last = true;
         if (seen.incomplete) one.incomplete = true;
       }
