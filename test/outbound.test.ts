@@ -382,6 +382,7 @@ describe("GitHub's API over the proxy", () => {
     // Text in quotes is what is looked for, as it is: its brackets and its "repo:" are not the query's.
     expect((await sent('"panic("')).get("q")).toBe('repo:acme/demo "panic("');
     expect((await sent('"repo:acme/secret is mentioned" dst')).get("q")).toBe('repo:acme/demo "repo:acme/secret is mentioned" dst');
+    expect((await sent('is:issue   label:"good  first issue"  repo:x/y')).get("q")).toBe('repo:acme/demo is:issue label:"good  first issue"');
     expect((await sent('"a) OR (b" OR timezone repo:x/y')).get("q")).toBe('repo:acme/demo ("a) OR (b" OR timezone)');
     const last = await sent("dst", "&per_page=50&sort=updated&advanced_search=false");
     expect(last.get("per_page")).toBe("50");

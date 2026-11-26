@@ -173,9 +173,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // What is in quotes is the text being looked for, kept as it is: a bracket or a "repo:" there is not the query's own.
       const parts = (url.searchParams.get("q") ?? "").split(/("[^"]*")/);
       const asked = parts
-        .map((part, at) => (at % 2 === 1 ? part : part.replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ")))
+        // (Spaces are tidied outside the quotes only: inside, two spaces are part of a name.)
+        .map((part, at) => (at % 2 === 1 ? part : part.replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ").replace(/\s+/g, " ")))
         .join("")
-        .replace(/\s+/g, " ")
         .trim();
       // Its shape, with each quoted text as one plain word.
       const shape = asked.replace(/"[^"]*"/g, "w");
