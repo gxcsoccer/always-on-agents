@@ -112,24 +112,34 @@ const HIDDEN = "";
 export function emphasised(text: string): string {
   // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
   const out: string[] = [];
-  let fence: { char: string; length: number; quoted: boolean } | undefined;
+  // The block of code that is open: its fence, how many quotations it stands in, and how far in a fence that ends it may stand.
+  let fence: { char: string; length: number; quotes: number; from: number; to: number } | undefined;
   let lines: string[] = [];
   const flush = () => {
     if (lines.length > 0) out.push(paragraph(lines.join("\n")));
     lines = [];
   };
   for (const line of text.split("\n")) {
-    // A fence wherever one may stand: at the start of a line, or after the marks of quotations and of list items on it,
-    // however far in. (Taken more widely than Markdown takes it: what is between two of them is left as it is.)
-    const fenced = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)])(?=\s|$))*\s*(`{3,}|~{3,})(.*)$/.exec(line);
     // A block of code opened inside a quotation ends where the quotation does, closed or not: what follows a blank line after it is prose again.
-    if (fence?.quoted && line.trim() === "") fence = undefined;
+    if (fence && fence.quotes > 0 && line.trim() === "") fence = undefined;
     if (fence) {
-      if (fenced && fenced[1][0] === fence.char && fenced[1].length >= fence.length && fenced[2].trim() === "") fence = undefined;
+      // What ends it is told narrowly: a fence of its kind and no shorter, with nothing after it, in as many quotations and
+      // no list item's mark before it, standing where the one that opened it stood (within three spaces). A line of the code
+      // that only looks like one (a list item's, or further in) does not end it. One left open leaves what follows as it is.
+      const closing = /^([ >]*)(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (closing && closing[2][0] === fence.char && closing[2].length >= fence.length && closing[1].split(">").length - 1 === fence.quotes && closing[1].length >= fence.from && closing[1].length <= fence.to) fence = undefined;
       out.push(line);
-    } else if (fenced && !(fenced[1][0] === "`" && fenced[2].includes("`"))) {
+      continue;
+    }
+    // What opens one is told widely: a fence at the start of a line, or after the marks of quotations and of list items on
+    // it, however far in. (More widely than Markdown takes it: what is then left as it is would at worst have been mended.)
+    const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*)(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenced && !(fenced[3][0] === "`" && fenced[4].includes("`"))) {
       flush();
-      fence = { char: fenced[1][0], length: fenced[1].length, quoted: /^\s*(?:(?:[-*+]|\d{1,9}[.)])\s+)*>/.test(line) };
+      // Where its container begins: just past the last mark before it (a quotation's mark may have no space after it).
+      const marks = fenced[1];
+      const within = marks === "" ? 0 : marks.length + 1 - (marks.endsWith(">") ? 1 : 0);
+      fence = { char: fenced[3][0], length: fenced[3].length, quotes: marks.split(">").length - 1, from: Math.min(within, marks.length + fenced[2].length), to: Math.max(within, marks.length + fenced[2].length) + 3 };
       out.push(line);
     } else if (line.trim() === "") {
       flush();
@@ -190,8 +200,9 @@ function paragraph(text: string): string {
     // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
     .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
     .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
-    // (A bare address ends where the characters an address is written with end: words written right after it, with no space, are not part of it.)
-    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|https?:\/\/[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+/g, hide);
+    // (A bare address runs to the next space: where it ends and words written right against it begin is for whoever shows
+    // it to say, and some take the words for part of it. Left alone, they lead where they led.)
+    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|(?:https?:\/\/|www\.)\S+/gi, hide);
   // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
   // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
   if (/[`\[\]]/.test(seen)) return text;

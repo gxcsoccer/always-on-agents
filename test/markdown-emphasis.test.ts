@@ -16,8 +16,11 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     ["| **状态：**好 | 别的 |", "| **状态**：好 | 别的 |"],
     ["- 一\n  - **嵌套：**内容", "- 一\n  - **嵌套**：内容"],
     ["- [ ] **待办：**写测试", "- [ ] **待办**：写测试"],
-    // Words written right after a bare address, with no space, are not part of it.
-    ["请看 https://example.com/a?b=1，**结论：**通过。", "请看 https://example.com/a?b=1，**结论**：通过。"],
+    ["请看 https://example.com/a?b=1 ，**结论：**通过。", "请看 https://example.com/a?b=1 ，**结论**：通过。"],
+    // A fence closed as it was opened, in a quotation written without a space or in a list item; what follows is prose.
+    [">~~~text\n>**代码：**不动\n>~~~\n\n**结论：**通过", ">~~~text\n>**代码：**不动\n>~~~\n\n**结论**：通过"],
+    ["- ```\n  **代码：**不动\n  ```\n- **结论：**通过", "- ```\n  **代码：**不动\n  ```\n- **结论**：通过"],
+    ["  ~~~\n**代码：**不动\n ~~~\n**结论：**通过", "  ~~~\n**代码：**不动\n ~~~\n**结论**：通过"],
     // A quotation's block of code that nothing closes ends with the quotation.
     ["> ```\n> code\n\n**结论：**通过", "> ```\n> code\n\n**结论**：通过"],
     ["**提示：**字😀", "**提示**：字😀"],
@@ -81,6 +84,17 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "[文档](<guide)/**标题：**正文>)",
     "[文档](/guide \"题)**标题：**正文\")",
     "[文档](/guide '题)**标题：**正文')，**后面：**也不动",
+    // Within a block of code, a line that only looks like the fence that would end it: a list item's, one further in, a shorter one, one of the other kind.
+    "~~~md\n- ~~~\n**标题：**正文\n~~~",
+    "~~~md\n    ~~~\n**标题：**正文\n~~~",
+    "````md\n```\n**标题：**正文\n````",
+    "~~~md\n```\n**标题：**正文\n~~~",
+    "~~~md\n> ~~~\n**标题：**正文\n~~~",
+    "- ~~~\n  code\n~~~\n**标题：**正文",
+    // A bare address with words right against it: where it ends is not ours to say.
+    "https://example.com/文档/**标题：**正文",
+    "请看 https://example.com/a?b=1，**结论：**通过。",
+    "www.example.com/文档/**标题：**正文",
     "[r]: /guide/**标题：**正文",
     "[r]: </guide/**标题：**正文> \"**题：**文\"",
     "见[**标题：**正文][r]",
