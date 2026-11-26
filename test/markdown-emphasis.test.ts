@@ -16,6 +16,9 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     ["| **状态：**好 | 别的 |", "| **状态**：好 | 别的 |"],
     ["- 一\n  - **嵌套：**内容", "- 一\n  - **嵌套**：内容"],
     ["- [ ] **待办：**写测试", "- [ ] **待办**：写测试"],
+    // Beside emphasis that holds, on its line and over lines: that stays between the same marks.
+    ["**甲** 和 **乙：**丙", "**甲** 和 **乙**：丙"],
+    ["**第一段\n尾** 之后 **标题：**正文", "**第一段\n尾** 之后 **标题**：正文"],
     // Before and after a block of code that begins at the very start of a line, and ends within three spaces of it.
     ["**前：**文\n\n```ts\nconst a = '**代码：**不动';\n  ```\n\n**后：**文", "**前**：文\n\n```ts\nconst a = '**代码：**不动';\n  ```\n\n**后**：文"],
     ["1. **步骤：**做\n\n~~~\n**代码：**不动\n~~~\n\n2. **结论：**好", "1. **步骤**：做\n\n~~~\n**代码：**不动\n~~~\n\n2. **结论**：好"],
@@ -112,6 +115,18 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     // Nor from a line that begins as markup of another kind may, within which a fence is no fence.
     "<pre>\n```\n</pre>\n**标题：**正文\n```",
     "<details>\n**标题：**正文",
+    // Lines ended with a carriage return; markup of another kind within a quotation, or within a line.
+    "~~~md\r\n**标题：**正文\r\n~~~\r\n",
+    "> <pre>\n> **标题：**正文\n> </pre>",
+    "参见 <a title=\"A > B\" href=\"/文档/**标题：**正文\">手册</a>",
+    // An address of another kind, and one with a space that is no plain space in it.
+    "ftp://example.com/资料/**标题：**正文",
+    "https://example.com/资料\u00a0**标题：**正文",
+    "mailto:a@example.com?subject=**标题：**正文",
+    // Emphasis that runs over lines and holds: the marks on one line belong to two of them.
+    "**第一段\n尾**（旁注）**新段\n结束**",
+    // Mending one would undo emphasis that holds between other marks.
+    "正文**：注**后文**尾**",
     "[r]: /guide/**标题：**正文",
     "[r]: </guide/**标题：**正文> \"**题：**文\"",
     "见[**标题：**正文][r]",

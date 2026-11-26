@@ -110,6 +110,8 @@ const HIDDEN = "";
  * changes nothing more.
  */
 export function emphasised(text: string): string {
+  // (Lines ended otherwise than Markdown is written here: nothing is told of such a text, and it is left as it is.)
+  if (text.includes("\r")) return text;
   // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
   const all = text.split("\n");
   const out: string[] = [];
@@ -141,7 +143,8 @@ export function emphasised(text: string): string {
       if (fenced[1] !== "") return [...out, ...all.slice(n)].join("\n");
       fence = { char: fenced[2][0], length: fenced[2].length };
       out.push(line);
-    } else if (/^ {0,3}</.test(line)) {
+    } else if (/<[A-Za-z/!?]/.test(line)) {
+      // (Markup of another kind anywhere on a line: a tag with what it says of itself, a block in which nothing is Markdown.)
       flush();
       return [...out, ...all.slice(n)].join("\n");
     } else if (line.trim() === "") {
@@ -194,45 +197,84 @@ function uncoded(text: string): string {
   return out;
 }
 
-/** One paragraph, with each `**…**` in it that certainly did not hold made to; left whole where what in it is code or a link is not plain. */
-function paragraph(text: string): string {
-  // What is not prose keeps its place and is not looked into.
+/** A paragraph with what in it is not prose hidden, each thing in its place: code, escaped characters, links whose ends are plain, addresses. */
+function hidden(text: string): string {
   const hide = (found: string) => found.replace(/[^\n]/g, HIDDEN);
-  const seen = uncoded(text)
-    // A link or a picture with where it leads, where its ends are plain: brackets within its words one deep, and an address
-    // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
-    .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
-    .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
-    // (A bare address runs to the next space: where it ends and words written right against it begin is for whoever shows
-    // it to say, and some take the words for part of it. Left alone, they lead where they led.)
-    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|(?:https?:\/\/|www\.)\S+/gi, hide);
+  return (
+    uncoded(text)
+      // A link or a picture with where it leads, where its ends are plain: brackets within its words one deep, and an address
+      // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
+      .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
+      .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
+      // (A bare address of any kind runs to the next plain space: where it ends and words written right against it begin is
+      // for whoever shows it to say, and some take the words for part of it. Left alone, they lead where they led.)
+      .replace(/(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|www\.|mailto:|xmpp:)[^ \t\n]*/gi, hide)
+  );
+}
+
+/** Where the marks of strong emphasis stand in a paragraph (with what is not prose hidden): two asterisks by themselves. */
+const marksIn = (seen: string): number[] => [...seen.matchAll(/(?<![*_])\*\*(?![*_])/g)].map((each) => each.index);
+
+/**
+ * Which of a paragraph's marks make emphasis together, as Markdown pairs them: read from left to
+ * right, each mark that may close taken with the nearest before it that may open and is still
+ * waiting (those waiting between them are given up), and one that closes nothing left waiting if
+ * it may open. Told from the text as it is written, what stands beside each mark as a whole
+ * character. As pairs of the marks' numbers.
+ */
+function paired(text: string, marks: number[]): Set<string> {
+  const pairs = new Set<string>();
+  const waiting: number[] = [];
+  marks.forEach((at, n) => {
+    const before = [...text.slice(Math.max(0, at - 2), at)].at(-1);
+    const after = [...text.slice(at + 2, at + 4)][0];
+    const opens = holds(after, before);
+    const closes = holds(before, after);
+    if (closes && waiting.length > 0) pairs.add(`${waiting.pop()}-${n}`);
+    else if (opens) waiting.push(n);
+  });
+  return pairs;
+}
+
+/** One paragraph, with each `**…**` in it that certainly did not hold made to; left whole where it is not plain that nothing else changes. */
+function paragraph(text: string): string {
+  const seen = hidden(text);
   // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
   // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
   if (/[`\[\]]/.test(seen)) return text;
-  const lines = text.split("\n");
-  const seenLines = seen.split("\n");
-  // A line indented far enough to be code somewhere (under a list item it may be) is left as it is.
-  return lines.map((line, n) => (/^(?: {0,3}> ?)*(?: {4}|\t| {0,3}\t)/.test(line) ? line : strong(line, seenLines[n]))).join("\n");
-}
-
-/** One line of prose (and the same line with what is not prose hidden), with each `**…**` in it that certainly did not hold made to. */
-function strong(line: string, seen: string): string {
-  // The marks: two asterisks by themselves, taken two by two. An odd number of them, or any other asterisk on the line, or
-  // an underscore that could be a mark (emphasis within emphasis, or beside it), and it is not plainly this case. (An
-  // underscore within a word, as in a name written with them, is no mark.)
-  const marks = [...seen.matchAll(/(?<![*_])\*\*(?![*_])/g)].map((each) => each.index);
-  if (marks.length === 0 || marks.length % 2 === 1 || /\*|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/.test(seen.replace(/(?<![*_])\*\*(?![*_])/g, ""))) return line;
+  // The marks, taken two by two over the paragraph. An odd number of them, or any other asterisk in it, or an underscore
+  // that could be a mark (emphasis within emphasis, or beside it), and it is not plainly this case. (An underscore within
+  // a word, as in a name written with them, is no mark.)
+  const marks = marksIn(seen);
+  if (marks.length === 0 || marks.length % 2 === 1 || /\*|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/.test(seen.replace(/(?<![*_])\*\*(?![*_])/g, ""))) return text;
+  // What holds as it is written, by Markdown's own pairing.
+  const held = paired(text, marks);
   let out = "";
   let from = 0;
+  const made: string[] = [];
   for (let n = 0; n < marks.length; n += 2) {
     const [open, close] = [marks[n], marks[n + 1]];
-    // (What stands just outside each mark, as a whole character: one written with two units is one.)
+    const inside = text.slice(open + 2, close);
+    // Only two marks on one line that make nothing as they stand, on a line that is not indented far enough to be code
+    // somewhere (under a list item it may be).
+    const line = text.slice(text.lastIndexOf("\n", open) + 1, open);
+    const apart = inside.includes("\n") || held.has(`${n}-${n + 1}`) || /^(?: {0,3}> ?)*(?: {4}|\t| {0,3}\t)/.test(line);
+    // (What stands just outside each mark, as a whole character: one written with two units is one. The edge of a line is whitespace.)
     const left = [...seen.slice(0, open)].at(-1);
     const right = [...seen.slice(close + 2)][0];
-    out += line.slice(from, open) + mended(line.slice(open + 2, close), seen.slice(open + 2, close), left, right);
+    const now = apart ? `**${inside}**` : mended(inside, seen.slice(open + 2, close), left === "\n" ? undefined : left, right === "\n" ? undefined : right);
+    if (now !== `**${inside}**`) made.push(`${n}-${n + 1}`);
+    out += text.slice(from, open) + now;
     from = close + 2;
   }
-  return out + line.slice(from);
+  out += text.slice(from);
+  if (made.length === 0) return text;
+  // As mended, everything that held still holds between the same marks, and what was mended holds now: by the same
+  // pairing, read from the new text. Otherwise something else would have changed with it, and the paragraph is left as it was.
+  const after = marksIn(hidden(out));
+  if (after.length !== marks.length) return text;
+  const now = paired(out, after);
+  return [...held, ...made].every((each) => now.has(each)) && now.size === held.size + made.length ? out : text;
 }
 
 /** Whether a mark opens (with `inner` just inside it and `outer` just outside), or closes, by Markdown's rule; the edge of the line is whitespace. */

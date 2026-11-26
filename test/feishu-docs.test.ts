@@ -3972,8 +3972,8 @@ describe("how the bot's words are sent", () => {
     await deliverFeishu(env as any, scope, dm, { id: 903, idem: "msg:fixed", text, authored: false, encoding: 2 });
     expect(JSON.parse(sentAs().content)).toEqual({ text });
     // What the model wrote as the chat's own mention is still only text, mended or not.
-    await deliverFeishu(env as any, scope, dm, { id: 904, idem: "msg:quiet", text: '**注意：**请看 <at user_id="all"></at>', authored: true, encoding: 2 });
-    expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).toBe('**注意**：请看 <\u200bat user_id="all"><\u200b/at>');
+    await deliverFeishu(env as any, scope, dm, { id: 904, idem: "msg:quiet", text: '**注意：**请看\n\n<at user_id="all"></at> **之后：**不动', authored: true, encoding: 2 });
+    expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).toBe('**注意**：请看\n\n<\u200bat user_id="all"><\u200b/at> **之后：**不动');
   });
 
   it("sends a message whose sending began under the earlier version exactly as that version did", async () => {
