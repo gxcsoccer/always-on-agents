@@ -87,6 +87,8 @@ async function notes(event: any, ctx: any, final: boolean): Promise<{ entries: u
   let got: { id: string; text: string }[] | undefined;
   // The last fetch is tried a little harder: there is no later one.
   for (let attempt = 0; attempt < (final ? 3 : 1) && got === undefined; attempt++) {
+    // (A moment between tries: a task object that is just being moved answers again in a few hundred milliseconds.)
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
     got = await ask("notes", { run: RUN, have, final }, NOTES_TIMEOUT_MS)
       .then((reply) => (reply.ok && Array.isArray(reply.notes) ? reply.notes : undefined))
       .catch(() => undefined);

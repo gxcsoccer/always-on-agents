@@ -286,9 +286,9 @@ describe("a sandbox task that is told something while it is at work", () => {
     // The fetching leaves no trace in the record of what happened to the task.
     expect(it.records.get("state").inbox.some((entry: any) => entry.kind === "notes")).toBe(false);
     // Too long, or too many: turned away as that, with nothing dropped to make room.
-    await expect(it.task.tell({ id: "long", text: "x".repeat(4_001) })).rejects.toThrow("too long");
+    expect(await it.task.tell({ id: "long", text: "x".repeat(4_001) })).toMatchObject({ state: "refused", error: expect.stringContaining("too long") });
     for (let n = 2; n <= 20; n++) await it.task.tell({ id: `n${n}`, text: "more" });
-    await expect(it.task.tell({ id: "n21", text: "more" })).rejects.toThrow("put anything more after it");
+    expect(await it.task.tell({ id: "n21", text: "more" })).toMatchObject({ state: "refused", error: expect.stringContaining("put anything more after it") });
     expect(it.records.get("state").notes).toHaveLength(20);
   });
 
@@ -426,6 +426,21 @@ describe("a sandbox task that is told something while it is at work", () => {
     it.records.delete("state");
     await expect(it.task.told("a")).rejects.toThrow("no longer kept");
     await expect(it.task.told("never")).rejects.toThrow("no longer kept");
+  });
+
+  it("takes nothing for a task that was at work before processes were given runs: its container's process never fetches, so nothing would read it", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    // As a task started by the version before this one stands when this one is deployed over it.
+    const old = it.records.get("state");
+    delete old.run;
+    delete old.notes_closed;
+    it.records.set("state", old);
+    expect(await it.task.tell({ id: "a", text: "A" })).toEqual({ state: "closed" });
+    expect(it.records.get("state").notes).toBeUndefined();
+    // One that is only just being started (and will be given a run) does take.
+    it.records.set("state", { ...it.records.get("state"), phase: "starting", notes_refused: [] });
+    expect(await it.task.tell({ id: "b", text: "B" })).toEqual({ state: "taken" });
   });
 
   it("gives the process a run of its own each time it is started, before it is started", async () => {

@@ -494,20 +494,23 @@ export class TaskSandbox extends DurableObject<Env> {
    * no more are taken for this run of the agent (it has ended, or has made its last fetch).
    * Taken is not read: see `notes`.
    */
-  async tell(note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" }> {
+  async tell(note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" } | { state: "refused"; error: string }> {
     const state = this.#state();
     if (!state) return { state: "closed" };
     if (state.notes?.some((each) => each.id === note.id)) return { state: "taken" };
     if (state.notes_refused?.includes(note.id)) return { state: "closed" };
     // Also while it is being brought back after its container was lost: the process that comes fetches it.
-    const open = (ACTIVE.has(state.phase) || state.phase === "starting") && (state.notes_closed === undefined || state.notes_closed !== state.run);
+    // (One at work has a process that was given a run. A task from before there were runs is at work in a container
+    // whose process never fetches notes: it takes none, rather than take what nothing will read.)
+    const open = (state.phase === "starting" || (ACTIVE.has(state.phase) && state.run !== undefined)) && (state.notes_closed === undefined || state.notes_closed !== state.run);
     if (!open) {
       state.notes_refused = [...(state.notes_refused ?? []), note.id].slice(-50);
       this.#save(state);
       return { state: "closed" };
     }
-    if (note.text.length > MAX_NOTE_LENGTH) throw new Error(`that is too long to add to work under way (${MAX_NOTE_LENGTH} characters at most)`);
-    if ((state.notes?.length ?? 0) >= MAX_NOTES) throw new Error(`${MAX_NOTES} things have already been added to this piece of work; put anything more after it instead`);
+    // Turned away for what it is: said as an answer, so that it is not taken for a call that did not get through.
+    if (note.text.length > MAX_NOTE_LENGTH) return { state: "refused", error: `that is too long to add to work under way (${MAX_NOTE_LENGTH} characters at most)` };
+    if ((state.notes?.length ?? 0) >= MAX_NOTES) return { state: "refused", error: `${MAX_NOTES} things have already been added to this piece of work; put anything more after it instead` };
     state.notes = [...(state.notes ?? []), { id: note.id, text: note.text, at: Date.now() }];
     this.#save(state);
     return { state: "taken" };

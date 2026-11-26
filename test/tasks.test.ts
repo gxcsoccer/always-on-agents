@@ -54,7 +54,7 @@ function bench(state: DurableObjectState) {
     fateOf: (async () => "none") as (noteId: string) => Promise<"taken" | "closed" | "none">,
     /** What the sandbox was told for a task at work, and what it says to that. */
     told: [] as [string, { id: string; text: string }][],
-    tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" }>,
+    tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" } | { state: "refused"; error: string }>,
     /** Tasks the sandbox has already taken, by id, as they stand there. */
     took: {} as Record<string, { phase: string; error?: string }>,
     /** What a task left for a later one to go on from, by task id; nothing for one that left nothing or whose leavings are gone. */
@@ -833,11 +833,10 @@ describe("tasks, by themselves", () => {
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           store.sql.exec("UPDATE tasks SET status = 'needs_input' WHERE id = ?", b.task_id);
           expect(((await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "do not push yet")) as { note: string }).note).toContain("does not take back what it is waiting to do");
-          // A worker that cannot be told anything.
-          worker.tell = async () => {
-            throw new Error("too long");
-          };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("too long");
+          // Turned away by the worker for a reason of its own: said as that, and nothing is kept as perhaps taken.
+          worker.tell = async () => ({ state: "refused", error: "that is too long to add" });
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("nothing was added: that is too long to add");
+          expect(store.rows("SELECT 1 FROM task_notes WHERE call_id = 'call_t3'")).toEqual([]);
         });
       });
 
@@ -848,7 +847,7 @@ describe("tasks, by themselves", () => {
           worker.tell = async () => {
             throw new Error("connection reset");
           };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).rejects.toThrow("it may or may not have been taken. Do not send it again as something new");
           expect(store.rows("SELECT state FROM task_notes WHERE call_id = 'call_t1'")).toEqual([{ state: "sent" }]);
           // The work ends. The call is made again: asked what became of it, not sent again.
           await tasks.event(a.task_id, 1, "result", { text: "done" });
@@ -864,13 +863,13 @@ describe("tasks, by themselves", () => {
 
           // One the worker never had: nothing was added, said as that.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("may or may not have been taken");
           await tasks.event(b.task_id, 1, "result", { text: "done" });
           worker.fateOf = async () => "none";
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).toMatchObject({ ok: false, state: "closed" });
           // One whose fate cannot be found out: said to be not known, with no advice to do it over.
           const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("may or may not have been taken");
           await tasks.event(c.task_id, 1, "result", { text: "done" });
           worker.fateOf = async () => {
             throw new Error("unreachable");
@@ -878,7 +877,7 @@ describe("tasks, by themselves", () => {
           await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("may or may not have been taken into account; do not hand it over again on a guess");
           // While the work is still at it, the same call made again is simply sent again by its id.
           const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).rejects.toThrow("may or may not have been taken");
           worker.tell = async () => ({ state: "taken" });
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).toMatchObject({ ok: true, state: "taken" });
         });
@@ -903,6 +902,11 @@ describe("tasks, by themselves", () => {
           expect(told).toContain("One thing added to it while it was at work could not be confirmed to have reached it before it ended (added at 04:05 UTC)");
           // How many and when, never what: this is the conversation's record, which everyone there shares.
           expect(told).toContain("Do not repeat here what was added");
+          // Of work that did not end well, nothing is said of going on from it (it cannot be gone on from).
+          const f = (await tasks.dispatch(RUN, SESSION_KEY, "call_f", "sandbox", "F", "f", { repository: null })) as { task_id: string };
+          await tasks.event(f.task_id, 1, "failed", { error: "boom", notes_not_read: [{ id: "x", at: 1 }] });
+          expect(events().at(-1)!.text).toContain("could not be confirmed to have reached it");
+          expect(events().at(-1)!.text).not.toContain("goes on from this piece");
           // Nothing of the kind where everything was read.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           await tasks.event(b.task_id, 1, "result", { text: "ok" });
@@ -1207,6 +1211,83 @@ describe("tasks, by themselves", () => {
           await tasks.cancel(SESSION_KEY, d.task_id);
           expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
           void begun;
+        });
+      });
+
+      it("comes back to a place it could not give back at a time set afresh each time, never at once over and over", async () => {
+        await within(async ({ tasks, store, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.release = async () => {
+            throw new Error("registry unreachable");
+          };
+          await tasks.settle();
+          const next = () => store.rows<{ next_at: number }>("SELECT next_at FROM task_releases WHERE task_id = ?", b.task_id)[0].next_at;
+          for (let n = 0; n < 3; n++) {
+            store.sql.exec("UPDATE task_releases SET next_at = 0");
+            await tasks.settle();
+            // Still owed, and due in a while: the Brain is not woken for it at once.
+            expect(next()).toBeGreaterThan(Date.now() + 10_000);
+            expect(tasks.nextWakeAt(Date.now())).toBeGreaterThan(Date.now() + 10_000);
+          }
+        });
+      });
+
+      it("owes back the taking a waiting piece asked for, by its lease, when it is called off or ends with that asking perhaps still on its way", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const leaseOf = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "take").at(-1)?.[2];
+          const backs = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "back").map((each) => each[2]);
+          // Called off while it is being started: the asking for a place was never answered (it may yet arrive).
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("dispatching");
+          const asked = leaseOf(b.task_id);
+          expect(asked).toMatch(/^[0-9a-f-]{36}$/);
+          slots.acquire = async () => true;
+          await tasks.cancel(SESSION_KEY, b.task_id);
+          expect(kept(b.task_id).status).toBe("cancelled");
+          // Owed by that lease at once (written before anything was awaited), and given back by it on the next pass.
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", b.task_id)).toEqual([{ lease: asked }]);
+          store.sql.exec("UPDATE task_releases SET next_at = 0");
+          await tasks.settle();
+          expect(backs(b.task_id)).toContain(asked);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Ended some other way while out of waiting, found so by a later pass (as after the Brain was replaced): owed the same.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          const lease = leaseOf(d.task_id);
+          store.sql.exec("UPDATE tasks SET status = 'cancelled' WHERE id = ?", d.task_id);
+          store.sql.exec("UPDATE task_queued SET next_at = 0");
+          await tasks.settle();
+          expect(backs(d.task_id)).toContain(lease);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Called off while it waits again after an asking that was never answered.
+          slots.acquire = async () => true;
+          const e = (await tasks.dispatch(RUN, SESSION_KEY, "call_e", "sandbox", "E", "e", REPO)) as { task_id: string };
+          const f = (await tasks.dispatch(RUN, SESSION_KEY, "call_f", "sandbox", "F", "f", { repository: null }, e.task_id)) as { task_id: string };
+          await tasks.settle();
+          store.sql.exec("UPDATE task_queued SET lease = 'left-over' WHERE task_id = ?", f.task_id);
+          await tasks.cancel(SESSION_KEY, f.task_id);
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", f.task_id)).toEqual([{ lease: "left-over" }]);
+          // And asked how it stands, a waiting piece says what it waits for.
+          const g = (await tasks.dispatch(RUN, SESSION_KEY, "call_g", "sandbox", "G", "g", { repository: null }, e.task_id)) as { task_id: string };
+          expect(await tasks.status(g.task_id)).toMatchObject({ status: "queued", queued_after: e.task_id });
         });
       });
 

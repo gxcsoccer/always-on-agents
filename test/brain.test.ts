@@ -1978,6 +1978,11 @@ describe("records and limits", () => {
     await registry.releaseTaskSlot("t-plain");
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3b")).toBe(true);
     await registry.releaseTaskSlot("t-lease", "L3b");
+    // A place held under one lease is not said to be had by an asking under another that was never given back.
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M1")).toBe(true);
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M2")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M1")).toBe(true);
+    await registry.releaseTaskSlot("t-two");
     expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L5")).toBe(true);
     await registry.releaseTaskSlot("t-lease");
     expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);

@@ -74,11 +74,12 @@ export interface Worker {
    * from its next step on. `taken`: the worker has it and will bring it before its agent at the
    * next point where that can be done (taken is not read: what was not read by the time the work
    * ends is said in its ending). `closed`: this run of the work takes no more (it has ended, or is
-   * about to); it can be put after it instead. The same `note.id` again gets the same answer.
-   * Throwing means it is not known whether it was taken, or says why it cannot be (too long, too many).
+   * about to); it can be put after it instead. `refused`: it will not take this one, for the
+   * reason it gives (too long, too many). The same `note.id` again gets the same answer.
+   * Throwing means only that it is not known whether it was taken.
    * A worker without this cannot be told anything once it is at work.
    */
-  tell?(env: Env, id: string, note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" }>;
+  tell?(env: Env, id: string, note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" } | { state: "refused"; error: string }>;
   /**
    * What became of a note given earlier with `tell`, by its id, without giving anything now:
    * `taken`, `closed` (it was turned away), or `none` (the worker still has its whole record of the work, and never had it). Where it can no longer say (its record is gone), it throws. For finding out
