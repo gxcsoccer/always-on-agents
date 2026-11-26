@@ -21,7 +21,7 @@ import {
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../../env";
-import { githubTokenFor } from "../../connectors/github-app";
+import { fromTheirs, githubTokenFor } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
 import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
@@ -257,17 +257,6 @@ const TASK_SCRIPT = `echo $$ >${PID_PATH}
 code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
-
-/**
- * Whether a credential issued for a tenant is still that tenant's to use. One issued through the
- * App is, while the installation it came from is the tenant's; one that does not say which
- * installation that was (an earlier version kept them so) is not known to be, and is asked for
- * again. The deployment's own token, of local development, comes from no installation.
- */
-export async function fromTheirs(source: string, installation: string | undefined, tenant: string, tenantOf: (installation: string) => Promise<string | null>): Promise<boolean> {
-  if (installation === undefined) return source === "token";
-  return (await tenantOf(installation)) === tenant;
-}
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
 Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Aim for under 6,000 characters, most important first: beyond ${MAX_RESULT_TEXT.toLocaleString("en-US")} it is cut off.

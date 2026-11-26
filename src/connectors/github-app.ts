@@ -49,6 +49,17 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
   return undefined;
 }
 
+/**
+ * Whether a credential issued for a tenant is still that tenant's to use. One issued through the
+ * App is, while the installation it came from is the tenant's; one that does not say which
+ * installation that was (an earlier version kept them so) is not known to be, and is asked for
+ * again. The deployment's own token, of local development, comes from no installation.
+ */
+export async function fromTheirs(source: string, installation: string | undefined, tenant: string, tenantOf: (installation: string) => Promise<string | null>): Promise<boolean> {
+  if (installation === undefined) return source === "token";
+  return (await tenantOf(installation)) === tenant;
+}
+
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */
 export async function appJwt(appId: string, privateKeyPem: string, now = Date.now()): Promise<string> {
   const key = await crypto.subtle.importKey("pkcs8", pemToPkcs8(privateKeyPem).buffer as ArrayBuffer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);

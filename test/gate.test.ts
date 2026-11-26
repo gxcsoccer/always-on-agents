@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
-import { fromTheirs } from "../src/workers/sandbox/task";
+import { fromTheirs } from "../src/connectors/github-app";
 
 /** A task that is running, as the real object would have stored it. */
 async function runningTask() {
@@ -218,8 +218,5 @@ describe("the repository credential a task is lent", () => {
     expect(await fromTheirs("app:1", "778", "lend4", tenantOf)).toBe(false);
     // The deployment's own token, of local development, comes from none.
     expect(await fromTheirs("token", undefined, "lend4", tenantOf)).toBe(true);
-  });
-    expect(await stub.githubToken()).toBe("test-github-token");
-    expect(await stub.githubReadToken()).toBeUndefined();
   });
 });
