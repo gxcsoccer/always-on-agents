@@ -206,7 +206,7 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
   /** Where they talk to the agent: alone (their own chat), or in a chat several people share. */
   const at = (chatId?: string) => {
     const stub = (env as any).BRAIN.getByName(scopeName(chatId ? { tenant, kind: "chat", id: chatId } : { tenant, kind: "user", id: openId })) as any;
-    const event = (text: string, mentions: unknown[] = [], post?: unknown[][]) =>
+    const event = (text: string, mentions: unknown[] = [], post?: unknown[][], parent?: string) =>
       normalize(app, {
         schema: "2.0",
         header: { event_type: "im.message.receive_v1", tenant_key: org, app_id: app.app_id },
@@ -214,13 +214,16 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
           sender: { sender_type: "user", tenant_key: org, sender_id: { open_id: openId } },
           message: chatId
             ? { message_id: `om_${chatId}_${openId}_${++n}`, chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }] }
-            : { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", ...(post ? { message_type: "post", content: JSON.stringify({ title: "", content: post }) } : { message_type: "text", content: JSON.stringify({ text }) }), ...(mentions.length ? { mentions } : {}) },
+            : { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", ...(post ? { message_type: "post", content: JSON.stringify({ title: "", content: post }) } : { message_type: "text", content: JSON.stringify({ text }) }), ...(mentions.length ? { mentions } : {}), ...(parent ? { parent_id: parent, root_id: parent } : {}) },
         },
       })!.event;
-    const says = async (text: string, mentions: unknown[] = [], post?: unknown[][]) => {
-      await stub.ingest(event(text, mentions, post));
+    const says = async (text: string, mentions: unknown[] = [], post?: unknown[][], parent?: string) => {
+      await stub.ingest(event(text, mentions, post, parent));
       await rest(stub);
+      return `om_${openId}_${n}`;
     };
+    /** Written as a reply to an earlier message, by that one's id. */
+    const replies = (to: string, text: string) => says(text, [], undefined, to);
     /** Lets what is due happen: the grant telling the Brain, the Brain carrying on. */
     const settle = async () => {
       await runDurableObjectAlarm(await grant());
@@ -235,7 +238,7 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
     const mine = (each: { to: string }) => each.to === to || each.to.startsWith(`reply:om_${chatId ? `${chatId}_` : `${openId}_`}`);
     const heard = () => world.sent.filter((each) => mine(each) && each.type === "text").map((each) => String(each.content.text));
     const cards = () => world.sent.filter((each) => mine(each) && each.type === "interactive").map((each) => each.content);
-    return { stub, says, settle, later, heard, cards };
+    return { stub, says, replies, settle, later, heard, cards };
   };
   /** What they were sent directly, outside any chat they asked in. */
   const directly = (type: "text" | "interactive") => world.sent.filter((each) => each.to === openId && each.type === type).map((each) => each.content);
@@ -877,6 +880,36 @@ describe("commenting on GitHub as the person who asked", () => {
     await alone.says(`${PUBLIC}#7 和 ${PUBLIC}#9 好像是一回事`);
     expect((await asked("就在那条下面评论：我这边也遇到了", PUBLIC, 9)).error).toContain("more than one issue or pull request before");
     expect(world.commentWrites).toHaveLength(sent + 1);
+  });
+
+  it("comments on the one in the message the person replied to, whatever they spoke of since", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    for (const number of [7, 9]) reported(PUBLIC, number, `site ${number}`);
+    model.replies([say("")]);
+    const first = await alone.says(`先看一下 ${PUBLIC}#7`);
+    model.replies([say("")]);
+    await alone.says(`再看看 ${PUBLIC}#9`);
+    // She goes back to the first by replying to it. Not the one spoken of last.
+    model.replies([comments(PUBLIC, 9)], ...done("好"));
+    await alone.replies(first, "就在这条下面评论：我这边也遇到了");
+    expect(toolOutputs()[0].error).toContain("is not the issue or pull request the person pointed at in what they replied to");
+    expect(alone.cards()).toEqual([]);
+    // The one she replied to; she has yet to authorise, and it is that one still when she has.
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await alone.replies(first, "就在这条下面评论：我这边也遇到了");
+    expect(JSON.stringify(alone.cards()[0])).toContain("在 acme/site#7 下发表评论");
+    model.replies(...done("评论好了"));
+    expect((await consent(linkOn(alone.cards()[0]), ann.account)).status).toBe(200);
+    await alone.settle();
+    expect(world.commentWrites).toEqual([expect.objectContaining({ repo: PUBLIC, number: 7 })]);
+    // A reply to something that points at nothing: asked which, not taken from what else was said.
+    model.replies([say("")]);
+    const idle = await alone.says("今天先这样");
+    model.replies([comments(PUBLIC, 9)], ...done("好"));
+    await alone.replies(idle, "就在这条下面评论：我这边也遇到了");
+    expect(toolOutputs()[0].error).toContain("what they replied to does not say which");
+    expect(world.commentWrites).toHaveLength(1);
   });
 
   it("notifies only those the person mentioned themselves in what they asked, in a comment as in an issue", async () => {

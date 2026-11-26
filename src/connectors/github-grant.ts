@@ -15,7 +15,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../env";
-import { type InboundEvent, type Scope, scopeName } from "../events";
+import { chainLevels, type InboundEvent, type Scope, scopeName } from "../events";
 import { registry } from "../registry";
 import { chatFactsFor } from "./feishu-api";
 import { chatIs } from "./feishu-docs";
@@ -733,16 +733,23 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
       // the one they pointed at last, in the latest of their earlier messages that points at
       // anything there. Not whichever of the things they spoke of the call happens to name.
       const here = new Set(context.said.flatMap((each) => reposIn(each.text)));
-      const before = pointsOf(context.said.length, own.length).filter((each) => here.size === 0 || (each.repo !== undefined && here.has(each.repo)));
-      const last = before.filter((each) => each.index === Math.max(...before.map((one) => one.index)));
+      const within = (found: ReturnType<typeof pointsOf>) => found.filter((each) => here.size === 0 || (each.repo !== undefined && here.has(each.repo)));
+      // Written as a reply: what they replied to says which, before anything else they said. The
+      // message of their own nearest up the chain of replies; if that points at nothing (or it
+      // was not theirs, or is not here), it is not guessed at from what else was said.
+      const replied = context.said.flatMap((each) => [each.data.replies_to, ...chainLevels(each.data).map((level) => level.subject)]).filter((subject): subject is string => typeof subject === "string");
+      const parent = replied.map((subject) => own.findIndex((each, index) => index >= context.said.length && typeof each.data.message_id === "string" && subject.endsWith(`:message:${each.data.message_id}`))).find((index) => index >= 0);
+      const before = within(pointsOf(context.said.length, own.length));
+      const last = replied.length > 0 ? (parent === undefined ? [] : within(pointsOf(parent, parent + 1))) : before.filter((each) => each.index === Math.max(...before.map((one) => one.index)));
       const points = now.length > 0 ? now : last;
       const meant = points.find((each) => each.repo === repo && each.number === number);
-      // (Several at once, in that last message, and it is not plain which of them is gone on with.)
+      // (Several at once, in that message, and it is not plain which of them is gone on with.)
       const several = now.length === 0 && new Set(last.map((each) => `${each.repo}#${each.number}`)).size > 1;
       if (!meant || several) {
         if (points.some((each) => each.number === number && each.repo === undefined)) return { error: `the person named more than one repository, and it is not plain which of them #${number} is in; nothing was posted. Ask them which one they mean (as owner/name#${number}, or by its address)` };
         if (several) return { error: "the person pointed at more than one issue or pull request before, and it is not plain which of them they mean now; nothing was posted. Ask them which one (as owner/name#number, or by its address)" };
-        return { error: `that is not the issue or pull request the person pointed at ${now.length > 0 ? "this time" : "last"} (they say which as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
+        if (now.length === 0 && replied.length > 0 && last.length === 0) return { error: "the person wrote this as a reply, and what they replied to does not say which issue or pull request; nothing was posted. Ask them which one they mean (as owner/name#number, or by its address)" };
+        return { error: `that is not the issue or pull request the person pointed at ${now.length > 0 ? "this time" : replied.length > 0 ? "in what they replied to" : "last"} (they say which as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
       }
       relied(meant.index);
       if (!meant.plain) relied(named);
