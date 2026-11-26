@@ -49,7 +49,8 @@ export const githubConnector: Connector = {
     }
     return undefined;
   },
-  channel: { deliver: deliverGithub, standing: commentStanding },
+  // A comment is Markdown. Nobody is reminded by `mention` there (it is not carried out for comments).
+  channel: { shows: () => ({ markdown: true, reminds: false }), deliver: deliverGithub, standing: commentStanding },
 };
 
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);

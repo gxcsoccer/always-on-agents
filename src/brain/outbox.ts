@@ -98,9 +98,19 @@ export class Outbox implements Wakes {
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
+  /**
+   * Where a message of this conversation goes: the answer to a request that waited, where the
+   * request came from, as it was then; otherwise where it is told, then where the conversation is
+   * answered, then the scope's last known place. `own` says it is one of the first three: the
+   * last is not known to be this conversation's, and nobody is reminded there.
+   */
+  whereTo(sessionId: string, bound?: { continuation?: Pick<Continuation, "target">; target?: string }): { target: string | undefined; own: boolean } {
+    const own = bound?.continuation?.target ?? bound?.target ?? (this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target as string | null | undefined) ?? undefined;
+    return { target: own ?? this.#s.meta("default_target") ?? undefined, own: own !== undefined };
+  }
+
   enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: (target: string) => string[] }): { ok: true } {
-    // The answer to a request that waited goes where the request came from, as it was then.
-    const target = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#s.meta("default_target");
+    const { target, own } = this.whereTo(sessionId, bound);
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
     const already = this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", idem).length > 0;
@@ -123,9 +133,8 @@ export class Outbox implements Wakes {
     // Whom it reminds: settled now that where it goes is known, and kept with it once, for every attempt at sending it.
     // (Only where that is this conversation's own place, or the place a request came from: where the
     // scope's last known place stands in for it, it is not known to be of this conversation, and nobody is reminded there.)
-    const own = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target;
     // (And only for a message kept just now: one kept before is as it was kept, whether it reminded anyone or not.)
-    const mention = bound?.mention && !already && own === target && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
+    const mention = bound?.mention && !already && own && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
     if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);

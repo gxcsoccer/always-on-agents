@@ -1609,6 +1609,8 @@ describe("reminding people where several talk", () => {
     model.replies([call("send_message", { text: "只有字 @Carol ou_colleague。", notify: null })], [say("")]);
     await here.says("那就这样");
     expect(last()).toBe("只有字 @Carol ou_colleague。");
+    // The model was told what its messages come to in this chat, in the Brain's own words.
+    expect(modelCalls.at(-1).instructions).toContain("Your messages here are shown as Markdown. A message here can remind people: name them in notify.");
     // Words that begin as a heading, a list, a table or a block of code keep their first line to themselves: the mention goes on a line before them.
     for (const text of ["# 结果\n\n都好了。", "- 第一项\n- 第二项", "1. 第一步", "> 引用的话", "| 列 |\n| --- |\n| 值 |", "```\ncode\n```", "---\n\n下面是结果。", "\tcode"]) {
       model.replies([call("send_message", { text, notify: [ann.openId] })], [say("")]);

@@ -9,7 +9,7 @@ import config from "../agent.config";
 import { TOOLS } from "../brain/tools";
 import type { Env } from "../env";
 import type { InboundEvent, Principal, Scope, Target } from "../events";
-import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Picture, PictureRef, Quoted, Receipt, Standing } from "./types";
+import type { ApprovalQuestion, Connector, ConnectorTool, Holds, OutboundMessage, Outcome, Picture, PictureRef, Quoted, Receipt, Shows, Standing } from "./types";
 import { DeliveryVoid } from "./types";
 
 export type * from "./types";
@@ -149,6 +149,16 @@ export async function received(env: Env, name: string, scope: Scope, event: { so
 export function direct(name: string, origin: Record<string, string>, person: string): Target | undefined {
   try {
     return byName.get(name)?.channel?.direct?.(origin, person);
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a message sent to this address comes to there, where its connector says. Only its two answers, as plain yes or no. */
+export function shows(scope: Scope, target: Target): Shows | undefined {
+  try {
+    const said = byName.get(target.connector)?.channel?.shows?.(scope, target);
+    return said ? { markdown: said.markdown === true, reminds: said.reminds === true } : undefined;
   } catch {
     return undefined;
   }

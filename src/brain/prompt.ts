@@ -91,11 +91,25 @@ export interface PromptParts {
   guidance?: string;
   /** Requests in this conversation that wait on something or are being carried on, with the person's own words. */
   requests?: { id: string; asked: string }[];
+  /** What a message sent in this conversation comes to where it is shown, as its connector answers (see `Channel.shows`). */
+  shows?: { markdown: boolean; reminds: boolean };
 }
+
+/**
+ * What the model is told of the place its messages are shown in: fixed sentences, chosen by a
+ * connector's yes or no. Nothing of the conversation, of what was read, or of what a platform
+ * returned is in them.
+ */
+const SHOWN = {
+  markdown: "Your messages here are shown as Markdown.",
+  plain: "Your messages here are shown as plain text, marks and all: write them without Markdown.",
+  reminds: "A message here can remind people: name them in notify. An @name or an id written in the text is only text, and reminds nobody.",
+  silent: "The notify parameter has no effect here.",
+};
 
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
 export function buildInstructions(parts: PromptParts): string {
-  const sections = [BASE, SITUATION[parts.situation], `Where you are\n${SCOPE[parts.scope.kind]}`];
+  const sections = [BASE, SITUATION[parts.situation], `Where you are\n${SCOPE[parts.scope.kind]}${parts.shows ? `${SCOPE[parts.scope.kind].includes("\n\n") ? "\n\n" : "\n"}${parts.shows.markdown ? SHOWN.markdown : SHOWN.plain} ${parts.shows.reminds ? SHOWN.reminds : SHOWN.silent}` : ""}`];
   // The deployment's own words, so they stand with the stable text and before anything a conversation wrote.
   if (parts.guidance) sections.push(`Where to hand work (this deployment's guidance)\n${parts.guidance}`);
   sections.push(`Standing instructions from the people here (instructions.md)\n${loaded(parts.instructions, MAX_LOADED_INSTRUCTIONS, "instructions.md", "(none yet)")}`);
