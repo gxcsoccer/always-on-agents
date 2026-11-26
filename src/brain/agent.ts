@@ -386,7 +386,8 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("DELETE FROM runs WHERE status != 'running' AND ended_at < ?", old);
       // (By when it last was due, not by when it was set: one set long ago that has only now fired
       // for the last time is still gone by, by the run its firing starts, for whom it may remind.)
-      this.#store.sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ? AND due_at < ?", old, old);
+      // And not while a firing of it is still to be taken up, however late it fired.
+      this.#store.sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ? AND due_at < ? AND id NOT IN (SELECT json_extract(principal, '$.id') FROM inbox WHERE source = 'timer' AND status IN ('pending', 'claimed'))", old, old);
       this.#store.sql.exec("DELETE FROM task_events WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM tasks WHERE status IN ('succeeded', 'failed', 'lost', 'cancelled') AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM task_bounds WHERE task_id NOT IN (SELECT id FROM tasks)");

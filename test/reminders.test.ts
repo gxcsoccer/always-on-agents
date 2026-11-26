@@ -261,6 +261,15 @@ describe("who a message may remind", () => {
       expect(store.rows("SELECT status FROM timers WHERE id = 'tmr_once'")).toEqual([{ status: "done" }]);
       expect(reminders.claim(run("o3"), [ANN], HERE)).toEqual([]);
       expect(store.rows("SELECT person FROM reminded WHERE event LIKE 'timer:tmr_once:%'")).toEqual([{ person: ANN }]);
+      // One called off after it fired: the firing that was already waiting reminds nobody.
+      store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, data, created_at) VALUES ('tmr_off', 1, 600, 'chat', 'n', ?, 1)", JSON.stringify({ by: ANN, named: [], place: PLACE }));
+      fires("tmr_off", "c1");
+      store.sql.exec("UPDATE timers SET status = 'cancelled' WHERE id = 'tmr_off'");
+      expect(reminders.claim(run("c1"), [ANN], HERE)).toEqual([]);
+      // One that has run its rounds and ended by itself still reminds, of its last firing.
+      store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, data, status, created_at) VALUES ('tmr_ended', 1, 600, 'chat', 'n', ?, 'done', 1)", JSON.stringify({ by: ANN, named: [], place: PLACE }));
+      fires("tmr_ended", "e1");
+      expect(reminders.claim(run("e1"), [ANN], HERE)).toEqual([ANN]);
       // One set before any of this was kept reminds nobody.
       store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES ('tmr_old', 1, NULL, 'chat', 'n', 1)");
       fires("tmr_old", "old");

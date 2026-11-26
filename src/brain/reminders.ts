@@ -126,7 +126,9 @@ export class Reminders {
       if (task && typeof kept?.by === "string" && typeof kept.place === "string") about = { event: `task:${id}`, by: kept.by, named: named(kept.named), sessionKey: task.session_key, place: kept.place };
     } else if (events.length === 1 && only.source === "timer" && only.kind === "timer") {
       const id = String((JSON.parse(only.principal) as { id?: unknown }).id ?? "");
-      const timer = this.#s.rows<{ data: string | null; session_key: string }>("SELECT data, session_key FROM timers WHERE id = ?", id)[0];
+      const timer = this.#s.rows<{ data: string | null; session_key: string; status: string }>("SELECT data, session_key, status FROM timers WHERE id = ?", id)[0];
+      // Called off since it fired: a firing of it that was already waiting reminds nobody.
+      if (timer?.status === "cancelled") return undefined;
       const kept = JSON.parse(timer?.data ?? "{}") as Partial<Asked> & { stop_after_reminding?: unknown; reminded?: unknown };
       // One set to stop once it has reminded has done so, at an earlier firing: no later one reminds, whenever it is taken up.
       if (kept.stop_after_reminding === true && kept.reminded !== undefined) return undefined;

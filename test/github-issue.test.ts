@@ -1680,4 +1680,30 @@ describe("reminding people where several talk", () => {
     expect(last()).toBe(`<at user_id="${ann.openId}"></at> 构建通过了。`);
     expect(await rowsOf(here.stub, "SELECT status FROM timers")).toEqual([{ status: "done" }]);
   });
+
+  it("reminds the one who set a timer long ago when it fires at last, however late, and nobody once it was called off", async () => {
+    const ann = someone();
+    const here = ann.at("oc_timer_old");
+    const DAY = 86_400_000;
+    // Set a year ago, to fire once; the scope was asleep for a month past the time, and wakes now. The day's clearing out runs in the same waking.
+    model.replies([call("set_timer", { delay_seconds: 60, note: "到点了告诉她", repeat_every_seconds: null, stop_after_reminding: null })], [say("")]);
+    await here.says("一年后提醒我续费");
+    await rowsOf(here.stub, "UPDATE timers SET created_at = ?, due_at = ?", Date.now() - 396 * DAY, Date.now() - 31 * DAY);
+    await rowsOf(here.stub, "DELETE FROM meta WHERE key = 'housekeeping_at'");
+    model.replies([call("send_message", { text: "该续费了。", notify: [ann.openId] })], [say("")]);
+    await rest(here.stub);
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 该续费了。`);
+
+    // A repeating one that has just come due; she calls it off before its firing is taken up. What is said then reminds nobody.
+    model.replies([call("set_timer", { delay_seconds: 60, note: "每小时提醒她", repeat_every_seconds: 3600, stop_after_reminding: null })], [say("")]);
+    await here.says("每小时提醒我喝水");
+    const id = (await rowsOf(here.stub, "SELECT id FROM timers WHERE status = 'active'"))[0].id as string;
+    await rowsOf(here.stub, "UPDATE timers SET due_at = ? WHERE id = ?", Date.now() - 1, id);
+    await here.stub.ingest(normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: ann.openId } }, message: { message_id: "om_call_off", chat_id: "oc_timer_old", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 不用提醒了" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }] } } })!.event);
+    model.replies([call("cancel_timer", { id })], [call("send_message", { text: "好，不提醒了。", notify: null })], [say("")], [call("send_message", { text: "喝水。", notify: [ann.openId] })], [say("")]);
+    await rest(here.stub);
+    expect(await rowsOf(here.stub, "SELECT status FROM timers WHERE id = ?", id)).toEqual([{ status: "cancelled" }]);
+    expect(world.sent.filter((each) => each.type === "text").map((each) => String(each.content.text)).filter((text) => text.includes(`<at user_id="${ann.openId}"></at> 喝水`))).toEqual([]);
+  });
 });
