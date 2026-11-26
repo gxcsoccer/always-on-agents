@@ -3961,6 +3961,21 @@ describe("how the bot's words are sent", () => {
     expect(sentAs()).toMatchObject({ msg_type: "post", reply_in_thread: true });
   });
 
+  it("makes emphasis hold that full-width punctuation would have kept from holding, for a message first sent under the encoding that says so", async () => {
+    const text = "**结论：**可以合入。\n\n`**代码：**不动`";
+    await deliverFeishu(env as any, scope, dm, { id: 901, idem: "msg:mended", text, authored: true, encoding: 2 });
+    expect(JSON.parse(sentAs().content)).toEqual({ zh_cn: { content: [[{ tag: "md", text: "**结论**：可以合入。\n\n`**代码：**不动`" }]] } });
+    // One whose sending began under the encoding before goes out as it did then, at every attempt.
+    await deliverFeishu(env as any, scope, dm, { id: 902, idem: "msg:unmended", text, authored: true, encoding: 1 });
+    expect(JSON.parse(sentAs().content)).toEqual({ zh_cn: { content: [[{ tag: "md", text }]] } });
+    // The system's own fixed words are not Markdown, and are not touched.
+    await deliverFeishu(env as any, scope, dm, { id: 903, idem: "msg:fixed", text, authored: false, encoding: 2 });
+    expect(JSON.parse(sentAs().content)).toEqual({ text });
+    // What the model wrote as the chat's own mention is still only text, mended or not.
+    await deliverFeishu(env as any, scope, dm, { id: 904, idem: "msg:quiet", text: '**注意：**请看 <at user_id="all"></at>', authored: true, encoding: 2 });
+    expect(JSON.parse(sentAs().content).zh_cn.content[0][0].text).toBe('**注意**：请看 <\u200bat user_id="all"><\u200b/at>');
+  });
+
   it("sends a message whose sending began under the earlier version exactly as that version did", async () => {
     // Its first attempt went out as text, with this uuid; whether it arrived is not known.
     await deliverFeishu(env as any, scope, dm, { id: 900, idem: "msg:legacy", text: "**旧的**", authored: true, encoding: 0 });

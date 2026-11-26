@@ -510,7 +510,9 @@ export interface OutboundMessage {
   /**
    * Which encoding to send it with, fixed at its first attempt so that every retry sends the very
    * same thing under the same `idem`: 0 for the encoding before connectors could choose one (a
-   * message whose sending began then), 1 for the current one.
+   * message whose sending began then), 1 for the first a connector chose by, 2 for the current
+   * one, under which a connector may put the words right as it writes them out. A connector sends
+   * a message of an earlier encoding as it would have then.
    */
   encoding?: number;
   /** When the message was written, in ms. */

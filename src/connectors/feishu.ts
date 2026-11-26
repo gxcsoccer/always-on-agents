@@ -16,7 +16,7 @@
  * Outbound: replies as the bot, using the app's tenant_access_token. An approval question goes out
  * as a card, and is replaced by a closed card once it is decided or withdrawn.
  */
-import { mentionsOf } from "./markdown";
+import { mentionsOf, emphasised } from "./markdown";
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
@@ -709,7 +709,8 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
           .map((id) => `<at user_id="${id}"></at>`)
           .join(" ")
       : "";
-  const words = current && message.authored ? quiet(message.text) : message.text;
+  // (From the second encoding on, emphasis that full-width punctuation would have kept from holding is made to hold.)
+  const words = current && message.authored ? quiet((message.encoding ?? 0) >= 2 ? emphasised(message.text) : message.text) : message.text;
   // On a line of their own where the words begin as a heading, a list, a quotation, a table, a
   // rule or a block of code would: put on the same line, the words would no longer begin that way, and
   // would be shown with their marks.
