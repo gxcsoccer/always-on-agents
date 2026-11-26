@@ -91,7 +91,7 @@ export interface RunnerHost {
   /** The message something sent to this address is written under, where the connector says. */
   under(target: Target): string | undefined;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised" | "told">;
-  readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
+  readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub" | "whereTo">;
   /** Who a message may remind: see Reminders. */
   readonly reminders: Pick<Reminders, "claim">;
   readonly tools: Pick<RunTools, "for">;
@@ -1335,12 +1335,17 @@ export class Runner {
     return acting !== undefined && toolsIn(acting, this.#b.toolsOf).some((each) => each.name === name && each.effect === "read");
   }
 
-  /** What a message comes to where this conversation is answered, as that place's connector says. */
-  #shows(sessionId: string | undefined): { markdown: boolean; reminds: boolean } | undefined {
-    const target = sessionId ? this.#s.rows<{ target: string | null }>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target : undefined;
-    if (!target) return undefined;
+  /**
+   * What a message of this run comes to where it goes, as that place's connector says: the place
+   * the outbox would send it to (where the request came from, for a run that carries one on).
+   * Where that is only the scope's last known place, nobody is reminded there, whatever it can do.
+   */
+  #shows(runId: string, sessionId: string | undefined): { markdown: boolean; reminds: boolean } | undefined {
+    if (!sessionId) return undefined;
     try {
-      return this.#b.shows(JSON.parse(target) as Target);
+      const { target, own } = this.#b.outbox.whereTo(sessionId, { continuation: this.#b.requests.continuationOf(runId) });
+      const said = target ? this.#b.shows(JSON.parse(target) as Target) : undefined;
+      return said && { markdown: said.markdown, reminds: said.reminds && own };
     } catch {
       return undefined;
     }
@@ -1384,7 +1389,7 @@ export class Runner {
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
       // Only where this very call to the model is given the tool to hand work over with: by the same word that decides its tools.
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
-      shows: this.#shows(session?.id),
+      shows: this.#shows(runId, session?.id),
       work: [
         ...this.#s
           .rows<{ id: string; worker: string; title: string; status: string; after: string | null }>("SELECT id, worker, title, status, (SELECT from_id FROM task_follows WHERE task_id = tasks.id) AS after FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input', 'queued') AND session_key = ? ORDER BY created_at", session?.session_key ?? "")

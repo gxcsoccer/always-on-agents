@@ -40,6 +40,8 @@ function bench(state: DurableObjectState) {
   const settings = {
     /** What the connector says a replied-to message was: a value, or a function giving it. */
     quoted: undefined as any,
+    /** The scope's last known place, where a conversation has none of its own. */
+    fallback: undefined as string | undefined,
     /** What the connector says a message comes to at an address. */
     shows: undefined as undefined | ((target: { connector: string; address: Record<string, string> }) => { markdown: boolean; reminds: boolean } | undefined),
     /** The tenant's limits as the registry gives them, by how often it has been asked (the first time: 1). */
@@ -127,6 +129,11 @@ function bench(state: DurableObjectState) {
       notify: (idem: string, sessionId: string, runId: string | null, text: string) => void log.push(["notify", idem, sessionId, runId, text]),
       notice: (which: string) => `notice:${which}`,
       scrub: (which: string, value: unknown) => void log.push(["scrub", which, value]),
+      // As the outbox picks it: where a carried request came from, else where the conversation is answered, else the scope's last known place.
+      whereTo: (sessionId: string, bound?: { continuation?: { target?: string } }) => {
+        const own = bound?.continuation?.target ?? store.rows<{ target: string | null }>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? undefined;
+        return { target: own ?? settings.fallback, own: own !== undefined };
+      },
     } as unknown as RunnerHost["outbox"],
     tools: { for: (run: RunRow) => (log.push(["toolsFor", run.id]), toolHost) },
   };
@@ -277,6 +284,24 @@ describe("the run loop, by itself", () => {
         // Asked of where this conversation is answered.
         expect(places.at(-1)).toEqual(JSON.parse(store.rows<{ target: string }>("SELECT target FROM sessions")[0].target));
         expect(asked.at(-1)!.instructions).toContain("Your messages here are shown as plain text, marks and all: write them without Markdown. A message here can remind people: name them in notify.");
+        // A run that carries a request on answers where the request came from, though the conversation has since been written to from elsewhere: asked of that place.
+        const origin = JSON.stringify({ connector: "feishu", address: { chat_id: "oc_origin" } });
+        settings.shows = (target) => (places.push(target), { markdown: true, reminds: target.address.chat_id === "oc_origin" });
+        settings.carried = { id: "call_1", status: "resuming", target: origin };
+        event("carried on");
+        model.push(answer([says("hi")], 250));
+        await go();
+        expect(places.at(-1)).toEqual(JSON.parse(origin));
+        expect(asked.at(-1)!.instructions).toContain("A message here can remind people");
+        settings.carried = undefined;
+        // A conversation with no place of its own, answered at the scope's last known one: nobody is reminded there, whatever that place can do.
+        store.sql.exec("UPDATE sessions SET target = NULL");
+        settings.fallback = origin;
+        event("from nowhere", { reply_to: null });
+        model.push(answer([says("hi")], 250));
+        await go();
+        expect(asked.at(-1)!.instructions).toContain("Your messages here are shown as Markdown. The notify parameter has no effect here.");
+        settings.fallback = undefined;
         // A connector that fails to answer, or a conversation with nowhere it is answered: the model is told nothing of the place.
         settings.shows = () => {
           throw new Error("no answer");
@@ -622,7 +647,7 @@ describe("the run loop, by itself", () => {
         expect(asked[0].input).toHaveLength(1);
         expect(asked[0].instructions.length).toBeGreaterThan(0);
         // Its connector says nothing of the place: neither does the prompt.
-        expect(asked[0].instructions).not.toMatch(/Your messages here|reminded from here|can remind people/);
+        expect(asked[0].instructions).not.toMatch(/Your messages here|notify parameter|can remind people/);
         expect(asked[0].tools.map((each) => each.name)).toContain("send_message");
         expect(run(id)).toMatchObject({ status: "done", steps: 1, input_tokens: 240, output_tokens: 10 });
         expect(inbox()[0].status).toBe("done");

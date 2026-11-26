@@ -8,8 +8,8 @@ describe("what the model is told of the place its messages are shown in", () => 
   it("is one of a few fixed sentences for each of the connector's answers, with the words on where it is", () => {
     const told = (answers?: { markdown: boolean; reminds: boolean }) => /Where you are\n[^\n]*\n?([^\n]*)/.exec(buildInstructions(parts({ shows: answers })))![1];
     expect(told({ markdown: true, reminds: true })).toBe("Your messages here are shown as Markdown. A message here can remind people: name them in notify. An @name or an id written in the text is only text, and reminds nobody.");
-    expect(told({ markdown: true, reminds: false })).toBe("Your messages here are shown as Markdown. Nobody can be reminded from here: notify does nothing.");
-    expect(told({ markdown: false, reminds: false })).toBe("Your messages here are shown as plain text, marks and all: write them without Markdown. Nobody can be reminded from here: notify does nothing.");
+    expect(told({ markdown: true, reminds: false })).toBe("Your messages here are shown as Markdown. The notify parameter has no effect here.");
+    expect(told({ markdown: false, reminds: false })).toBe("Your messages here are shown as plain text, marks and all: write them without Markdown. The notify parameter has no effect here.");
     // No answers: nothing is said.
     expect(told(undefined)).toBe("");
     // It stands with the stable text, before anything a conversation wrote.

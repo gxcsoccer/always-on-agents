@@ -104,7 +104,7 @@ const SHOWN = {
   markdown: "Your messages here are shown as Markdown.",
   plain: "Your messages here are shown as plain text, marks and all: write them without Markdown.",
   reminds: "A message here can remind people: name them in notify. An @name or an id written in the text is only text, and reminds nobody.",
-  silent: "Nobody can be reminded from here: notify does nothing.",
+  silent: "The notify parameter has no effect here.",
 };
 
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
