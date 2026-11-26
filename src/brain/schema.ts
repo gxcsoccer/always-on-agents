@@ -329,6 +329,9 @@ export const MIGRATIONS: string[] = [
   // 34: the earlier task a task goes on from, written with the task once that was found to be
   // allowed: a start made again goes by this, not by what the call says the second time.
   `CREATE TABLE IF NOT EXISTS task_follows (task_id TEXT PRIMARY KEY, from_id TEXT NOT NULL);`,
+  // 35: a task put after one that has not ended yet, until it runs: what its worker is to be given,
+  // when it was let through to be started (nothing before that), and when to look at it next.
+  `CREATE TABLE IF NOT EXISTS task_queued (task_id TEXT PRIMARY KEY, options TEXT NOT NULL, started_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -186,6 +186,32 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const first = toolOutputs().find((each: any) => each.work_id).work_id;
+    model.replies([call("hand_over", { worker: "sandbox", title: "Add tests", brief: "add tests for the fix", continue_from: first, repository: null }), call("send_message", { text: "等它修完就接着补测试。" })], [say("")]);
+    await stub.ingest(message("when that is done, add tests for it"));
+    await wake(stub);
+    const second = toolOutputs().at(-1).work_id ?? toolOutputs().find((each: any) => each.status === "queued").work_id;
+    expect(await task(second).calls()).toEqual([]);
+
+    // The first reports that it ended well. Nobody hands the second over again: it is started by the Brain itself.
+    model.replies([call("send_message", { text: "修好了，接着在补测试。" })], [say("")]);
+    await stub.taskEvent(first, 1, "result", { text: "Fixed." });
+    await wake(stub);
+    await wake(stub);
+    const started = (await task(second).calls()).filter((each: any) => each.method === "start");
+    expect(started).toHaveLength(1);
+    expect(started[0].args).toMatchObject({ id: second, prompt: "add tests for the fix", seed: { from: first, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" } });
+    const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT id, status FROM tasks ORDER BY created_at").toArray());
+    expect(kept).toEqual([{ id: first, status: "succeeded" }, { id: second, status: "running" }]);
+    // The model did not hand anything over in the step that told of the first's ending.
+    expect(toolOutputs().filter((each: any) => each.work_id)).toHaveLength(2);
+  });
+
   it("lists work the sandbox finished here as something that can be gone on from, and starts the next piece from what it left", async () => {
     const { stub } = brain();
     model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
@@ -266,22 +292,32 @@ describe("timers and memory", () => {
     const { work_id: id, status } = toolOutputs().at(-1);
     expect(status).toBe("running");
 
-    model.replies([call("work_status", { work_id: id })], [call("hand_over", { worker: "sandbox", title: "More", brief: "and this", continue_from: id, repository: null })], [call("cancel_work", { work_id: id })], [say("")]);
+    model.replies([call("work_status", { work_id: id })], [call("hand_over", { worker: "sandbox", title: "More", brief: "and this", continue_from: id, repository: null })], [call("cancel_work", { work_id: id })], [say("")], [say("")]);
     await stub.ingest(message("how is it going? stop it"));
     await wake(stub);
-    expect(modelCalls.at(-4).instructions).toContain(`- ${id} [sandbox] "Fix the build": running`);
+    expect(modelCalls.some((each: any) => String(each.instructions).includes(`- ${id} [sandbox] "Fix the build": running`))).toBe(true);
     const outputs = toolOutputs().slice(-3);
     expect(outputs[0]).toMatchObject({ status: "running" });
-    // The sandbox goes on only from a piece of work that has ended: one still running has left nothing yet. Said, and nothing started.
-    expect(outputs[1].error).toContain("has not ended yet, so there is nothing of it to go on from");
+    // Something more for a piece of work that has not ended is put after it: written, said to wait, and listed as waiting for it.
+    expect(outputs[1]).toMatchObject({ status: "queued", note: expect.stringContaining(`waits for ${id} to end`) });
+    const behind = outputs[1].work_id;
+    expect(modelCalls.some((each: any) => String(each.instructions).includes(`- ${behind} [sandbox] "More": waiting for ${id} to end`))).toBe(true);
+    expect(await task(behind).calls()).toEqual([]);
     expect(outputs[2]).toMatchObject({ ok: true, status: "cancelled" });
+    // The first was called off, so what waited behind it is not started; that is told in a step of its own.
+    await wake(stub);
+    await wake(stub);
+    expect(modelCalls.at(-1).input.some((each: any) => typeof each.content === "string" && each.content.includes(behind) && each.content.includes("was to go on from"))).toBe(true);
     // It does not take the place of a request that waits: said before anything is started.
     model.replies([call("hand_over", { worker: "sandbox", title: "t", brief: "b", continue_from: null, repository: null, replaces: "req_1" })], [say("")]);
     await stub.ingest(message("do this instead"));
     await wake(stub);
     expect(toolOutputs().at(-1).error).toContain("cannot take the place of a request that waits");
     const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT worker, state FROM work").toArray());
-    expect(kept).toEqual([{ worker: "sandbox", state: "cancelled" }]);
+    expect(kept).toEqual([
+      { worker: "sandbox", state: "cancelled" },
+      { worker: "sandbox", state: "failed" },
+    ]);
   });
 
   it("lets a person set standing instructions, and shows them to later runs", async () => {
