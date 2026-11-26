@@ -656,24 +656,51 @@ export class Tasks implements Wakes {
     const asker = people.length === 1 ? people[0] : null;
     if (task && task.session_key === sessionKey && asker === null) throw new Error("something can be added to work under way only in answer to the one person whose work it is, and this step was not started by a message of theirs alone; nothing was added");
     if (!task || task.session_key !== sessionKey || task.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(taskId)} of this person's here to add anything to; nothing was added`);
-    if (task.status === "queued") throw new Error("that piece of work has not begun yet (it waits for another to end), so there is nothing at work to tell. If what they want of it has changed, call it off and hand it over again as they now want it");
-    if (task.status === "dispatching" || task.status === "unconfirmed") throw new Error("it is not known yet that this piece of work has begun, so nothing can be added to it at this moment; try again shortly");
-    let worker: Worker;
-    try {
-      worker = this.#b.workerOf(String(task.worker));
-    } catch {
-      throw new Error("the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
-    }
-    if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
-    // Something new is added only to work that is at it. For work that has ended, a call made again is
-    // told what it was told when it was first made (kept here, with the record of its being passed on);
-    // a call never made before is told that nothing more is taken, and the worker is not asked at all.
-    const passed = this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length > 0;
     const closed = { ok: false, work_id: taskId, state: "closed", note: "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did." };
-    if (TERMINAL_TASK.has(String(task.status)) && !passed) return closed;
-    const answer = passed && TERMINAL_TASK.has(String(task.status)) ? ({ state: "taken" } as const) : await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
-    if (answer.state === "closed") return closed;
-    if (!passed) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
+    // What became of this very call, if it was made before: known here, whatever has become of the work or its worker since.
+    const kept = this.#s.rows<{ task_id: string; state: string }>("SELECT task_id, state FROM task_notes WHERE call_id = ?", callId)[0];
+    if (kept && kept.task_id !== taskId) throw new Error("this call was first made for another piece of work; nothing was added");
+    const settle = (state: "taken" | "closed") => {
+      this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE task_notes SET state = ? WHERE call_id = ?", state, callId);
+        if (state === "taken" && this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length === 0) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
+      });
+    };
+    if (kept?.state === "closed") return closed;
+    if (kept?.state !== "taken") {
+      if (!kept) {
+        // Something new is added only to work that is at it.
+        if (task.status === "queued") throw new Error("that piece of work has not begun yet (it waits for another to end), so there is nothing at work to tell. If what they want of it has changed, call it off and hand it over again as they now want it");
+        if (task.status === "dispatching" || task.status === "unconfirmed") throw new Error("it is not known yet that this piece of work has begun, so nothing can be added to it at this moment; try again shortly");
+        if (TERMINAL_TASK.has(String(task.status))) return closed;
+      }
+      let worker: Worker;
+      try {
+        worker = this.#b.workerOf(String(task.worker));
+      } catch {
+        throw new Error(kept ? "this was sent to the work once and the answer never came; its worker is no longer part of this deployment, so whether it was taken cannot be found out. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess" : "the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
+      }
+      if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
+      const ended = TERMINAL_TASK.has(String(this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status));
+      if (kept && ended) {
+        // Sent once, the answer lost, and the work has ended since: nothing is given now. What became of it is asked.
+        let fate: "taken" | "closed" | "none";
+        try {
+          if (!worker.told) throw new Error("no way to ask");
+          fate = await within(worker.told(this.#b.env, taskId, callId));
+        } catch {
+          throw new Error("this was sent to the work once and the answer never came; the work has ended, and whether it was taken cannot be found out just now. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess");
+        }
+        settle(fate === "taken" ? "taken" : "closed");
+        if (fate !== "taken") return closed;
+      } else {
+        // Written down before it is sent: an answer that is lost leaves this, and the call made again goes by it.
+        if (!kept) this.#s.sql.exec("INSERT INTO task_notes (call_id, task_id, state, at) VALUES (?, ?, 'sent', ?)", callId, taskId, Date.now());
+        const answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+        settle(answer.state);
+        if (answer.state === "closed") return closed;
+      }
+    }
     // Read again after the wait.
     const now = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
     return {
@@ -949,6 +976,8 @@ export class Tasks implements Wakes {
    */
   async event(taskId: string, seq: number, kind: WorkerEventKind, report: Record<string, unknown>): Promise<{ ok: boolean }> {
     let body = report;
+    // Of notes that were not read, only which and when is kept and told: never their words, whatever a worker sends.
+    if (Array.isArray(body.notes_not_read)) body = { ...body, notes_not_read: (body.notes_not_read as { id?: unknown; at?: unknown }[]).map((note) => ({ id: String(note?.id ?? ""), ...(typeof note?.at === "number" ? { at: note.at } : {}) })) };
     const outcome: { known: boolean; wake: boolean; terminal: boolean; spent?: number } = this.#s.transaction(() => {
       const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
       if (!task) return { known: false, wake: false, terminal: false };

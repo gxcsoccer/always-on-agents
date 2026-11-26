@@ -47,6 +47,7 @@ export const sandboxWorker: Worker = {
     return told(started);
   },
   tell: (env, id, note) => env.TASKS.getByName(id).tell(note),
+  told: (env, id, noteId) => env.TASKS.getByName(id).told(noteId),
   answer: (env, id, decision, reason, question, standing) => env.TASKS.getByName(id).answer(decision, reason, question, standing),
   decisionOn: (env, id, question) => env.TASKS.getByName(id).decisionOn(question),
   async standing(env, id) {

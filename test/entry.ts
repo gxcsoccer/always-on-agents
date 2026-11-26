@@ -27,6 +27,9 @@ export class FakeTask extends DurableObject {
     this.#record("tell", note);
     return { state: note.text.includes("(too late)") ? "closed" : "taken" };
   }
+  async told(noteId: string) {
+    return ((this.ctx.storage.kv.get("calls") as { method: string; args: any }[] | undefined) ?? []).some((each) => each.method === "tell" && each.args?.id === noteId && !String(each.args.text).includes("(too late)")) ? "taken" : "none";
+  }
   /** As the real task: how it stands, or that there is none. */
   async status() {
     return this.ctx.storage.kv.get("started") === true ? { phase: "running" } : { error: "no such task" };
