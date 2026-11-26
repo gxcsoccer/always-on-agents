@@ -684,12 +684,17 @@ function unsearched(reads: unknown): string | undefined {
   const each = Object.values(search?.each ?? {});
   // A search that was refused, or failed, or was never answered is in no page that was read: it
   // is in the count of how the searches were answered. One such, and it was not all looked
-  // through. (A query not accepted as written, 400 or 422, was no search: what it was put right into is what counts.)
+  // through, whatever GitHub's reason (it answers 422 for what may not be seen, too). Only a
+  // query the proxy itself turned away as not a query, before asking GitHub anything, was no
+  // search: what it was put right into is what counts.
   const by = Object.entries((search as { by_status?: Record<string, unknown> } | undefined)?.by_status ?? {});
-  if (by.some(([status, count]) => Number(count) > 0 && !/^2/.test(status) && status !== "400" && status !== "422")) return "made a search that was refused or failed";
+  if (by.some(([status, count]) => Number(count) > 0 && !/^2/.test(status) && status !== "rejected")) return "made a search that was refused or failed";
   if (!search || each.length === 0) return "made no search of the repository's issues that was read";
   if (search.others) return "made more searches than were told apart";
   if (each.some((one) => one.incomplete === true)) return "made a search that was not complete";
+  // More found than GitHub gives of one search: its pages are not all there is. To be asked more narrowly.
+  if (each.some((one) => (one as { cut?: unknown }).cut === true)) return "made a search that found more than GitHub gives of one search (it has to be made narrower to be read through)";
+  if (each.some((one) => (one as { unsure?: unknown }).unsure === true)) return "made a search with more pages than could be kept track of";
   if (each.some((one) => one.last !== true)) return "made a search that was not read to its last page";
   // From the first page on, with none left out.
   const whole = (pages: unknown) => Array.isArray(pages) && pages.length > 0 && pages.length === Math.max(...(pages as number[])) && new Set(pages as number[]).size === pages.length && (pages as number[]).every((page) => Number.isInteger(page) && page >= 1);

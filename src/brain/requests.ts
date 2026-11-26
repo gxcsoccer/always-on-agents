@@ -412,7 +412,10 @@ export class Requests implements Wakes {
   putOff(id: string, by: string): void {
     const record = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND status = 'resuming'", id)[0];
     if (!record) return;
-    this.#s.sql.exec("UPDATE continuations SET status = 'waiting', run_id = NULL, call_id = NULL, claimed_at = NULL, check_at = NULL WHERE id = ?", id);
+    // (Which run was carrying it on stays written on it, as when it is told to wait again: that
+    // run is still this request's and nothing else until it ends, and can say and do nothing
+    // more. The next to take it up writes itself there.)
+    this.#s.sql.exec("UPDATE continuations SET status = 'waiting', claimed_at = NULL, check_at = NULL WHERE id = ?", id);
     this.hint(record, `put_off:${by}`);
   }
 

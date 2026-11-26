@@ -1386,7 +1386,7 @@ function readsOf(reads: unknown): string {
   const seen = reads as { search?: { by_status?: Record<string, number>; read?: number; more?: number; none?: number; incomplete?: number }; other?: { by_status?: Record<string, number> } } | undefined;
   if (!seen || typeof seen !== "object") return "";
   const count = (by: Record<string, number> | undefined) => Object.values(by ?? {}).reduce((sum, each) => sum + (Number(each) || 0), 0);
-  const bad = (by: Record<string, number> | undefined) => Object.entries(by ?? {}).filter(([status]) => !/^2/.test(status)).reduce((sum, [, each]) => sum + (Number(each) || 0), 0);
+  const bad = (by: Record<string, number> | undefined) => Object.entries(by ?? {}).filter(([status]) => !/^2/.test(status) && status !== "rejected").reduce((sum, [, each]) => sum + (Number(each) || 0), 0);
   const search = seen.search ?? {};
   const searches = count(search.by_status);
   const others = count(seen.other?.by_status);

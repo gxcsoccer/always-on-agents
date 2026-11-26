@@ -799,7 +799,9 @@ describe("keeping a request that has to wait", () => {
         const ready = () => store.rows<{ source_id: string }>("SELECT source_id FROM inbox WHERE kind = 'request.ready' AND status = 'pending'").map((each) => each.source_id);
         const had = ready().length;
         requests.putOff("call_1", "r9");
-        expect(kept("call_1")).toMatchObject({ status: "waiting", run_id: null, call_id: null, claimed_at: null, check_at: null, direct: before.direct, interaction: before.interaction, condition: before.condition, until: before.until, target: before.target });
+        // (The run that was carrying it on is still written on it: that run stays this request's, and can do nothing more.)
+        expect(requests.continuationOf("r9")?.id).toBe("call_1");
+        expect(kept("call_1")).toMatchObject({ status: "waiting", run_id: "r9", call_id: "resume_r9", claimed_at: null, check_at: null, direct: before.direct, interaction: before.interaction, condition: before.condition, until: before.until, target: before.target });
         // Said to be ready, once; and nothing new is said to the person.
         expect(ready().slice(had)).toEqual(["call_1:put_off:r9"]);
         expect(store.rows("SELECT idem FROM outbox")).toHaveLength(outbox);

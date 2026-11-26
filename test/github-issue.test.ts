@@ -1194,7 +1194,12 @@ describe("doing for a person what they asked to have done once some work has bee
     expect((await tried(search({ a: { pages: [1], last: true, incomplete: false } }, { others: true }))).error).toContain("more searches than were told apart");
     expect(world.writes).toHaveLength(before);
     // Two searches, each read from its first page to its last, one of them over two pages (a query put right after a refusal is no search): opened.
-    expect(await tried({ search: { by_status: { "400": 1, "200": 3 }, read: 3, more: 1, none: 1, incomplete: 0, each: { a: { pages: [1, 2], last: true, incomplete: false }, b: { pages: [1], last: true, incomplete: false } } }, other: { by_status: {} } })).toMatchObject({ created: true });
+    // What GitHub itself refused as it was written may be something that could not be seen: not looked through. Nor one it found more of than it gives, nor one with more pages than were kept track of.
+    expect((await tried({ search: { by_status: { "422": 1, "200": 1 }, read: 1, more: 0, none: 1, incomplete: 0, each: { b: { pages: [1], last: true, incomplete: false } } }, other: { by_status: {} } })).error).toContain("made a search that was refused or failed");
+    expect((await tried(search({ a: { pages: [1], last: true, incomplete: false, cut: true } as never }))).error).toContain("found more than GitHub gives of one search");
+    expect((await tried(search({ a: { pages: [1], last: true, incomplete: false, unsure: true } as never }))).error).toContain("more pages than could be kept track of");
+    expect(world.writes).toHaveLength(before);
+    expect(await tried({ search: { by_status: { rejected: 1, "200": 3 }, read: 3, more: 1, none: 1, incomplete: 0, each: { a: { pages: [1, 2], last: true, incomplete: false }, b: { pages: [1], last: true, incomplete: false } } }, other: { by_status: {} } })).toMatchObject({ created: true });
     expect(world.writes).toHaveLength(before + 1);
   });
 
