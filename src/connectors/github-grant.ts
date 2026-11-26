@@ -183,7 +183,7 @@ export class GithubGrant extends DurableObject<Env> {
     if (!before || !first?.held) return undefined;
     const name = await grantName(before.who);
     const account = String(first.held.account);
-    const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name, before.who.open_id);
+    const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name);
     if (!claimed) return "another";
     // As things are now: the grant may have been taken away while that was asked.
     const stored = await this.#load();

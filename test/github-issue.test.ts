@@ -484,16 +484,16 @@ describe("opening an issue on GitHub as the person who asked", () => {
     await alone.settle();
     expect(world.writes).toHaveLength(before);
     expect((await bob.stored()).grant).toBeUndefined();
-    // An account the operator has said is someone else's.
-    await registry().linkIdentity(TENANT, "github", "777", "ou_someone_else");
-    const cat = someone();
-    const hers = cat.at();
-    model.replies([opens(PUBLIC)], [say("")]);
-    await hers.says(`在 ${PUBLIC} 提个 issue：重连后消息重复`);
-    expect((await consent(linkOn(hers.cards()[0]), 777)).status).toBe(403);
-    await hers.settle();
-    expect(await registry().resolveIdentity(TENANT, "github", "777")).toBe("ou_someone_else");
     expect(world.writes).toHaveLength(before);
+    // An account the operator has named as a user of the tenant (for what it says on GitHub): the
+    // chat knows that person by another name, so this is no reason to refuse them, and the
+    // operator's word is left as it was.
+    await registry().linkIdentity(TENANT, "github", "777", "owner");
+    const cat = someone();
+    cat.account = 777;
+    await authorised(cat);
+    expect(await registry().resolveIdentity(TENANT, "github", "777")).toBe("owner");
+    expect((await cat.stored()).grant?.account).toBe(777);
   });
 
   it("creates nothing for a request that waited once the authorisation is taken away here, and keeps tenants apart", async () => {
@@ -653,7 +653,7 @@ describe("whose GitHub account it is", () => {
     const ann = someone();
     const alone = ann.at();
     // The account was noted as hers, and nothing more came of it.
-    expect(await registry().claimGithubPerson(TENANT, "9100", await grantName(ann.who), ann.openId)).toBe("new");
+    expect(await registry().claimGithubPerson(TENANT, "9100", await grantName(ann.who))).toBe("new");
     model.replies([opens(PUBLIC)], [say("")]);
     await alone.says(`在 ${PUBLIC} 提个 issue：重连后消息重复`);
     expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(403);
