@@ -240,6 +240,16 @@ export interface ToolResultAside {
   aside?: Record<string, unknown>;
 }
 
+/**
+ * A tool's result may carry `direct`: words for the person alone (a link the others where they
+ * asked may not be able to follow, say). The Brain takes it out of what the model is given and
+ * sends it to the person directly, through the connector their request came through, once for
+ * the call however often it is made. The tool names no address.
+ */
+export interface ToolResultDirect {
+  direct?: { text: string };
+}
+
 export interface ToolContext {
   env: Env;
   scope: Scope;

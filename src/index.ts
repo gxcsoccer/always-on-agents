@@ -12,6 +12,7 @@ export { BrainAgent } from "./brain/agent";
 export { Registry } from "./registry";
 export { FeishuGrant } from "./connectors/feishu-grant";
 export { DoubaoGrant } from "./connectors/doubao";
+export { GithubGrant } from "./connectors/github-grant";
 export { FeishuLink } from "./connectors/feishu-link";
 export { Outbound } from "./workers/sandbox/outbound";
 export { DirectoryBackupGateway, TaskSandbox } from "./workers/sandbox/task";

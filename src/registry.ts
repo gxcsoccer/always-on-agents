@@ -85,6 +85,8 @@ export class Registry extends DurableObject<Env> {
       );
       DROP TABLE IF EXISTS github_tokens;
       CREATE TABLE IF NOT EXISTS github_repos (repo TEXT PRIMARY KEY, tenant TEXT NOT NULL, secret TEXT);
+      CREATE TABLE IF NOT EXISTS github_people (tenant TEXT NOT NULL, account TEXT NOT NULL, grant_name TEXT NOT NULL, PRIMARY KEY (tenant, account));
+      CREATE INDEX IF NOT EXISTS github_people_account ON github_people (account);
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
@@ -290,6 +292,35 @@ export class Registry extends DurableObject<Env> {
   /** The repository a chat's tasks may be lent a credential for, as lowercase owner/name, if any. */
   async chatRepo(tenant: string, chat: string): Promise<string | null> {
     return this.ctx.storage.sql.exec<{ repo: string }>("SELECT repo FROM chat_repos WHERE tenant = ? AND chat = ?", tenant, chat).toArray()[0]?.repo ?? null;
+  }
+
+  /**
+   * Notes that a GitHub account (by GitHub's number for it) authorised as one person of a tenant,
+   * whose grant is kept under `grant`. False, and nothing noted, where the account is someone
+   * else's there already (by the operator's word, which is never written over here, or by an
+   * authorisation of theirs), or where this person holds another account: that one has to be
+   * given up first. "same": it was theirs already. One step, so two cannot both come to hold one.
+   */
+  async claimGithubPerson(tenant: string, account: string, grant: string, user: string): Promise<"new" | "same" | false> {
+    const sql = this.ctx.storage.sql;
+    const linked = await this.resolveIdentity(tenant, "github", account);
+    if (linked !== null && linked !== user) return false;
+    const held = sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0];
+    if (held) return held.grant_name === grant ? "same" : false;
+    if (sql.exec("SELECT 1 FROM github_people WHERE grant_name = ?", grant).toArray().length > 0) return false;
+    sql.exec("INSERT INTO github_people (tenant, account, grant_name) VALUES (?, ?, ?)", tenant, account, grant);
+    return "new";
+  }
+
+  /** That account is no longer the person's whose grant this is: that one, and no other they hold since. With no account named: whatever is noted as theirs. */
+  async releaseGithubPerson(grant: string, account?: string): Promise<void> {
+    if (account === undefined) this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
+    else this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
+  }
+
+  /** Every grant given as one GitHub account, in whichever tenant. */
+  async githubGrantsOf(account: string): Promise<string[]> {
+    return this.ctx.storage.sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE account = ?", account).toArray().map((each) => each.grant_name);
   }
 
   async resolveIdentity(tenant: string, provider: string, externalId: string): Promise<string | null> {

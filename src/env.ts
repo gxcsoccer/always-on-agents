@@ -1,6 +1,7 @@
 import type { BrainAgent } from "./brain/agent";
 import type { Registry } from "./registry";
 import type { DoubaoGrant } from "./connectors/doubao";
+import type { GithubGrant } from "./connectors/github-grant";
 import type { FeishuGrant } from "./connectors/feishu-grant";
 import type { FeishuLink } from "./connectors/feishu-link";
 import type { TaskSandbox } from "./workers/sandbox/task";
@@ -14,6 +15,7 @@ export interface Env {
   VERSION?: { id: string };
   FEISHU_GRANTS: DurableObjectNamespace<FeishuGrant>;
   DOUBAO_GRANTS: DurableObjectNamespace<DoubaoGrant>;
+  GITHUB_GRANTS: DurableObjectNamespace<GithubGrant>;
   CHECKPOINTS: R2Bucket;
 
   /** Where model calls go. The Brain calls it directly; the sandbox proxy adds the key for this host. */
@@ -28,6 +30,9 @@ export interface Env {
   /** The GitHub App the agent acts as. With these set, tokens are issued per installation and per repository. */
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /** The same App's client id and secret: for acting as a person who authorised it (see connectors/github-grant.ts). */
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
   /** The agent's account name on GitHub (an App's bot is `<app-slug>`), used to recognise mentions. */
   GITHUB_BOT_HANDLE?: string;
   /** The address commits are made under; for an App, `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. */
