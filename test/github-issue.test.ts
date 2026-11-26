@@ -29,6 +29,11 @@ const world = {
   refreshes: new Map<string, number>(),
   repos: new Map<string, { id: number; private: boolean; full_name: string; members: number[] }>(),
   issues: [] as { repo: string; number: number; html_url: string; title: string; body: string; user: { id: number } }[],
+  comments: [] as { repo: string; number: number; id: number; html_url: string; body: string; user: { id: number } }[],
+  /** Every comment asked of GitHub. */
+  commentWrites: [] as { repo: string; number: number; body: any; bearer: string }[],
+  /** Issues nobody may comment on. */
+  locked: new Set<string>(),
   /** Every creation asked of GitHub. */
   writes: [] as { repo: string; body: any; bearer: string }[],
   /** How many of the next creations GitHub takes without the answer coming back. */
@@ -58,6 +63,9 @@ function installWorld() {
   world.refreshes.clear();
   world.issues.length = 0;
   world.writes.length = 0;
+  world.comments.length = 0;
+  world.commentWrites.length = 0;
+  world.locked.clear();
   world.dropAnswers = 0;
   world.listingDown = false;
   world.reposDown = false;
@@ -120,6 +128,30 @@ function installWorld() {
     const user = world.tokens.get(bearer);
     if (!tenant && !user?.good) return Response.json({ message: "Bad credentials" }, { status: 401 });
     if (url.pathname === "/user") return Response.json({ id: user!.account, login: loginOf(user!.account) });
+    // One issue, and its comments.
+    const one = /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)(\/comments)?$/.exec(url.pathname);
+    if (one) {
+      const [name, number] = [one[1].toLowerCase(), Number(one[2])];
+      const where = world.repos.get(name);
+      const issue = world.issues.find((each) => each.repo === name && each.number === number);
+      if (!where || !issue || (!tenant && where.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
+      if (!one[3]) return Response.json({ number, title: issue.title, html_url: issue.html_url, locked: world.locked.has(`${name}#${number}`) });
+      if ((init?.method ?? "GET") === "GET") {
+        if (world.listingDown) return Response.json({ message: "down" }, { status: 502 });
+        const page = Number(url.searchParams.get("page") ?? 1);
+        // Oldest first, a hundred to a page, and not to be asked for by who wrote them.
+        return Response.json(world.comments.filter((each) => each.repo === name && each.number === number).slice((page - 1) * 100, page * 100));
+      }
+      const body = JSON.parse(String(init?.body));
+      world.commentWrites.push({ repo: name, number, body, bearer });
+      await world.duringWrite?.();
+      if (world.locked.has(`${name}#${number}`)) return Response.json({ message: "Unable to create comment because issue is locked." }, { status: 403 });
+      const id = 9_000 + world.comments.length + 1;
+      const made = { repo: name, number, id, html_url: `${issue.html_url}#issuecomment-${id}`, body: body.body, user: { id: user!.account } };
+      world.comments.push(made);
+      if (world.dropAnswers > 0) return (world.dropAnswers--, Promise.reject(new Error("network")));
+      return Response.json(made, { status: 201 });
+    }
     const at = /^\/repos\/([^/]+\/[^/]+)(\/issues)?$/.exec(url.pathname);
     const repo = at ? world.repos.get(at[1].toLowerCase()) : undefined;
     if (!at || !repo || (!tenant && repo.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
@@ -230,6 +262,13 @@ const toolOutputs = (asked: any = modelCalls.at(-1)): any[] => {
   return input.slice(input.map((each) => each.role).lastIndexOf("user") + 1).filter((each) => each.type === "function_call_output").map((each) => JSON.parse(each.output)).filter((each) => JSON.stringify(each) !== '{"ok":true}');
 };
 const opens = (repo: string, title = "重连后消息重复", body = "重连之后同一条消息收到两次。") => call("github_create_issue", { repo, title, body });
+const comments = (repo: string, number: number, body = "我这边也遇到了。") => call("github_comment", { repo, number, body });
+/** An issue someone else opened, there to be commented on. */
+const reported = (repo: string, number: number, title: string) => {
+  const made = { repo, number, html_url: `https://github.com/${world.repos.get(repo)!.full_name}/issues/${number}`, title, body: "", user: { id: 9_999 } };
+  world.issues.push(made);
+  return made;
+};
 /** The model says something to the person, and stops. */
 const done = (text: string) => [[call("send_message", { text })], [say("")]];
 const offered = (asked: any): string[] => asked.tools.map((t: any) => t.name);
@@ -281,7 +320,7 @@ describe("opening an issue on GitHub as the person who asked", () => {
     expect(world.writes).toHaveLength(1);
     expect(world.tokens.get(world.writes[0].bearer)).toMatchObject({ account: ann.account });
     expect(world.writes[0].body.title).toBe("重连后消息重复");
-    expect(world.writes[0].body.body).toMatch(/^重连之后同一条消息收到两次。\n\n<!-- request:[0-9a-f]{32} -->$/);
+    expect(world.writes[0].body.body).toMatch(/^重连之后同一条消息收到两次。\n\n<!-- always-on-agent:request:[0-9a-f]{32} -->$/);
     expect(Object.keys(world.writes[0].body).sort()).toEqual(["body", "title"]);
     expect(toolOutputs()).toEqual([expect.objectContaining({ created: true, number: 1, url: "https://github.com/Acme/site/issues/1" })]);
     expect(alone.heard().at(-1)).toContain("https://github.com/Acme/site/issues/1");
@@ -667,5 +706,142 @@ describe("whose GitHub account it is", () => {
     expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(200);
     await alone.settle();
     expect(world.issues.at(-1)).toMatchObject({ title: "之后", user: { id: 9_101 } });
+  });
+});
+
+describe("commenting on GitHub as the person who asked", () => {
+  it("asks them to authorise once, posts it once in their name on the one they named, and says what it is on", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    const issue = reported(PUBLIC, 7, "提醒的时区不对");
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await alone.says(`在 ${PUBLIC}#7 下面评论：我这边也遇到了`);
+    expect(offered(modelCalls[0])).toContain("github_comment");
+    // Nothing was posted, and nothing is said of the issue yet: she is shown how to authorise.
+    expect(world.commentWrites).toEqual([]);
+    expect(toolOutputs()).toEqual([{ waiting: true, request: expect.any(String), note: expect.any(String) }]);
+    expect(JSON.stringify(alone.cards()[0])).not.toContain("提醒的时区不对");
+
+    model.replies(...done("评论好了"));
+    expect((await consent(linkOn(alone.cards()[0]), ann.account)).status).toBe(200);
+    await alone.settle();
+    // Once, as her, with the words as asked and nothing else; the mark is one the agent's own are known by.
+    expect(world.commentWrites).toHaveLength(1);
+    expect(world.tokens.get(world.commentWrites[0].bearer)).toMatchObject({ account: ann.account });
+    expect(world.commentWrites[0]).toMatchObject({ repo: PUBLIC, number: 7 });
+    expect(world.commentWrites[0].body.body).toMatch(/^我这边也遇到了。\n\n<!-- always-on-agent:request:[0-9a-f]{32} -->$/);
+    expect(Object.keys(world.commentWrites[0].body)).toEqual(["body"]);
+    expect(toolOutputs()).toEqual([expect.objectContaining({ posted: true, repo: "Acme/site", number: 7, on: "提醒的时区不对", url: `${issue.html_url}#issuecomment-9001` })]);
+    // No issue was opened by it.
+    expect(world.writes).toEqual([]);
+
+    // The next needs no authorisation; named by its address this time.
+    model.replies([comments(PUBLIC, 7, "再补充一点。")], ...done("好了"));
+    await alone.says(`再到 https://github.com/Acme/site/issues/7 补一句：再补充一点`);
+    expect(world.commentWrites).toHaveLength(2);
+    expect(alone.cards()).toHaveLength(1);
+    // A pull request is commented on the same way, and is named as one.
+    reported(PUBLIC, 8, "修时区");
+    model.replies([comments(PUBLIC, 8, "看过了。")], ...done("好了"));
+    await alone.says(`在 https://github.com/acme/site/pull/8 评论：看过了`);
+    expect(world.commentWrites.at(-1)).toMatchObject({ number: 8 });
+  });
+
+  it("posts nothing on one the person did not name, with nothing to say, or on what is not there", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const cards = alone.cards().length;
+    reported(PUBLIC, 7, "提醒的时区不对");
+    reported(PUBLIC, 17, "别的事");
+    // A number of the model's own choosing, which only looks like the one she wrote; no words; no number at all.
+    const refused = async (asked: unknown) => {
+      model.replies([asked as any], [say("")]);
+      await alone.says(`去 ${PUBLIC}#7 评论一下，一共 17 个人遇到了`);
+      return toolOutputs()[0].error as string;
+    };
+    expect(await refused(comments(PUBLIC, 17))).toContain("has not said themselves which issue");
+    expect(await refused(call("github_comment", { repo: PUBLIC, number: 7, body: "  " }))).toContain("has to say something");
+    expect(await refused(call("github_comment", { repo: PUBLIC, number: "7a", body: "x" }))).toContain("by its number");
+    // One that is not there: said so, once her own token has looked.
+    model.replies([comments(PUBLIC, 99)], [say("")]);
+    await alone.says(`在 ${PUBLIC}#99 评论：我这边也遇到了`);
+    expect(toolOutputs()[0].error).toContain("no issue or pull request of that number");
+    // One nobody may comment on.
+    world.locked.add(`${PUBLIC}#7`);
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await alone.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
+    expect(toolOutputs()[0].error).toContain("did not let the person comment there");
+    expect(toolOutputs()[0].error).toContain("nothing was posted");
+    expect(world.comments).toEqual([]);
+    expect(alone.cards()).toHaveLength(cards);
+  });
+
+  it("finds one whose answer was lost, however far down the comments it is, and never posts it twice", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    // A busy issue: others have written a page and a half since.
+    for (let i = 0; i < 150; i++) world.comments.push({ repo: PUBLIC, number: 7, id: i + 1, html_url: "x", body: `+${i}`, user: { id: 9_999 } });
+    world.dropAnswers = 1;
+    model.replies([comments(PUBLIC, 7)], ...done("评论好了"));
+    await alone.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(toolOutputs()[0]).toMatchObject({ posted: true, number: 7 });
+
+    // Not to be found out: said as not known, with nothing sent again, then or when asked once more.
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    model.replies([comments(PUBLIC, 7, "第二条。")], ...done("不确定"));
+    await alone.says(`在 ${PUBLIC}#7 再评论：第二条`);
+    expect(world.commentWrites).toHaveLength(2);
+    expect(toolOutputs()[0].error).toContain("could not be confirmed whether the comment was posted");
+    expect(toolOutputs()[0].error).not.toContain("nothing was posted");
+  });
+
+  it("notifies only those the person mentioned themselves, in a comment as in an issue", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    model.replies([comments(PUBLIC, 7, "谢谢 @Octo-Cat 的排查，另外 cc @stranger 和 @acme/everyone。\n\n```\n@in-code stays\n```")], ...done("好了"));
+    await alone.says(`在 ${PUBLIC}#7 评论：谢谢 @octo-cat 的排查`);
+    expect(world.commentWrites[0].body.body).toMatch(/^谢谢 @Octo-Cat 的排查，另外 cc `@stranger` 和 `@acme\/everyone`。\n\n```\n@in-code stays\n```\n\n<!--/);
+    model.replies([opens(PUBLIC, "时区", "@stranger 说过这个。")], ...done("好了"));
+    await alone.says(`在 ${PUBLIC} 提个 issue：时区`);
+    expect(world.writes.at(-1)!.body.body).toMatch(/^`@stranger` 说过这个。\n\n<!--/);
+  });
+
+  it("gives the link, and what it is on, to the person alone where the others may not be able to see the repository", async () => {
+    const ann = someone();
+    await authorised(ann, PRIVATE);
+    const issue = reported(PRIVATE, 7, "只有里面的人知道的事");
+    const here = ann.at("oc_team");
+    model.replies([comments(PRIVATE, 7)], ...done("评论好了，链接私下发你"));
+    await here.says(`在 ${PRIVATE}#7 评论：我这边也遇到了`);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(JSON.stringify(toolOutputs())).not.toContain("只有里面的人知道的事");
+    expect(JSON.stringify(toolOutputs())).not.toContain("issuecomment");
+    expect(here.heard().join("\n")).not.toContain("只有里面的人知道的事");
+    expect(ann.directly("text").map((each) => each.text)).toEqual([`acme/core#7 只有里面的人知道的事\n${issue.html_url}#issuecomment-9001`]);
+    // Where the chat is outside the organisation's own, nothing is posted at all.
+    world.external.add("oc_guests");
+    const guests = ann.at("oc_guests");
+    model.replies([comments(PRIVATE, 7)], [say("")]);
+    await guests.says(`在 ${PRIVATE}#7 评论：我这边也遇到了`);
+    expect(toolOutputs()[0].error).toContain("nothing was posted");
+    expect(world.commentWrites).toHaveLength(1);
+  });
+
+  it("is not taken for a request when it comes back from GitHub as her words", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    model.replies([comments(PUBLIC, 7, "@always-on-agent 也看一下这个。")], ...done("好了"));
+    await alone.says(`在 ${PUBLIC}#7 评论：@always-on-agent 也看一下这个`);
+    const posted = world.comments.at(-1)!;
+    const { normalize: fromGithub } = await import("../src/connectors/github");
+    const payload = (body: string) => ({ action: "created", repository: { full_name: "Acme/site" }, issue: { number: 7 }, sender: { id: ann.account, login: loginOf(ann.account), type: "User" }, comment: { id: posted.id, body, user: { id: ann.account, login: loginOf(ann.account) }, author_association: "MEMBER", created_at: "2026-11-26T00:00:00Z", updated_at: "2026-11-26T00:00:00Z" } });
+    // The same words written by her own hand would be a request; with the mark they are the agent's.
+    expect(fromGithub("issue_comment", payload("@always-on-agent 也看一下这个。"))?.event).toBeDefined();
+    expect(fromGithub("issue_comment", payload(posted.body))).toBeUndefined();
   });
 });

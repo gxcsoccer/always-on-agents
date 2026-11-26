@@ -13,14 +13,14 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 export const githubConnector: Connector = {
   name: "github",
   // Also plugged into the chat connector: what a person there can have done on GitHub in their own name.
   serves: ["feishu"],
-  tools: [githubCreateIssue, githubDisconnect],
+  tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
   offers: grantOffers,
   invitation: grantInvitation,
@@ -126,15 +126,18 @@ export function commentableLines(files: { filename?: string; patch?: string }[],
  * command someone copies must be the command that was written, and nothing in code notifies
  * anyone. In prose, a mention is put in a code span, where it is plainly visible and inert. A
  * suggestion block becomes an ordinary code block.
+ *
+ * `allowed`: names (in lower case) whose mention is left as it is: the ones a person wrote
+ * themselves, where the text goes out in their name.
  */
-export function inert(text: string): string {
+export function inert(text: string, allowed?: ReadonlySet<string>): string {
   const out: string[] = [];
   let fence: { char: string; length: number } | undefined;
   let prose: string[] = [];
   const flush = () => {
     if (prose.length === 0) return;
     // Code spans may run over several lines; everything between them is prose.
-    out.push(prose.join("\n").replace(/(`+)[\s\S]*?\1|(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (match, span, name) => (span ? match : `\`@${name}\``)));
+    out.push(prose.join("\n").replace(/(`+)[\s\S]*?\1|(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (match, span, name) => (span || allowed?.has(String(name).toLowerCase()) ? match : `\`@${name}\``)));
     prose = [];
   };
   for (const line of text.split("\n")) {
