@@ -304,7 +304,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       }
       // (Anything else read with that credential is not a description that can be gone through: not passed on, and counted as that.)
       if (optional && answer.ok && request.method === "GET") {
-        await answer.body?.cancel();
+        // (Letting go of it can fail too, where it broke off on its way: counted and told all the same.)
+        await answer.body?.cancel().catch(() => undefined);
         await this.#task.noteGithubRead(kind, 502, {});
         return new Response("GitHub's answer is not one that can be passed on here\n", { status: 502 });
       }

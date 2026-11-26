@@ -309,6 +309,10 @@ describe("GitHub's API over the proxy", () => {
     answers.push(() => new Response("raw", { headers: { "content-type": "text/plain" } }));
     expect((await noted.send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
     expect(await noted.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
+    // The same where it breaks off on its way after its headers have come: told, and counted once.
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => (controller.enqueue(new TextEncoder().encode("ra")), controller.error(new Error("reset"))) }), { headers: { "content-type": "text/plain" } }));
+    expect((await noted.send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    expect(await noted.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }, { kind: "other", status: 502 }]);
     // Asked for in another form than a description (a pull request as its diff): read as a stranger would, and passed on as it is.
     for (const accept of ["application/vnd.github.diff", "application/vnd.github.patch", "text/html", "application/vnd.github+json, application/vnd.github.diff"]) {
       answers.push(() => new Response("diff --git a/x b/x", { headers: { "content-type": "application/vnd.github.diff" } }));
