@@ -289,11 +289,12 @@ describe("GitHub's API over the proxy", () => {
     const read = async (url: string) => (await send(url), forwarded.at(-1)!.headers.get("authorization"));
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await read("https://api.github.com/search/issues?q=dst")).toBe("Bearer test-public-token");
-    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "pulls", "pulls/3/files", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
+    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "issues/comments/55", "pulls", "pulls/3", "pulls/3/comments", "pulls/comments", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
     // Its files, who works on it, what it is: only by right. As anyone would see them.
     for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
     // Nor the record of what was changed on an issue, nor a listing narrowed by anything but the plain ways.
-    for (const path of ["issues/7/timeline", "issues/7/events", "issues/events", "issues?state=open&field=priority", "pulls?custom=1"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBeNull();
+    // Nor anything else under them: only what is named. Nor a listing narrowed by anything but the plain ways.
+    for (const path of ["issues/7/timeline", "issues/7/events", "issues/events", "issues/7/issue-field-values", "issues/7/labels", "issues/7/reactions", "issues/7/comments/9", "pulls/3/files", "pulls/3/reviews", "pulls/3/commits", "issues/x", "issues?state=open&field=priority", "pulls?custom=1"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBeNull();
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await read("https://api.github.com/search/issues?q=dst&fields=x")).toBeNull();
     // What only some may see of an issue is taken out of what is read that way, in a listing, in one issue and in a search.
@@ -325,15 +326,21 @@ describe("GitHub's API over the proxy", () => {
       expect(await answer.text()).not.toContain("integration");
       expect(forwarded.slice(before).map((each) => each.headers.get("authorization"))).toEqual(["Bearer test-public-token", null]);
     }
-    // Told to slow down is told as that, and not asked again.
+    // Told to slow down is told as that, and not asked again: by the allowance being used up, by a time to wait, or only in words (with allowance left and no time named).
     const before = forwarded.length;
     answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
     expect((await refused.send(issues)).status).toBe(403);
-    expect(forwarded).toHaveLength(before + 1);
+    answers.push(() => Response.json({ message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." }, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    const secondary = await refused.send(issues);
+    expect(secondary.status).toBe(403);
+    expect(((await secondary.json()) as { message: string }).message).toContain("secondary rate limit");
+    answers.push(() => Response.json({ message: "wait" }, { status: 403, headers: { "retry-after": "60", "x-ratelimit-remaining": "10" } }));
+    expect((await refused.send(issues)).headers.get("retry-after")).toBe("60");
+    expect(forwarded).toHaveLength(before + 3);
     // By right, a refusal is what it is: nothing is asked a second time.
     answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403 }));
     expect((await lent.send(issues)).status).toBe(403);
-    expect(forwarded).toHaveLength(before + 2);
+    expect(forwarded).toHaveLength(before + 4);
     // Such a one cannot be had: read with none, as it would have been. Not a failure.
     const none = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     expect((await none.send(issues)).status).toBe(200);

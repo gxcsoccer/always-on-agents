@@ -202,11 +202,13 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // allowed nothing, which GitHub answers for what is public and for nothing else. Anything
       // else there (its files, who works on it, the repository's own description, which even
       // that one would be given of a private repository) only by right.
-      // Not the record of what was changed on an issue (its timeline, its events): that tells of
-      // fields that only some may see. Nor a listing asked for by anything but the plain ways of
-      // listing, which are the same for everyone: what else it can be narrowed by depends on who asks.
+      // Just these: the list of issues or of pull requests, one of them, and the comments on
+      // it. Named one by one, so that nothing else under them comes to be read this way by being
+      // added there (what was changed on an issue, the values of its fields, the files of a pull
+      // request). And listed or searched only in the plain ways, which are the same for everyone:
+      // what else a listing can be narrowed by depends on who asks.
       const plain = "search" in api ? SEARCHED_BY : LISTED_BY;
-      const open = ("search" in api || (/^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname) && !/\/(?:timeline|events)(?:\/|$)/i.test(url.pathname))) && [...url.searchParams.keys()].every((name) => plain.has(name));
+      const open = ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
       token = await this.#task.githubReadToken();
       if (token === undefined && open) {
         token = await this.#task.githubPublicToken();
@@ -234,11 +236,16 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // stranger, and that answer is the one given. How GitHub turns an installation away says
       // things a stranger is not told (that something not public is there). Being told to slow
       // down is not that, and is passed on as it is.
-      const slowed = answer.status === 429 || answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after");
-      if (optional && [401, 403, 404, 422].includes(answer.status) && !slowed) {
-        await answer.body?.cancel();
-        headers.delete("authorization");
-        answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+      if (optional && [401, 403, 404, 422].includes(answer.status)) {
+        // (GitHub also says "slow down" with a 403 that has allowance left and names no time to
+        // wait: then it is in the words of the answer, which are read for it.)
+        const said = await answer.text().catch(() => "");
+        const slowed = answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after") || /rate limit|abuse detection/i.test(said);
+        if (slowed) answer = new Response(said, { status: answer.status, headers: answer.headers });
+        else {
+          headers.delete("authorization");
+          answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+        }
       }
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
@@ -353,6 +360,9 @@ function passed(answer: Response, body: BodyInit | null): Response {
   }
   return new Response(body, { status: answer.status, headers });
 }
+
+/** What of a public repository's issues and pull requests is read with the credential that is allowed nothing: the list, one of them, the comments on one or on all. */
+const OPEN_TO_ANYONE = /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/\d+(?:\/comments)?|\/comments(?:\/\d+)?)?$/i;
 
 /** The ways of listing issues and pull requests, and of searching them, that are the same whoever asks. */
 const LISTED_BY = new Set(["state", "labels", "sort", "direction", "since", "per_page", "page", "milestone", "assignee", "creator", "mentioned", "head", "base"]);
