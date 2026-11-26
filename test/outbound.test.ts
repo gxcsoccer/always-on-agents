@@ -405,7 +405,7 @@ describe("GitHub's API over the proxy", () => {
     const before = forwarded.length;
     for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone", "panic("]) expect((await send(search(q))).status, q).toBe(400);
     expect(forwarded).toHaveLength(before);
-    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400 }));
+    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400, rejected: true }));
   });
 
   it("passes a search on whole where all of it is the repository's, page after page", async () => {
@@ -427,15 +427,20 @@ describe("GitHub's API over the proxy", () => {
     // And a later page of a search that did find nothing says nothing either.
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     await send(search("nothing like it", "&page=2"));
+    // More found than GitHub gives of one search: said of that search, so that reading its pages is not taken for reading them all.
+    answers.push(() => Response.json({ total_count: 1_500, incomplete_results: false, items: [found("acme/demo", 9)] }));
+    await send(search("common word"));
+    expect((await recorded("searchPage")).at(-1)).toMatchObject({ page: 1, cut: true });
     // None at all, known to be all there is: the first page, counted none by GitHub.
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await (await send(search("nothing like it"))).json()).toEqual({ total_count: 0, incomplete_results: false, items: [] });
     // Which search each page was of, and which page: the same search for the pages of "dst", another for the other words.
     const pages = await recorded("searchPage");
-    expect(pages.map((each: any) => [each.of.split("\n")[0], each.page, each.more])).toEqual([["repo:acme/demo dst", 1, true], ["repo:acme/demo dst", 2, false], ["repo:acme/demo dst", 3, false], ["repo:acme/demo dst", 1, false], ["repo:acme/demo nothing like it", 2, false], ["repo:acme/demo nothing like it", 1, false]]);
+    expect(pages.map((each: any) => [each.of.split("\n")[0], each.page, each.more])).toEqual([["repo:acme/demo dst", 1, true], ["repo:acme/demo dst", 2, false], ["repo:acme/demo dst", 3, false], ["repo:acme/demo dst", 1, false], ["repo:acme/demo nothing like it", 2, false], ["repo:acme/demo common word", 1, false], ["repo:acme/demo nothing like it", 1, false]]);
     // The first page, with more after it; the last; and one that was all there is and held nothing.
     expect(await recorded("noteGithubRead")).toEqual([
       { kind: "search", status: 200, read: true, more: true },
+      { kind: "search", status: 200, read: true },
       { kind: "search", status: 200, read: true },
       { kind: "search", status: 200, read: true },
       { kind: "search", status: 200, read: true },

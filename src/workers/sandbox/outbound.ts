@@ -181,7 +181,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       const shape = asked.replace(/"[^"]*"/g, "w");
       // What is left may no longer be a query: an "or" with nothing on one side of it, empty brackets.
       if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(shape) || !balanced(shape)) {
-        await this.#task.noteGithubRead(kind, 400, {});
+        // Turned away here, before anything was asked of GitHub: told apart from what GitHub itself refuses.
+        await this.#task.noteGithubRead(kind, 400, { rejected: true });
         return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched. Text to look for that has brackets in it goes in double quotes\n", { status: 400 });
       }
       // Already in brackets as a whole (a next page of a search made here): not wrapped again.
@@ -264,7 +265,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const first = (url.searchParams.get("page") ?? "1") === "1";
     // Which search it was a page of: the same query, sorted and cut into pages the same way. So that it can be told, of each search, whether it was read to its end.
     const of = ["q", "sort", "order", "per_page"].map((name) => target.searchParams.get(name) ?? "").join("\n");
-    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0, of, page: Number(url.searchParams.get("page") ?? "1") || 1 });
+    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0, of, page: Number(url.searchParams.get("page") ?? "1") || 1, cut: typeof found.total_count === "number" && found.total_count > SEARCH_GIVES_AT_MOST });
     const { total_count: total, ...rest } = found;
     return passed(answer, JSON.stringify({ ...rest, ...(mixed ? {} : { total_count: total }), incomplete_results: incomplete, items }));
   }
@@ -295,6 +296,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     return new Response(`${message}\n`, { status: 403 });
   }
 }
+
+/** GitHub gives no more than this many results of one search, however many it found: past that, reading every page it gives is not reading them all. */
+const SEARCH_GIVES_AT_MOST = 1_000;
 
 /** GitHub's answer for the guest: what it says, and of its headers what a reader needs (how to go on, how much is left). */
 function passed(answer: Response, body: BodyInit | null): Response {
