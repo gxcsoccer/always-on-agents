@@ -35,6 +35,8 @@ const world = {
   dropAnswers: 0,
   /** GitHub does not answer a listing of issues. */
   listingDown: false,
+  /** GitHub does not answer when asked about a repository. */
+  reposDown: false,
   /** GitHub gives no answer to a renewal. */
   renewalsDown: false,
   duringWrite: undefined as undefined | (() => unknown),
@@ -58,6 +60,7 @@ function installWorld() {
   world.writes.length = 0;
   world.dropAnswers = 0;
   world.listingDown = false;
+  world.reposDown = false;
   world.renewalsDown = false;
   world.duringWrite = undefined;
   world.renewals = 0;
@@ -120,6 +123,7 @@ function installWorld() {
     const at = /^\/repos\/([^/]+\/[^/]+)(\/issues)?$/.exec(url.pathname);
     const repo = at ? world.repos.get(at[1].toLowerCase()) : undefined;
     if (!at || !repo || (!tenant && repo.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
+    if (!at[2] && world.reposDown) return Response.json({ message: "unavailable" }, { status: 503 });
     if (!at[2]) return Response.json({ id: repo.id, private: repo.private, full_name: repo.full_name });
     if ((init?.method ?? "GET") === "GET") {
       if (world.listingDown) return Response.json({ message: "down" }, { status: 502 });
@@ -618,5 +622,50 @@ describe("whose GitHub account it is", () => {
     world.listingDown = false;
     expect(await grant.post("call-lost")).toMatchObject({ stage: "posted", issue: { url: world.issues.at(-1)!.html_url } });
     expect(world.writes.filter((each) => each.body.title === "找回")).toHaveLength(1);
+  });
+
+  it("says of an issue that is there that it is there, and of one that may be that it is not known, when the same call is made again and a check cannot be made", async () => {
+    const ann = await (async (p) => (await authorised(p), p))(someone());
+    const alone = ann.at();
+    const again = async (id: string, title: string) => {
+      model.replies([call("github_create_issue", { repo: PUBLIC, title, body: "" }, id)], ...done("好"));
+      await alone.says(`在 ${PUBLIC} 提个 issue：${title}`);
+      return toolOutputs()[0];
+    };
+    // Created, and the same call comes again (the run was interrupted) while GitHub cannot be asked about the repository.
+    expect(await again("call_same_1", "已建成")).toMatchObject({ created: true });
+    const made = world.issues.at(-1)!;
+    world.reposDown = true;
+    expect(await again("call_same_1", "已建成")).toMatchObject({ created: true, url: made.html_url });
+    world.reposDown = false;
+    // Taken by GitHub and not confirmed; then the same.
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    expect((await again("call_same_2", "待核对")).error).toContain("could not be confirmed whether the issue was created");
+    world.reposDown = true;
+    const second = await again("call_same_2", "待核对");
+    expect(second.error).toContain("could not be confirmed whether the issue was created");
+    expect(second.error).not.toContain("nothing was created");
+    expect(world.writes.filter((each) => ["已建成", "待核对"].includes(each.body.title))).toHaveLength(2);
+  });
+
+  it("lets a person give up an account whose binding was interrupted half-way, and take another", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    // The account was noted as hers, and nothing more came of it.
+    expect(await registry().claimGithubPerson(TENANT, "9100", await grantName(ann.who), ann.openId)).toBe("new");
+    model.replies([opens(PUBLIC)], [say("")]);
+    await alone.says(`在 ${PUBLIC} 提个 issue：重连后消息重复`);
+    expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(403);
+    await alone.settle();
+    model.replies([call("github_disconnect", {})], ...done("已取消"));
+    await alone.says("取消 GitHub 授权");
+    expect(await registry().githubGrantsOf("9100")).toEqual([]);
+    model.replies([opens(PUBLIC, "之后")], [say("")]);
+    await alone.says(`在 ${PUBLIC} 提个 issue：之后`);
+    model.replies(...done("建好了"));
+    expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(200);
+    await alone.settle();
+    expect(world.issues.at(-1)).toMatchObject({ title: "之后", user: { id: 9_101 } });
   });
 });

@@ -135,7 +135,7 @@ export class GithubGrant extends DurableObject<Env> {
       title: "需要你的 GitHub 授权",
       text: `要以你的名义在 GitHub 上建 issue，需要你先授权。\n\n授权是给这个 GitHub 应用的：它在 GitHub 上被允许做的事，在你有权限的仓库里都能以你的身份做，不只是建 issue。我只用它来做你明确要求的这件事。${about}`,
       action: { label: "去授权", url },
-      note: "链接 10 分钟内有效，只对你本人有效。授权完成后我会接着处理，你不用再发一遍。之后随时可以在 GitHub 的 Settings → Applications 里撤销。",
+      note: "链接 10 分钟内有效。请只由你本人打开，不要转给别人：谁打开并确认，就是把谁的 GitHub 账号交给你在这里使用。授权完成后我会接着处理，你不用再发一遍。之后随时可以让我取消，或在 GitHub 的 Settings → Applications 里撤销。",
     };
   }
 
@@ -205,11 +205,6 @@ export class GithubGrant extends DurableObject<Env> {
     return "done";
   }
 
-  /** The asker's own words an invitation was made for, as kept (their first eighty letters). */
-  async asked(nonce: string): Promise<string> {
-    return (await this.#load())?.pending.find((each) => each.nonce === nonce)?.what?.text ?? "";
-  }
-
   /** An invitation someone came back through came to nothing. Says how it stands after this. */
   async refuse(nonce: string): Promise<"done" | "refused" | undefined> {
     const stored = await this.#load();
@@ -251,7 +246,8 @@ export class GithubGrant extends DurableObject<Env> {
     void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
-    if (stored.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(stored.who), String(stored.bound));
+    // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
+    if (only === undefined || stored.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(stored.who), only === undefined ? undefined : String(stored.bound));
   }
 
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
@@ -530,7 +526,26 @@ export const githubCreateIssue: ConnectorTool = {
   run: createIssue,
 };
 
+/**
+ * What became of an issue is one thing; what can be checked, or said, about it at the moment is
+ * another. Whatever stops a call short (a check that cannot be made just now, something that has
+ * changed since), an issue that is there is said to be there, and one that may be is said to be
+ * not known: "nothing was created" is said only of one that certainly was not.
+ */
 async function createIssue(context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
+  const seen: { op?: () => Promise<Op | undefined> } = {};
+  const result = await attempt(context, args, seen);
+  const now = typeof result === "object" && result !== null && "error" in result ? await seen.op?.() : undefined;
+  if (now?.stage === "posting" || now?.stage === "lost") return { error: UNCERTAIN };
+  if (now?.stage !== "posted" || !now.issue) return result;
+  const link = `${now.repo}#${now.issue.number}\n${now.issue.url}`;
+  // Who else here may see its link could not be worked out this time: it goes to the person alone.
+  return context.scope.kind === "chat"
+    ? { created: true, direct: { text: link }, note: "The issue was created as the person. Its link is being sent to them directly and is not given here: say that, and nothing more about it." }
+    : { created: true, repo: now.repo, number: now.issue.number, url: now.issue.url, note: "The issue was created as the person, in their name. Give them the link." };
+}
+
+async function attempt(context: ToolContext, args: Record<string, unknown>, seen: { op?: () => Promise<Op | undefined> }): Promise<unknown> {
   const { env, origin, scope } = context;
   if (scope.kind !== "user" && scope.kind !== "chat") return { error: "this can only be done for one person, where they talk to the agent" };
   const redirect = redirectUri(env);
@@ -543,6 +558,7 @@ async function createIssue(context: ToolContext, args: Record<string, unknown>):
 
   // What is to be created: as it was kept, for a request carried on; as asked, for a new one.
   const kept = await grant.op(context.callId);
+  seen.op = () => grant.op(context.callId);
   if (context.resuming && !kept) return CHANGED;
   const repo = kept?.repo ?? String(args.repo ?? "").trim().replace(/^https:\/\/github\.com\//i, "").replace(/\/+$/, "").toLowerCase();
   if (!kept) {
@@ -682,11 +698,9 @@ export async function grantCallback(request: Request, env: Env): Promise<Respons
     // Nothing is acted with yet. Whoever is at this browser may have been handed someone else's
     // link, and GitHub does not ask again once the App is authorised: they are shown the account
     // and asked. What they send back carries a word only this page was given.
-    const words = (await grant.asked(state[2])).replace(/[&<>"'`]/g, " ");
-    const about = words ? `那次请求说的是：「${words}」。` : "";
     const confirm = await grant.hold(state[2], invitation.generation, issued as Issued, { id: account.id, login: account.login });
     if (!confirm) return await refused("superseded");
-    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作。${about}如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
+    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
   } catch {
     return await refused("interrupted");
   }

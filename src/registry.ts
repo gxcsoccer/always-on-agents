@@ -312,9 +312,10 @@ export class Registry extends DurableObject<Env> {
     return "new";
   }
 
-  /** That account is no longer the person's whose grant this is: that one, and no other they hold since. */
-  async releaseGithubPerson(grant: string, account: string): Promise<void> {
-    this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
+  /** That account is no longer the person's whose grant this is: that one, and no other they hold since. With no account named: whatever is noted as theirs. */
+  async releaseGithubPerson(grant: string, account?: string): Promise<void> {
+    if (account === undefined) this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
+    else this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
   }
 
   /** Every grant given as one GitHub account, in whichever tenant. */
