@@ -270,6 +270,8 @@ export class RunTools {
               const to = typeof aside?.text === "string" && aside.text !== "" ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
               if (!to) return { ...rest, note: "What was to be sent to the person directly could not be sent: they cannot be reached directly here. Tell them so." };
               this.#b.outbox.enqueue(`direct:${key}`, run.session_id, null, String(aside!.text).slice(0, MAX_MESSAGE_TEXT), undefined, undefined, { target: JSON.stringify(to) });
+              // For them alone: its words are not kept once it has been delivered, like anything else said from what was brought in from outside.
+              this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", `direct:${key}`);
               return rest;
             }
             return result;

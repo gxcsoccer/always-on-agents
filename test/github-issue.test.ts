@@ -302,7 +302,6 @@ describe("opening an issue on GitHub as the person who asked", () => {
   it("is done only in a repository the person named themselves, and only in one the tenant has connected", async () => {
     const ann = await (async (p) => (await authorised(p), p))(someone());
     const alone = ann.at();
-    const before = world.writes.length;
     // The model names a repository she did not.
     model.replies([opens(PRIVATE)], ...done("哪个仓库？"));
     await alone.says("提个 issue：重连后消息重复");
@@ -311,6 +310,15 @@ describe("opening an issue on GitHub as the person who asked", () => {
     model.replies([opens("acme/sit")], ...done("哪个仓库？"));
     await alone.says("提个 issue：重连后消息重复");
     expect(toolOutputs()[0].error).toContain("has not named that repository");
+    // By its address on GitHub she has named it; an address elsewhere that ends the same way has not.
+    model.replies([opens(PRIVATE, "按地址")], ...done("好了"));
+    await alone.says("在 https://github.com/acme/core 提个 issue：按地址");
+    expect(world.issues.at(-1)).toMatchObject({ repo: PRIVATE, title: "按地址" });
+    const sofar = world.writes.length;
+    model.replies([opens("docs/site")], ...done("哪个仓库？"));
+    await alone.says("看 https://example.com/docs/site 提个 issue");
+    expect(toolOutputs()[0].error).toContain("has not named that repository");
+    expect(world.writes).toHaveLength(sofar);
     // One she named, which is not this tenant's: whatever her own account can reach there.
     model.replies([opens("other/thing")], ...done("不行"));
     await alone.says("在 other/thing 提个 issue：重连后消息重复");
@@ -321,7 +329,7 @@ describe("opening an issue on GitHub as the person who asked", () => {
     model.replies([opens("other/thing")], ...done("不行"));
     await alone.says("在 other/thing 提个 issue：重连后消息重复");
     expect(toolOutputs()[0].error).toContain("not one this organisation has connected");
-    expect(world.writes).toHaveLength(before);
+    expect(world.writes).toHaveLength(sofar);
   });
 
   it("is there where several people talk, without the chat being opened to documents: the way in goes to the person alone, the result to the chat", async () => {
@@ -599,6 +607,14 @@ describe("whose GitHub account it is", () => {
     world.listingDown = true;
     expect(await grant.post("call-lost")).toMatchObject({ stage: "lost" });
     expect(await grant.post("call-lost")).toMatchObject({ stage: "lost" });
+    // Nor is it ever said not to have been created, whatever fails afterwards: here, the token cannot be renewed just now.
+    await runInDurableObject(grant, async (_i: unknown, state: DurableObjectState) => {
+      const kept = (await state.storage.get<any>("grant"))!;
+      await state.storage.put("grant", { ...kept, grant: { ...kept.grant, expires_at: Date.now() } });
+    });
+    world.renewalsDown = true;
+    expect(await grant.post("call-lost")).toMatchObject({ stage: "lost" });
+    world.renewalsDown = false;
     world.listingDown = false;
     expect(await grant.post("call-lost")).toMatchObject({ stage: "posted", issue: { url: world.issues.at(-1)!.html_url } });
     expect(world.writes.filter((each) => each.body.title === "找回")).toHaveLength(1);
