@@ -91,7 +91,7 @@ export class Outbox implements Wakes {
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
-  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: string[] }): { ok: true } {
+  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: (target: string) => string[] }): { ok: true } {
     // The answer to a request that waited goes where the request came from, as it was then.
     const target = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#s.meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
@@ -112,8 +112,9 @@ export class Outbox implements Wakes {
       runId ? JSON.stringify(this.#b.requests.readsOf(runId)) : null,
       bound?.authored ? 1 : 0,
     );
-    // Whom it reminds, kept with it once and for every attempt at sending it.
-    if (bound?.mention && bound.mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(bound.mention));
+    // Whom it reminds: settled now that where it goes is known, and kept with it once, for every attempt at sending it.
+    const mention = bound?.mention && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
+    if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
     return { ok: true };

@@ -300,13 +300,14 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
+  // (Every one the chat lists, each name with each person it stands for: a name that stands for two is told from one that stands for one by having them all.)
   const mentioned = [
     ...new Map(
       mentions
         .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id)
-        .map((each: any) => [each.id.open_id as string, { name: token(each.name), id: each.id.open_id as string }]),
+        .map((each: any) => [`${token(each.name)}\n${each.id.open_id as string}`, { name: token(each.name), id: each.id.open_id as string }]),
     ).values(),
-  ].slice(0, 20);
+  ].slice(0, 100);
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.

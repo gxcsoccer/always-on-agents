@@ -387,9 +387,17 @@ export class RunTools {
           if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `msg:${callId}`).length > 0) return told((JSON.parse(this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", `msg:${callId}`)[0]?.mention ?? "[]") as string[]).length);
           // Who it reminds is settled, and taken for this thing, in the step that keeps the message.
           return this.#s.transaction(() => {
-            const mention = this.#b.reminders.claim(run, notify);
-            this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, { authored: true, mention });
-            return told(mention.length);
+            let reminded = 0;
+            // (Decided against where the message really goes, which is worked out as it is kept.)
+            this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, {
+              authored: true,
+              mention: (target) => {
+                const ids = this.#b.reminders.claim(run, notify, target);
+                reminded = ids.length;
+                return ids;
+              },
+            });
+            return told(reminded);
           });
         }
         // Everything such a run says belongs to the request it carries on. That request has one
@@ -449,7 +457,7 @@ export class RunTools {
         const due = Date.now() + delaySeconds * 1_000;
         // Who set it and whom they named, for when it fires: it may remind them then.
         const asked = this.#b.reminders.asked(run.id);
-        const kept = asked || stopAfterReminding ? JSON.stringify({ ...(asked ? { by: asked.by, named: asked.named } : {}), ...(stopAfterReminding && repeat !== null ? { stop_after_reminding: true } : {}) }) : null;
+        const kept = asked ? JSON.stringify({ ...asked, ...(stopAfterReminding && repeat !== null ? { stop_after_reminding: true } : {}) }) : null;
         sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, kept, Date.now());
         // A replayed call set nothing new: it is told when the timer it set fires next, or, if
         // that timer has fired for the last time or been cancelled since, that it will not.

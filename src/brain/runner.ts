@@ -793,11 +793,16 @@ export class Runner {
         if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#b.requests.draft(carried, run, this.#b.outbox.notice("notAnswered", run.session_id));
         // Whom the answer reminds is settled now that it is let go, and taken for the thing in this same step.
         const draft = this.#s.rows<{ notify: string | null }>("SELECT notify FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`)[0];
-        const mention = draft?.notify && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length > 0 ? this.#b.reminders.claim(run, JSON.parse(draft.notify) as string[]) : [];
+        // (Against where the answer goes: where the request came from.)
+        const mention = draft?.notify && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length > 0 ? this.#b.reminders.claim(run, JSON.parse(draft.notify) as string[], carried.target) : [];
         if (draft) this.#s.sql.exec("UPDATE outbox_reminds SET mention = ?, notify = NULL WHERE idem = ?", mention.length > 0 ? JSON.stringify(mention) : null, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
-      } else if (carried) this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
+      } else if (carried) {
+        this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
+        // With whom it was to remind: a draft that is dropped reminds nobody.
+        this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
+      }
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");

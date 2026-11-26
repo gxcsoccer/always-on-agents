@@ -119,7 +119,7 @@ function bench(state: DurableObjectState) {
       // As the requests part has it: what the run noted it read, each thing once.
       readsOf: (runId: string) => [...new Map((JSON.parse(store.meta(`sources:${runId}`) ?? "[]") as { connector: string; tool: string; args: string; identity: string }[]).map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()],
     } as unknown as RunnerHost["requests"],
-    reminders: { claim: (_run: unknown, asked: string[]) => (log.push(["claim", asked]), []) } as never,
+    reminders: { claim: (_run: unknown, asked: string[], target: unknown) => (log.push(["claim", asked, target]), []) } as never,
     outbox: {
       notify: (idem: string, sessionId: string, runId: string | null, text: string) => void log.push(["notify", idem, sessionId, runId, text]),
       notice: (which: string) => `notice:${which}`,

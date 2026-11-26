@@ -304,6 +304,9 @@ export class Requests implements Wakes {
   /** `authored`: written by the model, as against the system's fixed words in place of an answer. */
   draft(carried: Continuation, run: RunRow, text: string, authored = false): { ok: true } {
     this.#b.enqueueMessage(`answer:${carried.id}`, run.session_id, run.id, text, undefined, undefined, { continuation: carried, authored });
+    // Whom an earlier draft was to remind goes with its words: what is written in their place
+    // (by the model again, or by the system, as a notice) reminds whom it says itself, or nobody.
+    this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
     this.#s.sql.exec("UPDATE outbox SET status = 'draft', text = ?, reads = ?, authored = ? WHERE idem = ? AND status IN ('pending', 'draft') AND started = 0", text, JSON.stringify(this.readsOf(run.id)), authored ? 1 : 0, `answer:${carried.id}`);
     return { ok: true };
   }

@@ -1608,11 +1608,20 @@ describe("reminding people where several talk", () => {
     model.replies([call("hand_over", { worker: "sandbox", title: "查一下", brief: "看看构建。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then: null })], [say("")]);
     await here.says("查一下构建，做完告诉我和 @_user_2", [colleague]);
     const id = toolOutputs()[0].work_id as string;
-    expect(await rowsOf(here.stub, "SELECT named FROM task_named WHERE task_id = ?", id)).toEqual([{ named: JSON.stringify([{ name: "@Carol", id: "ou_colleague" }]) }]);
+    expect(JSON.parse((await rowsOf(here.stub, "SELECT asked FROM task_asked WHERE task_id = ?", id))[0].asked)).toMatchObject({ by: ann.openId, named: [{ name: "@Carol", id: "ou_colleague" }] });
     model.replies([call("send_message", { text: "查完了，构建是好的。", notify: [ann.openId, "@Carol"] })], [say("")]);
     await here.stub.taskEvent(id, 1, "result", { text: "构建通过。" });
     await rest(here.stub);
     expect(last()).toBe(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> 查完了，构建是好的。`);
+
+    // Work that failed has had its end too, and she asked to be told of that.
+    model.replies([call("hand_over", { worker: "sandbox", title: "再查一下", brief: "再看看构建。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then: null })], [say("")]);
+    await here.says("再查一次，失败了也告诉我");
+    const failing = toolOutputs()[0].work_id as string;
+    model.replies([call("send_message", { text: "这次没查成。", notify: [ann.openId] })], [say("")]);
+    await here.stub.taskEvent(failing, 1, "failed", { error: "boom" });
+    await rest(here.stub);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 这次没查成。`);
 
     // A request that had to wait for her to authorise: its answer is a draft until it is let go, and reminds her then.
     reported(PUBLIC, 7, "提醒的时区不对");

@@ -98,10 +98,7 @@ export class BrainAgent extends DurableObject<Env> {
       },
       registry: () => registry(this.env),
       deciders: (runId) => this.#deciders(runId),
-      namedBy: (runId, person) => {
-        const asked = this.#reminders.asked(runId);
-        return asked && asked.by === person ? asked.named : [];
-      },
+      askedIn: (runId) => this.#reminders.asked(runId),
       isDecider: (principal, source) => this.#isDecider(principal, source),
       canRevisit,
       standingOf: (source, subject) => standingOf(this.env, source, this.#store.scope(), subject),
@@ -394,7 +391,7 @@ export class BrainAgent extends DurableObject<Env> {
       // What was to follow a task goes with the task; what a request had done, once none of its tasks is left and nothing of it waits.
       this.#store.sql.exec("DELETE FROM task_then WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_on WHERE task_id NOT IN (SELECT id FROM tasks)");
-      this.#store.sql.exec("DELETE FROM task_named WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM task_asked WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM outbox_reminds WHERE idem NOT IN (SELECT idem FROM outbox)");
       this.#store.sql.exec("DELETE FROM reminded WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM request_acts WHERE request NOT IN (SELECT request FROM task_then) AND ('then:' || request) NOT IN (SELECT id FROM continuations WHERE status IN ('waiting', 'resuming'))");

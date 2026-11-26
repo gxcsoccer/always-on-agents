@@ -118,7 +118,7 @@ function bench(state: DurableObjectState) {
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
     deciders: () => settings.deciders,
-    namedBy: () => [],
+    askedIn: () => undefined,
     isDecider,
     canRevisit: mayRevisit,
     standingOf,
