@@ -275,7 +275,7 @@ describe("GitHub's API over the proxy", () => {
     expect(forwarded).toHaveLength(1);
     expect(forwarded[0]).toMatchObject({ url: issues, method: "GET", redirect: "manual" });
     expect(Object.fromEntries(forwarded[0].headers)).toEqual({ authorization: "Bearer test-read-token", accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "if-none-match": '"abc"', "user-agent": "always-on-agent" });
-    expect(await recorded("noteGithubRead")).toEqual([{ kind: "other", status: 200, incomplete: false }]);
+    expect(await recorded("noteGithubRead")).toEqual([{ kind: "other", status: 200 }]);
   });
 
   it("reads it with no credential at all where the task is lent none", async () => {
@@ -330,15 +330,34 @@ describe("GitHub's API over the proxy", () => {
     expect(forwarded).toHaveLength(2);
     expect(await recorded("noteGithubRead")).toEqual([
       { kind: "other", status: 302, incomplete: true },
-      { kind: "other", status: 301, incomplete: false },
+      { kind: "other", status: 301 },
     ]);
   });
 
-  it("searches issues in the task's repository only, whatever the query names", async () => {
+  it("takes out of a file or a directory read with a credential the address it could be downloaded from", async () => {
     const { send } = await proxyFor({ repository: "acme/demo" });
-    const sent = async (q: string) => {
+    const signed = "https://raw.githubusercontent.com/acme/demo/main/a.txt?token=SIGNED";
+    const json = { headers: { "content-type": "application/json; charset=utf-8" } };
+    answers.push(() => Response.json({ name: "a.txt", content: "aGk=", download_url: signed }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt?ref=main")).json()).toEqual({ name: "a.txt", content: "aGk=", download_url: null });
+    answers.push(() => Response.json([{ name: "a.txt", download_url: signed }, { name: "dir", download_url: null }], json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/")).json()).toEqual([{ name: "a.txt", download_url: null }, { name: "dir", download_url: null }]);
+    answers.push(() => Response.json({ name: "README.md", download_url: signed }, json));
+    expect(JSON.stringify(await (await send("https://api.github.com/repos/acme/demo/readme")).json())).not.toContain("SIGNED");
+    // Asked for as the file itself: that is its content, passed on.
+    answers.push(() => new Response("hi", { headers: { "content-type": "application/vnd.github.raw" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw" } })).text()).toBe("hi");
+    // Read with no credential it is what anyone is told.
+    const open = await proxyFor({ repository: "acme/demo", unlent: true });
+    answers.push(() => Response.json({ name: "a.txt", download_url: "https://raw.githubusercontent.com/acme/demo/main/a.txt" }, json));
+    expect(((await (await open.send("https://api.github.com/repos/acme/demo/contents/a.txt")).json()) as { download_url: string }).download_url).toContain("raw.githubusercontent.com");
+  });
+
+  it("searches issues in the task's repository only, whatever the query names", async () => {
+    const { send, recorded } = await proxyFor({ repository: "acme/demo" });
+    const sent = async (q: string, more = "&per_page=50&sort=updated") => {
       answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
-      await send(search(q, "&per_page=50&sort=updated"));
+      await send(search(q, more));
       return new URL(forwarded.at(-1)!.url).searchParams;
     };
     expect((await sent("time zone is:issue")).get("q")).toBe("repo:acme/demo time zone is:issue");
@@ -346,12 +365,23 @@ describe("GitHub's API over the proxy", () => {
     // "or", "not" and brackets: the repository is said of the whole of it.
     expect((await sent("dst OR timezone")).get("q")).toBe("repo:acme/demo (dst OR timezone)");
     expect((await sent("(dst OR timezone) is:open NOT reminder")).get("q")).toBe("repo:acme/demo ((dst OR timezone) is:open NOT reminder)");
-    expect((await sent("dst OR repo:acme/secret")).get("q")).toBe("repo:acme/demo (dst OR)");
+    expect((await sent("(dst) OR (timezone)")).get("q")).toBe("repo:acme/demo ((dst) OR (timezone))");
+    // The next page of such a search, as GitHub gives its address: the same query again, not wrapped once more.
+    expect((await sent("repo:acme/demo (dst OR timezone)", "&page=2")).get("q")).toBe("repo:acme/demo (dst OR timezone)");
     expect((await sent("")).get("q")).toBe("repo:acme/demo");
-    const last = await sent("dst");
+    const last = await sent("dst", "&per_page=50&sort=updated&advanced_search=false");
     expect(last.get("per_page")).toBe("50");
     expect(last.get("sort")).toBe("updated");
+    // Brackets and "or" mean what they say only where this is asked for: always, whatever the guest sent.
+    expect(last.getAll("advanced_search")).toEqual(["true"]);
+    for (const each of forwarded) expect(new URL(each.url).searchParams.get("advanced_search")).toBe("true");
     expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+
+    // What is no longer a query once the places it names are taken out is not sent as one.
+    const before = forwarded.length;
+    for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone"]) expect((await send(search(q))).status, q).toBe(400);
+    expect(forwarded).toHaveLength(before);
+    expect((await recorded("noteGithubRead")).slice(-7)).toEqual(Array(7).fill({ kind: "search", status: 400, incomplete: true }));
   });
 
   it("passes a search on whole where all of it is the repository's, page after page", async () => {
@@ -367,10 +397,11 @@ describe("GitHub's API over the proxy", () => {
     // None at all, known to be all there is.
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await (await send(search("nothing like it"))).json()).toEqual({ total_count: 0, incomplete_results: false, items: [] });
+    // The first page, with more after it; the last; and one that was all there is and held nothing.
     expect(await recorded("noteGithubRead")).toEqual([
-      { kind: "search", status: 200, incomplete: false },
-      { kind: "search", status: 200, incomplete: false },
-      { kind: "search", status: 200, incomplete: false },
+      { kind: "search", status: 200, read: true, more: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true, none: true },
     ]);
   });
 
@@ -386,7 +417,8 @@ describe("GitHub's API over the proxy", () => {
     expect(((await (await send(search("dst"))).json()) as { incomplete_results: boolean }).incomplete_results).toBe(true);
     answers.push(() => Response.json({ total_count: 1, items: [found("acme/demo", 1)] }));
     expect(((await (await send(search("dst"))).json()) as { incomplete_results: boolean }).incomplete_results).toBe(true);
-    expect((await recorded("noteGithubRead")).map((each: any) => each.incomplete)).toEqual([true, true, true, true]);
+    // None of these says "looked and found none", the empty page least of all.
+    expect(await recorded("noteGithubRead")).toEqual(Array(4).fill({ kind: "search", status: 200, read: true, incomplete: true }));
   });
 
   it("says how a read went when it did not go well, never as nothing found", async () => {
@@ -413,12 +445,13 @@ describe("GitHub's API over the proxy", () => {
     });
     expect((await send(search("dst"))).status).toBe(502);
     expect(await recorded("noteGithubRead")).toEqual([
-      { kind: "search", status: 403, incomplete: false },
+      { kind: "search", status: 403 },
       { kind: "search", status: 502, incomplete: true },
       { kind: "search", status: 502, incomplete: true },
       { kind: "search", status: 502, incomplete: true },
-      { kind: "search", status: 200, incomplete: false },
-      { kind: "other", status: 404, incomplete: false },
+      // Answered, and nothing of it read.
+      { kind: "search", status: 200 },
+      { kind: "other", status: 404 },
       { kind: "search", status: 0, incomplete: true },
     ]);
     // Nor a credential had: nothing is read, and that is counted.

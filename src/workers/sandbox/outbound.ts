@@ -170,15 +170,24 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // Wherever the query says to look, it is this repository: what it names is taken out and
       // this one put in, over the whole of what is left (in brackets where that has "or", "not"
       // or brackets of its own). What comes back is gone through as well, below.
-      const asked = (url.searchParams.get("q") ?? "").replace(/-?\b(?:repo|org|user):\S*/gi, " ").replace(/\s+/g, " ").trim();
-      const whole = /\b(?:OR|AND|NOT)\b|[()]/.test(asked) ? `(${asked})` : asked;
+      const asked = (url.searchParams.get("q") ?? "").replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ").replace(/\s+/g, " ").trim();
+      // What is left may no longer be a query: an "or" with nothing on one side of it, empty brackets.
+      if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(asked) || !balanced(asked)) {
+        await this.#task.noteGithubRead(kind, 400, { incomplete: true });
+        return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched\n", { status: 400 });
+      }
+      // Already in brackets as a whole (a next page of a search made here): not wrapped again.
+      const whole = /\b(?:OR|AND|NOT)\b|[()]/.test(asked) && !enclosed(asked) ? `(${asked})` : asked;
       target.searchParams.set("q", `repo:${own} ${whole}`.trim());
+      // Brackets and "or" mean what they say only where this is asked for; without it GitHub
+      // answers such a query with nothing found and calls that complete. Always, whatever the guest sent.
+      target.searchParams.set("advanced_search", "true");
     }
     let token: string | undefined;
     try {
       token = await this.#task.githubReadToken();
     } catch {
-      await this.#task.noteGithubRead(kind, 0, true);
+      await this.#task.noteGithubRead(kind, 0, { incomplete: true });
       return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });
     }
     // Lending took a moment, and no credential is also what a task that has ended is given.
@@ -196,25 +205,35 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // Manual: a redirect is not followed on the guest's behalf.
       answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
     } catch {
-      await this.#task.noteGithubRead(kind, 0, true);
+      await this.#task.noteGithubRead(kind, 0, { incomplete: true });
       return new Response("GitHub could not be reached; nothing was read\n", { status: 502 });
     }
     // Sent somewhere else for it: an address made for whoever holds it (an archive, a file), good
     // for a while without any credential. It is not handed into the sandbox.
     const elsewhere = answer.status >= 300 && answer.status < 400 && !sameOrigin(answer.headers.get("location"), url);
     if (elsewhere) {
-      await this.#task.noteGithubRead(kind, answer.status, true);
+      await this.#task.noteGithubRead(kind, answer.status, { incomplete: true });
       return new Response("GitHub answers this with a download address somewhere else, which is not passed into this sandbox; use git for the files of the repository\n", { status: 403 });
     }
     if (!("search" in api) || !answer.ok || request.method === "HEAD") {
-      await this.#task.noteGithubRead(kind, answer.status, false);
+      // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
+      await this.#task.noteGithubRead(kind, answer.status, {});
+      // A file or a directory of the repository comes with an address to download it from, which
+      // for a private one works for a while for whoever holds it. Read with a credential, it is
+      // taken out; the content itself, which the task was given anyway, stays.
+      if (token && answer.ok && request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/(?:contents(?:\/|$)|readme(?:\/|$))/i.test(url.pathname) && (answer.headers.get("content-type") ?? "").includes("json")) {
+        const listed = (await answer.json().catch(() => undefined)) as unknown;
+        if (listed === undefined) return new Response("GitHub's answer could not be read\n", { status: 502 });
+        const without = (each: unknown) => (each && typeof each === "object" && !Array.isArray(each) ? { ...(each as Record<string, unknown>), download_url: null } : each);
+        return passed(answer, JSON.stringify(Array.isArray(listed) ? listed.map(without) : without(listed)));
+      }
       return passed(answer, answer.body);
     }
     const found = (await answer.json().catch(() => undefined)) as { items?: unknown; incomplete_results?: unknown; total_count?: unknown } | undefined;
     const rows = found && Array.isArray(found.items) ? (found.items as { repository_url?: unknown }[]) : undefined;
     if (!found || !rows || rows.some((each) => typeof each?.repository_url !== "string")) {
       // Not passed on as a list of nothing, nor with rows quietly left out: "none found" is what an issue gets opened on.
-      await this.#task.noteGithubRead(kind, 502, true);
+      await this.#task.noteGithubRead(kind, 502, { incomplete: true });
       return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
     }
     const items = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
@@ -223,7 +242,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // count is left out rather than made up.
     const mixed = items.length !== rows.length;
     const incomplete = mixed || found.incomplete_results !== false;
-    await this.#task.noteGithubRead(kind, answer.status, incomplete);
+    // What this page was: read; whether there is more after it; whether it was all there is and that was nothing.
+    const more = /rel="next"/.test(answer.headers.get("link") ?? "");
+    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: !incomplete && !more && items.length === 0 });
     const { total_count: total, ...rest } = found;
     return passed(answer, JSON.stringify({ ...rest, ...(mixed ? {} : { total_count: total }), incomplete_results: incomplete, items }));
   }
@@ -263,6 +284,27 @@ function passed(answer: Response, body: BodyInit | null): Response {
     if (value !== null) headers.set(name, value);
   }
   return new Response(body, { status: answer.status, headers });
+}
+
+/** Whether every bracket in a query is closed, and none closed that was not opened. */
+function balanced(query: string): boolean {
+  let depth = 0;
+  for (const each of query) {
+    if (each === "(") depth += 1;
+    else if (each === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/** Whether a query is one pair of brackets around everything in it. */
+function enclosed(query: string): boolean {
+  if (!query.startsWith("(") || !query.endsWith(")")) return false;
+  let depth = 0;
+  for (let at = 0; at < query.length; at += 1) {
+    if (query[at] === "(") depth += 1;
+    else if (query[at] === ")" && --depth === 0) return at === query.length - 1;
+  }
+  return false;
 }
 
 function sameOrigin(location: string | null, from: URL): boolean {

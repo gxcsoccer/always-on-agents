@@ -114,8 +114,14 @@ export interface TaskState {
   github_token?: { token: string; expires_at: number; source: string; installation?: string };
   /** One that can only read, for GitHub's API. Kept apart: the one above can write. */
   github_read_token?: { token: string; expires_at: number; source: string; installation?: string };
-  /** What the proxy saw of this task's reads of GitHub's API, searches apart from the rest (a read of something else says nothing of what was looked for): how many were answered with which status ("failed": never answered), and how many searches were not known to be complete. */
-  github_reads?: { search: { by_status: Record<string, number>; incomplete: number }; other: { by_status: Record<string, number> } };
+  /**
+   * What the proxy saw of this task's reads of GitHub's API, searches apart from the rest (a read
+   * of something else says nothing of what was looked for). By status ("failed": never answered).
+   * Of searches also: `read`, pages whose results were read; `more`, of those, pages after which
+   * there were others; `none`, pages that were all there is and held nothing; `incomplete`, ones
+   * not known to be complete. "Looked and found none" is `none` with nothing incomplete or failed.
+   */
+  github_reads?: { search: { by_status: Record<string, number>; read: number; more: number; none: number; incomplete: number }; other: { by_status: Record<string, number> } };
   /** When the current `starting` phase began. Startup is timed from here, not from task creation. */
   starting_since: number;
   /** Reports not yet acknowledged by the Brain, in order. Delivered at least once. */
@@ -251,6 +257,17 @@ const TASK_SCRIPT = `echo $$ >${PID_PATH}
 code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
+
+/**
+ * Whether a credential issued for a tenant is still that tenant's to use. One issued through the
+ * App is, while the installation it came from is the tenant's; one that does not say which
+ * installation that was (an earlier version kept them so) is not known to be, and is asked for
+ * again. The deployment's own token, of local development, comes from no installation.
+ */
+export async function fromTheirs(source: string, installation: string | undefined, tenant: string, tenantOf: (installation: string) => Promise<string | null>): Promise<boolean> {
+  if (installation === undefined) return source === "token";
+  return (await tenantOf(installation)) === tenant;
+}
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
 Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Aim for under 6,000 characters, most important first: beyond ${MAX_RESULT_TEXT.toLocaleString("en-US")} it is cut off.
@@ -725,13 +742,13 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
-  async noteGithubRead(kind: "search" | "other", status: number, incomplete: boolean): Promise<void> {
+  async noteGithubRead(kind: "search" | "other", status: number, seen: { incomplete?: boolean; read?: boolean; more?: boolean; none?: boolean }): Promise<void> {
     const state = this.#state();
     if (!state) return;
-    const reads = state.github_reads ?? { search: { by_status: {}, incomplete: 0 }, other: { by_status: {} } };
+    const reads = state.github_reads ?? { search: { by_status: {}, read: 0, more: 0, none: 0, incomplete: 0 }, other: { by_status: {} } };
     const key = status === 0 ? "failed" : String(status);
     reads[kind].by_status[key] = (reads[kind].by_status[key] ?? 0) + 1;
-    if (kind === "search" && incomplete) reads.search.incomplete += 1;
+    if (kind === "search") for (const each of ["incomplete", "read", "more", "none"] as const) if (seen[each]) reads.search[each] += 1;
     state.github_reads = reads;
     this.#save(state);
   }
@@ -759,7 +776,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const source = this.env.GITHUB_APP_ID ? `app:${this.env.GITHUB_APP_ID}` : "token";
     // An installation can be given to another tenant. What was issued from it for this one is then
     // no longer this one's to use, however long it would still be good for: asked each time.
-    const theirs = async (installation?: string) => installation === undefined || (await registry(this.env).tenantForGithubInstallation(installation)) === tenant;
+    const theirs = async (installation?: string) => fromTheirs(source, installation, tenant, (id) => registry(this.env).tenantForGithubInstallation(id));
     const held = still[kept];
     if (held && held.source === source && held.expires_at - Date.now() > 5 * 60_000 && (await theirs(held.installation))) return held.token;
     const issued = await githubTokenFor(this.env, tenant, repo, to);

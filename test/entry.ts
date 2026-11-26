@@ -100,8 +100,8 @@ export class FakeTask extends DurableObject {
     }
     return (policy.repository ?? "") && !policy.unlent ? "test-read-token" : undefined;
   }
-  async noteGithubRead(kind: string, status: number, incomplete: boolean) {
-    this.#record("noteGithubRead", { kind, status, incomplete });
+  async noteGithubRead(kind: string, status: number, seen: Record<string, boolean>) {
+    this.#record("noteGithubRead", { kind, status, ...Object.fromEntries(Object.entries(seen).filter(([, value]) => value)) });
   }
   async repository() {
     return this.#policy().repository ?? "";
