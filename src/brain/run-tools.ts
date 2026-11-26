@@ -382,7 +382,7 @@ export class RunTools {
       workStatus: async (workId) => {
         const work = await this.#work(run, session.session_key, workId);
         // Work done in a person's name: how it stands, and nothing of what it brought back.
-        return work.task ? this.#b.tasks.status(workId) : { work_id: workId, worker: work.worker, state: work.standing };
+        return work.task ? this.#b.tasks.status(workId, session.session_key) : { work_id: workId, worker: work.worker, state: work.standing };
       },
       cancelWork: async (callId, workId) => {
         const work = await this.#work(run, session.session_key, workId);
@@ -402,7 +402,7 @@ export class RunTools {
         // The tool from before there was more than one worker: for the one this deployment starts, with what was then its one option.
         return this.#b.tasks.dispatch(run, session.session_key, callId, null, title, brief, { repository });
       },
-      taskStatus: (taskId) => this.#b.tasks.status(taskId),
+      taskStatus: (taskId) => this.#b.tasks.status(taskId, session.session_key),
       answerTask: (callId, taskId, decision, reason) => this.#b.tasks.answer(run, session.session_key, callId, taskId, decision, reason),
       cancelTask: (taskId) => this.#b.tasks.cancel(session.session_key, taskId),
     };

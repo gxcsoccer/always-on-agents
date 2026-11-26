@@ -722,9 +722,11 @@ export class Tasks implements Wakes {
     };
   }
 
-  async status(taskId: string): Promise<unknown> {
-    const task = this.#s.rows<Row>("SELECT id, title, status, pending, last_progress, result, created_at, updated_at FROM tasks WHERE id = ?", taskId)[0];
-    if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
+  async status(taskId: string, sessionKey?: string): Promise<unknown> {
+    const task = this.#s.rows<Row>("SELECT id, title, status, pending, last_progress, result, created_at, updated_at, session_key FROM tasks WHERE id = ?", taskId)[0];
+    // (A task is its conversation's: asked about from another, it is as if it were not there. Said the same either way.)
+    if (!task || (sessionKey !== undefined && task.session_key !== sessionKey)) throw new Error(`there is no piece of work ${JSON.stringify(taskId)} in this conversation`);
+    delete task.session_key;
     const after = task.status === "queued" ? this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", taskId)[0]?.from_id : undefined;
     return {
       ...task,
