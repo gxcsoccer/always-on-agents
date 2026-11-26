@@ -337,10 +337,21 @@ describe("GitHub's API over the proxy", () => {
     answers.push(() => Response.json({ message: "wait" }, { status: 403, headers: { "retry-after": "60", "x-ratelimit-remaining": "10" } }));
     expect((await refused.send(issues)).headers.get("retry-after")).toBe("60");
     expect(forwarded).toHaveLength(before + 3);
+    // Turned away with no words to say why (none sent, or they could not be read): left at that, and asked once only.
+    const once = forwarded.length;
+    answers.push(() => new Response(null, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => controller.error(new Error("reset")) }), { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(once + 2);
+    // Asked for by its headers alone, it is asked as a stranger from the start: once, with no credential.
+    answers.push(() => new Response(null, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues, { method: "HEAD" })).status).toBe(403);
+    expect(forwarded.slice(once + 2).map((each) => [each.method, each.headers.get("authorization")])).toEqual([["HEAD", null]]);
     // By right, a refusal is what it is: nothing is asked a second time.
     answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403 }));
     expect((await lent.send(issues)).status).toBe(403);
-    expect(forwarded).toHaveLength(before + 4);
+    expect(forwarded).toHaveLength(before + 7);
     // Such a one cannot be had: read with none, as it would have been. Not a failure.
     const none = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     expect((await none.send(issues)).status).toBe(200);

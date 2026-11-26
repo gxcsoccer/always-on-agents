@@ -208,7 +208,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // request). And listed or searched only in the plain ways, which are the same for everyone:
       // what else a listing can be narrowed by depends on who asks.
       const plain = "search" in api ? SEARCHED_BY : LISTED_BY;
-      const open = ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
+      // (And only to read the thing itself: asked for by its headers alone, a refusal comes with
+      // no words to tell why, so that is asked as a stranger from the start.)
+      const open = request.method === "GET" && ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
       token = await this.#task.githubReadToken();
       if (token === undefined && open) {
         token = await this.#task.githubPublicToken();
@@ -239,9 +241,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       if (optional && [401, 403, 404, 422].includes(answer.status)) {
         // (GitHub also says "slow down" with a 403 that has allowance left and names no time to
         // wait: then it is in the words of the answer, which are read for it.)
-        const said = await answer.text().catch(() => "");
-        const slowed = answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after") || /rate limit|abuse detection/i.test(said);
-        if (slowed) answer = new Response(said, { status: answer.status, headers: answer.headers });
+        // (Where the words cannot be read, why it was turned away is not known: it is left at
+        // that answer, and not asked a second time.)
+        const said = await answer.text().catch(() => undefined);
+        const slowed = answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after") || said === undefined || said === "" || /rate limit|abuse detection/i.test(said);
+        if (slowed) answer = new Response(said ?? "", { status: answer.status, headers: answer.headers });
         else {
           headers.delete("authorization");
           answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
