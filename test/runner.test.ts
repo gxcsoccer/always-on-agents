@@ -263,6 +263,21 @@ describe("the run loop, by itself", () => {
       expect(runs).toEqual([["result of t3", ""], ["do not post it after all"], ["result of t1"], ["result of t2"]]);
     });
 
+    it("finds the words that are waited for however many things wait for them ahead in the line", async () => {
+      const taken = await within(async ({ runner, store, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        for (let n = 0; n < 170; n++) {
+          store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, ?, 'succeeded', 1, 1)", `t${n}`, `op_t${n}`, PRIVATE, PERSON);
+          store.sql.exec("INSERT INTO task_then (task_id, request, tools, events) VALUES (?, 'run_0', '[\"x\"]', '{\"said\":[],\"recent\":[]}')", `t${n}`);
+          event(`result of t${n}`, { source: "worker", kind: "worker.result", source_id: `t${n}:1`, principal: { kind: "worker", id: `t${n}`, explicit: false }, data: { task_id: `t${n}` }, reply_to: null });
+        }
+        event("her words, after all of those");
+        const id = await runner.next();
+        return store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text);
+      });
+      expect(taken).toEqual(["her words, after all of those"]);
+    });
+
     it("takes a burst as several runs, by count and by size", async () => {
       await within(async ({ runner, store, event, inbox }) => {
         for (let i = 0; i < 45; i++) event(`m${i}`);

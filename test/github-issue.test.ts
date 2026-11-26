@@ -1208,6 +1208,59 @@ describe("doing for a person what they asked to have done once some work has bee
     expect(world.commentWrites).toEqual([expect.objectContaining({ repo: PUBLIC, number: 7 })]);
   });
 
+  it("comments in the repository the work was on, where that work went on from an earlier piece and was given none itself", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    // An earlier piece of work on the repository, ended well.
+    const [earlier] = await asks(alone, looks(null, "先看看代码"));
+    model.replies(...done("看完了"));
+    await ends(alone, earlier, "看完了代码。");
+    // Going on from it: no repository is given, it works on what the earlier one did.
+    model.replies([call("hand_over", { worker: "sandbox", title: "接着查 issue", brief: "接着查有没有相关的 issue。", continue_from: earlier, repository: null, then: BOTH })], [say("")]);
+    await alone.says(`接着刚才那个，看看 ${PUBLIC} 有没有相关的 issue，有就评论（${PRIVATE} 那边先不管）`);
+    const next = toolOutputs()[0].work_id as string;
+    expect(next).toBeDefined();
+    expect(await rowsOf(alone.stub, "SELECT repository FROM task_then WHERE task_id = ?", next)).toEqual([{ repository: `https://github.com/${PUBLIC}` }]);
+    model.replies([comments(PRIVATE, 7)], [comments(PUBLIC, 7)], ...done("评论了"));
+    await ends(alone, next, FOUND);
+    // Another repository is still refused; the one it was on is commented in.
+    expect(toolOutputs()[0].error).toContain("was not done on that repository");
+    expect(world.commentWrites).toEqual([expect.objectContaining({ repo: PUBLIC, number: 7 })]);
+    // Where the worker's host says what it was on, that is what counts.
+    const [told] = await asks(alone, looks(BOTH));
+    model.replies([comments(PUBLIC, 7, "再说一句。")], ...done("没评"));
+    await alone.stub.taskEvent(told, 1, "result", { text: FOUND, repository: `https://github.com/${PRIVATE}` });
+    await rest(alone.stub);
+    expect(toolOutputs()[0].error).toContain("it was done on acme/core");
+    expect(world.commentWrites).toHaveLength(1);
+  });
+
+  it("says of a thing done, when asked again, only what may be said now to those who are there", async () => {
+    const ann = someone();
+    await authorised(ann, PRIVATE);
+    const issue = reported(PRIVATE, 7, "只有里面的人知道的事");
+    await registry().linkChatRepo(TENANT, "oc_core_two", PRIVATE);
+    const here = ann.at("oc_core_two");
+    const handed = () => call("hand_over", { worker: "sandbox", title: "查", brief: "找相关的。", continue_from: null, repository: `https://github.com/${PRIVATE}`, then: BOTH });
+    model.replies([handed(), handed()], [say("")]);
+    await here.says(`帮我看看 https://github.com/${PRIVATE} 有没有时区相关的 issue，如果没有就提一个，如果有可以追加你的评论`);
+    const [first, second] = toolOutputs().map((each) => each.work_id as string);
+    for (const id of [first, second]) left.push({ stub: here.stub, id });
+    // The chat is set up for the repository: the link is given there.
+    model.replies([comments(PRIVATE, 7)], ...done("评论了"));
+    await ends(here, first, FOUND);
+    expect(JSON.stringify(toolOutputs())).toContain(`${issue.html_url}#issuecomment-`);
+    // It is no longer set up for it when the other piece of work ends and the same is asked again: not posted again, and the link is hers alone now.
+    await registry().linkChatRepo(TENANT, "oc_core_two", null);
+    model.replies([comments(PRIVATE, 7)], ...done("已经评论过了，链接私下发你"));
+    await ends(here, second, FOUND);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(JSON.stringify(toolOutputs())).not.toContain("issuecomment");
+    expect(JSON.stringify(toolOutputs())).not.toContain("只有里面的人知道的事");
+    expect(ann.directly("text").at(-1)!.text).toContain(`${issue.html_url}#issuecomment-`);
+  });
+
   it("does nothing in their name where they only asked to have it looked into", async () => {
     const ann = someone();
     const alone = await authorised(ann);
