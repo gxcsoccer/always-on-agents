@@ -833,7 +833,7 @@ export class Runner {
    * nobody (see actingFor): nothing else that goes by who a run is for is opened by this.
    * Everything is taken from the Brain's own rows; nothing a worker reported says who or what.
    */
-  following(runId: string): { acting: NonNullable<ReturnType<Runner["actingFor"]>>; tools: string[]; request: string; task: string; made: InboxRow[]; on?: string; until: number; seen?: Record<string, unknown> } | undefined {
+  following(runId: string): { acting: NonNullable<ReturnType<Runner["actingFor"]>>; tools: string[]; request: string; task: string; made: InboxRow[]; on?: string; until: number; seen?: Record<string, unknown>; conditions: Record<string, string> } | undefined {
     if (this.#b.requests.continuationOf(runId)) return undefined;
     const events = this.#b.requests.basis(runId);
     const then = events.length === 1 ? this.#thenOf(events[0]) : undefined;
@@ -846,11 +846,15 @@ export class Runner {
     // Where what was written can be changed afterwards and that is told: every message this rests on still says what it said.
     const earlier = kept.recent.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE id IN (${kept.recent.map(() => "?").join(",")})`, ...kept.recent);
     if (![...made, ...earlier].every((each) => this.#b.stillStands(each))) return undefined;
-    const tools = (JSON.parse(then.tools) as string[]).filter((name) => thenable(acting, this.#b.toolsOf).includes(name));
-    // What the worker's host counted of the work, as it came with the result (the event is the Brain's own row).
-    const data = JSON.parse(events[0].data ?? "{}") as { github_reads?: unknown };
+    // By name, with the condition each was named under, if any (tool:condition). Named both ways, it is under the condition.
+    const named = (JSON.parse(then.tools) as string[]).filter((name) => thenable(acting, this.#b.toolsOf).includes(name));
+    const conditions = Object.fromEntries(named.filter((each) => each.includes(":")).map((each) => [each.slice(0, each.indexOf(":")), each.slice(each.indexOf(":") + 1)]));
+    const tools = [...new Set(named.map((each) => each.split(":")[0]))];
+    // What the worker's host counted of the work, and what it says the work was on, as they came with the result (the event is the Brain's own row, made from the host's report).
+    const data = JSON.parse(events[0].data ?? "{}") as { github_reads?: unknown; repository?: unknown };
     const seen = data.github_reads && typeof data.github_reads === "object" ? { github_reads: data.github_reads } : undefined;
-    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(then.repository ? { on: then.repository } : {}), until: events[0].received_at + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}) } : undefined;
+    const on = typeof data.repository === "string" && data.repository !== "" ? data.repository : (then.repository ?? undefined);
+    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(on ? { on } : {}), until: events[0].received_at + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}), conditions } : undefined;
   }
 
   /** What was to follow the task an event is the good end of, if anything was and it has not been taken back. */
@@ -1272,7 +1276,9 @@ export class Runner {
     const workers = workersIn(acting, this.#b.toolsOf, this.#b.workers());
     const carrying = new Set(workers.flatMap((each) => (each.tool ? [each.tool] : [])));
     // (Nor where its worker is not among them: such a tool is a worker's way in and nothing else.)
-    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined, acting && workers.some((each) => each.start !== undefined) ? thenable(acting, this.#b.toolsOf) : []);
+    const follows = acting && workers.some((each) => each.start !== undefined);
+    const means = follows ? toolsIn(acting, this.#b.toolsOf).flatMap((each) => (each.follows ? Object.entries(each.conditions ?? {}).map(([condition, meaning]) => `- ${each.name}:${condition}: ${meaning}`) : [])).join("\n") : "";
+    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined, follows ? thenable(acting, this.#b.toolsOf) : [], means);
     const own = [...TOOLS, ...handing];
     // (What a hand-over may name as to follow it: what the run may do in the person's name itself.)
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
@@ -1389,10 +1395,14 @@ export class Runner {
       // In the order things came, but for what is to be done for a person who has said something
       // since: that waits until their words are taken up (which are themselves in this line, so
       // it does not wait for ever), and nobody else's turn is passed over for it.
-      // (So many waiting for words that those words are not among the ones looked at: the words themselves, then.)
-      const first =
-        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT ?", MAX_EVENTS_PER_RUN * 4).find((each) => !this.#waitsForWords(each)) ??
-        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND kind = 'message' ORDER BY id LIMIT 1")[0];
+      // (Looked for page by page, however many are waiting ahead of it.)
+      let first: InboxRow | undefined;
+      for (let from = 0; ; ) {
+        const page = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND id > ? ORDER BY id LIMIT ?", from, MAX_EVENTS_PER_RUN * 4);
+        first = page.find((each) => !this.#waitsForWords(each));
+        if (first || page.length === 0) break;
+        from = page.at(-1)!.id;
+      }
       if (!first) return undefined;
       if (first.kind !== "request.ready") {
         // The very messages looked at are the ones taken up: what arrives meanwhile waits its turn.

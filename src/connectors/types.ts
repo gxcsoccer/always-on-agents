@@ -221,6 +221,13 @@ export interface ConnectorTool {
    * however often it is called with it, and says so again rather than doing it again.
    */
   follows?: boolean;
+  /**
+   * Conditions it can be named to follow under, by name, each with what it means (said to the
+   * model when work is handed over). Named as tool:condition, the tool is called with
+   * `after.only_if` and holds itself to it, by what the work's host counted and not by what the
+   * worker says.
+   */
+  conditions?: Record<string, string>;
   /** JSON Schema properties. Every one is required; use a nullable type for an optional value. */
   parameters: Record<string, unknown>;
   run(context: ToolContext, args: Record<string, unknown>): Promise<unknown>;
@@ -309,6 +316,10 @@ export interface ToolContext {
     until: number;
     /** What the worker's host itself counted of what the work did (not what the worker says of it), as it came with the result. */
     seen?: Record<string, unknown>;
+    /** The condition it was named to follow under (one of the tool's own `conditions`), if any. */
+    only_if?: string;
+    /** This very call has had its end before: nothing is to be done again, only said of it what is still kept (to whoever may be told now). */
+    done?: true;
   };
   /**
    * To be called by a tool for each of the person's messages its action actually rests on: the

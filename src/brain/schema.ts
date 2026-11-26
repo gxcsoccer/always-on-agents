@@ -349,9 +349,10 @@ export const MIGRATIONS: string[] = [
   // another is given none and works on what that one did, so it is taken from that one.
   // `repository`: the same, of the task something was to follow. Of the one thing
   // done: which tool and a digest of what it was called with (never the words themselves), and,
-  // once it has an end, what was said of it (`result`), so that it is said again and not done again.
+  // `sending`, set in the one step that lets it be sent (after which taking it back is too late and
+  // is told so), and `result`, set once it has had its end, so that it is not done again.
   `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, repository TEXT, withdrawn INTEGER NOT NULL DEFAULT 0);
-   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, digest TEXT NOT NULL, result TEXT, at INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, digest TEXT NOT NULL, sending INTEGER NOT NULL DEFAULT 0, result TEXT, at INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS task_on (task_id TEXT PRIMARY KEY, repository TEXT NOT NULL);`,
 ];
 

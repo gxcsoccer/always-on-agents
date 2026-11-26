@@ -934,7 +934,7 @@ export class Tasks implements Wakes {
    * work: only the person who asked for it can, as with anything said to it. Returns the request
    * it was of, for whatever of that request still waits to be called off too.
    */
-  withdrawThen(run: RunRow, sessionKey: string, taskId: string): { request: string } | undefined {
+  withdrawThen(run: RunRow, sessionKey: string, taskId: string): { request: string; already: boolean } | undefined {
     const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
     if (!task || task.session_key !== sessionKey) throw new Error(`there is no piece of work ${taskId} here`);
     const askers = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
@@ -942,8 +942,12 @@ export class Tasks implements Wakes {
     const row = this.#s.rows<{ request: string }>("SELECT request FROM task_then WHERE task_id = ?", taskId)[0];
     if (!row) return undefined;
     // Every task of that request: what was to follow was asked for once, by the one request.
+    // In the same step as it is seen whether that one thing was already let go to be sent (or has
+    // had its end): the sending is let go in one step too (see BrainAgent.aboutToSend), so the
+    // two cannot both hold, and whichever came first is what is told.
+    const already = this.#s.rows<{ sending: number; result: string | null }>("SELECT sending, result FROM request_acts WHERE request = ?", row.request).some((each) => each.sending !== 0 || each.result !== null);
     this.#s.sql.exec("UPDATE task_then SET withdrawn = 1 WHERE request = ?", row.request);
-    return row;
+    return { request: row.request, already };
   }
 
   async cancel(sessionKey: string, taskId: string): Promise<unknown> {

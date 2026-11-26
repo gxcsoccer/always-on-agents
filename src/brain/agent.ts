@@ -416,21 +416,26 @@ export class BrainAgent extends DurableObject<Env> {
   /** Called by a connector when something changed for one of its subjects: see Requests.conditionReported. */
   /**
    * Asked by whatever is about to do something in a person's name for a call made here, at the
-   * last moment before it does: whether that is still wanted. Not, where what was to follow a
-   * task has been taken back, the request it waited as has ended, or the person has said
-   * something since in that conversation that has not been taken up (it may be "do not"). A call
-   * nothing is kept of here was made in the run of the person's own message, and stands.
+   * last moment before it does. "withdrawn": what was to follow a task has been taken back, or the
+   * request it waited as has ended; it is not to be done. "held": the person has said something
+   * since in that conversation that has not been taken up (it may be "do not"); it is put off, not
+   * given up. "go": it may be sent, and, for what follows a task, that is written down in this
+   * very step: taking it back afterwards is told that it was too late (see Tasks.withdrawThen),
+   * so that the sending and the taking back are decided by one record, here. A call nothing is
+   * kept of was made in the run of the person's own message, and goes.
    */
-  async stillWanted(call: string): Promise<boolean> {
-    if (call.startsWith("then:")) {
-      const of = this.#store.rows<{ session_key: string; requested_by: string | null; withdrawn: number }>("SELECT t.session_key, t.requested_by, n.withdrawn FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.request = ?", call.slice("then:".length));
-      if (of.length === 0 || of.some((each) => each.withdrawn !== 0)) return false;
-      if (of.some((each) => each.requested_by !== null && unheard(this.#store, each.session_key, each.requested_by))) return false;
-    }
+  async aboutToSend(call: string): Promise<"go" | "held" | "withdrawn"> {
     const kept = this.#store.rows<{ person: string | null; status: string; session_key: string }>("SELECT c.person, c.status, s.session_key FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", call)[0];
-    if (!kept) return true;
-    if (kept.status !== "resuming") return false;
-    return !(kept.person && unheard(this.#store, kept.session_key, kept.person));
+    if (kept && kept.status !== "resuming") return "withdrawn";
+    if (kept?.person && unheard(this.#store, kept.session_key, kept.person)) return "held";
+    if (!call.startsWith("then:")) return "go";
+    const request = call.slice("then:".length);
+    const of = this.#store.rows<{ session_key: string; requested_by: string | null; withdrawn: number }>("SELECT t.session_key, t.requested_by, n.withdrawn FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.request = ?", request);
+    if (of.length === 0 || of.some((each) => each.withdrawn !== 0)) return "withdrawn";
+    if (of.some((each) => each.requested_by !== null && unheard(this.#store, each.session_key, each.requested_by))) return "held";
+    // (No waiting between the looking and this: one step.)
+    this.#store.sql.exec("UPDATE request_acts SET sending = 1 WHERE request = ?", request);
+    return "go";
   }
 
   async conditionReported(connector: string, subject: string, event: string): Promise<{ ok: true }> {

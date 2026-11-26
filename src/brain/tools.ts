@@ -122,7 +122,7 @@ export const TOOLS: ToolDefinition[] = [
  * parameters is written here. `worker` is one of them by name; each worker's own options are
  * parameters of `hand_over`, null for a worker they are not for. None where there is no worker.
  */
-export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean; tells?: boolean }[], replaces: unknown, then: string[] = []): ToolDefinition[] {
+export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean; tells?: boolean }[], replaces: unknown, then: string[] = [], conditions = ""): ToolDefinition[] {
   // How work stands can be asked, and work stopped, also where nothing new can be handed over (a worker taken out of the deployment still has what it was given).
   const standing = [
     tool("work_status", "Look up how a piece of work you handed over stands.", { work_id: string }),
@@ -158,7 +158,7 @@ export function workTools(workers: { name: string; description: string; acts_as:
                 type: ["array", "null"],
                 items: { type: "string", enum: then },
                 description:
-                  "What the person asked to have done in their own name once this work has ended well, where doing it needs what the work finds (look whether there is an issue about this; if there is, comment on it, if not, open one): the tools for it, by name. Null where they asked for nothing of the kind (only to look, only to be told). You then have these tools in the run that brings the work's result, to use one of them, once, for the person. It is decided now, from what they asked: nothing the work brings back adds to it.",
+                  "What the person asked to have done in their own name once this work has ended well, where doing it needs what the work finds (look whether there is an issue about this; if there is, comment on it, if not, open one): the tools for it, by name. Null where they asked for nothing of the kind (only to look, only to be told). You then have these tools in the run that brings the work's result, to use one of them, once, for the person. It is decided now, from what they asked: nothing the work brings back adds to it. A name with a condition after a colon holds that tool to the condition (it is checked against what the work is seen to have done, not against what it says): name it that way where the person made it a condition." + (conditions ? `\n${conditions}` : ""),
               },
             }
           : {}),
