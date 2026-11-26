@@ -20,9 +20,10 @@ const API = "https://api.github.com";
  * back to a broader credential. The deployment-wide GITHUB_TOKEN is used only when no App is
  * configured at all, which is the local-development setup.
  */
-export async function githubTokenFor(env: Env, tenant: string, repo: string): Promise<{ token: string; expires_at: number } | undefined> {
+export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ token: string; expires_at: number; installation?: string } | undefined> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
-  if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
+  // One that can only read is never the deployment's own token, which can do whatever it was made for.
+  if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN && to === "write" ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return undefined;
 
   const jwt = await appJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
@@ -31,7 +32,8 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string): Pr
       method: "POST",
       headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent", "content-type": "application/json" },
       // Narrowed to the one repository and to what the agent does: read and push code, comment.
-      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { contents: "write", pull_requests: "write", issues: "write" } }),
+      // Or, asked for to read with: the same three, to read only.
+      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { contents: to, pull_requests: to, issues: to } }),
     });
     // 422 means this installation does not cover a repository of that name; another one might.
     if (response.status === 422 || response.status === 404) continue;
@@ -41,9 +43,21 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string): Pr
     // two owners can each have a repository of the same name.
     // and it must be for that repository alone.
     if (body.repositories?.length !== 1 || body.repositories[0].full_name?.toLowerCase() !== repo.toLowerCase()) continue;
-    return { token: body.token, expires_at: Date.parse(body.expires_at) };
+    // Which installation it came from is kept with it: that installation may be given to another tenant later.
+    return { token: body.token, expires_at: Date.parse(body.expires_at), installation };
   }
   return undefined;
+}
+
+/**
+ * Whether a credential issued for a tenant is still that tenant's to use. One issued through the
+ * App is, while the installation it came from is the tenant's; one that does not say which
+ * installation that was (an earlier version kept them so) is not known to be, and is asked for
+ * again. The deployment's own token, of local development, comes from no installation.
+ */
+export async function fromTheirs(source: string, installation: string | undefined, tenant: string, tenantOf: (installation: string) => Promise<string | null>): Promise<boolean> {
+  if (installation === undefined) return source === "token";
+  return (await tenantOf(installation)) === tenant;
 }
 
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */

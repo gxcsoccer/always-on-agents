@@ -69,7 +69,7 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
@@ -89,6 +89,19 @@ export class FakeTask extends DurableObject {
     const limit = (this.#policy() as { tokenWithdrawnAfter?: number }).tokenWithdrawnAfter;
     if (limit !== undefined && asked > limit) return undefined;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
+  }
+  /** As the real task: a credential that can only read, lent where the other is; none where the test says the task is not lent one. A test can have the lending fail, or the task end while it is asked. */
+  async githubReadToken() {
+    const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean };
+    if (policy.lendingFails) throw new Error("GitHub refused to issue a token: 500");
+    if (policy.endsWhileLending) {
+      this.ctx.storage.kv.put("policy", { ...policy, ended: true });
+      return undefined;
+    }
+    return (policy.repository ?? "") && !policy.unlent ? "test-read-token" : undefined;
+  }
+  async noteGithubRead(kind: string, status: number, seen: Record<string, boolean>) {
+    this.#record("noteGithubRead", { kind, status, ...Object.fromEntries(Object.entries(seen).filter(([, value]) => value)) });
   }
   async repository() {
     return this.#policy().repository ?? "";
