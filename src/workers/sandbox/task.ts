@@ -1494,7 +1494,7 @@ export class TaskSandbox extends DurableObject<Env> {
       } else state.stale_checkpoints = [...(state.stale_checkpoints ?? []), last.record];
     }
     if (state.phase === "succeeded") {
-      this.#emit(state, "result", { text: run.result?.text ?? "", usage: run.result?.usage, turns: run.result?.turns, recoveries: state.recoveries, model_calls: state.model_calls });
+      this.#emit(state, "result", { text: run.result?.text ?? "", usage: run.result?.usage, turns: run.result?.turns, recoveries: state.recoveries, model_calls: state.model_calls, ...(state.github_reads ? { github_reads: state.github_reads } : {}) });
     } else if (state.phase === "lost") {
       this.#emit(state, "lost", { error: state.error });
     } else {

@@ -52,6 +52,7 @@ function bench(state: DurableObjectState) {
     outside,
     actingFor: () => settings.acting,
     mayUse: () => settings.mayUse,
+    following: () => undefined,
     instructionEditors: () => {
       if (settings.editors instanceof Error) throw settings.editors;
       return settings.editors;

@@ -339,6 +339,14 @@ export const MIGRATIONS: string[] = [
   // `sent` before the worker is asked, so that a call made again after an answer was lost is not
   // told that nothing was added when something was.
   `CREATE TABLE IF NOT EXISTS task_notes (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL);`,
+  // 38: what a person's request said was to be done for them once a task it handed over has
+  // ended well, written when the task is handed over (before anything is read from outside):
+  // which of a connector's tools, and the person's own messages the request was made in
+  // (`events`: { said, recent }, inbox ids, as a request that waits keeps them). `request` is
+  // the run that handed the task over: every task of that run is of the one request. And the
+  // one thing a request has had done in the person's name, claimed before it is done.
+  `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, withdrawn INTEGER NOT NULL DEFAULT 0);
+   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, args TEXT NOT NULL, at INTEGER NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

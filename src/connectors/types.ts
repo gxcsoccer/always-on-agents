@@ -290,6 +290,13 @@ export interface ToolContext {
    */
   resuming?: { generation: number; notAfter: number };
   /**
+   * Set when the call is made after a piece of work the person's request handed over has ended
+   * well, as that request said it might be: what it acts on may be what the work found, not only
+   * what the person wrote. `said` and `recent` are still the person's own messages, the ones
+   * the request was made in.
+   */
+  after?: { work: string };
+  /**
    * To be called by a tool for each of the person's messages its action actually rests on: the
    * one in `said` that names the thing, or the one in `recent` (by its index there) when the
    * tool acts on that rather than on what was just said ("summarise it" after a link). The

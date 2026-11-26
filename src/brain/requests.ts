@@ -189,7 +189,7 @@ export class Requests implements Wakes {
    * of them. One step: the record, and the message that shows the way in, exist together or not
    * at all, so nothing can be acted on before there is a request to carry on.
    */
-  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, asked: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }): unknown {
+  wait(run: RunRow, acting: { connector: string; person: string; origin: Record<string, string>; events: { said: number[]; recent: number[]; bound?: number[] } }, id: string, tool: string, asked: Waiting["waiting"], replacing?: { record: Continuation; by: string; choosing?: number }, made?: InboxRow[]): unknown {
     // Where there is nothing for the person to do (what is waited for happens by itself),
     // nothing is put before them: the request is kept, and asked about as any other.
     const shows = asked.interaction !== undefined;
@@ -213,7 +213,8 @@ export class Requests implements Wakes {
       const existing = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ?", id)[0];
       // "here": in the conversation the request was made in, for their eyes only, where the
       // connector can; directly otherwise. Never where the others would see it.
-      const from = existing?.target ?? this.#anchor(this.basis(run.id), acting.events.bound ?? []).target;
+      // (`made`: the person's messages a request was made in, where the run that keeps it is not the one they started.)
+      const from = existing?.target ?? this.#anchor(made ?? this.basis(run.id), acting.events.bound ?? []).target;
       const here = waiting.privately === "here" && from ? this.#b.aside(acting.connector, acting.origin, acting.person, JSON.parse(from) as Target) : undefined;
       // Where they are reached directly: used at once where it cannot be shown where they asked,
       // and kept beside the request for the one case that it could, and then certainly was not.
@@ -227,7 +228,7 @@ export class Requests implements Wakes {
         // Carried on and told to wait once more: the same request, waiting on what it needs now.
         this.#s.sql.exec("UPDATE continuations SET status = 'waiting', subject = ?, condition = ?, generation = ?, interaction = ?, until = ?, direct = ?, claimed_at = NULL, check_at = NULL WHERE id = ?", waiting.subject, waiting.condition, waiting.generation, waiting.interaction, waiting.until, where, id);
       } else {
-        const basis = this.basis(run.id);
+        const basis = made ?? this.basis(run.id);
         // Its answer goes back where the person's own message came from, as that message said:
         // not to wherever the conversation, or the scope, happens to point later.
         const target = this.#anchor(basis, acting.events.bound ?? []).target;

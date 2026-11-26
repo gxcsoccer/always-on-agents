@@ -141,6 +141,7 @@ export class BrainAgent extends DurableObject<Env> {
       outside: this.#outside,
       actingFor: (runId) => this.#runner.actingFor(runId),
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
+      following: (runId) => this.#runner.following(runId),
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
       direct,

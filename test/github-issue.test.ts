@@ -1075,3 +1075,178 @@ describe("commenting on GitHub as the person who asked", () => {
     expect(fromGithub("issue_comment", payload(posted.body))).toBeUndefined();
   });
 });
+
+describe("doing for a person what they asked to have done once some work has been looked into", () => {
+  const ASK = `帮我看看 https://github.com/${PUBLIC} 有没有时区相关的 issue，如果没有就提一个，如果有可以追加你的评论`;
+  /** The work is handed to the sandbox; `then`: what the request said was to be done in the person's name after it. */
+  const looks = (then: string[] | null, title = "查时区相关的 issue") => call("hand_over", { worker: "sandbox", title, brief: "在这个仓库的 issue 里找和提醒时区有关的。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then });
+  const BOTH = ["github_create_issue", "github_comment"];
+  /** The person asks; the model hands the work over. The ids of the pieces of work, in the order handed over. */
+  const asks = async (here: ReturnType<ReturnType<typeof someone>["at"]>, ...handed: unknown[]) => {
+    model.replies(handed as any, [say("")]);
+    await here.says(ASK);
+    return toolOutputs().map((each) => each.work_id as string);
+  };
+  /** The work ends well, saying what it found; the Brain takes that up. */
+  const ends = async (here: ReturnType<ReturnType<typeof someone>["at"]>, id: string, text: string, seq = 1) => {
+    await here.stub.taskEvent(id, seq, "result", { text });
+    await rest(here.stub);
+  };
+  const FOUND = "找到一条相关的：#7《提醒的时区不对》，还开着。";
+  const NONE = "搜索完成，没有找到相关的 issue（开着和关着的都看了）。";
+
+  it("comments on the one the work found, as the person, once; and what it said of the work is kept", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const issue = reported(PUBLIC, 7, "提醒的时区不对");
+    const read = async () => (await rowsOf(alone.stub, "SELECT COUNT(*) AS n FROM items WHERE outside != 0"))[0].n;
+    const before = await read();
+    const [id] = await asks(alone, looks(BOTH));
+    // What may follow is offered by name when the work is handed over, and only what is done in a person's name.
+    const handing = modelCalls.at(-2)!.tools.find((each: any) => each.name === "hand_over");
+    expect(handing.parameters.properties.then.items.enum.sort()).toEqual(["github_comment", "github_create_issue", "github_disconnect"]);
+    expect(world.commentWrites).toEqual([]);
+
+    model.replies([comments(PUBLIC, 7, "我这边也遇到了：提醒按 UTC 算，差了 8 小时。")], ...done("在 #7 下评论了"));
+    await ends(alone, id, FOUND);
+    // The run the result started has the two tools she named and no other of the connector's; nothing more can be named to follow.
+    const run = modelCalls.at(-3)!;
+    expect(offered(run).filter((name) => name.startsWith("github_")).sort()).toEqual(BOTH.slice().sort());
+    expect(run.tools.find((each: any) => each.name === "hand_over").parameters.properties.then).toBeUndefined();
+    expect(world.commentWrites).toHaveLength(1);
+    expect(world.commentWrites[0]).toMatchObject({ repo: PUBLIC, number: 7 });
+    expect(world.tokens.get(world.commentWrites[0].bearer)).toMatchObject({ account: ann.account });
+    expect(toolOutputs()).toEqual([expect.objectContaining({ posted: true, number: 7, on: "提醒的时区不对", url: `${issue.html_url}#issuecomment-9001` })]);
+    expect(world.writes.filter((each) => each.body.title !== "重连后消息重复")).toEqual([]);
+    expect(alone.heard().at(-1)).toBe("在 #7 下评论了");
+    // What the run said is not taken away as words written from something read in private.
+    expect(await rowsOf(alone.stub, "SELECT private FROM outbox ORDER BY id DESC LIMIT 1")).toEqual([{ private: 0 }]);
+    expect(await read()).toBe(before);
+  });
+
+  it("opens one where the work found none", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const [id] = await asks(alone, looks(BOTH));
+    model.replies([opens(PUBLIC, "提醒时间没有按用户时区换算", "提醒按 UTC 触发。")], ...done("没有相关的，已新建"));
+    // With the result comes what the sandbox's proxy counted of its reads, which is not the worker's to say.
+    await alone.stub.taskEvent(id, 1, "result", { text: NONE, github_reads: { search: { by_status: { "200": 2, "403": 1 }, read: 2, more: 0, none: 1, incomplete: 0 }, other: { by_status: { "200": 3 } } } });
+    await rest(alone.stub);
+    expect(JSON.stringify(modelCalls.at(-3)!.input)).toContain("As counted where its requests went out, not as the worker says: 3 searches of issues; 2 read through; 1 complete with nothing found; 1 refused, failed or not complete; 3 other reads (0 refused or failed).");
+    expect(world.writes.at(-1)).toMatchObject({ repo: PUBLIC, body: { title: "提醒时间没有按用户时区换算" } });
+    expect(toolOutputs()[0]).toMatchObject({ created: true });
+    expect(world.commentWrites).toEqual([]);
+  });
+
+  it("does nothing in their name where they only asked to have it looked into", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [id] = await asks(alone, looks(null));
+    model.replies([comments(PUBLIC, 7)], ...done("找到了 #7"));
+    await ends(alone, id, FOUND);
+    expect(offered(modelCalls.at(-3)!).filter((name) => name.startsWith("github_"))).toEqual([]);
+    expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
+    expect(world.commentWrites).toEqual([]);
+  });
+
+  it("does one thing for one request, however many pieces of work it handed over and whatever each brings back", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const before = world.writes.length;
+    const [first, second] = await asks(alone, looks(BOTH, "查开着的"), looks(BOTH, "查关着的"));
+    expect(second).toBeDefined();
+    // The first brings back #7; something else is tried in the same run, and refused.
+    model.replies([comments(PUBLIC, 7)], [opens(PUBLIC, "再建一个", "多出来的")], ...done("评论了"));
+    await ends(alone, first, FOUND);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(toolOutputs().at(-1).error).toContain("one thing is done in the person's name");
+    // The other piece of work ends too. Another thing: refused. The same thing again: the one already done, not done twice.
+    model.replies([opens(PUBLIC, "再建一个", "多出来的")], ...done("已经评论过了"));
+    await ends(alone, second, NONE);
+    expect(toolOutputs()[0].error).toContain("one thing is done in the person's name");
+    // The result comes once more (it was delivered twice): nothing new.
+    await ends(alone, second, NONE);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(world.writes).toHaveLength(before);
+  });
+
+  it("lets a call that was not right be put right, where nothing was begun under it", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [id] = await asks(alone, looks(BOTH));
+    model.replies([call("github_comment", { repo: "site", number: 7, body: "我这边也遇到了。" })], [comments(PUBLIC, 7)], ...done("评论了"));
+    await ends(alone, id, FOUND);
+    expect(toolOutputs().map((each) => each.error ?? "ok")).toEqual([expect.stringContaining("owner/name"), "ok"]);
+    expect(JSON.stringify(toolOutputs())).not.toContain("untouched");
+    expect(world.commentWrites).toHaveLength(1);
+  });
+
+  it("asks a person who has not authorised yet, and then does that one thing where they asked", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [id] = await asks(alone, looks(BOTH));
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await ends(alone, id, FOUND);
+    expect(world.commentWrites).toEqual([]);
+    expect(JSON.stringify(alone.cards()[0])).toContain("在 acme/site#7 下发表评论");
+    model.replies(...done("评论好了"));
+    expect((await consent(linkOn(alone.cards()[0]), ann.account)).status).toBe(200);
+    await alone.settle();
+    expect(world.commentWrites).toEqual([expect.objectContaining({ repo: PUBLIC, number: 7 })]);
+    expect(alone.heard().at(-1)).toBe("评论好了");
+  });
+
+  it("does nothing once they have taken back what was to follow, and tells them what the work found all the same", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [id] = await asks(alone, looks(BOTH));
+    // While the work is under way she says not to. The work goes on.
+    model.replies([call("cancel_work", { work_id: id, only_what_follows: true })], ...done("好，不发了"));
+    await alone.says("先别发评论");
+    expect(toolOutputs()[0]).toMatchObject({ ok: true });
+    model.replies([comments(PUBLIC, 7)], ...done("找到了 #7，按你说的没有评论"));
+    await ends(alone, id, FOUND);
+    expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
+    expect(alone.heard().slice(-2)).toEqual(["好，不发了", "找到了 #7，按你说的没有评论"]);
+    expect(world.commentWrites).toEqual([]);
+  });
+
+  it("calls off with it what already waits for them to authorise", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [id] = await asks(alone, looks(BOTH));
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await ends(alone, id, FOUND);
+    const authorize = linkOn(alone.cards()[0]);
+    model.replies([call("cancel_work", { work_id: id, only_what_follows: true })], ...done("好，不发了"));
+    await alone.says("算了，先别发评论");
+    // She authorises all the same, afterwards: the account is hers to use here now, and nothing is posted.
+    await consent(authorize, ann.account);
+    await alone.settle();
+    expect(world.commentWrites).toEqual([]);
+  });
+
+  it("does nothing for anyone where the messages the request was made in no longer stand as theirs, or the work did not end well", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [failed] = await asks(alone, looks(BOTH));
+    model.replies([comments(PUBLIC, 7)], ...done("没查成"));
+    await alone.stub.taskEvent(failed, 1, "failed", { error: "boom" });
+    await rest(alone.stub);
+    expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
+    // The message it was asked in is gone from what is kept.
+    const [id] = await asks(alone, looks(BOTH));
+    await rowsOf(alone.stub, "UPDATE inbox SET text = NULL WHERE kind = 'message'");
+    model.replies([comments(PUBLIC, 7)], ...done("找到了 #7"));
+    await ends(alone, id, FOUND);
+    expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
+    expect(world.commentWrites).toEqual([]);
+  });
+});

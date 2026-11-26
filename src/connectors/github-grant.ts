@@ -592,7 +592,7 @@ const why = (kind: Kind, reason: string): string | undefined =>
 export const githubCreateIssue: ConnectorTool = {
   name: "github_create_issue",
   description:
-    "Opens an issue on GitHub as the person who asked, in their own name. Only when they ask for one outright, in a repository they named themselves (`repo`, as owner/name). They are asked to authorise the first time; nothing else is asked of them before it is created, so do not ask them to confirm. Write `title` and `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics, nothing read from documents. If it is not plain which matter they mean, ask which.",
+    "Opens an issue on GitHub as the person who asked, in their own name. Only when they ask for one outright, in a repository they named themselves (`repo`, as owner/name). They are asked to authorise the first time; nothing else is asked of them before it is created, so do not ask them to confirm. Write `title` and `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics, nothing read from documents. Where it follows a piece of work they asked for, also from what that work found for this request. If it is not plain which matter they mean, ask which.",
   effect: "act",
   optional: true,
   // Also where several people talk: for the one who asked, as them.
@@ -604,7 +604,7 @@ export const githubCreateIssue: ConnectorTool = {
 export const githubComment: ConnectorTool = {
   name: "github_comment",
   description:
-    "Posts a comment on an issue or a pull request on GitHub as the person who asked, in their own name (not a review of lines of code). Only when they ask for that outright, in a repository they named themselves (`repo`, as owner/name) and on the one they named (`number`). They are asked to authorise the first time; nothing else is asked of them before it is posted, so do not ask them to confirm. Write `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics. A mention (@name) notifies that person only if the person who asked wrote it so themselves; any other is shown and notifies no one.",
+    "Posts a comment on an issue or a pull request on GitHub as the person who asked, in their own name (not a review of lines of code). Only when they ask for that outright, in a repository they named themselves (`repo`, as owner/name) and on the one they named (`number`). They are asked to authorise the first time; nothing else is asked of them before it is posted, so do not ask them to confirm. Write `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics. Where it follows a piece of work they asked for, which was to find the one to comment on, `number` is the one that work found, and `body` may draw on what it found for this request. A mention (@name) notifies that person only if the person who asked wrote it so themselves; any other is shown and notifies no one.",
   effect: "act",
   optional: true,
   shared: true,
@@ -621,8 +621,12 @@ export const githubComment: ConnectorTool = {
 async function act(kind: Kind, context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
   const seen: { op?: () => Promise<Op | undefined> } = {};
   const result = await attempt(kind, context, args, seen);
-  const now = typeof result === "object" && result !== null && "error" in result ? await seen.op?.() : undefined;
+  const failed = typeof result === "object" && result !== null && "error" in result;
+  const now = failed ? await seen.op?.() : undefined;
   if (now?.stage === "posting" || now?.stage === "lost") return { error: uncertain(kind) };
+  // Nothing is kept of this call here: nothing was done under it and nothing begun. Said as a
+  // fact about what is kept, for whoever keeps count of what a request has had done.
+  if (failed && !now) return { ...(result as Record<string, unknown>), untouched: true };
   const made = now?.stage === "posted" ? receipt(now) : undefined;
   if (!made) return result;
   // Who else here may see its link could not be worked out this time: it goes to the person alone.
@@ -707,6 +711,9 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
     const named = own.findIndex((each) => reposIn(each.text).includes(repo));
     if (named < 0) return { error: `the person has not named that repository themselves; ${none}. Ask them which repository they mean (as owner/name)` };
     if (kind === "issue") relied(named);
+    // After a piece of work they asked for, which was to find which one: that is the work's to
+    // say, in the repository they named. (Whether it is there is seen with their own token.)
+    else if (context.after) relied(named);
     else {
       // So with which one is commented on, and the two go together: the one they pointed at in
       // that repository (its address, or owner/name#12). A number by itself (#12) is of the
