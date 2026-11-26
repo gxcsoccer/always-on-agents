@@ -111,11 +111,11 @@ export interface TaskState {
   model_calls: number;
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
-  github_token?: { token: string; expires_at: number; source: string };
+  github_token?: { token: string; expires_at: number; source: string; installation?: string };
   /** One that can only read, for GitHub's API. Kept apart: the one above can write. */
-  github_read_token?: { token: string; expires_at: number; source: string };
-  /** What the proxy saw of this task's reads of GitHub's API: how many were answered with which status, and how many searches said they were not complete. */
-  github_reads?: { by_status: Record<string, number>; incomplete: number };
+  github_read_token?: { token: string; expires_at: number; source: string; installation?: string };
+  /** What the proxy saw of this task's reads of GitHub's API, searches apart from the rest (a read of something else says nothing of what was looked for): how many were answered with which status ("failed": never answered), and how many searches were not known to be complete. */
+  github_reads?: { search: { by_status: Record<string, number>; incomplete: number }; other: { by_status: Record<string, number> } };
   /** When the current `starting` phase began. Startup is timed from here, not from task creation. */
   starting_since: number;
   /** Reports not yet acknowledged by the Brain, in order. Delivered at least once. */
@@ -724,13 +724,14 @@ export class TaskSandbox extends DurableObject<Env> {
     return this.#lend("read");
   }
 
-  /** What the proxy saw of one read of GitHub's API. */
-  async noteGithubRead(status: number, incomplete: boolean): Promise<void> {
+  /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
+  async noteGithubRead(kind: "search" | "other", status: number, incomplete: boolean): Promise<void> {
     const state = this.#state();
     if (!state) return;
-    const reads = state.github_reads ?? { by_status: {}, incomplete: 0 };
-    reads.by_status[String(status)] = (reads.by_status[String(status)] ?? 0) + 1;
-    if (incomplete) reads.incomplete += 1;
+    const reads = state.github_reads ?? { search: { by_status: {}, incomplete: 0 }, other: { by_status: {} } };
+    const key = status === 0 ? "failed" : String(status);
+    reads[kind].by_status[key] = (reads[kind].by_status[key] ?? 0) + 1;
+    if (kind === "search" && incomplete) reads.search.incomplete += 1;
     state.github_reads = reads;
     this.#save(state);
   }
@@ -756,12 +757,15 @@ export class TaskSandbox extends DurableObject<Env> {
     // Checked before the cache: a credential issued under an earlier configuration is not lent on.
     if (Boolean(this.env.GITHUB_APP_ID) !== Boolean(this.env.GITHUB_APP_PRIVATE_KEY)) return undefined;
     const source = this.env.GITHUB_APP_ID ? `app:${this.env.GITHUB_APP_ID}` : "token";
+    // An installation can be given to another tenant. What was issued from it for this one is then
+    // no longer this one's to use, however long it would still be good for: asked each time.
+    const theirs = async (installation?: string) => installation === undefined || (await registry(this.env).tenantForGithubInstallation(installation)) === tenant;
     const held = still[kept];
-    if (held && held.source === source && held.expires_at - Date.now() > 5 * 60_000) return held.token;
+    if (held && held.source === source && held.expires_at - Date.now() > 5 * 60_000 && (await theirs(held.installation))) return held.token;
     const issued = await githubTokenFor(this.env, tenant, repo, to);
     if (!issued) return undefined;
-    // Issuing took time. If the link was removed or the task ended meanwhile, the token is not handed over.
-    if (!(await entitled())) return undefined;
+    // Issuing took time. If the link was removed, the installation given away or the task ended meanwhile, the token is not handed over.
+    if (!(await entitled()) || !(await theirs(issued.installation))) return undefined;
     const fresh = this.#state();
     if (!fresh || (!ACTIVE.has(fresh.phase) && fresh.phase !== "starting")) return undefined;
     fresh[kept] = { ...issued, source };

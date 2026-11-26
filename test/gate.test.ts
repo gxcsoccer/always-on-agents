@@ -175,12 +175,36 @@ describe("the repository credential a task is lent", () => {
     expect(await stub.githubReadToken()).toBeUndefined();
   });
 
-  it("keeps count of what the proxy saw of its reads of GitHub's API", async () => {
+  it("keeps count of what the proxy saw of its reads of GitHub's API, searches apart from the rest", async () => {
     const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
-    await stub.noteGithubRead(200, false);
-    await stub.noteGithubRead(200, true);
-    await stub.noteGithubRead(403, false);
+    await stub.noteGithubRead("search", 200, false);
+    await stub.noteGithubRead("search", 200, true);
+    await stub.noteGithubRead("search", 0, true);
+    await stub.noteGithubRead("other", 403, false);
     const reads = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_reads);
-    expect(reads).toEqual({ by_status: { "200": 2, "403": 1 }, incomplete: 1 });
+    expect(reads).toEqual({ search: { by_status: { "200": 2, failed: 1 }, incomplete: 2 }, other: { by_status: { "403": 1 } } });
+  });
+
+  it("no longer lends what was issued from an installation that has since been given to another tenant", async () => {
+    await registry().createTenant("lend4", "lend4");
+    await registry().createTenant("lend5", "lend5");
+    await registry().linkGithubInstallation("777", "lend4");
+    const stub = await taskFrom("lend4:repo:acme/demo", "https://github.com/acme/demo");
+    // As it would be kept after being issued through that installation, good for a long while yet.
+    const keep = (which: string, token: string) =>
+      runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+        const task = state.storage.kv.get("state") as any;
+        state.storage.kv.put("state", { ...task, [which]: { token, expires_at: Date.now() + 3_600_000, source: "token", installation: "777" } });
+      });
+    await keep("github_token", "issued-earlier");
+    expect(await stub.githubToken()).toBe("issued-earlier");
+    await registry().linkGithubInstallation("777", "lend5");
+    // (What it falls back to here is this test deployment's own token; the one issued earlier is not lent.)
+    expect(await stub.githubToken()).not.toBe("issued-earlier");
+    await keep("github_read_token", "read-issued-earlier");
+    expect(await stub.githubReadToken()).toBeUndefined();
+    await registry().linkGithubInstallation("777", "lend4");
+    await keep("github_read_token", "read-issued-earlier");
+    expect(await stub.githubReadToken()).toBe("read-issued-earlier");
   });
 });

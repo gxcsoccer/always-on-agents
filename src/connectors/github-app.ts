@@ -20,7 +20,7 @@ const API = "https://api.github.com";
  * back to a broader credential. The deployment-wide GITHUB_TOKEN is used only when no App is
  * configured at all, which is the local-development setup.
  */
-export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ token: string; expires_at: number } | undefined> {
+export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ token: string; expires_at: number; installation?: string } | undefined> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   // One that can only read is never the deployment's own token, which can do whatever it was made for.
   if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN && to === "write" ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
@@ -43,7 +43,8 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
     // two owners can each have a repository of the same name.
     // and it must be for that repository alone.
     if (body.repositories?.length !== 1 || body.repositories[0].full_name?.toLowerCase() !== repo.toLowerCase()) continue;
-    return { token: body.token, expires_at: Date.parse(body.expires_at) };
+    // Which installation it came from is kept with it: that installation may be given to another tenant later.
+    return { token: body.token, expires_at: Date.parse(body.expires_at), installation };
   }
   return undefined;
 }
