@@ -103,6 +103,12 @@ export class RunTools {
     return { answering: one ? { source: one.request } : {} };
   }
 
+  /** What of a request's one thing already waits, or is being carried on, is called off. */
+  #callOffThen(request: string): void {
+    const waiting = this.#s.rows<{ id: string }>("SELECT id FROM continuations WHERE id = ? AND status IN ('waiting', 'resuming', 'answering')", `then:${request}`)[0];
+    if (waiting) this.#b.requests.endRequest(waiting.id, "cancelled", "the person took back what was to follow the work");
+  }
+
   /**
    * A piece of work the run may ask about or stop, by its id: a task, as tasks always were; or
    * work done in a person's name, which is that person's alone and in the conversation it was
@@ -170,7 +176,11 @@ export class RunTools {
         // since. Carrying the request on is another run's to do.
         // The same for a call that was answered with a request another call of the run had already made.
         const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${slot}`) ?? "null") as { request: string } | null)?.request;
-        if (!carried && (folded !== undefined || this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", slot).length > 0)) {
+        // (What follows a task shares its call with every other result of the request's tasks: one
+        // that waited and has since ended is not still waiting, and is answered further down by what became of it.)
+        const waited = this.#s.rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", slot)[0];
+        const ended = after !== undefined && waited !== undefined && !["waiting", "resuming", "answering"].includes(waited.status);
+        if (!carried && !ended && (folded !== undefined || waited !== undefined)) {
           this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
           const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", folded ?? slot)[0]?.interaction !== "";
           return { waiting: true, request: folded ?? slot, note: shown ? WAITING_NOTE : UNDER_WAY_NOTE };
@@ -226,7 +236,9 @@ export class RunTools {
         // What follows a task: the person may have said something since (not to, most of all), and
         // that is heard first. And the request has one thing done in the person's name: claimed
         // here, before it is done, so that two results of its tasks cannot each do one.
-        const receipt = after !== undefined && found.effect === "act";
+        // (Carried on after the person authorised, it is the same thing still.)
+        const request = after?.request ?? (carried?.id.startsWith("then:") ? carried.id.slice("then:".length) : undefined);
+        const receipt = request !== undefined && found.effect === "act";
         if (after) {
           if (Date.now() > after.until) throw new Error("what was to follow this work was not done in time, and is not done now; nothing was sent. The person can ask again");
           if (unheard(this.#s, String(session.session_key), acting.person)) throw new Error("the person has written since, and that is taken up first; nothing was done in their name. If they still want it, it is done when they say so");
@@ -236,6 +248,8 @@ export class RunTools {
           if (held && (held.tool !== name || held.digest !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
           // The very call again, and it has had its end: said again as it was said, and not done again, whatever the tool still keeps of it.
           if (held?.result != null) return JSON.parse(held.result) as unknown;
+          // Asked for before, kept waiting, and ended without being done (called off, out of time): that was its end.
+          if (held && ended) throw new Error(`what was to be done in the person's name for this was asked for and did not come to be done (it was ${waited!.status}); nothing more is sent. Tell them so; they can ask again`);
           if (!held) this.#s.sql.exec("INSERT INTO request_acts (request, tool, digest, at) VALUES (?, ?, ?, ?)", after.request, name, wanted, Date.now());
         }
         // Whatever comes back is from outside, including an error that quotes something. (Not what
@@ -305,11 +319,11 @@ export class RunTools {
               this.#b.outbox.enqueue(`direct:${key}`, run.session_id, null, String(aside!.text).slice(0, MAX_MESSAGE_TEXT), undefined, undefined, { target: JSON.stringify(to) });
               // For them alone: its words are not kept once it has been delivered, like anything else said from what was brought in from outside.
               this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", `direct:${key}`);
-              if (after && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(rest), after.request);
+              if (request !== undefined && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(rest), request);
               return rest;
             }
             // What became of the one thing a request had done, kept as it was said: for the same call made again.
-            if (after && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(result), after.request);
+            if (request !== undefined && !released) this.#s.sql.exec("UPDATE request_acts SET result = ? WHERE request = ?", JSON.stringify(result), request);
             return result;
           }
           // Nothing was read. The answer the model gets is written here, not by the tool.
@@ -448,11 +462,22 @@ export class RunTools {
           const taken = this.#b.tasks.withdrawThen(run, session.session_key, workId);
           if (!taken) return { ok: true, work_id: workId, note: "Nothing was to be done in the person's name after this work. It goes on as it was." };
           // What of it was already asked for and waits (for them to authorise, say) is called off with it.
-          const waiting = this.#s.rows<{ id: string }>("SELECT id FROM continuations WHERE id = ? AND status = 'waiting'", `then:${taken.request}`)[0];
-          if (waiting) this.#b.requests.endRequest(waiting.id, "cancelled", "the person took back what was to follow the work");
+          this.#callOffThen(taken.request);
           return { ok: true, work_id: workId, note: "Nothing will be done in the person's name after this work. The work itself goes on, and you are told how it ends. If something was already sent in their name before this, it is not taken back by this: say how that stands if you know." };
         }
-        if (work.task) return this.#b.tasks.cancel(session.session_key, workId);
+        if (work.task) {
+          const stopped = await this.#b.tasks.cancel(session.session_key, workId);
+          // The work is no longer wanted, and so nothing that was to follow it is: also where it
+          // had ended already and what follows only waits for the person. (Theirs to take back
+          // alone; from anyone else the work is stopped and that is left as it was.)
+          try {
+            const taken = this.#b.tasks.withdrawThen(run, session.session_key, workId);
+            if (taken) this.#callOffThen(taken.request);
+          } catch {
+            // Not the person who asked for it.
+          }
+          return stopped;
+        }
         if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : work.state === "cancelled" && work.handed ? "It was already called off here: nothing of it will be brought back. It had been handed over, so the worker may still finish it over there: tell the person that, not that it was stopped." : "It had already ended; there was nothing to stop." };
         // The request that carries it is called off, as any request of the person's is.
         const off = callOff(callId, workId, "") as { cancelled?: string };

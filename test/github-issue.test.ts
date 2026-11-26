@@ -1133,7 +1133,7 @@ describe("doing for a person what they asked to have done once some work has bee
     // With the result comes what the sandbox's proxy counted of its reads, which is not the worker's to say.
     await alone.stub.taskEvent(id, 1, "result", { text: NONE, github_reads: { search: { by_status: { "200": 3 }, read: 3, more: 1, none: 1, incomplete: 0 }, other: { by_status: { "200": 3, "404": 1 } } } });
     await rest(alone.stub);
-    expect(JSON.stringify(modelCalls.at(-3)!.input)).toContain("As counted where its requests went out, not as the worker says: 3 searches of issues; 3 read through; 1 complete with nothing found; 0 refused, failed or not complete; 4 other reads (1 refused or failed).");
+    expect(JSON.stringify(modelCalls.at(-3)!.input)).toContain("As counted where its requests went out, not as the worker says: 3 searches of issues; 0 refused or failed; 3 pages of results read; 1 of those with more pages after; 0 answered but not complete; 1 complete with nothing found; 4 other reads (1 refused or failed).");
     expect(world.writes.at(-1)).toMatchObject({ repo: PUBLIC, body: { title: "提醒时间没有按用户时区换算" } });
     expect(toolOutputs()[0]).toMatchObject({ created: true });
     expect(world.commentWrites).toEqual([]);
@@ -1290,6 +1290,87 @@ describe("doing for a person what they asked to have done once some work has bee
     expect(world.commentWrites).toHaveLength(1);
     // A call nothing is kept of here was made for the person's own message, and stands.
     expect(await alone.stub.stillWanted("call_of_her_own_message")).toBe(true);
+  });
+
+  it("says how the one thing ended to a later result of the same request, where it waited for the person and has had its end since", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [first, second] = await asks(alone, looks(BOTH, "查开着的"), looks(BOTH, "查关着的"));
+    // The first result: she has to authorise. She does, and it is posted, by the run that carries the request on.
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await ends(alone, first, FOUND);
+    model.replies(...done("评论好了"));
+    expect((await consent(linkOn(alone.cards()[0]), ann.account)).status).toBe(200);
+    await alone.settle();
+    expect(world.commentWrites).toHaveLength(1);
+    // What that run said is kept as words about something done, not taken away as written from something read.
+    expect(await rowsOf(alone.stub, "SELECT private FROM outbox WHERE text = '评论好了'")).toEqual([{ private: 0 }]);
+    // The second result. Something else: refused, as one thing was done. The same call: not told that it still waits; told what was done, and nothing is done again.
+    model.replies([opens(PUBLIC, "再建一个", "多出来的")], [comments(PUBLIC, 7)], ...done("已经评论过了"));
+    await ends(alone, second, FOUND);
+    expect(toolOutputs()).toEqual([{ error: expect.stringContaining("one thing is done in the person's name") }, expect.objectContaining({ posted: true, number: 7 })]);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(world.writes).toEqual([]);
+  });
+
+  it("does nothing more for a request whose one thing waited and was called off, and says that, not that it still waits", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    reported(PUBLIC, 7, "提醒的时区不对");
+    const [first, second] = await asks(alone, looks(BOTH, "查开着的"), looks(BOTH, "查关着的"));
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await ends(alone, first, FOUND);
+    // She no longer wants the work at all (it has ended; what follows only waits for her): that is called off with it.
+    model.replies([call("cancel_work", { work_id: first, only_what_follows: null })], ...done("好，取消了"));
+    await alone.says("算了，这个不要了");
+    expect(await rowsOf(alone.stub, "SELECT status FROM continuations WHERE id LIKE 'then:%'")).toEqual([{ status: "cancelled" }]);
+    model.replies([comments(PUBLIC, 7)], ...done("之前取消了"));
+    await ends(alone, second, FOUND);
+    expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
+    await consent(linkOn(alone.cards()[0]), ann.account);
+    await alone.settle();
+    expect(world.commentWrites).toEqual([]);
+  });
+
+  it("does it for each of two people in one chat as themselves, and gives what tells of a repository the others may not see to the one who asked alone", async () => {
+    const [ann, bob] = [someone(), someone()];
+    await authorised(ann, PRIVATE);
+    reported(PRIVATE, 7, "只有里面的人知道的事");
+    const room = "oc_two";
+    const [hers, his] = [ann.at(room), bob.at(room)];
+    const privately = () => call("hand_over", { worker: "sandbox", title: "查", brief: "找相关的。", continue_from: null, repository: `https://github.com/${PRIVATE}`, then: BOTH });
+    const asking = `帮我看看 https://github.com/${PRIVATE} 有没有时区相关的 issue，如果没有就提一个，如果有可以追加你的评论`;
+    model.replies([privately()], [say("")]);
+    await hers.says(asking);
+    const mine = toolOutputs()[0].work_id as string;
+    model.replies([privately()], [say("")]);
+    await his.says(asking);
+    const theirs = toolOutputs()[0].work_id as string;
+    // His ends first. He has not authorised: the way to is sent to him alone, and nothing is posted.
+    model.replies([comments(PRIVATE, 7, "我也遇到了。")], [say("")]);
+    await his.stub.taskEvent(theirs, 1, "result", { text: FOUND });
+    await rest(his.stub);
+    expect(world.commentWrites).toEqual([]);
+    expect(bob.directly("interactive")).toHaveLength(1);
+    expect(ann.directly("interactive")).toEqual([]);
+    // Hers: posted as her; the link and the title go to her alone, and not into the chat.
+    model.replies([comments(PRIVATE, 7, "我这边也遇到了。")], ...done("评论好了，链接私下发你"));
+    await hers.stub.taskEvent(mine, 1, "result", { text: FOUND });
+    await rest(hers.stub);
+    expect(world.commentWrites).toHaveLength(1);
+    expect(world.tokens.get(world.commentWrites[0].bearer)).toMatchObject({ account: ann.account });
+    expect(JSON.stringify(toolOutputs())).not.toContain("只有里面的人知道的事");
+    expect(ann.directly("text").at(-1)!.text).toContain("issuecomment");
+    expect(bob.directly("text")).toEqual([]);
+    expect(hers.heard().join("\n")).not.toContain("只有里面的人知道的事");
+    // He authorises: his is posted as him.
+    model.replies(...done("评论好了，链接私下发你"));
+    expect((await consent(linkOn(bob.directly("interactive")[0]), bob.account)).status).toBe(200);
+    await his.settle();
+    expect(world.commentWrites).toHaveLength(2);
+    expect(world.tokens.get(world.commentWrites[1].bearer)).toMatchObject({ account: bob.account });
+    expect(world.commentWrites[1].body.body).toContain("我也遇到了。");
   });
 
   it("says what became of it where it was already posted when they take it back", async () => {

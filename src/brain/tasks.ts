@@ -1384,6 +1384,15 @@ function readsOf(reads: unknown): string {
   const searches = count(search.by_status);
   const others = count(seen.other?.by_status);
   if (searches + others === 0) return " (As counted where its requests went out: it read nothing from GitHub's API.)";
-  const said = [`${searches} search${searches === 1 ? "" : "es"} of issues`, `${Number(search.read ?? 0)} read through`, `${Number(search.none ?? 0)} complete with nothing found`, `${Number(search.incomplete ?? 0) + bad(search.by_status)} refused, failed or not complete`, `${others} other read${others === 1 ? "" : "s"} (${bad(seen.other?.by_status)} refused or failed)`];
-  return ` (As counted where its requests went out, not as the worker says: ${said.join("; ")}. A search that was refused, failed or not complete did not show that there is nothing.)`;
+  // (Refused or failed, and answered but not complete, are counted apart where the requests went out: neither is in the other.)
+  const said = [
+    `${searches} search${searches === 1 ? "" : "es"} of issues`,
+    `${bad(search.by_status)} refused or failed`,
+    `${Number(search.read ?? 0)} page${Number(search.read ?? 0) === 1 ? "" : "s"} of results read`,
+    `${Number(search.more ?? 0)} of those with more pages after`,
+    `${Number(search.incomplete ?? 0)} answered but not complete`,
+    `${Number(search.none ?? 0)} complete with nothing found`,
+    `${others} other read${others === 1 ? "" : "s"} (${bad(seen.other?.by_status)} refused or failed)`,
+  ];
+  return ` (As counted where its requests went out, not as the worker says: ${said.join("; ")}. A search that was refused, failed, not complete, or not read to its last page did not show that there is nothing.)`;
 }
