@@ -110,47 +110,54 @@ const HIDDEN = "";
  * changes nothing more.
  */
 export function emphasised(text: string): string {
+  // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
+  const out: string[] = [];
   let fence: { char: string; length: number } | undefined;
-  let before: "start" | "blank" | "code" | "prose" = "start";
-  let listed = false;
-  return text
-    .split("\n")
-    .map((line) => {
-      const fenced = /^(?: {0,3}> ?)* {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-      if (fence) {
-        if (fenced && fenced[1][0] === fence.char && fenced[1].length >= fence.length && fenced[2].trim() === "") fence = undefined;
-        return line;
-      }
-      if (fenced && !(fenced[1][0] === "`" && fenced[2].includes("`"))) {
-        fence = { char: fenced[1][0], length: fenced[1].length };
-        before = "prose";
-        return line;
-      }
-      // (An indented line is code where Markdown reads it so, as in `prose` above; here what is not plainly prose is left alone.)
-      const blank = line.trim() === "";
-      const indented = /^( {4}|\t)/.test(line);
-      if (/^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/.test(line)) listed = true;
-      else if (!blank && !indented && before === "blank") listed = false;
-      if (!blank && indented && !listed && before !== "prose") {
-        before = "code";
-        return line;
-      }
-      before = blank ? (before === "code" ? "code" : "blank") : "prose";
-      return blank ? line : strong(line);
-    })
-    .join("\n");
+  let lines: string[] = [];
+  const flush = () => {
+    if (lines.length > 0) out.push(paragraph(lines.join("\n")));
+    lines = [];
+  };
+  for (const line of text.split("\n")) {
+    const fenced = /^(?: {0,3}> ?)* {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (fenced && fenced[1][0] === fence.char && fenced[1].length >= fence.length && fenced[2].trim() === "") fence = undefined;
+      out.push(line);
+    } else if (fenced && !(fenced[1][0] === "`" && fenced[2].includes("`"))) {
+      flush();
+      fence = { char: fenced[1][0], length: fenced[1].length };
+      out.push(line);
+    } else if (line.trim() === "") {
+      flush();
+      out.push(line);
+    } else lines.push(line);
+  }
+  flush();
+  return out.join("\n");
 }
 
-/** One line of prose, with each `**…**` in it that certainly did not hold made to. */
-function strong(line: string): string {
-  // What is not prose keeps its place and is not looked into. A code span that does not close on
-  // this line may run on to another: where it ends is not plain, and the line is left alone.
-  const hide = (found: string) => HIDDEN.repeat(found.length);
-  const seen = line
-    .replace(/\\[\s\S]/g, hide)
+/** One paragraph, with each `**…**` in it that certainly did not hold made to; left whole where what in it is code or a link is not plain. */
+function paragraph(text: string): string {
+  // What is not prose keeps its place and is not looked into.
+  const hide = (found: string) => found.replace(/[^\n]/g, HIDDEN);
+  const seen = text
+    .replace(/\\[^\n]/g, hide)
     .replace(/(`+)(?:(?!\1(?!`))[\s\S])*?\1(?!`)/g, hide)
-    .replace(/!?\[[^\]]*\]\([^)]*\)|<[^>\s]+>|https?:\/\/\S+/g, hide);
-  if (seen.includes("`")) return line;
+    // A link or a picture with where it leads, brackets within its words and within its address one deep; the box of a task; a tag; a bare address.
+    .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()]|\([^()]*\))*\)/g, hide)
+    .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
+    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|https?:\/\/\S+/g, hide);
+  // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
+  // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
+  if (/[`\[\]]/.test(seen)) return text;
+  const lines = text.split("\n");
+  const seenLines = seen.split("\n");
+  // A line indented far enough to be code somewhere (under a list item it may be) is left as it is.
+  return lines.map((line, n) => (/^(?: {0,3}> ?)*(?: {4}|\t| {0,3}\t)/.test(line) ? line : strong(line, seenLines[n]))).join("\n");
+}
+
+/** One line of prose (and the same line with what is not prose hidden), with each `**…**` in it that certainly did not hold made to. */
+function strong(line: string, seen: string): string {
   // The marks: two asterisks by themselves, taken two by two. An odd number of them, or any other asterisk on the line, or
   // an underscore that could be a mark (emphasis within emphasis, or beside it), and it is not plainly this case. (An
   // underscore within a word, as in a name written with them, is no mark.)
@@ -160,7 +167,10 @@ function strong(line: string): string {
   let from = 0;
   for (let n = 0; n < marks.length; n += 2) {
     const [open, close] = [marks[n], marks[n + 1]];
-    out += line.slice(from, open) + mended(line.slice(open + 2, close), seen.slice(open + 2, close), seen[open - 1], seen[close + 2]);
+    // (What stands just outside each mark, as a whole character: one written with two units is one.)
+    const left = [...seen.slice(0, open)].at(-1);
+    const right = [...seen.slice(close + 2)][0];
+    out += line.slice(from, open) + mended(line.slice(open + 2, close), seen.slice(open + 2, close), left, right);
     from = close + 2;
   }
   return out + line.slice(from);
