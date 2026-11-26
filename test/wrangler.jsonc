@@ -15,6 +15,8 @@
     "ADMIN_KEY": "test-admin",
     "GITHUB_WEBHOOK_SECRET": "test-webhook-secret",
     "GITHUB_TOKEN": "test-github-token",
+    "GITHUB_CLIENT_ID": "test-client-id",
+    "GITHUB_CLIENT_SECRET": "test-client-secret",
     "PUBLIC_ORIGIN": "https://agent.test",
     "GRANTS_KEY": "test-grants-key-0123456789abcdef0123456789"
   },
@@ -26,6 +28,7 @@
       { "name": "FEISHU_LINKS", "class_name": "FeishuLink" },
       { "name": "FEISHU_GRANTS", "class_name": "FeishuGrant" },
       { "name": "DOUBAO_GRANTS", "class_name": "DoubaoGrant" },
+      { "name": "GITHUB_GRANTS", "class_name": "GithubGrant" },
       { "name": "FAKE_FEISHU", "class_name": "FakeFeishu" },
       { "name": "REGISTRY", "class_name": "Registry" }
     ]
@@ -37,6 +40,7 @@
     "FeishuLink": { "type": "durable-object", "storage": "sqlite" },
     "FeishuGrant": { "type": "durable-object", "storage": "sqlite" },
     "DoubaoGrant": { "type": "durable-object", "storage": "sqlite" },
+    "GithubGrant": { "type": "durable-object", "storage": "sqlite" },
     "FakeFeishu": { "type": "durable-object", "storage": "sqlite" },
     "Registry": { "type": "durable-object", "storage": "sqlite" }
   }

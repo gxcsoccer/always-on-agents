@@ -22,6 +22,7 @@
   // Secrets (wrangler secret put / .dev.vars): OPENAI_API_KEY, ADMIN_KEY,
   // optional GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN; for reading people's Feishu documents:
   // PUBLIC_ORIGIN (https://your.domain) and GRANTS_KEY (32+ random characters)
+  // for acting on GitHub as a person who authorised the GitHub App: also GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET (the App's)
   // Which version is running: shown for a long connection, so that after a deploy it can be seen when it has taken the new code.
   "version_metadata": { "binding": "VERSION" },
   "r2_buckets": [{ "binding": "CHECKPOINTS", "bucket_name": "always-on-agent-checkpoints" }],
@@ -32,7 +33,8 @@
       { "name": "REGISTRY", "class_name": "Registry" },
       { "name": "FEISHU_LINKS", "class_name": "FeishuLink" },
       { "name": "FEISHU_GRANTS", "class_name": "FeishuGrant" },
-      { "name": "DOUBAO_GRANTS", "class_name": "DoubaoGrant" }
+      { "name": "DOUBAO_GRANTS", "class_name": "DoubaoGrant" },
+      { "name": "GITHUB_GRANTS", "class_name": "GithubGrant" }
     ]
   },
   "containers": [
@@ -50,7 +52,8 @@
     "Registry": { "type": "durable-object", "storage": "sqlite" },
     "FeishuLink": { "type": "durable-object", "storage": "sqlite" },
     "FeishuGrant": { "type": "durable-object", "storage": "sqlite" },
-    "DoubaoGrant": { "type": "durable-object", "storage": "sqlite" }
+    "DoubaoGrant": { "type": "durable-object", "storage": "sqlite" },
+    "GithubGrant": { "type": "durable-object", "storage": "sqlite" }
   },
   // The backstop for Feishu long connections; see `scheduled` in src/index.ts.
   "triggers": { "crons": ["* * * * *"] },

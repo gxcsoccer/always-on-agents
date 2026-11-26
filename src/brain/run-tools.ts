@@ -9,7 +9,7 @@ import { type WorkEnd, workIs } from "./work";
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
-import { chainLevels } from "../events";
+import { chainLevels, type Target } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, UNDER_WAY_NOTE, WAITING_NOTE } from "./requests";
@@ -38,6 +38,8 @@ export interface RunToolsHost {
   instructionEditors(runId: string): string[];
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
+  /** Where a person is reached directly through a connector, from a verified origin; undefined where they cannot be. */
+  direct(connector: string, origin: Record<string, string>, person: string): Target | undefined;
   /** Every worker this deployment lists. */
   workers(): Worker[];
   /** Whether a piece of work done in a person's name still stands under what it was done under. */
@@ -261,6 +263,14 @@ export class RunTools {
             const read = identified as { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
             if (read && typeof result === "object" && result !== null && !("error" in result)) {
               this.#b.requests.noteSource(run.id, { connector: acting.connector, tool: name, args: JSON.stringify(read.request), identity: read.identity, ...read.under });
+            }
+            // Words for the person alone: sent to them directly by the system, and not given to the model.
+            if (typeof result === "object" && result !== null && "direct" in result) {
+              const { direct: aside, ...rest } = result as Record<string, unknown> & { direct?: { text?: unknown } };
+              const to = typeof aside?.text === "string" && aside.text !== "" ? this.#b.direct(acting.connector, acting.origin, acting.person) : undefined;
+              if (!to) return { ...rest, note: "What was to be sent to the person directly could not be sent: they cannot be reached directly here. Tell them so." };
+              this.#b.outbox.enqueue(`direct:${key}`, run.session_id, null, String(aside!.text).slice(0, MAX_MESSAGE_TEXT), undefined, undefined, { target: JSON.stringify(to) });
+              return rest;
             }
             return result;
           }

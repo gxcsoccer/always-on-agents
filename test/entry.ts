@@ -9,6 +9,7 @@ import production from "../src/index";
 export { BrainAgent } from "../src/brain/agent";
 export { FeishuGrant } from "../src/connectors/feishu-grant";
 export { DoubaoGrant } from "../src/connectors/doubao";
+export { GithubGrant } from "../src/connectors/github-grant";
 export { FeishuLink } from "../src/connectors/feishu-link";
 export { Registry } from "../src/registry";
 export { Outbound } from "../src/workers/sandbox/outbound";

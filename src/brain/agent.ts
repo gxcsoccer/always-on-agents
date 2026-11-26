@@ -143,6 +143,7 @@ export class BrainAgent extends DurableObject<Env> {
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
+      direct,
       workers,
       workStands: (work) => this.#workStands(work),
       // Built after this part: read when they are used.
