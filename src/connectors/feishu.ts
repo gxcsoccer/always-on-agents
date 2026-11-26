@@ -16,6 +16,7 @@
  * Outbound: replies as the bot, using the app's tenant_access_token. An approval question goes out
  * as a card, and is replaced by a closed card once it is decided or withdrawn.
  */
+import { mentionsOf } from "./markdown";
 import type { Env } from "../env";
 import { type InboundEvent, type Scope, type Target, privateSessionKey, scopeName } from "../events";
 import { type FeishuApp, registry } from "../registry";
@@ -256,6 +257,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   let documents: DocumentRef[] = [];
   // The pictures in it, by the names Feishu gives them: fetched for the run that acts on the message, and never kept.
   let pictures: PictureRef[] = [];
+  let handles: string[] = [];
   if (message.message_type === "text") {
     try {
       text = String(JSON.parse(message.content).text ?? "");
@@ -263,6 +265,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       return undefined;
     }
     documents = documentsIn(text);
+    // (A placeholder for someone mentioned in the chat, @_user_1, is not a name anyone typed.)
+    handles = [...mentionsOf(text)].slice(0, 50);
     // Mentions arrive as placeholders (@_user_1). They are replaced in a single pass over the
     // original text, so nothing inserted for one mention can be rewritten while handling another.
     // The bot's own is dropped: it only says the message is for the agent, which the event already
@@ -279,6 +283,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
       return undefined;
     }
     text = flat(content, mentions, [app.bot_open_id]);
+    handles = [...mentionsOf(typed(content))].slice(0, 50);
     documents = linkedIn(content);
     pictures = picturesIn(content, message.message_id);
   } else if (message.message_type === "image") {
@@ -294,8 +299,6 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   } else {
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
-
-  const people = [...new Set((Array.isArray(mentions) ? mentions : []).filter((each: any) => (typeof each?.id === "string" ? each.id : each?.id?.open_id) !== app.bot_open_id).map((each: any) => token(each?.name)))].slice(0, 50);
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
@@ -328,9 +331,11 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // Which documents this message links to, for a tool that reads what the person pointed at.
         ...(documents.length ? { documents } : {}),
         ...(pictures.length ? { pictures } : {}),
-        // The people of this chat the message mentions, as their names stand in its text (see `token`).
-        // They are people here: a tool that acts somewhere else must not take such a name for one there.
-        ...(people.length ? { people } : {}),
+        // The names the person typed out as mentions themselves (@name), taken from the message
+        // while it still had its lines and its parts: not a person of the chat they mentioned
+        // (whose name is put into the text for them), nor anything in code or in a quotation. For
+        // a tool that writes somewhere a mention notifies. A message without this says of none.
+        ...(handles.length ? { handles } : {}),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,
@@ -555,6 +560,12 @@ function linkedIn(post: any): (DocumentRef & { link: string })[] {
     return each?.tag === "text" || each?.tag === "md" ? linksIn(String(each.text ?? "")) : [];
   };
   return ((body as any)?.content ?? []).flatMap((line: any) => (Array.isArray(line) ? line.flatMap(piece) : []));
+}
+
+/** What the writer of a rich-text message typed as words, line by line: not its code blocks, not the people it mentions, not its links. */
+function typed(post: any): string {
+  const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
+  return ((body as any)?.content ?? []).map((line: any) => (Array.isArray(line) ? line.map((each: any) => (each?.tag === "text" || each?.tag === "md" ? String(each.text ?? "") : " ")).join("") : "")).join("\n");
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */

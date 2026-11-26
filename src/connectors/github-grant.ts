@@ -20,7 +20,7 @@ import { registry } from "../registry";
 import { chatFactsFor } from "./feishu-api";
 import { chatIs } from "./feishu-docs";
 import { challengeOf, grantsKey, lifetime, open, random, seal } from "./feishu-grant";
-import { inert, mentionsOf } from "./github";
+import { inert } from "./github";
 import { githubTokenFor } from "./github-app";
 import type { ConnectorTool, Holds, Invitation, ToolContext, Waiting } from "./types";
 
@@ -719,34 +719,31 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
         const here = [...new Set(reposIn(text))];
         return here.length === 1 ? here[0] : here.length === 0 && everywhere.length === 1 ? everywhere[0] : undefined;
       };
-      // What they say now comes first: only where that points at nothing of this number is what they said shortly before looked at.
-      let settled = false;
-      for (const [from, to] of [[0, context.said.length], [context.said.length, own.length]]) {
-        const among = own.map((each, index) => ({ index, text: each.text })).slice(from, to);
-        const pointed = among.find((each) => targetsIn(each.text).whole.some((at) => at.repo === repo && at.number === number));
-        const loose = among.filter((each) => targetsIn(each.text).bare.includes(number));
-        const mine = loose.find((each) => of(each.text) === repo);
-        if (pointed) relied(pointed.index);
-        else if (mine) (relied(named), relied(mine.index));
-        else if (loose.some((each) => of(each.text) === undefined)) return { error: `the person named more than one repository, and it is not plain which of them #${number} is in; nothing was posted. Ask them which one they mean (as owner/name#${number}, or by its address)` };
-        else continue;
-        settled = true;
-        break;
+      // What they point at now, worked out from their words before the call is looked at: if they
+      // point at anything this time, it is that and nothing they pointed at before (they may have
+      // changed their mind, to another number or another repository). Only where what they say
+      // now points at nothing is what they said shortly before taken, by the same reading.
+      const pointsOf = (from: number, to: number) =>
+        own.slice(from, to).flatMap((each, at) => {
+          const found = targetsIn(each.text);
+          return [...found.whole.map((one) => ({ ...one, index: from + at, plain: true })), ...found.bare.map((bare) => ({ repo: of(each.text), number: bare, index: from + at, plain: false }))];
+        });
+      const now = pointsOf(0, context.said.length);
+      const points = now.length > 0 ? now : pointsOf(context.said.length, own.length);
+      const meant = points.find((each) => each.repo === repo && each.number === number);
+      if (!meant) {
+        if (points.some((each) => each.number === number && each.repo === undefined)) return { error: `the person named more than one repository, and it is not plain which of them #${number} is in; nothing was posted. Ask them which one they mean (as owner/name#${number}, or by its address)` };
+        return { error: `that is not the issue or pull request the person pointed at ${now.length > 0 ? "this time" : "themselves"} (they say which as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
       }
-      if (!settled) return { error: `the person has not said themselves which issue or pull request in that repository (as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
+      relied(meant.index);
+      if (!meant.plain) relied(named);
     }
-    // In their name, a mention notifies someone only where they wrote it so themselves: in what
-    // they asked this time, or in an earlier message of theirs that this rests on. Not in code,
-    // nor in what they quoted (where the chat keeps a quotation apart as lines of its own: one that flattens a message to a line does not, and there a name in it counts as theirs).
-    // (A name the chat put there for one of its own people, whom they mentioned in the chat, is a person of the chat, not an account on GitHub.)
-    const theirs = new Set(
-      own
-        .filter((_, index) => index < context.said.length || rests.has(index))
-        .flatMap((each) => {
-          const here = new Set((Array.isArray(each.data.people) ? each.data.people : []).map((name) => String(name).replace(/^@/, "").toLowerCase()));
-          return [...mentionsOf(each.text)].filter((name) => !here.has(name));
-        }),
-    );
+    // In their name, a mention notifies someone only where they typed it so themselves: in what
+    // they asked this time, or in an earlier message of theirs that this rests on. Which names
+    // those are is what the chat connector noted of each message as it arrived, while it still
+    // had its lines and its parts (not code, not a quotation, not a person of the chat they
+    // mentioned there); a message it noted nothing of gives none.
+    const theirs = new Set(own.filter((_, index) => index < context.said.length || rests.has(index)).flatMap((each) => (Array.isArray(each.data.handles) ? each.data.handles.map((name) => String(name).toLowerCase()) : [])));
     const body = inert(written, theirs);
     if (body.length > MAX_BODY) return { error: `the body is too long: at most ${MAX_BODY} characters` };
     fresh = kind === "comment" ? { title: "", body, kind, number } : { title, body, kind: undefined, number: undefined };
@@ -793,9 +790,11 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
   // be told, it is taken as one they may not see.
   const hidden = async () => {
     if (scope.kind !== "chat") return false;
+    // First that the name still means the repository this was done in: a chat set up for a
+    // repository is set up for it by name, and a name can come to mean another one.
     const now = await repositoryOf(env, scope.tenant, repo);
-    const open = typeof now === "object" && now.id === op.repo_id && !now.private;
-    return !open && (await registry(env).chatRepo(scope.tenant, scope.id)) !== repo;
+    if (typeof now !== "object" || now.id !== op.repo_id) return true;
+    return now.private && (await registry(env).chatRepo(scope.tenant, scope.id)) !== repo;
   };
   const made = done.stage === "posted" ? receipt(done, repository.name) : undefined;
   if (!made) {

@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { commentableLines, githubConnector, inert, isOurs, mentionsOf } from "../src/connectors/github";
+import { commentableLines, githubConnector, inert, isOurs } from "../src/connectors/github";
+import { mentionsOf } from "../src/connectors/markdown";
 import { DeliveryDeferred } from "../src/connectors/types";
 import type { CodeReview } from "../src/connectors/types";
 import type { Env } from "../src/env";

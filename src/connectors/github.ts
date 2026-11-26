@@ -9,6 +9,7 @@
  * `explicit`. Everything else — a push, a CI result, a PR being opened — merely happened, and must
  * never be treated as that person's instruction or consent.
  */
+import { MENTION, prose } from "./markdown";
 import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
@@ -132,72 +133,6 @@ export function commentableLines(files: { filename?: string; patch?: string }[],
  */
 export function inert(text: string, allowed?: ReadonlySet<string>): string {
   return prose(text, (passage) => passage.replace(MENTION, (match, span, name) => (span || allowed?.has(String(name).toLowerCase()) ? match : `\`@${name}\``)));
-}
-
-/**
- * The names a text mentions (@name, @org/team), in lower case, as its writer's own: not in code,
- * and not in what they quote from someone else (lines that begin with ">").
- */
-export function mentionsOf(text: string): Set<string> {
-  const names = new Set<string>();
-  const own = text.split("\n").filter((line) => !/^\s*>/.test(line)).join("\n");
-  prose(own, (passage) => passage.replace(MENTION, (match, span, name) => (span ? match : (names.add(String(name).toLowerCase()), match))));
-  return names;
-}
-
-/** A code span (left alone), or a mention. */
-const MENTION = /(`+)[\s\S]*?\1|(?<![\w.`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g;
-
-/**
- * A text with each passage of prose put through `change`, and its code blocks left as they are.
- * An indented line is code only where Markdown reads it so: after a blank line (or at the start),
- * and not under a list item, where an indented line is the item going on. Where it is not plain
- * which it is, it is taken as prose: a mention that would notify is the thing not to let through.
- */
-function prose(text: string, change: (passage: string) => string): string {
-  const out: string[] = [];
-  let fence: { char: string; length: number } | undefined;
-  let lines: string[] = [];
-  const flush = () => {
-    if (lines.length === 0) return;
-    // Code spans may run over several lines; everything between them is prose.
-    out.push(change(lines.join("\n")));
-    lines = [];
-  };
-  let before: "start" | "blank" | "code" | "prose" = "start";
-  let listed = false;
-  for (const line of text.split("\n")) {
-    const opener = /^([ \t>]*)(`{3,}|~{3,})(.*)$/.exec(line);
-    if (fence) {
-      if (opener && opener[2][0] === fence.char && opener[2].length >= fence.length && opener[3].trim() === "") fence = undefined;
-      out.push(line);
-      continue;
-    }
-    if (opener) {
-      flush();
-      fence = { char: opener[2][0], length: opener[2].length };
-      out.push(/^\s*suggestion\b/i.test(opener[3]) ? `${opener[1]}${opener[2]}text` : line);
-      before = "prose";
-      continue;
-    }
-    const blank = line.trim() === "";
-    const indented = /^( {4}|\t)/.test(line);
-    if (/^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/.test(line)) listed = true;
-    // A list is over once something that is neither part of it nor indented under it follows a blank line.
-    else if (!blank && !indented && before === "blank") listed = false;
-    if (!blank && indented && !listed && before !== "prose") {
-      // Indented far enough to be a code block, where one can begin.
-      flush();
-      out.push(line);
-      before = "code";
-      continue;
-    }
-    lines.push(line);
-    // (A blank line between lines of an indented block is part of it.)
-    before = blank ? (before === "code" ? "code" : "blank") : "prose";
-  }
-  flush();
-  return out.join("\n");
 }
 
 /** A path shown literally, whatever characters it holds, spaces included. */
