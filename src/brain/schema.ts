@@ -339,6 +339,21 @@ export const MIGRATIONS: string[] = [
   // `sent` before the worker is asked, so that a call made again after an answer was lost is not
   // told that nothing was added when something was.
   `CREATE TABLE IF NOT EXISTS task_notes (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL);`,
+  // 38: what a person's request said was to be done for them once a task it handed over has
+  // ended well, written when the task is handed over (before anything is read from outside):
+  // which of a connector's tools, and the person's own messages the request was made in
+  // (`events`: { said, recent }, inbox ids, as a request that waits keeps them). `request` is
+  // the run that handed the task over: every task of that run is of the one request. And the
+  // one thing a request has had done in the person's name, claimed before it is done.
+  // `task_on`: what a task was given to work on, as the Brain gave it; one that goes on from
+  // another is given none and works on what that one did, so it is taken from that one.
+  // `repository`: the same, of the task something was to follow. Of the one thing
+  // done: which tool and a digest of what it was called with (never the words themselves), and,
+  // `sending`, set in the one step that lets it be sent (after which taking it back is too late and
+  // is told so), and `result`, set once it has had its end, so that it is not done again.
+  `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, repository TEXT, withdrawn INTEGER NOT NULL DEFAULT 0);
+   CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, digest TEXT NOT NULL, sending INTEGER NOT NULL DEFAULT 0, result TEXT, at INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS task_on (task_id TEXT PRIMARY KEY, repository TEXT NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

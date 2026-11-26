@@ -790,6 +790,27 @@ describe("keeping a request that has to wait", () => {
         await use(all, () => all.sent("invite:grant_1.nonce"));
       });
 
+    it("is put back to waiting as it was when carrying it on is put off: nothing said, nothing of it changed, and ready to be taken up again", async () => {
+      await asking(({ requests, store, kept }) => {
+        const before = kept("call_1");
+        const outbox = store.rows("SELECT idem FROM outbox").length;
+        // Taken up to be carried on.
+        store.sql.exec("UPDATE continuations SET status = 'resuming', run_id = 'r9', call_id = 'resume_r9', claimed_at = 5, check_at = 6 WHERE id = 'call_1'");
+        const ready = () => store.rows<{ source_id: string }>("SELECT source_id FROM inbox WHERE kind = 'request.ready' AND status = 'pending'").map((each) => each.source_id);
+        const had = ready().length;
+        requests.putOff("call_1", "r9");
+        // (The run that was carrying it on is still written on it: that run stays this request's, and can do nothing more.)
+        expect(requests.continuationOf("r9")?.id).toBe("call_1");
+        expect(kept("call_1")).toMatchObject({ status: "waiting", run_id: "r9", call_id: "resume_r9", claimed_at: null, check_at: null, direct: before.direct, interaction: before.interaction, condition: before.condition, until: before.until, target: before.target });
+        // Said to be ready, once; and nothing new is said to the person.
+        expect(ready().slice(had)).toEqual(["call_1:put_off:r9"]);
+        expect(store.rows("SELECT idem FROM outbox")).toHaveLength(outbox);
+        // One that is not being carried on is left alone.
+        requests.putOff("call_1", "r10");
+        expect(ready().slice(had)).toHaveLength(1);
+      });
+    });
+
     it("goes where the connector says that is, and nothing more is said once it is there", async () => {
       await asking(({ requests, store, kept }, invite) => {
         expect(invite().target).toBe(HERE);

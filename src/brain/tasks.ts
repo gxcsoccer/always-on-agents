@@ -173,7 +173,7 @@ export class Tasks implements Wakes {
    * more than one): then the worker the deployment names for that tool (`firstWorker`), while it is offered. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
-  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null): Promise<unknown> {
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }): Promise<unknown> {
     const scope = this.#s.scope();
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
@@ -273,6 +273,12 @@ export class Tasks implements Wakes {
         if (from !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_follows (task_id, from_id) VALUES (?, ?)", id, from);
         this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
+        // What the person's request said was to be done for them after it, and the messages it
+        // was made in: kept with the task from the start, under the run that hands it over.
+        // What it works on: what it was given, or, going on from another, what that one worked on.
+        const on = typeof options.repository === "string" && options.repository !== "" ? options.repository : from !== null ? (this.#s.rows<{ repository: string }>("SELECT repository FROM task_on WHERE task_id = ?", from)[0]?.repository ?? null) : null;
+        if (on !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_on (task_id, repository) VALUES (?, ?)", id, on);
+        if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events, repository) VALUES (?, ?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events), on);
       });
       // (One that waits is watched from when it is let through to be started, not while it waits.)
       if (!waits) this.#watch(id, sessionKey, title, now, this.#limits().task_minutes * 60_000);
@@ -923,6 +929,27 @@ export class Tasks implements Wakes {
     return { ok: true, task_id: taskId, decision: decided, ...(earlier ? { decided_by: earlier } : {}), ...reach, note: `the worker had already been told to ${decided}; ${intent.decided_by}'s "${intent.decision}" came too late to change that` };
   }
 
+  /**
+   * Takes back what was to be done in a person's name after a task, and leaves the task at its
+   * work: only the person who asked for it can, as with anything said to it. Returns the request
+   * it was of, for whatever of that request still waits to be called off too.
+   */
+  withdrawThen(run: RunRow, sessionKey: string, taskId: string): { request: string; already: boolean } | undefined {
+    const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+    if (!task || task.session_key !== sessionKey) throw new Error(`there is no piece of work ${taskId} here`);
+    const askers = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+    if (askers.length !== 1 || task.requested_by !== askers[0]) throw new Error("only the person who asked for this piece of work can take back what was to follow it");
+    const row = this.#s.rows<{ request: string }>("SELECT request FROM task_then WHERE task_id = ?", taskId)[0];
+    if (!row) return undefined;
+    // Every task of that request: what was to follow was asked for once, by the one request.
+    // In the same step as it is seen whether that one thing was already let go to be sent (or has
+    // had its end): the sending is let go in one step too (see BrainAgent.aboutToSend), so the
+    // two cannot both hold, and whichever came first is what is told.
+    const already = this.#s.rows<{ sending: number; result: string | null }>("SELECT sending, result FROM request_acts WHERE request = ?", row.request).some((each) => each.sending !== 0 || each.result !== null);
+    this.#s.sql.exec("UPDATE task_then SET withdrawn = 1 WHERE request = ?", row.request);
+    return { request: row.request, already };
+  }
+
   async cancel(sessionKey: string, taskId: string): Promise<unknown> {
     const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
@@ -1329,7 +1356,7 @@ function renderEnding(task: Row, kind: WorkerEventKind, body: Record<string, unk
     const told = body.delivered ? `The people here have already been asked by the system, with the code ${body.code}. Do not ask again. When one of them replies, pass their decision on with answer_task.` : "The question could not be delivered to anyone here.";
     return `${head} is paused and needs approval to ${what} ${told}`;
   }
-  if (kind === "result") return `${head} finished. The worker's own summary (unverified): ${clipResult(String(body.text ?? ""))}`;
+  if (kind === "result") return `${head} finished.${readsOf(body.github_reads)} The worker's own summary (unverified): ${clipResult(String(body.text ?? ""))}`;
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
   // The Brain's own finding says why; a worker's report of a lost task means that where it ran stopped under it.
   return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: it stopped where it was running and could not be restored.`;
@@ -1348,4 +1375,31 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   if (unread.length === 0) return told;
   const when = unread.map((note) => (typeof note?.at === "number" ? new Date(note.at).toISOString().slice(11, 16) : "")).filter((at) => at !== "");
   return `${told}\n${unread.length === 1 ? "One thing" : `${unread.length} things`} added to it while it was at work could not be confirmed to have reached it before it ended${when.length > 0 ? ` (added at ${when.join(", ")} UTC)` : ""}: take it that the work took no account of ${unread.length === 1 ? "it" : "them"}. Tell the person whose work it was, and ask whether they still want it done${kind === "result" ? ", as something that goes on from this piece" : ""}. Do not repeat here what was added.`
+}
+
+/**
+ * What the sandbox's own proxy saw of the task's reads of GitHub, in words: counted where the
+ * requests went out, not told by the worker. For telling "looked and found none" from "could not
+ * look": the first is a search that was read through, complete, and counted none by GitHub.
+ */
+function readsOf(reads: unknown): string {
+  const seen = reads as { search?: { by_status?: Record<string, number>; read?: number; more?: number; none?: number; incomplete?: number }; other?: { by_status?: Record<string, number> } } | undefined;
+  if (!seen || typeof seen !== "object") return "";
+  const count = (by: Record<string, number> | undefined) => Object.values(by ?? {}).reduce((sum, each) => sum + (Number(each) || 0), 0);
+  const bad = (by: Record<string, number> | undefined) => Object.entries(by ?? {}).filter(([status]) => !/^2/.test(status) && status !== "rejected").reduce((sum, [, each]) => sum + (Number(each) || 0), 0);
+  const search = seen.search ?? {};
+  const searches = count(search.by_status);
+  const others = count(seen.other?.by_status);
+  if (searches + others === 0) return " (As counted where its requests went out: it read nothing from GitHub's API.)";
+  // (Refused or failed, and answered but not complete, are counted apart where the requests went out: neither is in the other.)
+  const said = [
+    `${searches} search${searches === 1 ? "" : "es"} of issues`,
+    `${bad(search.by_status)} refused or failed`,
+    `${Number(search.read ?? 0)} page${Number(search.read ?? 0) === 1 ? "" : "s"} of results read`,
+    `${Number(search.more ?? 0)} of those with more pages after`,
+    `${Number(search.incomplete ?? 0)} answered but not complete`,
+    `${Number(search.none ?? 0)} complete with nothing found`,
+    `${others} other read${others === 1 ? "" : "s"} (${bad(seen.other?.by_status)} refused or failed)`,
+  ];
+  return ` (As counted where its requests went out, not as the worker says: ${said.join("; ")}. A search that was refused, failed, not complete, or not read to its last page did not show that there is nothing.)`;
 }

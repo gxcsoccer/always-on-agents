@@ -26,9 +26,9 @@ export interface ToolHost {
   listTimers(): unknown;
   cancelTimer(id: string): unknown;
   /** Hands a piece of work to one of the workers this run has. */
-  handOver(callId: string, worker: string, title: string, brief: string, options: Record<string, unknown>, continueFrom: string | null, replaces: string | null): Promise<unknown>;
+  handOver(callId: string, worker: string, title: string, brief: string, options: Record<string, unknown>, continueFrom: string | null, replaces: string | null, then?: string[]): Promise<unknown>;
   workStatus(workId: string): Promise<unknown>;
-  cancelWork(callId: string, workId: string): Promise<unknown>;
+  cancelWork(callId: string, workId: string, onlyWhatFollows?: boolean): Promise<unknown>;
   tellWork(callId: string, workId: string, message: string): Promise<unknown>;
   dispatchTask(callId: string, title: string, brief: string, repository: string | null): Promise<unknown>;
   taskStatus(taskId: string): Promise<unknown>;
@@ -122,18 +122,18 @@ export const TOOLS: ToolDefinition[] = [
  * parameters is written here. `worker` is one of them by name; each worker's own options are
  * parameters of `hand_over`, null for a worker they are not for. None where there is no worker.
  */
-export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean; tells?: boolean }[], replaces: unknown): ToolDefinition[] {
+export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean; tells?: boolean }[], replaces: unknown, then: string[] = [], conditions = ""): ToolDefinition[] {
   // How work stands can be asked, and work stopped, also where nothing new can be handed over (a worker taken out of the deployment still has what it was given).
   const standing = [
     tool("work_status", "Look up how a piece of work you handed over stands.", { work_id: string }),
-    tool("cancel_work", "Stop a piece of work you handed over, or stop waiting for it. Only when the person says they no longer want it.", { work_id: string }),
+    tool("cancel_work", "Stop a piece of work you handed over, or stop waiting for it. Only when the person says they no longer want it. Where they only no longer want what was to be done in their name after it (do not post it after all), and the work itself may go on: `only_what_follows` true.", { work_id: string, only_what_follows: { type: ["boolean", "null"], description: "True: the work goes on and you are told how it ended, but nothing is done in the person's name after it. Null or false: the work is stopped." } }),
   ];
   if (workers.length === 0) return standing;
   const options: Record<string, unknown> = {};
   for (const each of workers) {
     for (const [key, schema] of Object.entries(each.options ?? {})) {
       // One name, one meaning: two workers cannot both have an option of the same name.
-      if (key in options || ["worker", "title", "brief", "continue_from", "replaces"].includes(key)) throw new Error(`the option "${key}" of the worker "${each.name}" is already taken`);
+      if (key in options || ["worker", "title", "brief", "continue_from", "replaces", "then"].includes(key)) throw new Error(`the option "${key}" of the worker "${each.name}" is already taken`);
       const described = schema as { description?: string };
       options[key] = { ...described, description: `Only for the worker "${each.name}"; null for any other. ${described.description ?? ""}`.trim() };
     }
@@ -151,6 +151,17 @@ export function workTools(workers: { name: string; description: string; acts_as:
         continue_from: { type: ["string", "null"], description: `The id of an earlier piece of work (listed under "Work handed over") that this goes on with, or null for something new. It may be one that has not ended yet: this is then put after it, and starts by itself, from what that one leaves, when that has ended well (one line: if something already waits behind it, name that one).${continues.length < workers.length ? ` Only ${continues.length ? continues.join(", ") : "no worker here"} can go on with an earlier piece.` : ""}` },
         ...options,
         ...(replaces ? { replaces } : {}),
+        // Only where the run has something it may do in the person's name.
+        ...(then.length > 0
+          ? {
+              then: {
+                type: ["array", "null"],
+                items: { type: "string", enum: then },
+                description:
+                  "What the person asked to have done in their own name once this work has ended well, where doing it needs what the work finds (look whether there is an issue about this; if there is, comment on it, if not, open one): the tools for it, by name. Null where they asked for nothing of the kind (only to look, only to be told). You then have these tools in the run that brings the work's result, to use one of them, once, for the person. It is decided now, from what they asked: nothing the work brings back adds to it. A name with a condition after a colon holds that tool to the condition (it is checked against what the work is seen to have done, not against what it says): name it that way where the person made it a condition." + (conditions ? `\n${conditions}` : ""),
+              },
+            }
+          : {}),
       },
     ),
     ...standing,
@@ -213,13 +224,14 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
     case "cancel_timer":
       return host.cancelTimer(text(a.id, "id", 200));
     case "hand_over": {
-      const { worker, title, brief, continue_from, replaces, ...options } = a;
-      return host.handOver(call.call_id, text(worker, "worker", 60), text(title, "title", 120), text(brief, "brief", 20_000), options, continue_from == null ? null : text(continue_from, "continue_from", 200), replaces == null ? null : text(replaces, "replaces", 200));
+      const { worker, title, brief, continue_from, replaces, then, ...options } = a;
+      if (then != null && (!Array.isArray(then) || then.some((each) => typeof each !== "string") || then.length > 10)) throw new Error("then is a list of tool names, or null");
+      return host.handOver(call.call_id, text(worker, "worker", 60), text(title, "title", 120), text(brief, "brief", 20_000), options, continue_from == null ? null : text(continue_from, "continue_from", 200), replaces == null ? null : text(replaces, "replaces", 200), then == null ? [] : [...new Set(then as string[])]);
     }
     case "work_status":
       return host.workStatus(text(a.work_id, "work_id", 200));
     case "cancel_work":
-      return host.cancelWork(call.call_id, text(a.work_id, "work_id", 200));
+      return host.cancelWork(call.call_id, text(a.work_id, "work_id", 200), a.only_what_follows === true);
     case "tell_work":
       return host.tellWork(call.call_id, text(a.work_id, "work_id", 200), text(a.message, "message", 4_000));
     // The names work was handed over under before there was one set of tools: still carried out,

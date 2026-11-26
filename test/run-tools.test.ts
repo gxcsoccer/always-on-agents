@@ -37,6 +37,10 @@ function bench(state: DurableObjectState) {
     mayUse: true,
     editors: ["ou_1"] as string[] | Error,
     basis: [7, 8],
+    /** What a run a task's result started may do in a person's name (see Runner.following); none, as for most runs. */
+    following: undefined as ReturnType<RunToolsHost["following"]>,
+    /** The event such a run was started by, as the requests part would give it. */
+    event: undefined as Record<string, unknown> | undefined,
   };
   /** The connector's one tool: what it was given, and what it says back. */
   const tool = {
@@ -52,6 +56,7 @@ function bench(state: DurableObjectState) {
     outside,
     actingFor: () => settings.acting,
     mayUse: () => settings.mayUse,
+    following: () => settings.following,
     instructionEditors: () => {
       if (settings.editors instanceof Error) throw settings.editors;
       return settings.editors;
@@ -61,9 +66,10 @@ function bench(state: DurableObjectState) {
       continuationOf: () => settings.carried as Continuation | undefined,
       mayCancel: (_run, requestId, by, ask) => (calls.push(["mayCancel", requestId, by, ask]), { record: { id: requestId } as Continuation, choosing: 3 }),
       cancel: note("cancel"),
-      basis: () => settings.basis.map((id) => ({ id })) as never,
+      basis: () => (settings.event ? [settings.event] : settings.basis.map((id) => ({ id }))) as never,
       endRequest: note("endRequest"),
       noteSource: note("noteSource"),
+      putOff: note("putOff"),
       wait: (...args: unknown[]) => (calls.push(["wait", ...args]), { waiting: "kept" }),
       draft: (...args: unknown[]) => (calls.push(["draft", ...args]), { ok: true as const }),
     } as RunToolsHost["requests"],
@@ -85,7 +91,7 @@ function bench(state: DurableObjectState) {
   const run = store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0];
   const tools = (): ToolHost => new RunTools(store, host).for(run);
   const of = (name: string) => calls.filter(([each]) => each === name).map(([, ...args]) => args);
-  return { store, host, settings, tool, outside, calls, of, run, tools };
+  return { store, host, settings, tool, outside, calls, of, run, tools, read };
 }
 
 describe("a run's tools", () => {
@@ -331,6 +337,67 @@ describe("a run's tools", () => {
         settings.acting = undefined;
         await expect(tools().connectorTool("c1", "feishu_read_document", {})).rejects.toThrow('there is no tool "feishu_read_document" in this run');
         expect(tool.given).toEqual([]);
+      });
+    });
+
+    it("does the one thing a request named to follow its work: put off, it comes round again; done, it is not done again; and nothing else is done", async () => {
+      await within(async ({ tools, tool, outside, store, settings, read }) => {
+        // The run a task's result started: it acts for nobody, and may do this one thing for the person who asked.
+        (read as { effect: string }).effect = "act";
+        settings.acting = undefined;
+        settings.event = { id: 9, source: "worker", source_id: "t1:1", kind: "worker.result", session_key: SESSION_KEY, principal: JSON.stringify({ kind: "worker", id: "t1", explicit: false }), text: "Task t1 finished.", data: JSON.stringify({ task_id: "t1" }) };
+        settings.following = { acting: PERSON, tools: ["feishu_read_document"], request: "req1", task: "t1", made: [{ id: 7 }] as never, on: "acme/site", until: Date.now() + 60_000, conditions: { feishu_read_document: "if_none_found" } };
+        const again = () => store.rows<{ source_id: string; status: string }>("SELECT source_id, status FROM inbox WHERE source = 'worker'");
+        const kept = () => store.rows<{ tool: string; result: string | null }>("SELECT tool, result FROM request_acts WHERE request = 'req1'");
+
+        // The person has said something that is not taken up yet, the tool finds at the last moment: put off.
+        tool.answer = async () => ({ held: true, error: "put off" });
+        expect(await tools().connectorTool("c1", "feishu_read_document", { url: "u" })).toEqual({ error: "put off", put_off: true });
+        const [{ context }] = tool.given;
+        expect(context).toMatchObject({ person: "ou_1", callId: "then:req1", after: { work: "t1", on: "acme/site", only_if: "if_none_found" } });
+        expect(context.after?.done).toBeUndefined();
+        // The task's result is brought once more, to be taken up after their words; the claim stands, with no end yet; nothing is marked as read from outside.
+        expect(again()).toEqual([{ source_id: "t1:1:again:r1", status: "pending" }]);
+        expect(kept()).toEqual([{ tool: "feishu_read_document", result: null }]);
+        expect(outside.has("c1")).toBe(false);
+
+        // Something else meanwhile: refused. The same again: done this time, and that it has had its end is kept.
+        await expect(tools().connectorTool("c2", "feishu_read_document", { url: "other" })).rejects.toThrow("one thing is done in the person's name");
+        tool.answer = async () => ({ posted: true });
+        expect(await tools().connectorTool("c3", "feishu_read_document", { url: "u" })).toEqual({ posted: true });
+        expect(kept()).toEqual([{ tool: "feishu_read_document", result: "1" }]);
+        expect(again()).toHaveLength(1);
+        // Asked once more (another result of the same request): the tool is told it was done, and decides what to say of it now.
+        tool.answer = async (context) => (context.after?.done ? { done: true } : { posted: "again" });
+        expect(await tools().connectorTool("c4", "feishu_read_document", { url: "u" })).toEqual({ done: true });
+
+        // She has said something that is not taken up, seen before the tool is even called: put off the same way, and not given longer for it.
+        settings.following = { ...settings.following!, request: "req3" };
+        settings.event = { ...settings.event!, source_id: "t1:1:again:r0", received_at: 2_000, data: JSON.stringify({ task_id: "t1", first_at: 1_000 }) };
+        store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, data, status, received_at) VALUES ('feishu', 'om_unread', 'message', ?, ?, 'how is it going?', '{}', 'pending', 1)", SESSION_KEY, JSON.stringify({ kind: "human", id: "ou_1", explicit: true }));
+        const calls = tool.given.length;
+        expect(await tools().connectorTool("c6", "feishu_read_document", { url: "u" })).toMatchObject({ put_off: true, error: expect.stringContaining("put off until it has been") });
+        expect(tool.given).toHaveLength(calls);
+        expect(store.rows<{ data: string }>("SELECT data FROM inbox WHERE source_id = 't1:1:again:r0:again:r1'").map((each) => JSON.parse(each.data).first_at)).toEqual([1_000]);
+        expect(store.rows("SELECT 1 FROM request_acts WHERE request = 'req3'")).toEqual([]);
+        store.sql.exec("DELETE FROM inbox WHERE source_id = 'om_unread'");
+
+        // Past the time it was to be done by: not done.
+        settings.following = { ...settings.following!, request: "req2", until: Date.now() - 1 };
+        await expect(tools().connectorTool("c5", "feishu_read_document", { url: "u" })).rejects.toThrow("was not done in time");
+      });
+    });
+
+    it("puts a request it is carrying on back to waiting where the tool says it is put off, whatever the request was kept for", async () => {
+      await within(async ({ tools, tool, outside, store, settings, of }) => {
+        settings.carried = { id: "req9", status: "resuming", call_id: "c1", tool: "feishu_read_document", args: JSON.stringify({ url: "u" }), generation: 1, claimed_at: Date.now() };
+        tool.answer = async () => ({ held: true, error: "put off" });
+        expect(await tools().connectorTool("c1", "feishu_read_document", {})).toEqual({ error: "put off", put_off: true });
+        expect(of("putOff")).toEqual([["req9", "r1"]]);
+        // Nothing was read, nothing is kept anew, and the run does nothing more.
+        expect(of("wait")).toEqual([]);
+        expect(outside.has("c1")).toBe(false);
+        expect(store.rows("SELECT closed FROM runs WHERE id = 'r1'")).toEqual([{ closed: "waited" }]);
       });
     });
 

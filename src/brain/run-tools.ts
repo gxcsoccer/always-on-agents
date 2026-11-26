@@ -13,7 +13,7 @@ import { chainLevels, type Target } from "../events";
 import type { Outbox } from "./outbox";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, UNDER_WAY_NOTE, WAITING_NOTE } from "./requests";
-import type { BrainStore, Row, RunRow } from "./store";
+import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import type { Tasks } from "./tasks";
 import { MAX_MESSAGE_TEXT, type ToolHost } from "./tools";
 
@@ -34,6 +34,8 @@ export interface RunToolsHost {
   actingFor(runId: string): Acting | undefined;
   /** Whether this run may still use a tool, given what it has read. */
   mayUse(runId: string, name: string): boolean;
+  /** What a run started by a task's result may do in a person's name, as their request said when it handed the task over: see Runner.following. */
+  following(runId: string): { acting: Acting; tools: string[]; request: string; task: string; made: InboxRow[]; on?: string; until: number; seen?: Record<string, unknown>; conditions: Record<string, string> } | undefined;
   /** Who may be changing the standing instructions in this run; throws if nobody may. */
   instructionEditors(runId: string): string[];
   /** A connector's tools. */
@@ -44,9 +46,9 @@ export interface RunToolsHost {
   workers(): Worker[];
   /** Whether a piece of work done in a person's name still stands under what it was done under. */
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
-  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised">;
+  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised" | "putOff">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
-  readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell">;
+  readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
 }
 
 export class RunTools {
@@ -102,6 +104,24 @@ export class RunTools {
   }
 
   /**
+   * Brings the event a run was started by once more, to be taken up again in its turn: for the
+   * result of a task whose following was put off. It keeps when it first came, so that what was
+   * to follow is not given longer to be done by being put off.
+   */
+  #again(run: RunRow): void {
+    const event = this.#b.requests.basis(run.id)[0];
+    if (!event) return;
+    const data = JSON.parse(event.data ?? "{}") as Record<string, unknown>;
+    this.#s.insertEvent({ source: event.source, source_id: `${event.source_id}:again:${run.id}`, kind: event.kind, session_key: event.session_key, principal: JSON.parse(event.principal) as never, text: event.text ?? "", data: { ...data, first_at: typeof data.first_at === "number" ? data.first_at : event.received_at } });
+  }
+
+  /** What of a request's one thing already waits, or is being carried on, is called off. */
+  #callOffThen(request: string): void {
+    const waiting = this.#s.rows<{ id: string }>("SELECT id FROM continuations WHERE id = ? AND status IN ('waiting', 'resuming', 'answering')", `then:${request}`)[0];
+    if (waiting) this.#b.requests.endRequest(waiting.id, "cancelled", "the person took back what was to follow the work");
+  }
+
+  /**
    * A piece of work the run may ask about or stop, by its id: a task, as tasks always were; or
    * work done in a person's name, which is that person's alone and in the conversation it was
    * handed over in. Told from what is kept of it on either side: a request kept before there
@@ -150,10 +170,16 @@ export class RunTools {
     const host: ToolHost = {
       connectorTool: async (callId, name, args) => {
         // Decided afresh at the moment of use, from what is stored: also after an interruption.
-        const acting = this.#b.actingFor(run.id);
-        const found = acting && toolsIn(acting, this.#b.toolsOf).find((each) => each.name === name);
+        // A run a task's result started acts for nobody; what the person's request said was to
+        // follow the task is done for them here all the same, on the strength of that request.
+        const after = this.#b.actingFor(run.id) ? undefined : this.#b.following(run.id);
+        const acting = this.#b.actingFor(run.id) ?? after?.acting;
+        const found = acting && toolsIn(acting, this.#b.toolsOf).find((each) => each.name === name && (!after || after.tools.includes(name)));
         if (!acting || !found) throw new Error(`there is no tool "${name}" in this run`);
         const carried = this.#b.requests.continuationOf(run.id);
+        // One thing is done in a person's name for one request, however many tasks it handed over
+        // and however often their results come: every such call is the same one, by the request.
+        const slot = after ? `then:${after.request}` : callId;
         // A run that carries a request on makes one call: the one made for it, with what the
         // request was made with. Nothing the model asks for in such a run is carried out.
         if (carried && (carried.status !== "resuming" || carried.call_id !== callId || carried.tool !== name)) throw new Error("this run can only answer the request it carries on");
@@ -161,18 +187,30 @@ export class RunTools {
         // after an interruption: the connector is not asked a second time, whatever has happened
         // since. Carrying the request on is another run's to do.
         // The same for a call that was answered with a request another call of the run had already made.
-        const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${callId}`) ?? "null") as { request: string } | null)?.request;
-        if (!carried && (folded !== undefined || this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", callId).length > 0)) {
+        const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${slot}`) ?? "null") as { request: string } | null)?.request;
+        // (What follows a task shares its call with every other result of the request's tasks: one
+        // that waited and has since ended is not still waiting, and is answered further down by what became of it.)
+        // Which call it is: by a digest, so that none of what is to be written is kept here beside it.
+        // Another thing than the one the request has had done, or has under way, is refused before
+        // anything else is said of it: also while that one still waits for the person.
+        const { replaces: _, ...mine } = args;
+        const wanted = after ? await digestOf([name, mine]) : "";
+        const held = after ? this.#s.rows<{ tool: string; digest: string; result: string | null }>("SELECT tool, digest, result FROM request_acts WHERE request = ?", after.request)[0] : undefined;
+        if (held && (held.tool !== name || held.digest !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
+        const waited = this.#s.rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", slot)[0];
+        const ended = after !== undefined && waited !== undefined && !["waiting", "resuming", "answering"].includes(waited.status);
+        if (!carried && !ended && (folded !== undefined || waited !== undefined)) {
           this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
-          const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", folded ?? callId)[0]?.interaction !== "";
-          return { waiting: true, request: folded ?? callId, note: shown ? WAITING_NOTE : UNDER_WAY_NOTE };
+          const shown = this.#s.rows<{ interaction: string }>("SELECT interaction FROM continuations WHERE id = ?", folded ?? slot)[0]?.interaction !== "";
+          return { waiting: true, request: folded ?? slot, note: shown ? WAITING_NOTE : UNDER_WAY_NOTE };
         }
         // A tool that carries a worker is that worker's way in, under whatever name it is called:
         // something new goes through it only where the run has that worker. (What was already
         // asked for is carried on above and below, whether or not the worker is still listed.)
         if (found.hands_to && !carried && !workersIn(acting, this.#b.toolsOf, this.#b.workers()).some((each) => each.tool === name)) throw new Error(`there is no worker to hand this to here`);
-        const key = carried ? carried.id : callId;
+        const key = carried ? carried.id : slot;
         const { replaces, ...asked } = args;
+        if (after && replaces != null) throw new Error("what follows a piece of work takes no request's place; nothing was sent");
         // (A new call names it in one way only, the one checked here: what a kept request was kept with is not for a new call to give.)
         // (Given in that other way, it is not dropped and the work then handed over as something new: nothing is sent.)
         if (found.hands_to && !carried && asked.from != null) {
@@ -203,7 +241,8 @@ export class RunTools {
         const named = new Set<number>();
         let identified: { request: Record<string, unknown>; identity: string; under: { condition: string; generation: number } } | undefined;
         const evidence = () => {
-          const said = this.#b.requests.basis(run.id).map((each) => each.id);
+          // (What follows a task rests on the messages the task was asked for in.)
+          const said = (after ? after.made : this.#b.requests.basis(run.id)).map((each) => each.id);
           const recent = [...relied].map((index) => acting.recentIds[index]).filter((each) => each !== undefined);
           // `bound`: the messages the tool said its action rests on. A reply to one of these is about this request.
           return { said, recent, bound: [...[...named].map((index) => said[index]).filter((each) => each !== undefined), ...recent] };
@@ -213,8 +252,29 @@ export class RunTools {
           this.#b.requests.endRequest(carried.id, "void", "it was not finished in time");
           throw new Error("this request was not finished in time; nothing was read. The person can ask again");
         }
-        // Whatever comes back is from outside, including an error that quotes something.
-        this.#b.outside.add(callId);
+        // What follows a task: the person may have said something since (not to, most of all), and
+        // that is heard first. And the request has one thing done in the person's name: claimed
+        // here, before it is done, so that two results of its tasks cannot each do one.
+        // (Carried on after the person authorised, it is the same thing still.)
+        const request = after?.request ?? (carried?.id.startsWith("then:") ? carried.id.slice("then:".length) : undefined);
+        const receipt = request !== undefined && found.effect === "act";
+        if (after) {
+          if (Date.now() > after.until) throw new Error("what was to follow this work was not done in time, and is not done now; nothing was sent. The person can ask again");
+          // Put off, not given up: the result is brought once more, after their words.
+          if (unheard(this.#s, String(session.session_key), acting.person)) {
+            this.#again(run);
+            return { put_off: true, error: "the person has said something that has not been taken up yet, so this is put off until it has been; nothing was done in their name so far. It comes round again by itself after that: do not do it another way, and do not tell them it failed" };
+          }
+          // (The very call again, and it has had its end: the tool is asked what is still kept of it,
+          // to say to whoever may be told now, and told that it is not to be done again.)
+          // Asked for before, kept waiting, and ended without being done (called off, out of time): that was its end.
+          if (held && held.result == null && ended) throw new Error(`what was to be done in the person's name for this was asked for and did not come to be done (it was ${waited!.status}); nothing more is sent. Tell them so; they can ask again`);
+          if (!held) this.#s.sql.exec("INSERT INTO request_acts (request, tool, digest, at) VALUES (?, ?, ?, ?)", after.request, name, wanted, Date.now());
+        }
+        // Whatever comes back is from outside, including an error that quotes something. (Not what
+        // comes back from something done, after a task: that says what was done, to be told to
+        // the person, and the run's own words about the task's result are not to be taken away with it.)
+        if (!receipt) this.#b.outside.add(callId);
         // Which tool and for whom. Not its arguments: they can name what the person is reading.
         this.#s.audit(acting.person, "tool.used", { tool: name, call: key });
         let waits = false;
@@ -225,7 +285,7 @@ export class RunTools {
           // it turns out to be a request already kept, or cannot be kept).
           let standing: "open" | WorkEnd | undefined;
           const work = handsTo ? { work: (as: "open" | WorkEnd) => void (standing = as) } : {};
-          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}) }, given);
+          const result = await found.run({ ...work, env: this.#b.env, scope: this.#s.scope(), person: acting.person, origin: acting.origin, said: acting.said, recent: acting.recent, ...this.#answering(run, acting, carried !== undefined), callId: key, relied: (from, index) => void (from === "said" ? named : relied).add(index), identified: (request, identity, under) => void (identified = { request, identity, under }), ...(carried ? { resuming: { generation: carried.generation, notAfter } } : {}), ...(after ? { after: { work: after.task, until: after.until, ...(after.on ? { on: after.on } : {}), ...(after.seen ? { seen: after.seen } : {}), ...(after.conditions[name] ? { only_if: after.conditions[name] } : {}), ...(held?.result != null ? { done: true as const } : {}) } } : {}) }, given);
           // A tool that says it waits and does not say it whole has not answered: what it gave is
           // not passed on (it can name the way in), nothing is kept, and nothing else is changed.
           if (typeof result === "object" && result !== null && "waiting" in result && !isWaiting(result)) return UNUSABLE;
@@ -255,6 +315,27 @@ export class RunTools {
             this.#b.outside.delete(callId);
             return { settled: true, note: say === undefined ? SETTLED_SILENT : SETTLED_NOTE };
           }
+          // Said by the tool of a call it kept nothing of: nothing was done and nothing begun. The
+          // claim is given back, where nothing waits under it either, so that a call put right can
+          // be made. (By what is kept, on both sides; not by what an error says.)
+          // Put off, not refused: the person has said something that has to be taken up first. It
+          // comes round again after that, by itself: the task's result is brought once more, or the
+          // request goes back to waiting and is said to be ready.
+          if (typeof result === "object" && result !== null && (result as { held?: unknown }).held === true) {
+            delete (result as { held?: unknown }).held;
+            (result as { put_off?: true }).put_off = true;
+            if (after) this.#again(run);
+            // Any request carried on, whatever it was kept for: back to waiting as it was.
+            else if (carried) {
+              this.#b.requests.putOff(carried.id, run.id);
+              waits = true;
+              this.#b.outside.delete(callId);
+              this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
+            }
+          }
+          const released = after !== undefined && typeof result === "object" && result !== null && (result as { untouched?: unknown }).untouched === true && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", key).length === 0;
+          if (released) this.#s.sql.exec("DELETE FROM request_acts WHERE request = ?", after!.request);
+          if (typeof result === "object" && result !== null && "untouched" in result) delete (result as { untouched?: unknown }).untouched;
           if (!isWaiting(result)) {
             if (handsTo && standing) workIs(this.#s, { id: key, worker: handsTo, sessionKey: String(session.session_key), person: acting.person }, standing);
             if (replaced) this.#b.requests.cancel(replaced.record, callId, replaced.choosing);
@@ -272,12 +353,16 @@ export class RunTools {
               this.#b.outbox.enqueue(`direct:${key}`, run.session_id, null, String(aside!.text).slice(0, MAX_MESSAGE_TEXT), undefined, undefined, { target: JSON.stringify(to) });
               // For them alone: its words are not kept once it has been delivered, like anything else said from what was brought in from outside.
               this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", `direct:${key}`);
+              if (request !== undefined && !released && !putOff(result)) this.#s.sql.exec("UPDATE request_acts SET result = '1' WHERE request = ?", request);
               return rest;
             }
+            // What became of the one thing a request had done, kept as it was said: for the same call made again.
+            // That the one thing a request had done has had its end (not what was said of it: who may be told what is decided anew each time).
+            if (request !== undefined && !released && !putOff(result)) this.#s.sql.exec("UPDATE request_acts SET result = '1' WHERE request = ?", request);
             return result;
           }
           // Nothing was read. The answer the model gets is written here, not by the tool.
-          const kept = this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined);
+          const kept = this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, result.waiting, replaced ? { ...replaced, by: callId } : undefined, ...(after ? [after.made] : []));
           // Only once the request is kept: one that could not be is an ordinary failure of the call.
           waits = true;
           this.#b.outside.delete(callId);
@@ -287,7 +372,7 @@ export class RunTools {
           return kept;
         } finally {
           // What this run has already written to send, and whatever it writes from here on.
-          if (!waits) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
+          if (!waits && !receipt) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
         }
       },
       sendMessage: (callId, text) => {
@@ -369,7 +454,7 @@ export class RunTools {
         return { ok: true, cancelled: active };
       },
 
-      handOver: async (callId, name, title, brief, options, continueFrom, replaces) => {
+      handOver: async (callId, name, title, brief, options, continueFrom, replaces, then = []) => {
         // A call made before and made again is the piece of work it was, whatever the deployment lists now.
         if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) {
           const again = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, options, continueFrom)) as { task_id: string; status: string; note?: string };
@@ -383,13 +468,21 @@ export class RunTools {
         const foreign = Object.entries(options).filter(([key, value]) => value != null && !(key in (worker.options ?? {})));
         if (foreign.length > 0) throw new Error(`the worker "${name}" has no option ${foreign.map(([key]) => key).join(", ")}; leave it null`);
         // Carried by a connector's tool: that tool is called for it, and what it cannot do yet waits as its request.
+        if (worker.tool && then.length > 0) throw new Error(`nothing can be named to follow work handed to "${name}"; nothing was handed over`);
         if (worker.tool) return host.connectorTool(callId, worker.tool, { brief, continue_from: continueFrom, replaces });
         // Said before anything is started: a worker the Brain starts does not take a waiting request's place.
         if (replaces !== null) throw new Error(`the worker "${name}" cannot take the place of a request that waits; if the person no longer wants that one, call it off first, then hand this over`);
         if (continueFrom !== null && !worker.goes_on) throw new Error(`the worker "${name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
         // Only its own options go to it: another worker's, left null, are not its business nor part of its record.
         const own = Object.fromEntries(Object.entries(options).filter(([key]) => key in (worker.options ?? {})));
-        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom)) as { task_id: string; status: string; note?: string };
+        // What is to follow it in the person's name: only what this run may do in their name
+        // itself, said now, in the run their own messages started.
+        const acting = this.#b.actingFor(run.id);
+        const may = acting ? thenable(acting, this.#b.toolsOf) : [];
+        const unknown = then.filter((each) => !may.includes(each));
+        if (unknown.length > 0) throw new Error(`${unknown.join(", ")} cannot be named to follow this work: ${may.length > 0 ? `only ${may.join(", ")} can here` : "nothing can be done in a person's name from this run"}; nothing was handed over`);
+        const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds } } : undefined;
+        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom, following)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
       workStatus: async (workId) => {
@@ -397,9 +490,31 @@ export class RunTools {
         // Work done in a person's name: how it stands, and nothing of what it brought back.
         return work.task ? this.#b.tasks.status(workId, session.session_key) : { work_id: workId, worker: work.worker, state: work.standing };
       },
-      cancelWork: async (callId, workId) => {
+      cancelWork: async (callId, workId, onlyWhatFollows = false) => {
         const work = await this.#work(run, session.session_key, workId);
-        if (work.task) return this.#b.tasks.cancel(session.session_key, workId);
+        if (onlyWhatFollows) {
+          if (!work.task) throw new Error("only what was to follow a task can be taken back by itself");
+          const taken = this.#b.tasks.withdrawThen(run, session.session_key, workId);
+          if (!taken) return { ok: true, work_id: workId, note: "Nothing was to be done in the person's name after this work. It goes on as it was." };
+          // What of it was already asked for and waits (for them to authorise, say) is called off with it.
+          this.#callOffThen(taken.request);
+          // Decided in one place with the sending: it had been let go before this.
+          if (taken.already) return { ok: true, work_id: workId, too_late: true, note: "What was to follow this work had already been sent on its way in the person's name before this, or done: taking it back now does not undo it. Tell them that, and how it ended if this conversation shows it; nothing more will be done in their name after the work." };
+          return { ok: true, work_id: workId, note: "Nothing will be done in the person's name after this work. The work itself goes on, and you are told how it ends. If something was already sent in their name before this, it is not taken back by this: say how that stands if you know." };
+        }
+        if (work.task) {
+          const stopped = await this.#b.tasks.cancel(session.session_key, workId);
+          // The work is no longer wanted, and so nothing that was to follow it is: also where it
+          // had ended already and what follows only waits for the person. (Theirs to take back
+          // alone; from anyone else the work is stopped and that is left as it was.)
+          try {
+            const taken = this.#b.tasks.withdrawThen(run, session.session_key, workId);
+            if (taken) this.#callOffThen(taken.request);
+          } catch {
+            // Not the person who asked for it.
+          }
+          return stopped;
+        }
         if (work.state !== "open" || !work.waits) return { ok: true, work_id: workId, state: work.standing, note: work.state === "open" ? "It is being finished just now and cannot be stopped at this moment." : work.state === "cancelled" && work.handed ? "It was already called off here: nothing of it will be brought back. It had been handed over, so the worker may still finish it over there: tell the person that, not that it was stopped." : "It had already ended; there was nothing to stop." };
         // The request that carries it is called off, as any request of the person's is.
         const off = callOff(callId, workId, "") as { cancelled?: string };
@@ -441,6 +556,28 @@ export function standingOf(state: string, waits?: "authorisation" | "result", ha
   // Called off here after it was handed over: this side stopped waiting, and what became of it over there is not known.
   if (state === "cancelled" && handed) return "cancelled (no longer waited for here; it had been handed over, and the worker may still have finished it over there)";
   return state !== "open" ? state : waits === "authorisation" ? (handed ? "waiting_for_authorisation (it was handed over already, or may have been; the person has to authorise again before it can go on; they were shown how)" : "waiting_for_authorisation (not handed over yet: the person has to authorise it first; they were shown how)") : waits === "result" ? "waiting_for_result (handed over; the worker is at it)" : "under way";
+}
+
+/** What a run that acts for a person may name, when it hands work over, as to be done in their name once the work has ended well: the things it may do in their name itself. */
+export function thenable(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): string[] {
+  // (By its name, and by its name with each condition it can be held to: name:condition.)
+  return toolsIn(acting, toolsOf)
+    .filter((each) => each.effect === "act" && each.follows === true && each.hands_to === undefined)
+    .flatMap((each) => [each.name, ...Object.keys(each.conditions ?? {}).map((condition) => `${each.name}:${condition}`)]);
+}
+
+/** Whether a tool's answer says the thing was put off (or waits): not an end. */
+function putOff(result: unknown): boolean {
+  return typeof result === "object" && result !== null && ("put_off" in result || "waiting" in result);
+}
+
+async function digestOf(value: unknown): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value))))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** The earliest thing a person has said in a conversation that has not been taken up yet. */
+export function unheard(store: BrainStore, sessionKey: string, person: string): InboxRow | undefined {
+  return store.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND kind = 'message' AND session_key = ? AND json_extract(principal, '$.kind') = 'human' AND json_extract(principal, '$.id') = ? ORDER BY id LIMIT 1", sessionKey, person)[0];
 }
 
 export function toolsIn(acting: Pick<Acting, "connector" | "shared"> & { said?: { data: Record<string, unknown> }[] }, toolsOf: (connector: string) => ConnectorTool[]): ConnectorTool[] {

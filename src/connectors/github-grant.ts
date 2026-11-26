@@ -113,7 +113,7 @@ function tokensOf(issued: Issued, now: number) {
 export class GithubGrant extends DurableObject<Env> {
   /** Renewals and sends under way in this instance: a second asker waits for the first, and nothing is done twice. */
   #renewing?: Promise<Acting | "later" | undefined>;
-  #posting = new Map<string, Promise<Op | "unauthorised" | "later" | undefined>>();
+  #posting = new Map<string, Promise<Op | "unauthorised" | "later" | "held" | undefined>>();
 
   /** Makes an invitation for this person to authorise, for one request. */
   async invite(who: Who, redirect: string, generation: number, what: { brain: string; call: string; text: string; where: "private" | "chat"; action?: string }): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
@@ -274,7 +274,7 @@ export class GithubGrant extends DurableObject<Env> {
   }
 
   /** Keeps an issue as it is first asked for. Asked for again by the same call, it is the one kept, as it was kept. */
-  async begin(who: Who, call: string, what: Pick<Op, "repo" | "repo_id" | "private" | "title" | "body"> & Pick<Op, "kind" | "number">, brain: string): Promise<Op | "full"> {
+  async begin(who: Who, call: string, what: Pick<Op, "repo" | "repo_id" | "private" | "title" | "body"> & Pick<Op, "kind" | "number">, brain: string, until?: number): Promise<Op | "full"> {
     const stored = (await this.#load()) ?? { who, generation: 1, pending: [] };
     if (!same(stored.who, who)) throw new Error("this record belongs to someone else");
     const before = await this.op(call);
@@ -287,7 +287,8 @@ export class GithubGrant extends DurableObject<Env> {
       if (oldest < 0) return "full";
       void this.ctx.storage.delete(kept.splice(oldest, 1)[0][0]);
     }
-    const op: Op = { ...what, stage: "asked", created_at: now, deadline: now + LIMIT_MS, generation: stored.generation, brain };
+    // (`until`: a time it was already to be done by when it was asked, which asking does not put off.)
+    const op: Op = { ...what, stage: "asked", created_at: now, deadline: Math.min(now + LIMIT_MS, until ?? Infinity), generation: stored.generation, brain };
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.put(`op:${call}`, op);
     return op;
@@ -299,7 +300,7 @@ export class GithubGrant extends DurableObject<Env> {
    * sending. "unauthorised": there is no token to act with (any more); nothing was created.
    * "later": whether there is one cannot be told just now; nothing was created, and it can be asked again.
    */
-  post(call: string): Promise<Op | "unauthorised" | "later" | undefined> {
+  post(call: string): Promise<Op | "unauthorised" | "later" | "held" | undefined> {
     const under = this.#posting.get(call);
     if (under) return under;
     const going = this.#post(call).finally(() => this.#posting.delete(call));
@@ -307,7 +308,7 @@ export class GithubGrant extends DurableObject<Env> {
     return going;
   }
 
-  async #post(call: string): Promise<Op | "unauthorised" | "later" | undefined> {
+  async #post(call: string): Promise<Op | "unauthorised" | "later" | "held" | undefined> {
     const op = await this.op(call);
     if (!op || op.stage === "posted" || op.stage === "failed") return op;
     const end = async (stage: Op["stage"], more: Partial<Op> = {}) => {
@@ -365,6 +366,24 @@ export class GithubGrant extends DurableObject<Env> {
     // The last thing before the send: what it was asked under still stands, and its time is not up.
     if (!(await stands())) return end("failed", { why: "changed" });
     if (Date.now() >= op.deadline) return end("failed", { why: "late" });
+    // And it is still wanted, asked of where it was asked for, now: what was to follow some work
+    // may have been taken back, or the person may have said something since that has not been
+    // taken up. Where it lets this go it writes that down in the same step, and from then on
+    // whoever takes it back is told it was too late: the one record both go by is there.
+    if (op.brain) {
+      let say: "go" | "held" | "withdrawn";
+      try {
+        say = await this.env.BRAIN.getByName(op.brain).aboutToSend(call);
+      } catch {
+        return end("failed", { why: "unreachable" });
+      }
+      if (say === "withdrawn") return end("failed", { why: "withdrawn" });
+      // Put off: it is kept as it was asked, to be sent when it is asked for again.
+      if (say === "held") return "held";
+      // That took a moment: what it was asked under still stands, and its time is not up.
+      if (!(await stands())) return end("failed", { why: "changed" });
+      if (Date.now() >= op.deadline) return end("failed", { why: "late" });
+    }
     // As which account: what is looked for later is this account's and no other's.
     op.account = held.account;
     await this.ctx.storage.put(`op:${call}`, { ...op, stage: "posting" } satisfies Op);
@@ -589,17 +608,21 @@ const why = (kind: Kind, reason: string): string | undefined =>
     issues_off: "issues are turned off in that repository; nothing was created",
     not_accepted: `GitHub did not accept the ${kind} as written; ${NONE[kind]}`,
     no_target: "there is no issue or pull request of that number in that repository that the person can see; nothing was posted",
+    withdrawn: `the person took this back, or what it waited as has ended; ${NONE[kind]}`,
     no_comment: "GitHub did not let the person comment there (the conversation may be locked, or they may not be allowed to); nothing was posted",
   })[reason];
 
 export const githubCreateIssue: ConnectorTool = {
   name: "github_create_issue",
   description:
-    "Opens an issue on GitHub as the person who asked, in their own name. Only when they ask for one outright, in a repository they named themselves (`repo`, as owner/name). They are asked to authorise the first time; nothing else is asked of them before it is created, so do not ask them to confirm. Write `title` and `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics, nothing read from documents. If it is not plain which matter they mean, ask which.",
+    "Opens an issue on GitHub as the person who asked, in their own name. Only when they ask for one outright, in a repository they named themselves (`repo`, as owner/name). They are asked to authorise the first time; nothing else is asked of them before it is created, so do not ask them to confirm. Write `title` and `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics, nothing read from documents. Where it follows a piece of work they asked for, also from what that work found for this request. If it is not plain which matter they mean, ask which.",
   effect: "act",
   optional: true,
   // Also where several people talk: for the one who asked, as them.
   shared: true,
+  // Done once for a call, however often the call is made.
+  follows: true,
+  conditions: { if_none_found: "only if the work, having searched the repository's issues, found none: where the person asked for one to be opened only if there is none already. It is then opened only where every search the work made was answered whole and read to its last page" },
   parameters: { repo: { type: "string" }, title: { type: "string" }, body: { type: "string" } },
   run: (context, args) => act("issue", context, args),
 };
@@ -607,10 +630,11 @@ export const githubCreateIssue: ConnectorTool = {
 export const githubComment: ConnectorTool = {
   name: "github_comment",
   description:
-    "Posts a comment on an issue or a pull request on GitHub as the person who asked, in their own name (not a review of lines of code). Only when they ask for that outright, in a repository they named themselves (`repo`, as owner/name) and on the one they named (`number`). They are asked to authorise the first time; nothing else is asked of them before it is posted, so do not ask them to confirm. Write `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics. A mention (@name) notifies that person only if the person who asked wrote it so themselves; any other is shown and notifies no one.",
+    "Posts a comment on an issue or a pull request on GitHub as the person who asked, in their own name (not a review of lines of code). Only when they ask for that outright, in a repository they named themselves (`repo`, as owner/name) and on the one they named (`number`). They are asked to authorise the first time; nothing else is asked of them before it is posted, so do not ask them to confirm. Write `body` from what the person themselves said and pointed at, and from nothing else in this conversation: no one else's words or names, nothing from other topics. Where it follows a piece of work they asked for, which was to find the one to comment on, `number` is the one that work found, and `body` may draw on what it found for this request. A mention (@name) notifies that person only if the person who asked wrote it so themselves; any other is shown and notifies no one.",
   effect: "act",
   optional: true,
   shared: true,
+  follows: true,
   parameters: { repo: { type: "string" }, number: { type: "integer" }, body: { type: "string" } },
   run: (context, args) => act("comment", context, args),
 };
@@ -624,8 +648,13 @@ export const githubComment: ConnectorTool = {
 async function act(kind: Kind, context: ToolContext, args: Record<string, unknown>): Promise<unknown> {
   const seen: { op?: () => Promise<Op | undefined> } = {};
   const result = await attempt(kind, context, args, seen);
-  const now = typeof result === "object" && result !== null && "error" in result ? await seen.op?.() : undefined;
+  const failed = typeof result === "object" && result !== null && "error" in result;
+  const now = failed ? await seen.op?.() : undefined;
   if (now?.stage === "posting" || now?.stage === "lost") return { error: uncertain(kind) };
+  // Nothing is kept of this call here: nothing was done under it and nothing begun. Said as a
+  // fact about what is kept, for whoever keeps count of what a request has had done.
+  // (Only where it was looked for and is not there: a call stopped before that says nothing of what is kept.)
+  if (failed && seen.op && !now) return { ...(result as Record<string, unknown>), untouched: true };
   const made = now?.stage === "posted" ? receipt(now) : undefined;
   if (!made) return result;
   // Who else here may see its link could not be worked out this time: it goes to the person alone.
@@ -647,6 +676,30 @@ function receipt(op: Op, name = op.repo): { open: Record<string, unknown>; alone
     open: { created: true, repo: name, number: op.issue.number, url: op.issue.url, note: "The issue was created as the person, in their name. Give them the link." },
     alone: { created: true, direct: { text: `${name}#${op.issue.number}\n${op.issue.url}` }, note: "The issue was created as the person. Its link is being sent to them directly and is not given here: say that, and nothing more about it." },
   };
+}
+
+/** Why what was counted of some work's searches of issues does not show that it looked through them all; nothing where it does. */
+function unsearched(reads: unknown): string | undefined {
+  const search = (reads as { search?: { each?: Record<string, { pages?: unknown; last?: unknown; incomplete?: unknown }>; others?: unknown } } | undefined)?.search;
+  const each = Object.values(search?.each ?? {});
+  // A search that was refused, or failed, or was never answered is in no page that was read: it
+  // is in the count of how the searches were answered. One such, and it was not all looked
+  // through, whatever GitHub's reason (it answers 422 for what may not be seen, too). Only a
+  // query the proxy itself turned away as not a query, before asking GitHub anything, was no
+  // search: what it was put right into is what counts.
+  const by = Object.entries((search as { by_status?: Record<string, unknown> } | undefined)?.by_status ?? {});
+  if (by.some(([status, count]) => Number(count) > 0 && !/^2/.test(status) && status !== "rejected")) return "made a search that was refused or failed";
+  if (!search || each.length === 0) return "made no search of the repository's issues that was read";
+  if (search.others) return "made more searches than were told apart";
+  if (each.some((one) => one.incomplete === true)) return "made a search that was not complete";
+  // More found than GitHub gives of one search: its pages are not all there is. To be asked more narrowly.
+  if (each.some((one) => (one as { cut?: unknown }).cut === true)) return "made a search that found more than GitHub gives of one search (it has to be made narrower to be read through)";
+  if (each.some((one) => (one as { unsure?: unknown }).unsure === true)) return "made a search with more pages than could be kept track of";
+  if (each.some((one) => one.last !== true)) return "made a search that was not read to its last page";
+  // From the first page on, with none left out.
+  const whole = (pages: unknown) => Array.isArray(pages) && pages.length > 0 && pages.length === Math.max(...(pages as number[])) && new Set(pages as number[]).size === pages.length && (pages as number[]).every((page) => Number.isInteger(page) && page >= 1);
+  if (each.some((one) => !whole(one.pages))) return "made a search of which not every page was read";
+  return undefined;
 }
 
 /** Every repository a text names whole: by its address on GitHub (the first two parts of the path), or as owner/name standing by itself, never part of some other address or path. In lower case. */
@@ -685,6 +738,8 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
   const kept = await grant.op(context.callId);
   seen.op = () => grant.op(context.callId);
   if (context.resuming && !kept) return changed(kind);
+  // This very call has had its end, and nothing is kept of it here any more: not done again.
+  if (!kept && context.after?.done) return { done: true, note: `This was done before, for this same request, and what was kept here of how it ended is gone. Nothing was sent again. Tell the person it was done, and that the ${kind} can be looked for on GitHub.` };
   // (A call's number is one kind of thing's: what was kept under it as the other is not this.)
   if (kept && (kept.kind ?? "issue") !== kind) return changed(kind);
   const repo = kept?.repo ?? String(args.repo ?? "").trim().replace(/^https:\/\/github\.com\//i, "").replace(/\/+$/, "").toLowerCase();
@@ -709,7 +764,24 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
     // Which repository is the person's to say, not the model's: named whole in their own words (owner/name, or its address on GitHub).
     const named = own.findIndex((each) => reposIn(each.text).includes(repo));
     if (named < 0) return { error: `the person has not named that repository themselves; ${none}. Ask them which repository they mean (as owner/name)` };
+    if (context.after) {
+      // After a piece of work: in the repository that work was given to look into, and no other
+      // the person has spoken of.
+      const on = String(context.after.on ?? "").trim().replace(/^https:\/\/github\.com\//i, "").replace(/(\.git|\/)+$/i, "").toLowerCase();
+      if (on !== repo) return { error: `the work this follows was not done on that repository${on ? ` (it was done on ${on})` : ""}; ${none}` };
+      // An issue only if the work found none (as it was named to follow): only where its looking
+      // shows that. By what was counted where the work's requests went out, search by search,
+      // not by what the worker says: there was a search; every one was complete and read from
+      // its first page to its last. Anything short of that is "could not find out".
+      if (kind === "issue" && context.after.only_if === "if_none_found") {
+        const short = unsearched((context.after.seen as { github_reads?: unknown } | undefined)?.github_reads);
+        if (short) return { error: `the work ${short}, so it has not shown that there is no such issue; nothing was created. Tell the person what it did find and that it could not be found out whether there is one already; they can ask again` };
+      }
+    }
     if (kind === "issue") relied(named);
+    // After a piece of work they asked for, which was to find which one: that is the work's to
+    // say, in the repository they named. (Whether it is there is seen with their own token.)
+    else if (context.after) relied(named);
     else {
       // So with which one is commented on, and the two go together: the one they pointed at in
       // that repository (its address, or owner/name#12). A number by itself (#12) is of the
@@ -785,7 +857,7 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
   if (repository === "unknown") return { error: `it could not be confirmed with GitHub that this repository is one this organisation has connected; ${none}. The person can ask again later` };
   if (repository === "not_connected" || (kept && kept.repo_id !== repository.id)) return { error: `that repository is not one this organisation has connected here (the GitHub App is not installed for it), so nothing is done there; ${none}` };
 
-  const op = kept ?? (await grant.begin(who, context.callId, { repo, repo_id: repository.id, private: repository.private, ...fresh! }, scopeName(scope)));
+  const op = kept ?? (await grant.begin(who, context.callId, { repo, repo_id: repository.id, private: repository.private, ...fresh! }, scopeName(scope), context.after?.until));
   if (op === "full") return { error: `too many issues and comments were asked for and are still being kept track of for this person; ${none}. Try again later` };
   if (op.generation !== standing.generation) return changed(kind);
   // (One left as not known is looked for again, where there is a token to look with.)
@@ -793,6 +865,8 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
   if (done === undefined) return changed(kind);
   // Once it was sent, or may have been, nothing that fails afterwards says that it was not created.
   if ((op.stage === "posting" || op.stage === "lost") && typeof done === "string") return { error: uncertain(kind) };
+  // Put off, with nothing sent: it comes round again once what the person has said is taken up.
+  if (done === "held") return { held: true, error: `the person has said something that has not been taken up yet, so this is put off until it has been; ${none} so far. It comes round again by itself after that: do not do it another way, and do not tell them it failed` };
   if (done === "later") return { error: `GitHub could not be asked just now whether the person's authorisation still stands; ${none}, and nothing about their authorisation was changed. They can ask again in a little while` };
   if (done === "unauthorised") {
     if (Date.now() >= op.deadline) return { error: why(kind, "late") };

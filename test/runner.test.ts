@@ -233,6 +233,51 @@ describe("the run loop, by itself", () => {
       expect(await taken([])).toEqual([["a1", "a2", "b1", "a3", "approve AB12", "", "a4", "approve CD34", "deny CD34", "deny EF56", "a5", "aside", "a6"]]);
     });
 
+    it("takes the result of a task that something was to follow in a person's name alone, after what that person has said since, and passes over nobody else's turn for it", async () => {
+      const runs = await within(async ({ runner, store, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        const task = (id: string, then: boolean) => {
+          store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, ?, 'succeeded', 1, 1)", id, `op_${id}`, PRIVATE, PERSON);
+          if (then) store.sql.exec("INSERT INTO task_then (task_id, request, tools, events) VALUES (?, 'run_0', '[\"x\"]', '{\"said\":[],\"recent\":[]}')", id);
+        };
+        const result = (id: string) => event(`result of ${id}`, { source: "worker", kind: "worker.result", source_id: `${id}:1`, principal: { kind: "worker", id, explicit: false }, data: { task_id: id }, reply_to: null });
+        task("t1", true);
+        task("t2", true);
+        task("t3", false);
+        result("t1");
+        result("t2");
+        // One nothing was to follow, and something no person wrote: taken together, as they always were.
+        result("t3");
+        event("", { source: "timer", kind: "timer", principal: { kind: "system", id: "timer" } });
+        // What the person said after the results had come in.
+        event("do not post it after all");
+        const taken: string[][] = [];
+        for (let id = await runner.next(); id; id = await runner.next()) {
+          taken.push(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text));
+          store.sql.exec("UPDATE inbox SET status = 'done' WHERE run_id = ?", id);
+          store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+        }
+        return taken;
+      });
+      // Those two wait for her words; nothing else is passed over for them, and they are done after, each alone.
+      expect(runs).toEqual([["result of t3", ""], ["do not post it after all"], ["result of t1"], ["result of t2"]]);
+    });
+
+    it("finds the words that are waited for however many things wait for them ahead in the line", async () => {
+      const taken = await within(async ({ runner, store, event, settings }) => {
+        settings.connectorTools = [{ name: "feishu_read_document", effect: "read" } as ConnectorTool];
+        for (let n = 0; n < 170; n++) {
+          store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, ?, 'succeeded', 1, 1)", `t${n}`, `op_t${n}`, PRIVATE, PERSON);
+          store.sql.exec("INSERT INTO task_then (task_id, request, tools, events) VALUES (?, 'run_0', '[\"x\"]', '{\"said\":[],\"recent\":[]}')", `t${n}`);
+          event(`result of t${n}`, { source: "worker", kind: "worker.result", source_id: `t${n}:1`, principal: { kind: "worker", id: `t${n}`, explicit: false }, data: { task_id: `t${n}` }, reply_to: null });
+        }
+        event("her words, after all of those");
+        const id = await runner.next();
+        return store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text);
+      });
+      expect(taken).toEqual(["her words, after all of those"]);
+    });
+
     it("takes a burst as several runs, by count and by size", async () => {
       await within(async ({ runner, store, event, inbox }) => {
         for (let i = 0; i < 45; i++) event(`m${i}`);

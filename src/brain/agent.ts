@@ -32,7 +32,7 @@ import { Tasks } from "./tasks";
 import { Marks } from "./marks";
 import { Timers } from "./timers";
 import { type Continuation, Requests } from "./requests";
-import { RunTools } from "./run-tools";
+import { RunTools, unheard } from "./run-tools";
 import { Runner } from "./runner";
 import { limitsFrom } from "../limits";
 
@@ -112,6 +112,7 @@ export class BrainAgent extends DurableObject<Env> {
       },
       outside: this.#outside,
       isDecider: (principal, source) => this.#isDecider(principal, source),
+      stillStands: (event) => this.#revisions.stillStands(event),
       toolsOf,
       guidance,
       workers,
@@ -141,6 +142,7 @@ export class BrainAgent extends DurableObject<Env> {
       outside: this.#outside,
       actingFor: (runId) => this.#runner.actingFor(runId),
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
+      following: (runId) => this.#runner.following(runId),
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
       direct,
@@ -380,6 +382,10 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("DELETE FROM task_queued WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_releases WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_notes WHERE task_id NOT IN (SELECT id FROM tasks)");
+      // What was to follow a task goes with the task; what a request had done, once none of its tasks is left and nothing of it waits.
+      this.#store.sql.exec("DELETE FROM task_then WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM task_on WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM request_acts WHERE request NOT IN (SELECT request FROM task_then) AND ('then:' || request) NOT IN (SELECT id FROM continuations WHERE status IN ('waiting', 'resuming'))");
       // The index of work is kept as long as what it points at: work that has ended, for the same time.
       this.#store.sql.exec("DELETE FROM work WHERE state != 'open' AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM audit WHERE at < ?", now - RETAIN_AUDIT_MS);
@@ -408,6 +414,30 @@ export class BrainAgent extends DurableObject<Env> {
   // Kept in ./requests. What is here is only what the wake cycle and the connectors call.
 
   /** Called by a connector when something changed for one of its subjects: see Requests.conditionReported. */
+  /**
+   * Asked by whatever is about to do something in a person's name for a call made here, at the
+   * last moment before it does. "withdrawn": what was to follow a task has been taken back, or the
+   * request it waited as has ended; it is not to be done. "held": the person has said something
+   * since in that conversation that has not been taken up (it may be "do not"); it is put off, not
+   * given up. "go": it may be sent, and, for what follows a task, that is written down in this
+   * very step: taking it back afterwards is told that it was too late (see Tasks.withdrawThen),
+   * so that the sending and the taking back are decided by one record, here. A call nothing is
+   * kept of was made in the run of the person's own message, and goes.
+   */
+  async aboutToSend(call: string): Promise<"go" | "held" | "withdrawn"> {
+    const kept = this.#store.rows<{ person: string | null; status: string; session_key: string }>("SELECT c.person, c.status, s.session_key FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.id = ?", call)[0];
+    if (kept && kept.status !== "resuming") return "withdrawn";
+    if (kept?.person && unheard(this.#store, kept.session_key, kept.person)) return "held";
+    if (!call.startsWith("then:")) return "go";
+    const request = call.slice("then:".length);
+    const of = this.#store.rows<{ session_key: string; requested_by: string | null; withdrawn: number }>("SELECT t.session_key, t.requested_by, n.withdrawn FROM task_then n JOIN tasks t ON t.id = n.task_id WHERE n.request = ?", request);
+    if (of.length === 0 || of.some((each) => each.withdrawn !== 0)) return "withdrawn";
+    if (of.some((each) => each.requested_by !== null && unheard(this.#store, each.session_key, each.requested_by))) return "held";
+    // (No waiting between the looking and this: one step.)
+    this.#store.sql.exec("UPDATE request_acts SET sending = 1 WHERE request = ?", request);
+    return "go";
+  }
+
   async conditionReported(connector: string, subject: string, event: string): Promise<{ ok: true }> {
     return this.#requests.conditionReported(connector, subject, event);
   }
