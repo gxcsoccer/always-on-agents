@@ -1210,6 +1210,83 @@ describe("tasks, by themselves", () => {
         });
       });
 
+      it("comes back to a place it could not give back at a time set afresh each time, never at once over and over", async () => {
+        await within(async ({ tasks, store, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.release = async () => {
+            throw new Error("registry unreachable");
+          };
+          await tasks.settle();
+          const next = () => store.rows<{ next_at: number }>("SELECT next_at FROM task_releases WHERE task_id = ?", b.task_id)[0].next_at;
+          for (let n = 0; n < 3; n++) {
+            store.sql.exec("UPDATE task_releases SET next_at = 0");
+            await tasks.settle();
+            // Still owed, and due in a while: the Brain is not woken for it at once.
+            expect(next()).toBeGreaterThan(Date.now() + 10_000);
+            expect(tasks.nextWakeAt(Date.now())).toBeGreaterThan(Date.now() + 10_000);
+          }
+        });
+      });
+
+      it("owes back the taking a waiting piece asked for, by its lease, when it is called off or ends with that asking perhaps still on its way", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const leaseOf = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "take").at(-1)?.[2];
+          const backs = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "back").map((each) => each[2]);
+          // Called off while it is being started: the asking for a place was never answered (it may yet arrive).
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("dispatching");
+          const asked = leaseOf(b.task_id);
+          expect(asked).toMatch(/^[0-9a-f-]{36}$/);
+          slots.acquire = async () => true;
+          await tasks.cancel(SESSION_KEY, b.task_id);
+          expect(kept(b.task_id).status).toBe("cancelled");
+          // Owed by that lease at once (written before anything was awaited), and given back by it on the next pass.
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", b.task_id)).toEqual([{ lease: asked }]);
+          store.sql.exec("UPDATE task_releases SET next_at = 0");
+          await tasks.settle();
+          expect(backs(b.task_id)).toContain(asked);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Ended some other way while out of waiting, found so by a later pass (as after the Brain was replaced): owed the same.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          const lease = leaseOf(d.task_id);
+          store.sql.exec("UPDATE tasks SET status = 'cancelled' WHERE id = ?", d.task_id);
+          store.sql.exec("UPDATE task_queued SET next_at = 0");
+          await tasks.settle();
+          expect(backs(d.task_id)).toContain(lease);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Called off while it waits again after an asking that was never answered.
+          slots.acquire = async () => true;
+          const e = (await tasks.dispatch(RUN, SESSION_KEY, "call_e", "sandbox", "E", "e", REPO)) as { task_id: string };
+          const f = (await tasks.dispatch(RUN, SESSION_KEY, "call_f", "sandbox", "F", "f", { repository: null }, e.task_id)) as { task_id: string };
+          await tasks.settle();
+          store.sql.exec("UPDATE task_queued SET lease = 'left-over' WHERE task_id = ?", f.task_id);
+          await tasks.cancel(SESSION_KEY, f.task_id);
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", f.task_id)).toEqual([{ lease: "left-over" }]);
+          // And asked how it stands, a waiting piece says what it waits for.
+          const g = (await tasks.dispatch(RUN, SESSION_KEY, "call_g", "sandbox", "G", "g", { repository: null }, e.task_id)) as { task_id: string };
+          expect(await tasks.status(g.task_id)).toMatchObject({ status: "queued", queued_after: e.task_id });
+        });
+      });
+
       it("does not wait on a place being given back either: that is written down, tried within the pass's time, and tried again by its id", async () => {
         await within(async ({ tasks, kept, store, worker, slots }) => {
           const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };

@@ -424,25 +424,22 @@ export class Tasks implements Wakes {
     // one not known to have been given back is tried again by its id on a later pass.
     // (Written down with nothing awaited before it, wherever a place may have been taken and will not be used:
     // so that the owing of it outlives this pass, whatever happens to the pass.)
-    // Each asking for a place has a lease of its own, and what is owed back is that taking: a giving
-    // back that arrives late, after the place was given back and taken afresh, then removes nothing.
-    const owe = (taskId: string) => {
-      if (this.#s.rows("SELECT 1 FROM task_releases WHERE task_id = ?", taskId).length > 0) return;
-      const lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", taskId)[0]?.lease ?? null;
-      this.#s.sql.exec("INSERT INTO task_releases (task_id, next_at, lease) VALUES (?, ?, ?)", taskId, Date.now() + QUEUED_AGAIN_MS, lease);
-      // The next asking, if there is one, is another taking.
-      this.#s.sql.exec("UPDATE task_queued SET lease = NULL WHERE task_id = ?", taskId);
-    };
+    const owe = (taskId: string) => this.#owe(taskId);
     const owed = (taskId: string) => this.#s.rows("SELECT 1 FROM task_releases WHERE task_id = ?", taskId).length > 0;
     const giveBack = async (taskId: string) => {
       owe(taskId);
-      if (left() === 0) return;
+      if (left() === 0) {
+        // Not got to in this pass: due again a little later, not in the past.
+        this.#s.sql.exec("UPDATE task_releases SET next_at = ? WHERE task_id = ? AND next_at <= ?", Date.now() + 1_000, taskId, Date.now());
+        return;
+      }
       try {
         const lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_releases WHERE task_id = ?", taskId)[0]?.lease ?? undefined;
         await within(this.#b.registry().releaseTaskSlot(taskId, lease), Math.min(left(), CONFIRM_CALL_MS));
         this.#s.sql.exec("DELETE FROM task_releases WHERE task_id = ?", taskId);
       } catch {
-        // Tried again later.
+        // Tried again later: at a time that is set afresh, so that one that keeps failing is not come back to at once, over and over.
+        this.#s.sql.exec("UPDATE task_releases SET next_at = ? WHERE task_id = ?", Date.now() + QUEUED_AGAIN_MS, taskId);
       }
     };
     for (const owed of this.#s.rows<{ task_id: string }>("SELECT task_id FROM task_releases WHERE next_at <= ? LIMIT 20", Date.now())) await giveBack(owed.task_id);
@@ -455,7 +452,10 @@ export class Tasks implements Wakes {
       const later = (ms: number) => this.#s.sql.exec("UPDATE task_queued SET attempts = attempts + 1, next_at = ? WHERE task_id = ?", Date.now() + ms, row.task_id);
       let task = read();
       if (!task || (task.status !== "queued" && task.status !== "dispatching")) {
+        // Ended, or called off, with an asking for a place perhaps still on its way (it was never let through): that taking is owed back.
+        if (let_through() === null && this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", row.task_id)[0]?.lease) owe(row.task_id);
         done();
+        if (owed(row.task_id)) await giveBack(row.task_id);
         continue;
       }
       const from = String(this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", row.task_id)[0]?.from_id ?? "");
@@ -714,9 +714,11 @@ export class Tasks implements Wakes {
   async status(taskId: string): Promise<unknown> {
     const task = this.#s.rows<Row>("SELECT id, title, status, pending, last_progress, result, created_at, updated_at FROM tasks WHERE id = ?", taskId)[0];
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
+    const after = task.status === "queued" ? this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", taskId)[0]?.from_id : undefined;
     return {
       ...task,
       ...(task.status === "unconfirmed" ? { note: UNCONFIRMED_NOTE } : {}),
+      ...(after ? { queued_after: after, note: queuedNote(after) } : {}),
       pending: task.pending ? JSON.parse(task.pending) : null,
       result: task.result ? JSON.parse(task.result) : null,
       created_at: new Date(task.created_at).toISOString(),
@@ -905,13 +907,17 @@ export class Tasks implements Wakes {
     if (TERMINAL_TASK.has(task.status)) return { ok: true, task_id: taskId, status: task.status };
     // One that still waits has no worker at it and no place: called off here, in one step.
     if (task.status === "queued") {
-      this.#s.sql.exec("UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'queued'", Date.now(), taskId);
-      if (this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status === "cancelled") {
-        this.#s.transaction(() => {
-          workIs(this.#s, { id: taskId, worker: String(task.worker), sessionKey: String(task.session_key), person: (task.requested_by as string | null) ?? null }, taskEnd("cancelled"));
-          this.#s.sql.exec("DELETE FROM task_queued WHERE task_id = ?", taskId);
-          this.#behind(taskId);
-        });
+      const off = this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'queued'", Date.now(), taskId);
+        if (this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status !== "cancelled") return false;
+        workIs(this.#s, { id: taskId, worker: String(task.worker), sessionKey: String(task.session_key), person: (task.requested_by as string | null) ?? null }, taskEnd("cancelled"));
+        // A place may have been asked for on an earlier turn of its, with the answer never heard: that taking is owed back.
+        if (this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", taskId)[0]?.lease) this.#owe(taskId);
+        this.#s.sql.exec("DELETE FROM task_queued WHERE task_id = ?", taskId);
+        this.#behind(taskId);
+        return true;
+      });
+      if (off) {
         this.#s.audit("(agent)", "task.cancelled", { task_id: taskId });
         await this.#b.wakeBy(Date.now() + 300);
         return { ok: true, task_id: taskId, status: "cancelled" };
@@ -919,15 +925,34 @@ export class Tasks implements Wakes {
       // (Its turn came meanwhile: it is being started, and is stopped as any other.)
       return this.cancel(sessionKey, taskId);
     }
+    // One being brought on from waiting may have an asking for a place still on its way: that taking is owed back by its
+    // lease (giving back by the task's id alone, below, finds nothing yet, and would leave the late asking to take a place).
+    if (this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ? AND started_at IS NULL", taskId)[0]?.lease) this.#owe(taskId);
     await this.#stop(task);
     // A question still open when the task is cancelled has nothing left to answer.
     const open = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
     if (this.#set(taskId, "cancelled", {}) && open) this.#setAside(open);
+    // (It waits no more, whatever it was waiting for; what it may be owed back was written down above.)
+    this.#s.sql.exec("DELETE FROM task_queued WHERE task_id = ?", taskId);
     this.#s.audit("(agent)", "task.cancelled", { task_id: taskId });
     await this.#b.registry().releaseTaskSlot(taskId);
     // (What waits behind it is looked at straight away, not at the next alarm that happens to come.)
     await this.#b.wakeBy(Date.now() + 300);
     return { ok: true, task_id: taskId, status: "cancelled" };
+  }
+
+  /**
+   * Writes down that the place a waiting piece asked for is owed back. Each asking has a lease of
+   * its own, and what is owed back is that taking: so a giving back that arrives late, after the
+   * place was given back and taken afresh, removes nothing, and an asking that arrives after its
+   * taking was given back takes nothing. With nothing awaited: it outlives whatever comes next.
+   */
+  #owe(taskId: string): void {
+    if (this.#s.rows("SELECT 1 FROM task_releases WHERE task_id = ?", taskId).length > 0) return;
+    const lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", taskId)[0]?.lease ?? null;
+    this.#s.sql.exec("INSERT INTO task_releases (task_id, next_at, lease) VALUES (?, ?, ?)", taskId, Date.now() + QUEUED_AGAIN_MS, lease);
+    // The next asking, if there is one, is another taking.
+    this.#s.sql.exec("UPDATE task_queued SET lease = NULL WHERE task_id = ?", taskId);
   }
 
   /** Has what waits behind a piece of work looked at now: that piece has ended, one way or another. */
