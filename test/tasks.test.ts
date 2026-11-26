@@ -61,7 +61,7 @@ function bench(state: DurableObjectState) {
     answer: (async (decision: "allow" | "deny") => ({ ok: true, decision })) as (...args: any[]) => Promise<any>,
     fate: {} as Record<string, unknown>,
   };
-  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean> };
+  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
   const amended: unknown[][] = [];
   const background: Promise<unknown>[] = [];
   const woken: number[] = [];
@@ -106,7 +106,7 @@ function bench(state: DurableObjectState) {
     registry: () =>
       ({
         acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.acquire()),
-        releaseTaskSlot: async (taskId: string) => void slots.released.push(taskId),
+        releaseTaskSlot: async (taskId: string) => (await slots.release(), void slots.released.push(taskId)),
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
     deciders: () => settings.deciders,
@@ -976,6 +976,66 @@ describe("tasks, by themselves", () => {
           due(store);
           await tasks.settle();
           expect(kept(c.task_id).status).toBe("running");
+        });
+      });
+
+      it("is not started on an asking for a place that was never answered, once it may no longer be: the limit there has become none, or its hour has run out", async () => {
+        for (const how of ["none", "late"] as const) {
+          await within(async ({ tasks, kept, store, worker, slots, events }) => {
+            const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+            const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+            worker.left[a.task_id] = left(a.task_id);
+            await tasks.event(a.task_id, 1, "result", { text: "ok" });
+            slots.acquire = async () => {
+              throw new Error("registry unreachable");
+            };
+            await tasks.settle();
+            expect(kept(b.task_id).status).toBe("dispatching");
+            // Meanwhile what let it be started no longer holds; the registry answers again, and has room.
+            if (how === "none") store.setMeta("limits", JSON.stringify({ scope_active_tasks: 0 }));
+            else store.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", Date.now() - 61 * 60_000, a.task_id);
+            slots.acquire = async () => true;
+            const begun = worker.started.length;
+            due(store);
+            await tasks.settle();
+            expect(worker.started).toHaveLength(begun);
+            expect(kept(b.task_id).status).toBe("failed");
+            expect(JSON.parse(kept(b.task_id).result).error).toContain(how === "none" ? "the limit set for this place is none" : "no place came free for it in an hour");
+            // A place the unanswered asking may have taken is given back.
+            expect(slots.released).toContain(b.task_id);
+            expect(events().at(-1)).toMatchObject({ kind: "worker.failed" });
+          });
+        }
+      });
+
+      it("does not wait on a place being given back either: that is written down, tried within the pass's time, and tried again by its id", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // What A left is not kept, so B's start is turned down; and the registry is slow to take the place back.
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          vi.useFakeTimers();
+          try {
+            slots.release = () => new Promise(() => undefined);
+            const began = Date.now();
+            const pass = tasks.settle();
+            await vi.advanceTimersByTimeAsync(9_000);
+            await pass;
+            expect(Date.now() - began).toBeLessThan(9_500);
+            expect(kept(b.task_id).status).toBe("failed");
+            expect(store.rows("SELECT task_id FROM task_releases")).toEqual([{ task_id: b.task_id }]);
+            expect(tasks.nextWakeAt(Date.now())).not.toBeNull();
+            // It answers on a later pass: given back, and no longer owed.
+            slots.release = async () => undefined;
+            store.sql.exec("UPDATE task_releases SET next_at = 0");
+            const again = tasks.settle();
+            await vi.advanceTimersByTimeAsync(100);
+            await again;
+            expect(slots.released).toContain(b.task_id);
+            expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          } finally {
+            vi.useRealTimers();
+          }
         });
       });
 
