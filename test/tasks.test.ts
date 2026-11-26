@@ -930,6 +930,110 @@ describe("tasks, by themselves", () => {
         });
       });
 
+      it("is carried on after the Brain was replaced while a place was being asked for: the place is asked for again by its id, and only then is it started and watched", async () => {
+        await within(async ({ tasks, kept, store, worker, slots, timer }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          // As it was kept at the moment the place was being asked for: out of waiting, not yet let through.
+          const mid = () => {
+            store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", b.task_id);
+            store.sql.exec("UPDATE task_queued SET started_at = NULL, next_at = 0 WHERE task_id = ?", b.task_id);
+          };
+          mid();
+          // The tenant is full: it is not started on the strength of having been taken out of waiting. It waits again.
+          slots.acquire = async () => false;
+          const begun = worker.started.length;
+          let asked = slots.acquired.length;
+          await tasks.settle();
+          expect(slots.acquired.length).toBe(asked + 1);
+          expect(worker.started).toHaveLength(begun);
+          expect(kept(b.task_id).status).toBe("queued");
+          expect(timer(b.task_id)).toBeUndefined();
+          // Much later, with a place free: asked for, let through from now, watched, started.
+          mid();
+          store.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", Date.now() - 16 * 60_000, b.task_id);
+          slots.acquire = async () => true;
+          asked = slots.acquired.length;
+          await tasks.settle();
+          expect(slots.acquired.length).toBe(asked + 1);
+          expect(kept(b.task_id).status).toBe("running");
+          expect(worker.started).toHaveLength(begun + 1);
+          expect((worker.started.at(-1) as any).accept_by).toBeGreaterThan(Date.now());
+          expect(timer(b.task_id)).toMatchObject({ status: "active" });
+          // No answer about the place at all: it stays as it is, and is asked for again; nothing is started meanwhile.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null }, b.task_id)) as { task_id: string };
+          worker.left[b.task_id] = left(b.task_id);
+          await tasks.event(b.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("registry unreachable");
+          };
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("dispatching");
+          expect(worker.started).toHaveLength(begun + 1);
+          slots.acquire = async () => true;
+          due(store);
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("running");
+        });
+      });
+
+      it("gives the one behind it an end to its waiting when it is let through, so that a line does not wait on a time set before", async () => {
+        await within(async ({ tasks, kept, store, worker }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null }, b.task_id)) as { task_id: string };
+          const next = () => store.rows<{ next_at: number }>("SELECT next_at FROM task_queued WHERE task_id = ?", c.task_id)[0].next_at;
+          await tasks.settle();
+          const while_waiting = next();
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("running");
+          await tasks.settle();
+          // C now waits until a little past the latest B could still be running, by B's own watchdog.
+          const watched = store.rows<{ due_at: number }>("SELECT due_at FROM timers WHERE id = ?", `watch_${b.task_id}`)[0].due_at;
+          expect(next()).toBe(watched + 5 * 60_000);
+          expect(next()).not.toBe(while_waiting);
+          // B never ends: past that moment C gives up.
+          store.sql.exec("UPDATE timers SET due_at = ? WHERE id = ?", Date.now() - 6 * 60_000, `watch_${b.task_id}`);
+          due(store);
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("failed");
+        });
+      });
+
+      it("does not keep the Brain from its conversations for workers that do not answer: one pass has a time of its own, and what it did not get to is looked at again soon", async () => {
+        await within(async ({ tasks, kept, store, worker, woken }) => {
+          const firsts: string[] = [];
+          for (const n of [1, 2, 3]) {
+            const a = (await tasks.dispatch(RUN, SESSION_KEY, `call_a${n}`, "sandbox", "A", "a", REPO)) as { task_id: string };
+            const b = (await tasks.dispatch(RUN, SESSION_KEY, `call_b${n}`, "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+            worker.left[a.task_id] = left(a.task_id);
+            await tasks.event(a.task_id, 1, "result", { text: "ok" });
+            firsts.push(b.task_id);
+          }
+          vi.useFakeTimers();
+          try {
+            worker.start = () => new Promise(() => undefined);
+            const began = Date.now();
+            let over = false;
+            const pass = tasks.settle().then(() => (over = true));
+            await vi.advanceTimersByTimeAsync(8_500);
+            await pass;
+            expect(over).toBe(true);
+            expect(Date.now() - began).toBeLessThan(9_000);
+            // None was answered: all are as they were left, and the pass asked to be woken again soon.
+            expect(firsts.map((id) => kept(id).status).every((status) => status === "dispatching" || status === "queued")).toBe(true);
+            expect(woken.at(-1)).toBeLessThan(Date.now() + 20_000);
+            expect(tasks.nextWakeAt(Date.now())).not.toBeNull();
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+      });
+
       it("is for the same person, worker and conversation as going on from finished work; has a bound on how many wait; and gives up waiting in the end", async () => {
         await within(async ({ tasks, kept, store, settings, task }) => {
           const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
