@@ -1,7 +1,7 @@
 import { exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { classifyGit, describePush, parseReceivePack } from "../src/workers/sandbox/outbound";
+import { classifyGit, describePush, isLocalItem, parseReceivePack } from "../src/workers/sandbox/outbound";
 import { task } from "./helpers";
 
 /** What the proxy let through to the outside world. */
@@ -245,5 +245,15 @@ describe("git over the proxy", () => {
     expect((await push(unreadable.send, "acme/demo", "garbage")).status).toBe(403);
     expect(await unreadable.recorded("authorize")).toHaveLength(0);
     expect(forwarded).toHaveLength(0);
+  });
+});
+
+describe("what the agent sends the model for a note brought into its session", () => {
+  // As pi 0.87.1 was seen to send it to a Responses-style model (eval/lab/notes.lab.mjs, case J).
+  it("is a plain message of the user's, which the sandbox lets out as any other", () => {
+    const item = { role: "user", content: [{ type: "input_text", text: "[Added by the person who asked for this work, while you were at it. …]\n\nalso fix the footer" }] };
+    expect(isLocalItem(item)).toBe(true);
+    // And still nothing that names something for the provider to fetch.
+    expect(isLocalItem({ type: "custom_message", content: "x" })).toBe(false);
   });
 });

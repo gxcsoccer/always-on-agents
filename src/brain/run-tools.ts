@@ -44,7 +44,7 @@ export interface RunToolsHost {
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
-  readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel">;
+  readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell">;
 }
 
 export class RunTools {
@@ -393,6 +393,8 @@ export class RunTools {
           ? { ok: true, cancelled: workId, how: "stopped", note: "It had not been handed over yet and will not be. Tell the person so." }
           : { ok: true, cancelled: workId, how: "no_longer_waited_for", note: "Nothing of it will be brought back here. The worker may still finish it over there: tell the person that, not that it was stopped." };
       },
+      // Only a task can be told anything (work carried by a connector's tool goes on through that tool).
+      tellWork: async (callId, workId, message) => this.#b.tasks.tell(run, session.session_key, callId, workId, message),
       dispatchTask: async (callId, title, brief, repository) => {
         // The tool from before there was more than one worker: for the one this deployment starts, with what was then its one option.
         return this.#b.tasks.dispatch(run, session.session_key, callId, null, title, brief, { repository });

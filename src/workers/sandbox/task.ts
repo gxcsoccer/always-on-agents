@@ -513,7 +513,7 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** Called through Outbound when the container reports or asks. The reply goes back to the container. */
-  async callback(kind: string, token: string, body: unknown): Promise<{ ok: boolean; decision?: string; reason?: string }> {
+  async callback(kind: string, token: string, body: unknown): Promise<{ ok: boolean; decision?: string; reason?: string; notes?: { id: string; text: string }[] }> {
     const state = this.#state();
     if (!state || token !== state.token) return { ok: false };
     const request = (body ?? {}) as { tool_use_id?: string; tool_name?: string; command?: string };
@@ -548,7 +548,7 @@ export class TaskSandbox extends DurableObject<Env> {
         }
       }
       if (changed) this.#save(state);
-      return { ok: true, notes: missing.map((note) => ({ id: note.id, text: note.text })) } as never;
+      return { ok: true, notes: missing.map((note) => ({ id: note.id, text: note.text })) };
     }
 
     // The gate polls for its answer. Not recorded in the inbox: it would be one entry every two seconds.

@@ -49,6 +49,9 @@ function bench(state: DurableObjectState) {
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
     /** Something that happens while the sandbox is being asked to stop. */
+    /** What the sandbox was told for a task at work, and what it says to that. */
+    told: [] as [string, { id: string; text: string }][],
+    tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" }>,
     /** Tasks the sandbox has already taken, by id, as they stand there. */
     took: {} as Record<string, { phase: string; error?: string }>,
     /** What a task left for a later one to go on from, by task id; nothing for one that left nothing or whose leavings are gone. */
@@ -78,6 +81,7 @@ function bench(state: DurableObjectState) {
         return (worker.cancelled.push(taskId), { ok: true });
       },
       snapshot: async () => worker.left[taskId] ?? null,
+      tell: async (note: { id: string; text: string }) => (worker.told.push([taskId, note]), worker.tell(taskId, note)),
       status: async () => worker.took[taskId] ?? { error: "no such task" },
       claimed: async () => {
         worker.asked.push(taskId);
@@ -764,6 +768,81 @@ describe("tasks, by themselves", () => {
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_10", "probe", "t", "b", {}, "t_probe")).rejects.toThrow("cannot go on with an earlier piece of work");
         // And one worker's work is not another's to go on from.
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_11", "sandbox", "t", "b", { repository: null }, "t_probe")).rejects.toThrow("there is no piece of work");
+      });
+    });
+
+    describe("something said to a piece of work that is under way", () => {
+      it("is passed to its worker by the id of the call, for its own person in their own step, and said to be passed on, not done", async () => {
+        await within(async ({ tasks, worker, audited, settings, task, store }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
+          const said = (await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also fix the footer")) as { ok: boolean; state: string; note: string };
+          expect(said).toMatchObject({ ok: true, state: "taken", note: expect.stringContaining("not read yet") });
+          expect(worker.told).toEqual([[a.task_id, { id: "call_t1", text: "also fix the footer" }]]);
+          // Recorded without what was said.
+          expect(audited("task.told")).toEqual([{ actor: "alice", task_id: a.task_id, call: "call_t1", length: 19 }]);
+          // The same call made again: asked of the worker by the same id, and recorded once.
+          await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also fix the footer");
+          expect(worker.told).toHaveLength(2);
+          expect(worker.told[1][1].id).toBe("call_t1");
+          expect(audited("task.told")).toHaveLength(1);
+
+          // Not someone else's, not in a step that is nobody's own, not from another conversation, not one there is none of.
+          const before = worker.told.length;
+          const alice = settings.deciders;
+          settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", a.task_id, "x")).rejects.toThrow("there is no piece of work");
+          settings.deciders = [];
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", a.task_id, "x")).rejects.toThrow("only in answer to the one person");
+          settings.deciders = alice;
+          await expect(tasks.tell(RUN, "thread:other", "call_t4", a.task_id, "x")).rejects.toThrow("there is no piece of work");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t5", "no-such", "x")).rejects.toThrow("there is no piece of work");
+          // Not one that has not begun, or is not known to have.
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t6", b.task_id, "x")).rejects.toThrow("has not begun yet");
+          task("t_un", { status: "unconfirmed" });
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t7", "t_un", "x")).rejects.toThrow("not known yet that this piece of work has begun");
+          expect(worker.told).toHaveLength(before);
+          expect(store.rows("SELECT 1 FROM audit WHERE action = 'task.told'")).toHaveLength(1);
+        });
+      });
+
+      it("says so when the work takes no more, without making it something that comes after by itself; and when the work waits for an approval, that this takes nothing back", async () => {
+        await within(async ({ tasks, worker, audited, store }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
+          worker.tell = async () => ({ state: "closed" });
+          const written = store.rows("SELECT 1 FROM tasks").length;
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "one more thing")).toMatchObject({ ok: false, state: "closed", note: expect.stringContaining("put it after that piece") });
+          expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(written);
+          expect(audited("task.told")).toEqual([]);
+          // A call that was taken, made again after the work has ended, is told what became of it: the worker knows.
+          await tasks.event(a.task_id, 1, "result", { text: "done" });
+          worker.tell = async () => ({ state: "taken" });
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t0", a.task_id, "said earlier")).toMatchObject({ ok: true, state: "taken" });
+
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
+          store.sql.exec("UPDATE tasks SET status = 'needs_input' WHERE id = ?", b.task_id);
+          expect(((await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "do not push yet")) as { note: string }).note).toContain("does not take back what it is waiting to do");
+          // A worker that cannot be told anything.
+          worker.tell = async () => {
+            throw new Error("too long");
+          };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("too long");
+        });
+      });
+
+      it("has what did not reach the work told with its ending, in so many words", async () => {
+        await within(async ({ tasks, events }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
+          await tasks.event(a.task_id, 1, "result", { text: "Fixed the build.", notes_not_read: [{ id: "call_t1", text: "also fix the footer" }] });
+          const told = events().at(-1)!.text as string;
+          expect(told).toContain("finished. The worker's own summary (unverified): Fixed the build.");
+          expect(told).toContain("did NOT reach it before it ended");
+          expect(told).toContain('- "also fix the footer"');
+          // Nothing of the kind where everything was read.
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
+          await tasks.event(b.task_id, 1, "result", { text: "ok" });
+          expect(events().at(-1)!.text).not.toContain("did NOT reach");
+        });
       });
     });
 

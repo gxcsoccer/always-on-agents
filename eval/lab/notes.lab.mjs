@@ -1,13 +1,18 @@
 // Runs the real pi (0.87.1) with the repository's real container/gate.ts, against a model that
 // answers by rote and a stand-in for the task's Durable Object, and checks what reaches the model.
-// Usage: node lab.mjs <path to gate.ts>
+// Not part of the tests: it needs pi installed, which the repository does not depend on.
+//   mkdir /tmp/pi && cd /tmp/pi && npm init -y && npm install --ignore-scripts @earendil-works/pi-coding-agent@0.87.1
+//   PI=/tmp/pi/node_modules/.bin/pi node eval/lab/notes.lab.mjs container/gate.ts
+// (The version is the one the sandbox image installs: see the Dockerfile.)
 import { spawn } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const GATE = process.argv[2];
+import { resolve } from "node:path";
+const GATE = resolve(process.argv[2] ?? "container/gate.ts");
+const PI = process.env.PI ?? join(new URL(".", import.meta.url).pathname, "node_modules/.bin/pi");
 const HERE = new URL(".", import.meta.url).pathname;
 const root = mkdtempSync(join(tmpdir(), "steer-lab-"));
 const body = (req) => new Promise((resolve) => { let s = ""; req.on("data", (c) => (s += c)); req.on("end", () => resolve(s ? JSON.parse(s) : {})); });
@@ -56,7 +61,7 @@ function pi(sessions, { resume = false, run = "r1", provider = "probe", prompt =
   const env = { PATH: process.env.PATH, HOME: root, PI_CODING_AGENT_DIR: conf, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", TMPDIR: root, TASK_ID: "task-X", TASK_PASS: "p", TASK_RUN: run, TASK_DIRECTORY: taskDir, GATE_BRAIN_URL: `http://127.0.0.1:${taskPort}`, GATE_NOTES_TIMEOUT_MS: "700" };
   const args = ["--mode", "json", "--no-approve", "--provider", provider, "--model", "fake", "--extension", GATE, "--session-dir", sessions, ...(resume ? ["--continue"] : []), "--", prompt];
   return new Promise((resolve) => {
-    const child = spawn(join(HERE, "node_modules/.bin/pi"), args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(PI, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
     child.stdout.on("data", (c) => (out += c)); child.stderr.on("data", (c) => (err += c));
     const started = Date.now();
@@ -126,7 +131,7 @@ reset({ taken: [{ id: "a", text: "NOTE-ALPHA" }], run: "r3" });
 model.fail = true;
 r = await pi(sessionWithA, { resume: true, run: "r3", provider: "probe2", prompt: "go on" });
 const items = model.calls[0];
-writeFileSync(join(HERE, "responses-input.json"), JSON.stringify(items, null, 2));
+writeFileSync(join(root, "responses-input.json"), JSON.stringify(items, null, 2));
 const noteItem = Array.isArray(items) ? items.find((item) => JSON.stringify(item).includes("NOTE-ALPHA")) : undefined;
 check("J a note in the session goes to a Responses-style model as a plain user message", noteItem !== undefined && (noteItem.type === undefined || noteItem.type === "message") && noteItem.role === "user", noteItem ?? items);
 console.log("     the item:", JSON.stringify(noteItem));

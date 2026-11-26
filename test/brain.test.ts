@@ -186,6 +186,35 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("passes on to work under way what its person adds, offers that only where a worker can be told, and says plainly when it did not reach the work", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const id = toolOutputs().find((each: any) => each.work_id).work_id;
+    expect(modelCalls.at(-1).tools.some((tool: any) => tool.name === "tell_work")).toBe(true);
+
+    model.replies([call("tell_work", { work_id: id, message: "also fix the footer while you are there" }), call("send_message", { text: "已经转告它了。" })], [say("")]);
+    await stub.ingest(message("also fix the footer while you are there"));
+    await wake(stub);
+    expect(toolOutputs().find((each: any) => each.state === "taken")).toMatchObject({ ok: true, work_id: id, note: expect.stringContaining("not read yet") });
+    const told = (await task(id).calls()).filter((each: any) => each.method === "tell");
+    expect(told).toHaveLength(1);
+    expect(told[0].args.text).toBe("also fix the footer while you are there");
+
+    // Too late for it: said, and nothing is handed over in its place by the Brain.
+    model.replies([call("tell_work", { work_id: id, message: "and the header (too late)" })], [say("")]);
+    await stub.ingest(message("and the header"));
+    await wake(stub);
+    expect(toolOutputs().at(-1)).toMatchObject({ ok: false, state: "closed" });
+
+    // It ends without having read one of them: the step that tells of its ending is told so.
+    model.replies([call("send_message", { text: "修好了；页脚那句它没来得及看到。" })], [say("")]);
+    await stub.taskEvent(id, 1, "result", { text: "Fixed.", notes_not_read: [{ id: "x", text: "also fix the footer while you are there" }] });
+    await wake(stub);
+    expect(modelCalls.some((each: any) => JSON.stringify(each.input).includes("did NOT reach it before it ended"))).toBe(true);
+  });
+
   it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {
     const { stub } = brain();
     model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);

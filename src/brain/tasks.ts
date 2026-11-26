@@ -1198,7 +1198,7 @@ function questionCode(): string {
   return [...crypto.getRandomValues(new Uint8Array(4))].map((byte) => alphabet[byte % alphabet.length]).join("");
 }
 
-function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
+function renderEnding(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
   const head = `Task ${task.id} "${task.title}"`;
   if (kind === "needs_input") {
     const what = String(body.what ?? describeRequest(body));
@@ -1209,4 +1209,16 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
   // The Brain's own finding says why; a worker's report of a lost task means that where it ran stopped under it.
   return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: it stopped where it was running and could not be restored.`;
+}
+
+/**
+ * A worker's report, as the model is told of it. With an ending comes what was said to the work
+ * while it was under way and did not reach it: told as that, in so many words, so that it is
+ * never taken to have been acted on.
+ */
+function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
+  const told = renderEnding(task, kind, body);
+  const unread = Array.isArray(body.notes_not_read) ? (body.notes_not_read as { text?: unknown }[]).map((note) => String(note?.text ?? "").slice(0, 500)).filter((text) => text !== "") : [];
+  if (unread.length === 0) return told;
+  return `${told}\nWhat was added to it while it was at work and did NOT reach it before it ended (it took no account of this; tell the person so, and ask whether they still want it done, as something that goes on from this piece):\n${unread.map((text) => `- ${JSON.stringify(text)}`).join("\n")}`;
 }
