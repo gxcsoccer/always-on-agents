@@ -266,7 +266,7 @@ describe("GitHub's API over the proxy", () => {
     for (const path of ["/", "/user", "/graphql", "/repos/acme", "/repos/../demo/issues", "/repos/acme/../issues", "/repos/acme/demo%2f..%2fsecret/issues", "/repos/acme/demo/contents/a%2e%2e/b", "/repos/acme/demo//issues", "/search/code", "/search/issues/x", "/app/installations/1/access_tokens", "/orgs/acme/repos"])
       expect(api(path), path).toBeUndefined();
     // The other side of a comparison named in another repository is a read of that one.
-    for (const path of ["/repos/acme/demo/compare/main...someone:topic", "/repos/acme/demo/compare/main...someone%3Atopic", "/repos/acme/demo/compare/someone:demo:main...topic"]) expect(api(path), path).toBeUndefined();
+    for (const path of ["/repos/acme/demo/compare/main...someone:topic", "/repos/acme/demo/compare/main...someone%3Atopic", "/repos/acme/demo/compare/someone:demo:main...topic", "/repos/acme/demo/Compare/main...someone:topic"]) expect(api(path), path).toBeUndefined();
   });
 
   it("reads the task's own repository with a credential that can only read, and with headers made here", async () => {
@@ -329,7 +329,7 @@ describe("GitHub's API over the proxy", () => {
     expect((await send("https://api.github.com/repositories/42/issues")).status).toBe(403);
     expect(forwarded).toHaveLength(2);
     expect(await recorded("noteGithubRead")).toEqual([
-      { kind: "other", status: 302, incomplete: true },
+      { kind: "other", status: 302 },
       { kind: "other", status: 301 },
     ]);
   });
@@ -357,6 +357,11 @@ describe("GitHub's API over the proxy", () => {
     expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe("hello, world\n");
     answers.push(() => new Response('{"download_url":"kept, it is the file\'s own"}', { headers: { "content-type": "application/vnd.github.raw+json; charset=utf-8" } }));
     expect(await (await send("https://api.github.com/repos/acme/demo/contents/b.json", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe('{"download_url":"kept, it is the file\'s own"}');
+    // A description that cannot be read is told as that, and counted as that: not as a read that went well.
+    const broken = await proxyFor({ repository: "acme/demo" });
+    answers.push(() => new Response("{not json", json));
+    expect((await broken.send("https://api.github.com/repos/acme/demo/contents/a.txt")).status).toBe(502);
+    expect(await broken.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
     // Read with no credential it is what anyone is told.
     const open = await proxyFor({ repository: "acme/demo", unlent: true });
     answers.push(() => Response.json({ name: "a.txt", download_url: "https://raw.githubusercontent.com/acme/demo/main/a.txt" }, json));
@@ -396,7 +401,7 @@ describe("GitHub's API over the proxy", () => {
     const before = forwarded.length;
     for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone", "panic("]) expect((await send(search(q))).status, q).toBe(400);
     expect(forwarded).toHaveLength(before);
-    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400, incomplete: true }));
+    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400 }));
   });
 
   it("passes a search on whole where all of it is the repository's, page after page", async () => {
@@ -473,20 +478,20 @@ describe("GitHub's API over the proxy", () => {
     expect((await send(search("dst"))).status).toBe(502);
     expect(await recorded("noteGithubRead")).toEqual([
       { kind: "search", status: 403 },
-      { kind: "search", status: 502, incomplete: true },
-      { kind: "search", status: 502, incomplete: true },
-      { kind: "search", status: 502, incomplete: true },
+      { kind: "search", status: 502 },
+      { kind: "search", status: 502 },
+      { kind: "search", status: 502 },
       // Answered, and nothing of it read.
       { kind: "search", status: 200 },
       { kind: "other", status: 404 },
-      { kind: "search", status: 0, incomplete: true },
+      { kind: "search", status: 0 },
     ]);
     // Nor a credential had: nothing is read, and that is counted.
     const failing = await proxyFor({ repository: "acme/demo", lendingFails: true });
     const before = forwarded.length;
     expect((await failing.send(search("dst"))).status).toBe(502);
     expect(forwarded).toHaveLength(before);
-    expect(await failing.recorded("noteGithubRead")).toEqual([{ kind: "search", status: 0, incomplete: true }]);
+    expect(await failing.recorded("noteGithubRead")).toEqual([{ kind: "search", status: 0 }]);
   });
 });
 

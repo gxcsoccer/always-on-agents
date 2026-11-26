@@ -119,7 +119,7 @@ export interface TaskState {
    * of something else says nothing of what was looked for). By status ("failed": never answered).
    * Of searches also: `read`, pages whose results were read; `more`, of those, pages after which
    * there were others; `none`, pages that were all there is and held nothing; `incomplete`, ones
-   * not known to be complete. "Looked and found none" is `none` with nothing incomplete or failed.
+   * answered and not known to be complete (one refused or never answered is in its status alone). "Looked and found none" is `none` with nothing incomplete or failed.
    */
   github_reads?: { search: { by_status: Record<string, number>; read: number; more: number; none: number; incomplete: number }; other: { by_status: Record<string, number> } };
   /** When the current `starting` phase began. Startup is timed from here, not from task creation. */
