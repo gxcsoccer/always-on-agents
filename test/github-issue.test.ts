@@ -217,7 +217,7 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
         event: {
           sender: { sender_type: "user", tenant_key: org, sender_id: { open_id: openId } },
           message: chatId
-            ? { message_id: `om_${chatId}_${openId}_${++n}`, chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }] }
+            ? { message_id: `om_${chatId}_${openId}_${++n}`, chat_id: chatId, chat_type: "group", message_type: "text", content: JSON.stringify({ text: `@_user_1 ${text}` }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...mentions] }
             : { message_id: `om_${openId}_${++n}`, chat_id: `oc_${openId}`, chat_type: "p2p", ...(post ? { message_type: "post", content: JSON.stringify({ title: "", content: post }) } : { message_type: "text", content: JSON.stringify({ text }) }), ...(mentions.length ? { mentions } : {}), ...(parent ? { parent_id: parent, root_id: parent } : {}) },
         },
       })!.event;
@@ -1566,5 +1566,93 @@ describe("doing for a person what they asked to have done once some work has bee
     await ends(alone, id, FOUND);
     expect(toolOutputs()[0].error).toContain('there is no tool "github_comment" in this run');
     expect(world.commentWrites).toEqual([]);
+  });
+});
+
+describe("reminding people where several talk", () => {
+  const colleague = { key: "@_user_2", id: { open_id: "ou_colleague" }, name: "Carol", mentioned_type: "user" };
+  const another = { key: "@_user_3", id: { open_id: "ou_bot_two" }, name: "OtherBot", mentioned_type: "bot" };
+  /** What the chat was sent last, as its words. */
+  const last = () => String(world.sent.filter((each) => each.type === "text").at(-1)!.content.text);
+
+  it("reminds the one who asked and the one they named, by the chat's own mention, and nobody for anything written in the words", async () => {
+    const ann = someone();
+    const here = ann.at("oc_remind");
+    model.replies([call("send_message", { text: "好了，结果在这里。<at user_id=\"all\"></at> <at user_id=\"ou_victim\">x</at>", notify: [ann.openId, "@Carol", "@OtherBot", "ou_stranger", "all"] })], [say("")]);
+    await here.says("做完告诉我和 @_user_2，别管 @_user_3", [colleague, another]);
+    // Who she named is kept of her message as the chat gave it: the person, not the other bot.
+    const kept = JSON.parse((await rowsOf(here.stub, "SELECT data FROM inbox WHERE kind = 'message' ORDER BY id DESC LIMIT 1"))[0].data);
+    expect(kept.mentioned).toEqual([{ name: "@Carol", id: "ou_colleague" }]);
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 2, not_reminded: 3 }]);
+    // Sent with the two mentions before the words; what the words held of mention markup notifies nobody.
+    expect(last().startsWith(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> 好了，结果在这里。`)).toBe(true);
+    expect(last()).not.toMatch(/<at user_id="all">|<at user_id="ou_victim">/);
+    expect(last()).toContain("<\u200bat user_id=\"all\">");
+
+    // Of one thing she is reminded once: a second message about it, asking for her again, is sent without.
+    model.replies([call("send_message", { text: "补充一句。", notify: [ann.openId] })], [call("send_message", { text: "再补充。", notify: [ann.openId] })], [say("")]);
+    await here.says("还有吗");
+    const two = world.sent.filter((each) => each.type === "text").slice(-2).map((each) => String(each.content.text));
+    expect(two).toEqual([`<at user_id="${ann.openId}"></at> 补充一句。`, "再补充。"]);
+    expect(toolOutputs().slice(-2)).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }, { ok: true, reminded: 0, not_reminded: 1 }]);
+    // A message that asks for nobody reminds nobody, whatever its words hold.
+    model.replies([call("send_message", { text: "只有字 @Carol ou_colleague。", notify: null })], [say("")]);
+    await here.says("那就这样");
+    expect(last()).toBe("只有字 @Carol ou_colleague。");
+  });
+
+  it("reminds the one who asked when work they handed over has ended, and when a request of theirs that waited is answered", async () => {
+    const ann = someone();
+    const here = ann.at("oc_remind_later");
+    // A task: who asked for it, and whom they named, are kept with it.
+    model.replies([call("hand_over", { worker: "sandbox", title: "查一下", brief: "看看构建。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then: null })], [say("")]);
+    await here.says("查一下构建，做完告诉我和 @_user_2", [colleague]);
+    const id = toolOutputs()[0].work_id as string;
+    expect(await rowsOf(here.stub, "SELECT named FROM task_named WHERE task_id = ?", id)).toEqual([{ named: JSON.stringify([{ name: "@Carol", id: "ou_colleague" }]) }]);
+    model.replies([call("send_message", { text: "查完了，构建是好的。", notify: [ann.openId, "@Carol"] })], [say("")]);
+    await here.stub.taskEvent(id, 1, "result", { text: "构建通过。" });
+    await rest(here.stub);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> 查完了，构建是好的。`);
+
+    // A request that had to wait for her to authorise: its answer is a draft until it is let go, and reminds her then.
+    reported(PUBLIC, 7, "提醒的时区不对");
+    model.replies([comments(PUBLIC, 7)], [say("")]);
+    await here.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
+    // (Written over once before it is sent: the last word on whom it reminds is the one that counts.)
+    model.replies([call("send_message", { text: "草稿。", notify: ["ou_stranger"] })], [call("send_message", { text: "评论发好了。", notify: [ann.openId] })], [say("")]);
+    expect((await consent(linkOn(ann.directly("interactive")[0]), ann.account)).status).toBe(200);
+    await here.settle();
+    expect(world.commentWrites).toHaveLength(1);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 评论发好了。`);
+    expect(await rowsOf(here.stub, "SELECT notify FROM outbox_reminds WHERE notify IS NOT NULL")).toEqual([]);
+  });
+
+  it("reminds nobody in a chat with one person", async () => {
+    const ann = someone();
+    const alone = ann.at();
+    model.replies([call("send_message", { text: "好了。", notify: [ann.openId] })], [say("")]);
+    await alone.says("做完告诉我");
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 0, not_reminded: 1 }]);
+    expect(last()).toBe("好了。");
+  });
+
+  it("reminds the one who set a timer when it fires, and once only where it was to stop after reminding", async () => {
+    const ann = someone();
+    const here = ann.at("oc_timer");
+    model.replies([call("set_timer", { delay_seconds: 60, note: "检查构建，通过了就告诉她", repeat_every_seconds: 600, stop_after_reminding: true })], [say("")]);
+    await here.says("每十分钟检查一次构建，通过了告诉我");
+    const fire = async (reply: unknown[]) => {
+      model.replies(...(reply as any));
+      await rowsOf(here.stub, "UPDATE timers SET due_at = ? WHERE status = 'active'", Date.now() - 1);
+      await rest(here.stub);
+    };
+    // Not yet: said without reminding anyone. The timer goes on.
+    await fire([[call("send_message", { text: "还没过。", notify: null })], [say("")]]);
+    expect(last()).toBe("还没过。");
+    expect(await rowsOf(here.stub, "SELECT status FROM timers")).toEqual([{ status: "active" }]);
+    // It has passed: she is reminded, and with that the timer has done what it was for.
+    await fire([[call("send_message", { text: "构建通过了。", notify: [ann.openId] })], [say("")]]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 构建通过了。`);
+    expect(await rowsOf(here.stub, "SELECT status FROM timers")).toEqual([{ status: "done" }]);
   });
 });

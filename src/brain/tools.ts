@@ -16,13 +16,13 @@ export interface ToolCall {
 export interface ToolHost {
   /** A tool that is not one of the Brain's own: a connector's, if this run may use it. */
   connectorTool(callId: string, name: string, args: Record<string, unknown>): Promise<unknown>;
-  sendMessage(callId: string, text: string): unknown;
+  sendMessage(callId: string, text: string, notify?: string[]): unknown;
   sendReview(callId: string, summary: string, commit: string | null, comments: { path: string; line: number; body: string }[]): unknown;
   memoryList(): unknown;
   memoryRead(path: string): unknown;
   memoryWrite(path: string, content: string): unknown;
   memoryDelete(path: string): unknown;
-  setTimer(callId: string, delaySeconds: number, note: string, repeatEverySeconds: number | null): unknown;
+  setTimer(callId: string, delaySeconds: number, note: string, repeatEverySeconds: number | null, stopAfterReminding?: boolean): unknown;
   listTimers(): unknown;
   cancelTimer(id: string): unknown;
   /** Hands a piece of work to one of the workers this run has. */
@@ -62,7 +62,15 @@ export const TOOLS: ToolDefinition[] = [
   tool(
     "send_message",
     "Send a message to the people in this conversation. This is the only way they hear from you: text you write outside this tool is not shown to anyone. Send nothing when there is nothing worth their attention.",
-    { text: string },
+    {
+      text: string,
+      notify: {
+        type: ["array", "null"],
+        items: { type: "string" },
+        description:
+          "People this message is to remind (they get a notification where the place has such a thing), or null. Each as you see them in this conversation: a person's id, or a name the person who asked wrote with a mention (@name). Only the one who asked for the thing, people they named that way, and people who have written to you here can be reminded; anyone else is left out, and you are told how many were. Writing @name or an id in `text` reminds nobody: it is only text. Remind someone when they asked to be told, or the one who asked wanted them told; not otherwise.",
+      },
+    },
   ),
   tool(
     "send_review",
@@ -101,6 +109,7 @@ export const TOOLS: ToolDefinition[] = [
       delay_seconds: { type: "integer", description: "Seconds from now until it first fires." },
       note: { type: "string", description: "What you should do when it fires. Write it for a future you with no other context." },
       repeat_every_seconds: { ...nullable("integer"), description: "Null for a one-off; otherwise the interval, at least 60." },
+      stop_after_reminding: { ...nullable("boolean"), description: "For a repeating timer that checks for something and is to tell someone once, when it is so (\"check every ten minutes and tell me when it passes\"): true. It ends by itself with the first message from it that reminds someone, so they are told once. Null or false where each time it fires is to be told (\"remind me every hour\")." },
     },
   ),
   tool("list_timers", "List your active timers.", {}),
@@ -196,7 +205,8 @@ export async function executeTool(host: ToolHost, call: ToolCall): Promise<strin
 function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown {
   switch (call.name) {
     case "send_message":
-      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT));
+      if (a.notify != null && (!Array.isArray(a.notify) || a.notify.length > 20 || a.notify.some((each) => typeof each !== "string" || each.length > 200))) throw new Error("notify is a short list of people, or null");
+      return host.sendMessage(call.call_id, text(a.text, "text", MAX_MESSAGE_TEXT), a.notify == null ? [] : (a.notify as string[]));
     case "send_review": {
       if (!Array.isArray(a.comments) || a.comments.length > MAX_REVIEW_COMMENTS) throw new Error(`comments must be a list of at most ${MAX_REVIEW_COMMENTS}`);
       const comments = a.comments.map((c: Record<string, unknown>, i: number) => ({
@@ -218,7 +228,7 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
     case "memory_delete":
       return host.memoryDelete(text(a.path, "path", 200));
     case "set_timer":
-      return host.setTimer(call.call_id, integer(a.delay_seconds, "delay_seconds"), text(a.note, "note", 2_000), a.repeat_every_seconds == null ? null : integer(a.repeat_every_seconds, "repeat_every_seconds"));
+      return host.setTimer(call.call_id, integer(a.delay_seconds, "delay_seconds"), text(a.note, "note", 2_000), a.repeat_every_seconds == null ? null : integer(a.repeat_every_seconds, "repeat_every_seconds"), a.stop_after_reminding === true);
     case "list_timers":
       return host.listTimers();
     case "cancel_timer":

@@ -17,6 +17,7 @@ import { type Item, ModelError, type ModelRequest, type ModelResponse, type Tool
 import type { registry } from "../registry";
 import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
 import type { Outbox } from "./outbox";
+import type { Reminders } from "./reminders";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools, eligibleSource, standingOf, thenable, toolsIn, unheard, workersIn } from "./run-tools";
@@ -89,6 +90,8 @@ export interface RunnerHost {
   under(target: Target): string | undefined;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised" | "told">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
+  /** Who a message may remind: see Reminders. */
+  readonly reminders: Pick<Reminders, "claim">;
   readonly tools: Pick<RunTools, "for">;
 }
 
@@ -788,6 +791,10 @@ export class Runner {
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
         if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#b.requests.draft(carried, run, this.#b.outbox.notice("notAnswered", run.session_id));
+        // Whom the answer reminds is settled now that it is let go, and taken for the thing in this same step.
+        const draft = this.#s.rows<{ notify: string | null }>("SELECT notify FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`)[0];
+        const mention = draft?.notify && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length > 0 ? this.#b.reminders.claim(run, JSON.parse(draft.notify) as string[]) : [];
+        if (draft) this.#s.sql.exec("UPDATE outbox_reminds SET mention = ?, notify = NULL WHERE idem = ?", mention.length > 0 ? JSON.stringify(mention) : null, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);

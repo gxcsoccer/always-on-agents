@@ -91,7 +91,7 @@ export class Outbox implements Wakes {
     return candidates.length > 0 ? Math.min(...candidates) : null;
   }
 
-  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean }): { ok: true } {
+  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: string[] }): { ok: true } {
     // The answer to a request that waited goes where the request came from, as it was then.
     const target = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#s.meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
@@ -112,9 +112,17 @@ export class Outbox implements Wakes {
       runId ? JSON.stringify(this.#b.requests.readsOf(runId)) : null,
       bound?.authored ? 1 : 0,
     );
+    // Whom it reminds, kept with it once and for every attempt at sending it.
+    if (bound?.mention && bound.mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(bound.mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
     return { ok: true };
+  }
+
+  /** Whom a kept message reminds. */
+  #reminds(idem: string): { mention?: string[] } {
+    const kept = this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", idem)[0]?.mention;
+    return kept ? { mention: JSON.parse(kept) as string[] } : {};
   }
 
   /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */
@@ -231,7 +239,7 @@ export class Outbox implements Wakes {
     this.#s.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?), wire = ? WHERE id = ?", Date.now(), wire, row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.
-      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, authored: row.authored === 1, encoding: wire, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
+      const receipt = await this.#b.deliver(JSON.parse(row.target) as Target, { id: row.id, idem: row.idem, text: row.text, authored: row.authored === 1, ...this.#reminds(String(row.idem)), encoding: wire, created_at: row.created_at, ...(row.ask ? { ask: JSON.parse(row.ask) as ApprovalQuestion } : {}), ...(row.review ? { review: JSON.parse(row.review) as CodeReview } : {}), ...(row.interaction ? { interaction: row.interaction as string } : {}) });
       // If an earlier attempt had in fact been posted, that is when people could first answer it.
       const sentAt = receipt?.posted_at ?? Date.now();
       this.#s.transaction(() => {

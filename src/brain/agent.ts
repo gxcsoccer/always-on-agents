@@ -26,6 +26,7 @@ import { firstWorker, guidance, workerKnown, workerNamed, workers } from "../wor
 import { migrate } from "./schema";
 import { BrainStore, type Row, type Wakes } from "./store";
 import { Outbox } from "./outbox";
+import { Reminders } from "./reminders";
 import { Revisions } from "./revisions";
 import { quotes } from "./approval";
 import { Tasks } from "./tasks";
@@ -60,6 +61,7 @@ export class BrainAgent extends DurableObject<Env> {
   readonly #outbox: Outbox;
   /** What is known of messages that can change after they were said. */
   readonly #revisions: Revisions;
+  readonly #reminders: Reminders;
   /** Work handed to workers, and the approval questions they raise. */
   readonly #tasks: Tasks;
   /** What a run's tools do. */
@@ -73,6 +75,7 @@ export class BrainAgent extends DurableObject<Env> {
     super(ctx, env);
     this.#store = new BrainStore(ctx);
     this.#timers = new Timers(this.#store);
+    this.#reminders = new Reminders(this.#store, { basis: (runId) => this.#requests.basis(runId) });
     this.#marks = new Marks(this.#store, { unmark: (source, event, mark) => unreceived(this.env, source, this.#store.scope(), event, mark) });
     const brain = this;
     this.#revisions = new Revisions(this.#store, {
@@ -95,6 +98,10 @@ export class BrainAgent extends DurableObject<Env> {
       },
       registry: () => registry(this.env),
       deciders: (runId) => this.#deciders(runId),
+      namedBy: (runId, person) => {
+        const asked = this.#reminders.asked(runId);
+        return asked && asked.by === person ? asked.named : [];
+      },
       isDecider: (principal, source) => this.#isDecider(principal, source),
       canRevisit,
       standingOf: (source, subject) => standingOf(this.env, source, this.#store.scope(), subject),
@@ -113,6 +120,7 @@ export class BrainAgent extends DurableObject<Env> {
       outside: this.#outside,
       isDecider: (principal, source) => this.#isDecider(principal, source),
       stillStands: (event) => this.#revisions.stillStands(event),
+      reminders: this.#reminders,
       toolsOf,
       guidance,
       workers,
@@ -143,6 +151,7 @@ export class BrainAgent extends DurableObject<Env> {
       actingFor: (runId) => this.#runner.actingFor(runId),
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
       following: (runId) => this.#runner.following(runId),
+      reminders: this.#reminders,
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
       direct,
@@ -385,6 +394,9 @@ export class BrainAgent extends DurableObject<Env> {
       // What was to follow a task goes with the task; what a request had done, once none of its tasks is left and nothing of it waits.
       this.#store.sql.exec("DELETE FROM task_then WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_on WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM task_named WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM outbox_reminds WHERE idem NOT IN (SELECT idem FROM outbox)");
+      this.#store.sql.exec("DELETE FROM reminded WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM request_acts WHERE request NOT IN (SELECT request FROM task_then) AND ('then:' || request) NOT IN (SELECT id FROM continuations WHERE status IN ('waiting', 'resuming'))");
       // The index of work is kept as long as what it points at: work that has ended, for the same time.
       this.#store.sql.exec("DELETE FROM work WHERE state != 'open' AND updated_at < ?", old);

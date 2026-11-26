@@ -39,6 +39,9 @@ function bench(state: DurableObjectState) {
     basis: [7, 8],
     /** What a run a task's result started may do in a person's name (see Runner.following); none, as for most runs. */
     following: undefined as ReturnType<RunToolsHost["following"]>,
+    /** Whom a message may remind, of those asked for; and who asked, with whom they named, for a timer set in this run. */
+    remindable: [] as string[],
+    asked: undefined as { by: string; named: { name: string; id: string }[] } | undefined,
     /** The event such a run was started by, as the requests part would give it. */
     event: undefined as Record<string, unknown> | undefined,
   };
@@ -57,6 +60,10 @@ function bench(state: DurableObjectState) {
     actingFor: () => settings.acting,
     mayUse: () => settings.mayUse,
     following: () => settings.following,
+    reminders: {
+      claim: (_run: unknown, asked: string[]) => (calls.push(["claim", asked]), asked.filter((each) => settings.remindable.includes(each))),
+      asked: () => settings.asked,
+    } as RunToolsHost["reminders"],
     instructionEditors: () => {
       if (settings.editors instanceof Error) throw settings.editors;
       return settings.editors;
@@ -275,8 +282,39 @@ describe("a run's tools", () => {
     it("are kept to be sent", async () => {
       await within(({ tools, calls }) => {
         expect(tools().sendMessage("c1", "hello")).toEqual({ ok: true });
-        // Written by the model: the agent's own words.
-        expect(calls).toEqual([["enqueue", "msg:c1", SESSION, "r1", "hello", undefined, undefined, { authored: true }]]);
+        // Written by the model: the agent's own words. It reminds nobody, and nobody was asked for.
+        expect(calls).toEqual([["claim", []], ["enqueue", "msg:c1", SESSION, "r1", "hello", undefined, undefined, { authored: true, mention: [] }]]);
+      });
+    });
+
+    it("remind those of the people asked for whom they may, and say only how many", async () => {
+      await within(({ tools, of, settings, store }) => {
+        settings.remindable = ["ou_1", "@Carol"];
+        // Who is reminded is settled with the keeping of the message, in the order asked for; the answer names nobody.
+        expect(tools().sendMessage("c1", "done", ["ou_1", "ou_stranger", "@Carol"])).toEqual({ ok: true, reminded: 2, not_reminded: 1 });
+        expect(of("claim")).toEqual([[["ou_1", "ou_stranger", "@Carol"]]]);
+        expect(of("enqueue")[0][6]).toEqual({ authored: true, mention: ["ou_1", "@Carol"] });
+        // The same call again (the run was replayed) is the message already kept: nothing is settled a second time.
+        store.sql.exec("INSERT INTO outbox (idem, run_id, target, text, next_at, created_at) VALUES ('msg:c1', 'r1', '{}', 'done', 1, 1)");
+        store.sql.exec("INSERT INTO outbox_reminds (idem, mention) VALUES ('msg:c1', ?)", JSON.stringify(["ou_1", "ou_carol"]));
+        expect(tools().sendMessage("c1", "done", ["ou_1", "ou_stranger", "@Carol"])).toEqual({ ok: true, reminded: 2, not_reminded: 1 });
+        expect(of("claim")).toHaveLength(1);
+      });
+    });
+
+    it("keep with a timer who set it and whom they named, and that it is to stop once it has reminded", async () => {
+      await within(({ tools, settings, store }) => {
+        const kept = (id: string) => JSON.parse(store.rows<{ data: string | null }>("SELECT data FROM timers WHERE id = ?", id)[0].data ?? "null");
+        settings.asked = { by: "ou_1", named: [{ name: "@Carol", id: "ou_carol" }] };
+        const once = tools().setTimer("t1", 600, "check the build", 600, true) as { id: string };
+        expect(kept(once.id)).toEqual({ by: "ou_1", named: [{ name: "@Carol", id: "ou_carol" }], stop_after_reminding: true });
+        // One that does not repeat ends by itself: there is nothing to stop.
+        const single = tools().setTimer("t2", 600, "tell me", null, true) as { id: string };
+        expect(kept(single.id)).toEqual({ by: "ou_1", named: [{ name: "@Carol", id: "ou_carol" }] });
+        // Set where nothing says whose it is: nothing is kept, and it reminds nobody when it fires.
+        settings.asked = undefined;
+        const nobodys = tools().setTimer("t3", 600, "tick", null) as { id: string };
+        expect(kept(nobodys.id)).toBeNull();
       });
     });
 

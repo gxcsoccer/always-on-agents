@@ -354,6 +354,14 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE IF NOT EXISTS task_then (task_id TEXT PRIMARY KEY, request TEXT NOT NULL, tools TEXT NOT NULL, events TEXT NOT NULL, repository TEXT, withdrawn INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE IF NOT EXISTS request_acts (request TEXT PRIMARY KEY, tool TEXT NOT NULL, digest TEXT NOT NULL, sending INTEGER NOT NULL DEFAULT 0, result TEXT, at INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS task_on (task_id TEXT PRIMARY KEY, repository TEXT NOT NULL);`,
+  // 39: who a message reminds (their ids, fixed when it is kept, so that every attempt at
+  // sending it reminds the same people); whom the one who asked for a task named, kept with it;
+  // whom a drafted answer is to remind, until it is let go; and that a person was reminded of a
+  // thing (the message, the task, one firing of a timer), so that they are not reminded of it twice.
+  // (Beside the outbox and the tasks, by their keys, as the other things added to tasks are.)
+  `CREATE TABLE IF NOT EXISTS outbox_reminds (idem TEXT PRIMARY KEY, mention TEXT, notify TEXT);
+   CREATE TABLE IF NOT EXISTS task_named (task_id TEXT PRIMARY KEY, named TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS reminded (event TEXT NOT NULL, person TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (event, person));`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {
