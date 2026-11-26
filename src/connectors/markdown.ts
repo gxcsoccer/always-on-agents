@@ -112,7 +112,7 @@ const HIDDEN = "";
 export function emphasised(text: string): string {
   // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
   const out: string[] = [];
-  let fence: { char: string; length: number } | undefined;
+  let fence: { char: string; length: number; quoted: boolean } | undefined;
   let lines: string[] = [];
   const flush = () => {
     if (lines.length > 0) out.push(paragraph(lines.join("\n")));
@@ -122,12 +122,14 @@ export function emphasised(text: string): string {
     // A fence wherever one may stand: at the start of a line, or after the marks of quotations and of list items on it,
     // however far in. (Taken more widely than Markdown takes it: what is between two of them is left as it is.)
     const fenced = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)])(?=\s|$))*\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    // A block of code opened inside a quotation ends where the quotation does, closed or not: what follows a blank line after it is prose again.
+    if (fence?.quoted && line.trim() === "") fence = undefined;
     if (fence) {
       if (fenced && fenced[1][0] === fence.char && fenced[1].length >= fence.length && fenced[2].trim() === "") fence = undefined;
       out.push(line);
     } else if (fenced && !(fenced[1][0] === "`" && fenced[2].includes("`"))) {
       flush();
-      fence = { char: fenced[1][0], length: fenced[1].length };
+      fence = { char: fenced[1][0], length: fenced[1].length, quoted: /^\s*(?:(?:[-*+]|\d{1,9}[.)])\s+)*>/.test(line) };
       out.push(line);
     } else if (line.trim() === "") {
       flush();
@@ -138,18 +140,58 @@ export function emphasised(text: string): string {
   return out.join("\n");
 }
 
+/**
+ * A paragraph with its code spans and its escaped characters hidden, read from left to right as
+ * Markdown reads them: a run of backticks opens a span that the next run of exactly as many
+ * closes, and nothing within it is an escape; outside one, a backslash takes the character after
+ * it. A run that nothing closes is left showing.
+ */
+function uncoded(text: string): string {
+  let out = "";
+  for (let at = 0; at < text.length; ) {
+    if (text[at] === "`") {
+      let run = at;
+      while (text[run] === "`") run++;
+      const length = run - at;
+      // The next run of backticks of the very same length.
+      let close = -1;
+      for (let next = run; next < text.length; ) {
+        if (text[next] !== "`") {
+          next++;
+          continue;
+        }
+        let end = next;
+        while (text[end] === "`") end++;
+        if (end - next === length) {
+          close = end;
+          break;
+        }
+        next = end;
+      }
+      const upTo = close === -1 ? run : close;
+      out += close === -1 ? text.slice(at, run) : text.slice(at, upTo).replace(/[^\n]/g, HIDDEN);
+      at = upTo;
+    } else if (text[at] === "\\" && at + 1 < text.length && text[at + 1] !== "\n") {
+      // (A whole character, where it is written with two units.)
+      const taken = String.fromCodePoint(text.codePointAt(at + 1)!).length;
+      out += HIDDEN.repeat(1 + taken);
+      at += 1 + taken;
+    } else out += text[at++];
+  }
+  return out;
+}
+
 /** One paragraph, with each `**…**` in it that certainly did not hold made to; left whole where what in it is code or a link is not plain. */
 function paragraph(text: string): string {
   // What is not prose keeps its place and is not looked into.
   const hide = (found: string) => found.replace(/[^\n]/g, HIDDEN);
-  const seen = text
-    .replace(/\\[^\n]/g, hide)
-    .replace(/(`+)(?:(?!\1(?!`))[\s\S])*?\1(?!`)/g, hide)
+  const seen = uncoded(text)
     // A link or a picture with where it leads, where its ends are plain: brackets within its words one deep, and an address
     // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
     .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
     .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
-    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|https?:\/\/\S+/g, hide);
+    // (A bare address ends where the characters an address is written with end: words written right after it, with no space, are not part of it.)
+    .replace(/<\/?[A-Za-z][^>]*>|<[^>\s]+>|https?:\/\/[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+/g, hide);
   // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
   // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
   if (/[`\[\]]/.test(seen)) return text;

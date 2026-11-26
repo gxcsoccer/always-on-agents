@@ -16,6 +16,10 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     ["| **状态：**好 | 别的 |", "| **状态**：好 | 别的 |"],
     ["- 一\n  - **嵌套：**内容", "- 一\n  - **嵌套**：内容"],
     ["- [ ] **待办：**写测试", "- [ ] **待办**：写测试"],
+    // Words written right after a bare address, with no space, are not part of it.
+    ["请看 https://example.com/a?b=1，**结论：**通过。", "请看 https://example.com/a?b=1，**结论**：通过。"],
+    // A quotation's block of code that nothing closes ends with the quotation.
+    ["> ```\n> code\n\n**结论：**通过", "> ```\n> code\n\n**结论**：通过"],
     ["**提示：**字😀", "**提示**：字😀"],
     ["😀字**（注）**", "😀字（**注**）"],
     ["**见[文[档]](https://example.com/a_(b))：**正文", "**见[文[档]](https://example.com/a_(b))**：正文"],
@@ -42,6 +46,15 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "plain **bold** text",
     // Code, in a span or a block; an escaped mark; a link.
     "`**小标题：**正文`",
+    // A backslash within code escapes nothing: the span ends at its backtick, and the next one is another span.
+    "路径 `C:\\` 和 `**配置：**D:\\`",
+    // A longer run of backticks within a span does not close it.
+    "``a```**标题：**正文``",
+    "```a`` **标题：**正文 ``b```",
+    "\\`**标题：**正文`",
+    // An escaped character right against a mark is not looked into.
+    "\\\\**结论：**通过",
+    "> ```\n> **标题：**正文\n> 仍在引用里",
     "``a ` **小标题：**正文``",
     "```\n**小标题：**正文\n```",
     "~~~md\n**小标题：**正文\n~~~",
