@@ -108,7 +108,8 @@ export class RunTools {
   async #work(run: RunRow, sessionKey: string, id: string): Promise<{ task: true } | { task: false; worker: string; state: string; standing: string; waits?: "authorisation" | "result"; handed: boolean }> {
     // A task is its conversation's: one of another conversation in the same scope is not there to be asked about or stopped from here.
     const task = this.#s.rows<{ session_key: string }>("SELECT session_key FROM tasks WHERE id = ?", id)[0];
-    if (task && task.session_key !== sessionKey) throw new Error(`there is no piece of work ${JSON.stringify(id)} in this conversation`);
+    // (Said in the same words as for an id that is nobody's: which of the two it is, is not told.)
+    if (task && task.session_key !== sessionKey) throw new Error(`there is no piece of work ${id} here`);
     if (task) return { task: true };
     const record = this.#b.requests.record(id);
     if (record) this.#b.requests.indexed(id);

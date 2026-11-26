@@ -1528,7 +1528,7 @@ describe("tasks, by themselves", () => {
         expect(await tasks.status("t1")).toEqual({ id: "t1", title: "Title of t1", status: "needs_input", pending: { id: "q1", code: "ABCD" }, last_progress: "half way", result: { text: "done" }, created_at: "1970-01-01T00:00:01.000Z", updated_at: "1970-01-01T00:00:01.000Z" });
         task("t2");
         expect(await tasks.status("t2")).toMatchObject({ pending: null, result: null });
-        await expect(tasks.status("nope")).rejects.toThrow("there is no piece of work \"nope\" in this conversation");
+        await expect(tasks.status("nope")).rejects.toThrow("there is no piece of work nope here");
       });
     });
   });

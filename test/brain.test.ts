@@ -227,7 +227,13 @@ describe("timers and memory", () => {
     await stub.ingest(message("anything going on?", { session_key: "thread:elsewhere", source_id: "elsewhere-1" }));
     await wake(stub);
     expect(modelCalls.at(-2).instructions).not.toContain(id);
-    expect(toolOutputs().at(-1).error).toContain("in this conversation");
+    const elsewhere = toolOutputs().at(-1).error as string;
+    expect(elsewhere).toBe(`there is no piece of work ${id} here`);
+    // And an id that is nobody's is answered in the very same words: which of the two it is, is not told.
+    model.replies([call("work_status", { work_id: "00000000-0000-4000-8000-000000000000" })], [say("")]);
+    await stub.ingest(message("and this one?", { session_key: "thread:elsewhere", source_id: "elsewhere-2" }));
+    await wake(stub);
+    expect(toolOutputs().at(-1).error).toBe(elsewhere.replace(id, "00000000-0000-4000-8000-000000000000"));
   });
 
   it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {
