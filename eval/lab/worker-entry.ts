@@ -43,7 +43,7 @@ export default {
     try {
       if (["start", "tell", "told", "alarm", "files"].includes(String(what)) && request.method !== "POST") return refuse(405, "POST");
       if (what === "start" && (typeof body.prompt !== "string" || body.prompt.trim() === "")) return refuse(400, "prompt is needed");
-      if ((what === "tell" || what === "told") && typeof body.id !== "string") return refuse(400, "id is needed");
+      if ((what === "tell" || what === "told") && (typeof body.id !== "string" || body.id.trim() === "")) return refuse(400, "id is needed");
       if (what === "tell" && (typeof body.text !== "string" || body.text.trim() === "")) return refuse(400, "text is needed");
       if (what === "start") return out(await task.start({ id, prompt: String(body.prompt), ...(body.bounds ? { bounds: body.bounds } : {}) }));
       if (what === "tell") return out(await task.tell({ id: String(body.id), text: String(body.text) }));
