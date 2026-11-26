@@ -19,13 +19,18 @@ export interface RemindersHost {
   basis(runId: string): InboxRow[];
 }
 
-/** A person named with the platform's own mention in one message, as the connector noted it: the name as it stands in the text, and who it is. */
-export type Named = { name: string; id: string };
+/**
+ * A person named with the platform's own mention in one message, as the connector noted it: who
+ * it is, and the name as it stands in the text where that name stands for nobody else there
+ * (said by the connector, which saw everyone the message named).
+ */
+export type Named = { id: string; name?: string };
 
 /** What is kept of where and by whom a thing was asked, with a task or a timer, to go by when it comes back. */
 export type Asked = { by: string; named: Named[]; place: string };
 
-const named = (noted: unknown): Named[] => (Array.isArray(noted) ? noted.filter((each): each is Named => typeof each?.name === "string" && typeof each?.id === "string" && each.name !== "" && each.id !== "") : []);
+const named = (noted: unknown): Named[] =>
+  Array.isArray(noted) ? noted.filter((each) => typeof each?.id === "string" && each.id !== "").map((each) => ({ id: each.id as string, ...(typeof each.name === "string" && each.name !== "" ? { name: each.name as string } : {}) })) : [];
 
 /**
  * The place a message is written in or sent to, as the connector addresses it, without what is
@@ -129,7 +134,8 @@ export class Reminders {
     // Named by them: by who they are, always; by the name only where it means one person.
     const ids = new Set(about.named.map((each) => each.id));
     const names = new Map<string, Set<string>>();
-    for (const each of about.named) names.set(each.name.toLowerCase(), new Set([...(names.get(each.name.toLowerCase()) ?? []), each.id]));
+    // (A name the connector gave with one person, and that two of their messages gave with different people, means neither.)
+    for (const each of about.named) if (each.name !== undefined) names.set(each.name.toLowerCase(), new Set([...(names.get(each.name.toLowerCase()) ?? []), each.id]));
     const who = (asked: string): string | undefined => {
       const ref = asked.trim();
       if (ref === "") return undefined;
@@ -138,12 +144,18 @@ export class Reminders {
       if (meant?.size === 1) return [...meant][0];
       const exact = [...ids].find((id) => id.toLowerCase() === ref.toLowerCase());
       if (exact) return exact;
-      // Someone who has written to the agent in this conversation themselves: looked for by who they are, however long ago, in what is still kept of it.
-      for (const each of this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND text IS NOT NULL AND data IS NOT NULL AND lower(json_extract(principal, '$.id')) = ? ORDER BY id DESC LIMIT 50", sessionKey, ref.toLowerCase())) {
-        const writer = this.#writer(each);
-        if (writer !== undefined && placeOf(each.reply_to as string | null) === about!.place) return writer;
+      // Someone who has written to the agent in this conversation themselves: looked for by who
+      // they are, however long ago and whatever else of theirs is kept here since (answers of
+      // theirs brought in from elsewhere, say), through all that is still kept of it.
+      for (let before = Number.MAX_SAFE_INTEGER; ; ) {
+        const page = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND text IS NOT NULL AND data IS NOT NULL AND reply_to IS NOT NULL AND lower(json_extract(principal, '$.id')) = ? AND id < ? ORDER BY id DESC LIMIT 100", sessionKey, ref.toLowerCase(), before);
+        for (const each of page) {
+          const writer = this.#writer(each);
+          if (writer !== undefined && placeOf(each.reply_to as string | null) === about!.place) return writer;
+        }
+        if (page.length < 100) return undefined;
+        before = page.at(-1)!.id;
       }
-      return undefined;
     };
     return { event: about.event, who, ...(about.timer ? { timer: about.timer } : {}) };
   }

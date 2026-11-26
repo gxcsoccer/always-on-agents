@@ -300,14 +300,18 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
-  // (Every one the chat lists, each name with each person it stands for: a name that stands for two is told from one that stands for one by having them all.)
-  const mentioned = [
-    ...new Map(
-      mentions
-        .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id)
-        .map((each: any) => [`${token(each.name)}\n${each.id.open_id as string}`, { name: token(each.name), id: each.id.open_id as string }]),
-    ).values(),
-  ].slice(0, 100);
+  // Each person once, by who they are. Their name as it stands in the text is given with them only
+  // where it stands for nobody else in this message: worked out over everyone the chat lists,
+  // before anything is left out, so that a name can never come to look like one person's by
+  // the other having been dropped.
+  const people = new Map<string, string>(
+    mentions
+      .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id)
+      .map((each: any) => [each.id.open_id as string, token(each.name)]),
+  );
+  const borne = new Map<string, number>();
+  for (const name of people.values()) borne.set(name.toLowerCase(), (borne.get(name.toLowerCase()) ?? 0) + 1);
+  const mentioned = [...people].map(([id, name]) => (borne.get(name.toLowerCase()) === 1 ? { id, name } : { id })).slice(0, MAX_MENTIONED);
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
@@ -371,6 +375,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     },
   };
 }
+
+/** How many people named in one message are kept of it. (Far more than a message names; whether a name stands for one person is settled before any are left out.) */
+const MAX_MENTIONED = 500;
 
 /** A display name squeezed into one token, so no word of it can be read as part of the message. */
 const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;

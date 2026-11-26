@@ -77,6 +77,15 @@ describe("who a message may remind", () => {
       for (let n = 0; n < 260; n++) message(CAROL, `chatter ${n}`);
       message(ANN, "tell bob", { run: "r1" });
       expect(reminders.claim(run("r1"), [BOB], HERE)).toEqual([BOB]);
+      // Nor however many of his own answers from elsewhere were brought in here since he wrote here himself.
+      message("ou_ivy", "a question of hers, written here");
+      for (let n = 0; n < 230; n++) message("ou_ivy", `an answer of hers from another topic ${n}`, { data: { group: true, routed_from: "thread:t5" } });
+      message(ANN, "tell ivy", { run: "r2" });
+      expect(reminders.claim(run("r2"), ["ou_ivy"], HERE)).toEqual(["ou_ivy"]);
+      // One who only ever answered from elsewhere has not written here, through however many such.
+      for (let n = 0; n < 230; n++) message("ou_jon", `an answer of his from another topic ${n}`, { data: { group: true, routed_from: "thread:t5" } });
+      message(ANN, "tell jon", { run: "r3" });
+      expect(reminders.claim(run("r3"), ["ou_jon"], HERE)).toEqual([]);
     });
   });
 
@@ -106,9 +115,14 @@ describe("who a message may remind", () => {
 
   it("takes a name that would mean two people for neither, and one person named twice for one", async () => {
     await within(({ message, run, reminders }) => {
-      message(ANN, "tell @Li and @Li, and @Wu and @Wu", { run: "r1", data: { group: true, mentioned: [{ name: "@Li", id: "ou_li1" }, { name: "@Li", id: "ou_li2" }, { name: "@Wu", id: "ou_wu" }, { name: "@Wu", id: "ou_wu" }, { name: "", id: "ou_x" }, { name: "@NoId" }] } });
+      // As the connector notes it: a name is given with a person only where it stands for nobody else in that message.
+      message(ANN, "tell @Li and @Li, and @Wu", { run: "r1", data: { group: true, mentioned: [{ id: "ou_li1" }, { id: "ou_li2" }, { name: "@Wu", id: "ou_wu" }, { name: "@NoId" }] } });
       // The name that means two is no way of saying either; who they are still is.
-      expect(reminders.claim(run("r1"), ["@Li", "@Wu", "@NoId", "ou_x", "ou_li2"], HERE)).toEqual(["ou_wu", "ou_li2"]);
+      expect(reminders.claim(run("r1"), ["@Li", "@Wu", "@NoId", "ou_li2"], HERE)).toEqual(["ou_wu", "ou_li2"]);
+      // Two messages of one request that give one name with different people: that name means neither.
+      message(ANN, "tell @Sam", { run: "r2", data: { group: true, mentioned: [{ name: "@Sam", id: "ou_sam1" }] } });
+      message(ANN, "and @Sam", { run: "r2", data: { group: true, mentioned: [{ name: "@Sam", id: "ou_sam2" }] } });
+      expect(reminders.claim(run("r2"), ["@Sam", "ou_sam1"], HERE)).toEqual(["ou_sam1"]);
     });
   });
 

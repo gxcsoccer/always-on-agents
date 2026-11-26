@@ -41,7 +41,7 @@ function bench(state: DurableObjectState) {
     following: undefined as ReturnType<RunToolsHost["following"]>,
     /** Whom a message may remind, of those asked for; and who asked, with whom they named, for a timer set in this run. */
     remindable: [] as string[],
-    asked: undefined as { by: string; named: { name: string; id: string }[]; place: string } | undefined,
+    asked: undefined as { by: string; named: { id: string; name?: string }[]; place: string } | undefined,
     /** The event such a run was started by, as the requests part would give it. */
     event: undefined as Record<string, unknown> | undefined,
   };

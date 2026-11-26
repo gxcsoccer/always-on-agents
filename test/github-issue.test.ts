@@ -1582,7 +1582,13 @@ describe("reminding people where several talk", () => {
     await here.says("做完告诉我和 @_user_2，别管 @_user_3", [colleague, another]);
     // Who she named is kept of her message as the chat gave it: the person, not the other bot.
     const kept = JSON.parse((await rowsOf(here.stub, "SELECT data FROM inbox WHERE kind = 'message' ORDER BY id DESC LIMIT 1"))[0].data);
-    expect(kept.mentioned).toEqual([{ name: "@Carol", id: "ou_colleague" }]);
+    expect(kept.mentioned).toEqual([{ id: "ou_colleague", name: "@Carol" }]);
+    // A name that stands for two people in one message is given with neither, however many are named and wherever in the list the other is.
+    const crowd = Array.from({ length: 600 }, (_, n) => ({ key: `@_user_${n + 10}`, id: { open_id: `ou_p${n}` }, name: n === 0 || n === 599 ? "Li" : `P${n}`, mentioned_type: "user" }));
+    const noted = normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_crowd", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...crowd] } } })!.event.data!.mentioned as { id: string; name?: string }[];
+    expect(noted.find((each) => each.id === "ou_p0")).toEqual({ id: "ou_p0" });
+    expect(noted.find((each) => each.id === "ou_p1")).toEqual({ id: "ou_p1", name: "@P1" });
+    expect(noted.every((each) => each.name?.toLowerCase() !== "@li")).toBe(true);
     expect(toolOutputs()).toEqual([{ ok: true, reminded: 2, not_reminded: 3 }]);
     // Sent with the two mentions before the words; what the words held of mention markup notifies nobody.
     expect(last().startsWith(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> 好了，结果在这里。`)).toBe(true);
@@ -1608,7 +1614,7 @@ describe("reminding people where several talk", () => {
     model.replies([call("hand_over", { worker: "sandbox", title: "查一下", brief: "看看构建。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then: null })], [say("")]);
     await here.says("查一下构建，做完告诉我和 @_user_2", [colleague]);
     const id = toolOutputs()[0].work_id as string;
-    expect(JSON.parse((await rowsOf(here.stub, "SELECT asked FROM task_asked WHERE task_id = ?", id))[0].asked)).toMatchObject({ by: ann.openId, named: [{ name: "@Carol", id: "ou_colleague" }] });
+    expect(JSON.parse((await rowsOf(here.stub, "SELECT asked FROM task_asked WHERE task_id = ?", id))[0].asked)).toMatchObject({ by: ann.openId, named: [{ id: "ou_colleague", name: "@Carol" }] });
     model.replies([call("send_message", { text: "查完了，构建是好的。", notify: [ann.openId, "@Carol"] })], [say("")]);
     await here.stub.taskEvent(id, 1, "result", { text: "构建通过。" });
     await rest(here.stub);

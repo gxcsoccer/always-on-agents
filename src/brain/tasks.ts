@@ -84,7 +84,7 @@ export interface TasksHost {
   /** The people whose word counts in this run. */
   deciders(runId: string): Principal[];
   /** Who asked, whom they named and where, of the messages a run rests on (see Reminders): none where the run is not one person's alone. */
-  askedIn(runId: string): { by: string; named: { name: string; id: string }[]; place: string } | undefined;
+  askedIn(runId: string): { by: string; named: { id: string; name?: string }[]; place: string } | undefined;
   /** Whether this person's word counts here. */
   isDecider(principal: Principal, source: string): boolean;
   /** Whether this source can say what one of its messages says now. */
