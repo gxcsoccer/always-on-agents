@@ -86,3 +86,240 @@ export function prose(text: string, change: (passage: string) => string): string
   flush();
   return out.join("\n");
 }
+
+/** Punctuation and whitespace as Markdown's rule for emphasis takes them (the start and the end of a line count as whitespace). */
+const PUNCT = /[\p{P}\p{S}]/u;
+/** (Markdown's own set: the separators that are spaces, a tab, the ends of lines. Other things a pattern would call space are not.) */
+const SPACE = /[\p{Zs}\t\n\f\r]/u;
+/** Full-width punctuation: what is written right against the words in Chinese and Japanese, with no space after it. */
+const WIDE = /[、-〿！-／：-＠［-｀｛-･‘’“”…—]/;
+/** Marks that come in pairs: one of them is never moved without the other. */
+const PAIRS: Record<string, string> = { "（": "）", "「": "」", "『": "』", "【": "】", "《": "》", "〈": "〉", "〔": "〕", "［": "］", "｛": "｝", "“": "”", "‘": "’" };
+const OPENERS = Object.keys(PAIRS);
+const CLOSERS = Object.values(PAIRS);
+/** Stands in a line for what is not to be read as prose (code, a link, an escaped character), so that places in it stay where they are. */
+const HIDDEN = "";
+
+/**
+ * A text with its strong emphasis (`**…**`) made to hold where it certainly did not: where
+ * full-width punctuation stands just inside a mark and a word just outside it, which by
+ * Markdown's rule makes the mark no mark at all (`**标题：**正文` is shown with its asterisks).
+ * The punctuation is moved to the other side of the mark (`**标题**：正文`), and with a bracket or
+ * a quotation mark its other half, where that is at the other end. Nothing else is changed:
+ * emphasis that holds already, code, links, escaped characters, single asterisks, and anything
+ * that is not plainly this case. The words read the same before and after; doing it twice
+ * changes nothing more.
+ */
+export function emphasised(text: string): string {
+  // (Lines ended otherwise than Markdown is written here: nothing is told of such a text, and it is left as it is.)
+  if (text.includes("\r")) return text;
+  // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
+  const all = text.split("\n");
+  const out: string[] = [];
+  // The block of code that is open: its fence.
+  let fence: { char: string; length: number } | undefined;
+  let lines: string[] = [];
+  const flush = () => {
+    if (lines.length > 0) out.push(paragraph(lines.join("\n")));
+    lines = [];
+  };
+  for (let n = 0; n < all.length; n++) {
+    const line = all[n];
+    if (fence) {
+      // Opened at the very start of a line, it is in nothing: what ends it is a fence of its kind and no shorter, with
+      // nothing after it, no more than three spaces in.
+      const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (closing && closing[1][0] === fence.char && closing[1].length >= fence.length) fence = undefined;
+      out.push(line);
+      continue;
+    }
+    // A fence anywhere on a line's way in: at its start, after spaces, after the marks of quotations and of list items.
+    const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*\s*)(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenced && !(fenced[2][0] === "`" && fenced[3].includes("`"))) {
+      flush();
+      // Only one at the very start of a line is known to be in nothing, and so known to end where it seems to. Any other
+      // (further in, in a quotation, under a list item) ends where what it is in says, which is not worked out here: from
+      // it on, the text is left as it is. So it is from a line that begins as markup of another kind may (within which a
+      // fence is no fence).
+      if (fenced[1] !== "") return [...out, ...all.slice(n)].join("\n");
+      fence = { char: fenced[2][0], length: fenced[2].length };
+      out.push(line);
+    } else if (/<[A-Za-z/!?]/.test(line)) {
+      // (Markup of another kind anywhere on a line: a tag with what it says of itself, a block in which nothing is Markdown.)
+      flush();
+      return [...out, ...all.slice(n)].join("\n");
+    } else if (/^[ \t]*$/.test(line)) {
+      // (A blank line as Markdown has it: nothing, or spaces and tabs. A line of some other space is a line of the paragraph.)
+      flush();
+      out.push(line);
+    } else lines.push(line);
+  }
+  flush();
+  return out.join("\n");
+}
+
+/**
+ * A paragraph with its code spans and its escaped characters hidden, read from left to right as
+ * Markdown reads them: a run of backticks opens a span that the next run of exactly as many
+ * closes, and nothing within it is an escape; outside one, a backslash takes the character after
+ * it. A run that nothing closes is left showing.
+ */
+function uncoded(text: string): string {
+  let out = "";
+  for (let at = 0; at < text.length; ) {
+    if (text[at] === "`") {
+      let run = at;
+      while (text[run] === "`") run++;
+      const length = run - at;
+      // The next run of backticks of the very same length.
+      let close = -1;
+      for (let next = run; next < text.length; ) {
+        if (text[next] !== "`") {
+          next++;
+          continue;
+        }
+        let end = next;
+        while (text[end] === "`") end++;
+        if (end - next === length) {
+          close = end;
+          break;
+        }
+        next = end;
+      }
+      const upTo = close === -1 ? run : close;
+      out += close === -1 ? text.slice(at, run) : text.slice(at, upTo).replace(/[^\n]/g, HIDDEN);
+      at = upTo;
+    } else if (text[at] === "\\" && at + 1 < text.length && text[at + 1] !== "\n") {
+      // (A whole character, where it is written with two units.)
+      const taken = String.fromCodePoint(text.codePointAt(at + 1)!).length;
+      out += HIDDEN.repeat(1 + taken);
+      at += 1 + taken;
+    } else out += text[at++];
+  }
+  return out;
+}
+
+/** A paragraph with what in it is not prose hidden, each thing in its place: code, escaped characters, links whose ends are plain, addresses. */
+function hidden(text: string): string {
+  const hide = (found: string) => found.replace(/[^\n]/g, HIDDEN);
+  return (
+    uncoded(text)
+      // A link or a picture with where it leads, where its ends are plain: brackets within its words one deep, and an address
+      // written bare (no angle brackets, no title, no space), with brackets one deep. Any other is left showing its brackets.
+      .replace(/!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\((?:[^()\s<>"']|\([^()\s<>"']*\))*\)/g, hide)
+      .replace(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\[[ xX]\](?=\s)/gm, (found, lead: string) => lead + HIDDEN.repeat(found.length - lead.length))
+      // (A bare address of any kind runs to the next plain space: where it ends and words written right against it begin is
+      // for whoever shows it to say, and some take the words for part of it. Left alone, they lead where they led.)
+      .replace(/(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|www\.|mailto:|xmpp:)[^ \t\n]*/gi, hide)
+  );
+}
+
+/** Where the marks of strong emphasis stand in a paragraph (with what is not prose hidden): two asterisks by themselves. */
+const marksIn = (seen: string): number[] => [...seen.matchAll(/(?<![*_])\*\*(?![*_])/g)].map((each) => each.index);
+
+/**
+ * Which of a paragraph's marks make emphasis together, as Markdown pairs them: read from left to
+ * right, each mark that may close taken with the nearest before it that may open and is still
+ * waiting (those waiting between them are given up), and one that closes nothing left waiting if
+ * it may open. Told from the text as it is written, what stands beside each mark as a whole
+ * character. As pairs of the marks' numbers.
+ */
+function paired(text: string, marks: number[]): Set<string> {
+  const pairs = new Set<string>();
+  const waiting: number[] = [];
+  marks.forEach((at, n) => {
+    const before = [...text.slice(Math.max(0, at - 2), at)].at(-1);
+    const after = [...text.slice(at + 2, at + 4)][0];
+    const opens = holds(after, before);
+    const closes = holds(before, after);
+    if (closes && waiting.length > 0) pairs.add(`${waiting.pop()}-${n}`);
+    else if (opens) waiting.push(n);
+  });
+  return pairs;
+}
+
+/** One paragraph, with each `**…**` in it that certainly did not hold made to; left whole where it is not plain that nothing else changes. */
+function paragraph(text: string): string {
+  const seen = hidden(text);
+  // A backtick left over is a code span whose end is not on hand; a bracket left over, a link whose
+  // words, name or address (given here or defined elsewhere) cannot be told apart from prose. Left whole.
+  // So with a tilde: where it strikes words through, its marks are paired along with these.
+  if (/[`\[\]~]/.test(seen)) return text;
+  // The marks, taken two by two over the paragraph. An odd number of them, or any other asterisk in it, or an underscore
+  // that could be a mark (emphasis within emphasis, or beside it), and it is not plainly this case. (An underscore within
+  // a word, as in a name written with them, is no mark.)
+  const marks = marksIn(seen);
+  if (marks.length === 0 || marks.length % 2 === 1 || /\*|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/.test(seen.replace(/(?<![*_])\*\*(?![*_])/g, ""))) return text;
+  // What holds as it is written, by Markdown's own pairing.
+  const held = paired(text, marks);
+  let out = "";
+  let from = 0;
+  const made: string[] = [];
+  for (let n = 0; n < marks.length; n += 2) {
+    const [open, close] = [marks[n], marks[n + 1]];
+    const inside = text.slice(open + 2, close);
+    // Only two marks on one line that make nothing as they stand, on a line that is not indented far enough to be code
+    // somewhere (under a list item it may be).
+    const line = text.slice(text.lastIndexOf("\n", open) + 1, open);
+    const apart = inside.includes("\n") || held.has(`${n}-${n + 1}`) || /^(?: {0,3}> ?)*(?: {4}|\t| {0,3}\t)/.test(line);
+    // (What stands just outside each mark, as a whole character: one written with two units is one. The edge of a line is whitespace.)
+    const left = [...seen.slice(0, open)].at(-1);
+    const right = [...seen.slice(close + 2)][0];
+    const now = apart ? `**${inside}**` : mended(inside, seen.slice(open + 2, close), left === "\n" ? undefined : left, right === "\n" ? undefined : right);
+    if (now !== `**${inside}**`) made.push(`${n}-${n + 1}`);
+    out += text.slice(from, open) + now;
+    from = close + 2;
+  }
+  out += text.slice(from);
+  if (made.length === 0) return text;
+  // As mended, everything that held still holds between the same marks, and what was mended holds now: by the same
+  // pairing, read from the new text. Otherwise something else would have changed with it, and the paragraph is left as it was.
+  const after = marksIn(hidden(out));
+  if (after.length !== marks.length) return text;
+  const now = paired(out, after);
+  return [...held, ...made].every((each) => now.has(each)) && now.size === held.size + made.length ? out : text;
+}
+
+/** Whether a mark opens (with `inner` just inside it and `outer` just outside), or closes, by Markdown's rule; the edge of the line is whitespace. */
+const holds = (inner: string | undefined, outer: string | undefined): boolean =>
+  inner !== undefined && !SPACE.test(inner) && (!PUNCT.test(inner) || outer === undefined || SPACE.test(outer) || PUNCT.test(outer));
+
+/** What stands between two marks, with the marks (and what was moved outside them): as it was, unless it is plainly the case that is mended. */
+function mended(inside: string, seen: string, left: string | undefined, right: string | undefined): string {
+  const asWas = `**${inside}**`;
+  const chars = [...inside];
+  const shown = [...seen];
+  // (Code or a link right against a mark, inside or out: not looked into, so not plain.)
+  if (chars.length !== shown.length || chars.length === 0 || [left, right, shown[0], shown.at(-1)].includes(HIDDEN)) return asWas;
+  const opens = holds(shown[0], left);
+  const closes = holds(shown.at(-1), right);
+  if (opens && closes) return asWas;
+  // Only this: a mark with full-width punctuation just inside it and a word just outside. (Whitespace inside a mark is something else.)
+  if (SPACE.test(shown[0]) || SPACE.test(shown.at(-1)!)) return asWas;
+  if ((!opens && !WIDE.test(shown[0])) || (!closes && !WIDE.test(shown.at(-1)!))) return asWas;
+  const [first, last] = [chars[0], chars.at(-1)!];
+  const paired = PAIRS[first] === last && chars.length > 2;
+  let [lead, body, trail] = ["", chars, ""];
+  if (paired) [lead, body, trail] = [first, chars.slice(1, -1), last];
+  else if (OPENERS.includes(first) || CLOSERS.includes(first) || OPENERS.includes(last) || CLOSERS.includes(last)) {
+    // Half of a pair at one end, its other half not at the other: moving it would leave the pair half in, half out. But a
+    // mark that is no half of anything may still be moved at the other end, where the half stays inside and holds as it is.
+    if (!opens && (OPENERS.includes(first) || CLOSERS.includes(first))) return asWas;
+    if (!closes && (OPENERS.includes(last) || CLOSERS.includes(last))) return asWas;
+    if (!opens) [lead, body] = [first, chars.slice(1)];
+    if (!closes) [body, trail] = [body.slice(0, -1), last];
+  } else {
+    if (!opens) [lead, body] = [first, chars.slice(1)];
+    if (!closes) [body, trail] = [body.slice(0, -1), last];
+  }
+  // Marks that come in pairs: within what is emphasised now each has its other half, or it is not plain what was meant.
+  const depth: string[] = [];
+  for (const each of body) {
+    if (OPENERS.includes(each)) depth.push(PAIRS[each]);
+    else if (CLOSERS.includes(each) && depth.pop() !== each) return asWas;
+  }
+  if (depth.length > 0) return asWas;
+  // As mended, both marks hold; otherwise it is left as it was.
+  if (body.length === 0 || !holds(body[0], lead || left) || !holds(body.at(-1), trail || right)) return asWas;
+  return `${lead}**${body.join("")}**${trail}`;
+}

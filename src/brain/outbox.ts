@@ -72,6 +72,13 @@ export interface OutboxHost {
   readonly requests: Pick<Requests, "stampGuards" | "gate" | "endRequest" | "sessionKeyOf" | "readsOf" | "shown">;
 }
 
+/**
+ * The encoding a message is first sent with now. One whose sending began under an earlier one keeps
+ * that (see `OutboundMessage.encoding`): 1 was the first a connector could choose by; 2 is where a
+ * connector may put the words right as it writes them out (emphasis that would not have held).
+ */
+const WIRE = 2;
+
 export class Outbox implements Wakes {
   readonly #s: BrainStore;
   readonly #b: OutboxHost;
@@ -241,7 +248,7 @@ export class Outbox implements Wakes {
     // leaves a row that says "may have arrived", not one that looks untouched.
     // Its encoding is fixed now, before anything is sent: the current one for a first attempt, the
     // earlier one for a row whose sending began before there was a choice.
-    const wire = typeof row.wire === "number" ? row.wire : row.started ? 0 : 1;
+    const wire = typeof row.wire === "number" ? row.wire : row.started ? 0 : WIRE;
     this.#s.sql.exec("UPDATE outbox SET started = 1, uncertain = 1, first_attempt_at = COALESCE(first_attempt_at, ?), wire = ? WHERE id = ?", Date.now(), wire, row.id);
     try {
       // The time it was written goes along, so a retry looks for an earlier attempt in the same place every time.

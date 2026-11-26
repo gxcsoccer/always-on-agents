@@ -845,9 +845,21 @@ describe("the outbox, by itself", () => {
         // Begun under the earlier version: attempted, with no word back, and no encoding on record.
         set("msg:old", { started: 1, uncertain: 1, wire: null });
         await outbox.flush();
-        expect(delivered.map((each) => [each.message.idem, each.message.encoding])).toEqual([["msg:new", 1], ["msg:old", 0]]);
-        expect(row("msg:new").wire).toBe(1);
+        expect(delivered.map((each) => [each.message.idem, each.message.encoding])).toEqual([["msg:new", 2], ["msg:old", 0]]);
+        expect(row("msg:new").wire).toBe(2);
         expect(row("msg:old").wire).toBe(0);
+      });
+    });
+
+    it("stays what it was for a message whose first attempt went out under the one before, at every attempt after", async () => {
+      await within(async ({ outbox, row, set, delivered, store }) => {
+        outbox.enqueue("msg:mid", SESSION, null, "**标题：**正文", undefined, undefined, { authored: true });
+        set("msg:mid", { started: 1, uncertain: 1, wire: 1 });
+        await outbox.flush();
+        store.sql.exec("UPDATE outbox SET status = 'pending', next_at = 0 WHERE idem = 'msg:mid'");
+        await outbox.flush();
+        expect(delivered.map((each) => each.message.encoding)).toEqual([1, 1]);
+        expect(row("msg:mid").wire).toBe(1);
       });
     });
   });
