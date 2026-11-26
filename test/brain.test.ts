@@ -1902,6 +1902,20 @@ describe("records and limits", () => {
     // No sandbox at all for the tenant: a place cannot be had.
     await admin("PUT", { tenant_sandboxes: 0 });
     expect(await registry.acquireTaskSlot(tenant, "t-x")).toBe(false);
+    // A place taken more than once for one task, with a giving back in between: each taking has a lease, and a giving back that
+    // arrives late (after the place was given back and taken afresh) removes nothing; without a lease, whatever is there is given back.
+    const fourth = third;
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L1")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L1");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L2")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L1");
+    // Still held under L2: asking again for it finds it, and takes no second place.
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT lease FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([{ lease: "L2" }]);
+    await registry.releaseTaskSlot("t-lease", "L2");
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(true);
+    await registry.releaseTaskSlot("t-lease");
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
 
     // A day of nothing: no call may begin, asked with something to set aside or with nothing ("may another begin?").
     const other = `${tenant}-zero`;
