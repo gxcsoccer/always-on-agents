@@ -193,7 +193,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     }
     const items = found.items.filter((each) => typeof each.repository_url === "string" && each.repository_url.toLowerCase() === `https://api.github.com/repos/${own}`);
     await this.#task.noteGithubRead(answer.status, found.incomplete_results === true);
-    return passed(answer, JSON.stringify({ ...found, items }));
+    // The count is of what was found before that: less by what was taken out, so it does not promise pages that will come back empty.
+    const total = typeof (found as { total_count?: unknown }).total_count === "number" ? { total_count: Math.max(items.length, (found as { total_count: number }).total_count - (found.items.length - items.length)) } : {};
+    return passed(answer, JSON.stringify({ ...found, ...total, items }));
   }
 
   /**

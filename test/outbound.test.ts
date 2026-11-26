@@ -328,7 +328,8 @@ describe("GitHub's API over the proxy", () => {
     expect(sent.searchParams.get("per_page")).toBe("50");
     expect(sent.searchParams.get("sort")).toBe("updated");
     expect(forwarded[0].headers.get("authorization")).toBe("Bearer test-read-token");
-    const body = (await answer.json()) as { items: { number: number }[]; incomplete_results: boolean };
+    const body = (await answer.json()) as { items: { number: number }[]; incomplete_results: boolean; total_count: number };
+    expect(body.total_count).toBe(2);
     expect(body.items.map((each) => each.number)).toEqual([1, 3]);
     expect(body.incomplete_results).toBe(true);
     expect(answer.headers.get("link")).toContain('rel="next"');
