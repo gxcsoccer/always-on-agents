@@ -210,9 +210,9 @@ describe("timers and memory", () => {
 
     // It ends without having read one of them: the step that tells of its ending is told so.
     model.replies([call("send_message", { text: "修好了；页脚那句它没来得及看到。" })], [say("")]);
-    await stub.taskEvent(id, 1, "result", { text: "Fixed.", notes_not_read: [{ id: "x", text: "also fix the footer while you are there" }] });
+    await stub.taskEvent(id, 1, "result", { text: "Fixed.", notes_not_read: [{ id: "x", at: Date.now() }] });
     await wake(stub);
-    expect(modelCalls.some((each: any) => JSON.stringify(each.input).includes("did NOT reach it before it ended"))).toBe(true);
+    expect(modelCalls.some((each: any) => JSON.stringify(each.input).includes("could not be confirmed to have reached it before it ended"))).toBe(true);
   });
 
   it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {

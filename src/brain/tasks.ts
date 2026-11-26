@@ -650,9 +650,15 @@ export class Tasks implements Wakes {
       throw new Error("the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
     }
     if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
-    const answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
-    if (answer.state === "closed") return { ok: false, work_id: taskId, state: "closed", note: "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did." };
-    if (this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length === 0) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
+    // Something new is added only to work that is at it. For work that has ended, a call made again is
+    // told what it was told when it was first made (kept here, with the record of its being passed on);
+    // a call never made before is told that nothing more is taken, and the worker is not asked at all.
+    const passed = this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length > 0;
+    const closed = { ok: false, work_id: taskId, state: "closed", note: "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did." };
+    if (TERMINAL_TASK.has(String(task.status)) && !passed) return closed;
+    const answer = passed && TERMINAL_TASK.has(String(task.status)) ? ({ state: "taken" } as const) : await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+    if (answer.state === "closed") return closed;
+    if (!passed) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
     // Read again after the wait.
     const now = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
     return {
@@ -1244,7 +1250,10 @@ function renderEnding(task: Row, kind: WorkerEventKind, body: Record<string, unk
  */
 function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
   const told = renderEnding(task, kind, body);
-  const unread = Array.isArray(body.notes_not_read) ? (body.notes_not_read as { text?: unknown }[]).map((note) => String(note?.text ?? "").slice(0, 500)).filter((text) => text !== "") : [];
+  // Only how many, and when: what they said stays with whoever said it. This goes into the
+  // conversation's own record, which everyone there shares.
+  const unread = Array.isArray(body.notes_not_read) ? (body.notes_not_read as { at?: unknown }[]) : [];
   if (unread.length === 0) return told;
-  return `${told}\nWhat was added to it while it was at work and did NOT reach it before it ended (it took no account of this; tell the person so, and ask whether they still want it done, as something that goes on from this piece):\n${unread.map((text) => `- ${JSON.stringify(text)}`).join("\n")}`;
+  const when = unread.map((note) => (typeof note?.at === "number" ? new Date(note.at).toISOString().slice(11, 16) : "")).filter((at) => at !== "");
+  return `${told}\n${unread.length === 1 ? "One thing" : `${unread.length} things`} added to it while it was at work could not be confirmed to have reached it before it ended${when.length > 0 ? ` (added at ${when.join(", ")} UTC)` : ""}: take it that the work took no account of ${unread.length === 1 ? "it" : "them"}. Tell the person whose work it was, and ask whether they still want it done, as something that goes on from this piece. Do not repeat here what was added.`
 }

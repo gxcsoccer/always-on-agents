@@ -124,10 +124,11 @@ export interface TaskState {
   follows?: string;
   /**
    * What its person said to it while it was at work, each by the id it was given with. Kept until
-   * the task has ended. `held`: the agent's session was seen to hold it (by the session's own
-   * word, when it fetched): until then it is taken, not read.
+   * the task has ended. `held`: the run of the agent whose session was seen to hold it (by that
+   * session's own word, when it fetched). It counts only for the run the task has now: a session
+   * restored from an earlier copy may not hold it, and has to say so again.
    */
-  notes?: { id: string; text: string; at: number; held?: true }[];
+  notes?: { id: string; text: string; at: number; held?: string }[];
   /** Ids of notes that came when no more were being taken: told so then, and told the same if asked again. */
   notes_refused?: string[];
   /** Which process of the agent is the task's now: set before that process is started, and given to it. Fetches of notes by any other are not answered. */
@@ -530,22 +531,21 @@ export class TaskSandbox extends DurableObject<Env> {
       const have = new Set(Array.isArray(asked.have) ? asked.have.filter((id): id is string => typeof id === "string").slice(0, 200) : []);
       let changed = false;
       for (const note of state.notes ?? []) {
-        if (have.has(note.id) && !note.held) {
-          note.held = true;
+        if (have.has(note.id) && note.held !== state.run) {
+          note.held = state.run;
           changed = true;
         }
       }
       let missing = (state.notes ?? []).filter((note) => !have.has(note.id));
-      if (asked.final === true) {
-        // At its last fetch, with nothing left for another step (its calls to the model used up, or its
-        // life over): nothing is handed out. A task that has done its work is not made to fail by a step it cannot take.
-        const spent = (state.model_calls ?? 0) >= (state.bounds?.model_calls ?? MAX_MODEL_CALLS_PER_TASK) || Date.now() - state.created_at > lifetimeOf(state);
-        if (spent) missing = [];
-        // Nothing to give: from here no more are taken for this process (those that come are told so, and can be put after it instead).
-        if (missing.length === 0) {
-          state.notes_closed = state.run;
-          changed = true;
-        }
+      // A note brought in makes the agent take one more step. With nothing left for a step (its calls
+      // to the model used up, or its life over) none is handed out, at any fetch: work that is done,
+      // or as good as, is not made to fail by a step it cannot take. What was not handed out is said with the ending.
+      const spent = (state.model_calls ?? 0) >= (state.bounds?.model_calls ?? MAX_MODEL_CALLS_PER_TASK) || Date.now() - state.created_at > lifetimeOf(state);
+      if (spent) missing = [];
+      // At its last fetch with nothing to give: from here no more are taken for this process (those that come are told so, and can be put after it instead).
+      if (asked.final === true && missing.length === 0 && state.notes_closed !== state.run) {
+        state.notes_closed = state.run;
+        changed = true;
       }
       if (changed) this.#save(state);
       return { ok: true, notes: missing.map((note) => ({ id: note.id, text: note.text })) };
@@ -869,7 +869,9 @@ export class TaskSandbox extends DurableObject<Env> {
     state.out_seq += 1;
     // However it ends, what was said to it and was not seen to have reached its session is told with the
     // ending: taken is not read, and what was not read is never passed over in silence.
-    const unread = kind === "result" || kind === "failed" || kind === "lost" ? (state.notes ?? []).filter((note) => !note.held).map((note) => ({ id: note.id, text: note.text.slice(0, 500) })) : [];
+    // (By the run it has now: what an earlier run's session held says nothing of this one's. And without
+    // the words themselves: they stay with the task; whose they were knows them, and nobody else is shown them.)
+    const unread = kind === "result" || kind === "failed" || kind === "lost" ? (state.notes ?? []).filter((note) => note.held === undefined || note.held !== state.run).map((note) => ({ id: note.id, at: note.at })) : [];
     state.out.push({ seq: state.out_seq, kind, body: unread.length > 0 ? { ...body, notes_not_read: unread } : body });
   }
 
@@ -1053,6 +1055,10 @@ export class TaskSandbox extends DurableObject<Env> {
     before.grants = {};
     before.phase = "starting";
     before.starting_since = started;
+    // The process that was the task's is gone: from this very write nothing it still asks is answered,
+    // and notes are taken again, for the process that comes (which gets a run of its own when it is started).
+    before.run = crypto.randomUUID();
+    before.notes_closed = undefined;
     before.inbox.push({ at: started, kind: "recovering", body: { message: `from checkpoint taken ${Math.round((started - before.checkpoint.at) / 1000)}s ago` } });
     this.#save(before);
     try {

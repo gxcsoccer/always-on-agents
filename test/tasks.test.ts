@@ -814,10 +814,16 @@ describe("tasks, by themselves", () => {
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "one more thing")).toMatchObject({ ok: false, state: "closed", note: expect.stringContaining("put it after that piece") });
           expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(written);
           expect(audited("task.told")).toEqual([]);
-          // A call that was taken, made again after the work has ended, is told what became of it: the worker knows.
-          await tasks.event(a.task_id, 1, "result", { text: "done" });
+          // A call that was passed on while the work was at it, made again after the work has ended, is told what it was told then;
+          // one never made before is told that nothing more is taken. The worker is asked neither time.
           worker.tell = async () => ({ state: "taken" });
+          await tasks.tell(RUN, SESSION_KEY, "call_t0", a.task_id, "said earlier");
+          await tasks.event(a.task_id, 1, "result", { text: "done" });
+          const asked = worker.told.length;
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t0", a.task_id, "said earlier")).toMatchObject({ ok: true, state: "taken" });
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_new", a.task_id, "said after it ended")).toMatchObject({ ok: false, state: "closed" });
+          expect(worker.told).toHaveLength(asked);
+          expect(audited("task.told")).toHaveLength(1);
 
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           store.sql.exec("UPDATE tasks SET status = 'needs_input' WHERE id = ?", b.task_id);
@@ -833,15 +839,16 @@ describe("tasks, by themselves", () => {
       it("has what did not reach the work told with its ending, in so many words", async () => {
         await within(async ({ tasks, events }) => {
           const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
-          await tasks.event(a.task_id, 1, "result", { text: "Fixed the build.", notes_not_read: [{ id: "call_t1", text: "also fix the footer" }] });
+          await tasks.event(a.task_id, 1, "result", { text: "Fixed the build.", notes_not_read: [{ id: "call_t1", at: Date.UTC(2026, 10, 26, 4, 5) }] });
           const told = events().at(-1)!.text as string;
           expect(told).toContain("finished. The worker's own summary (unverified): Fixed the build.");
-          expect(told).toContain("did NOT reach it before it ended");
-          expect(told).toContain('- "also fix the footer"');
+          expect(told).toContain("One thing added to it while it was at work could not be confirmed to have reached it before it ended (added at 04:05 UTC)");
+          // How many and when, never what: this is the conversation's record, which everyone there shares.
+          expect(told).toContain("Do not repeat here what was added");
           // Nothing of the kind where everything was read.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           await tasks.event(b.task_id, 1, "result", { text: "ok" });
-          expect(events().at(-1)!.text).not.toContain("did NOT reach");
+          expect(events().at(-1)!.text).not.toContain("could not be confirmed");
         });
       });
     });
