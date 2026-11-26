@@ -89,7 +89,8 @@ export function prose(text: string, change: (passage: string) => string): string
 
 /** Punctuation and whitespace as Markdown's rule for emphasis takes them (the start and the end of a line count as whitespace). */
 const PUNCT = /[\p{P}\p{S}]/u;
-const SPACE = /\s/u;
+/** (Markdown's own set: the separators that are spaces, a tab, the ends of lines. Other things a pattern would call space are not.) */
+const SPACE = /[\p{Zs}\t\n\f\r]/u;
 /** Full-width punctuation: what is written right against the words in Chinese and Japanese, with no space after it. */
 const WIDE = /[、-〿！-／：-＠［-｀｛-･‘’“”…—]/;
 /** Marks that come in pairs: one of them is never moved without the other. */
@@ -147,7 +148,8 @@ export function emphasised(text: string): string {
       // (Markup of another kind anywhere on a line: a tag with what it says of itself, a block in which nothing is Markdown.)
       flush();
       return [...out, ...all.slice(n)].join("\n");
-    } else if (line.trim() === "") {
+    } else if (/^[ \t]*$/.test(line)) {
+      // (A blank line as Markdown has it: nothing, or spaces and tabs. A line of some other space is a line of the paragraph.)
       flush();
       out.push(line);
     } else lines.push(line);

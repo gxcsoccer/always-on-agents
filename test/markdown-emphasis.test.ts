@@ -127,6 +127,9 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "**第一段\n尾**（旁注）**新段\n结束**",
     // Words struck through in the same paragraph: their marks are paired along with these.
     "~~旧的~~ **标题：**正文",
+    // What a pattern would call space and Markdown does not: no edge for a mark, and no blank line.
+    "文**：甲**乙\u2028**丙**",
+    "`第一行\n\u00a0\n**标题：**正文\n\u00a0\n最后一行`",
     // Mending one would undo emphasis that holds between other marks.
     "正文**：注**后文**尾**",
     "[r]: /guide/**标题：**正文",
