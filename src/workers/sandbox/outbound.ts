@@ -229,10 +229,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // taken out; the content itself, which the task was given anyway, stays.
       // Only where it is that description (JSON) that was asked for: asked for as the file itself, the bytes are passed on as they are, whatever they hold.
       if (token && answer.ok && request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/(?:contents|readme|license)(?:\/|$)/i.test(url.pathname) && /^application\/json\b/i.test(answer.headers.get("content-type") ?? "")) {
-        const text = await answer.text();
         let listed: unknown;
         try {
-          listed = JSON.parse(text);
+          // (Reading it can fail too, part of the way through: the same as not being able to read it.)
+          listed = JSON.parse(await answer.text());
         } catch {
           // Counted as what the guest is told: not as a read that went well.
           await this.#task.noteGithubRead(kind, 502, {});
@@ -262,7 +262,9 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // first page can say, by GitHub's own count of none (a page past the last is empty too, of a search that found plenty).
     const more = /rel="next"/.test(answer.headers.get("link") ?? "");
     const first = (url.searchParams.get("page") ?? "1") === "1";
-    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0 });
+    // Which search it was a page of: the same query, sorted and cut into pages the same way. So that it can be told, of each search, whether it was read to its end.
+    const of = ["q", "sort", "order", "per_page"].map((name) => target.searchParams.get(name) ?? "").join("\n");
+    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0, of, page: Number(url.searchParams.get("page") ?? "1") || 1 });
     const { total_count: total, ...rest } = found;
     return passed(answer, JSON.stringify({ ...rest, ...(mixed ? {} : { total_count: total }), incomplete_results: incomplete, items }));
   }

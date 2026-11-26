@@ -362,6 +362,10 @@ describe("GitHub's API over the proxy", () => {
     answers.push(() => new Response("{not json", json));
     expect((await broken.send("https://api.github.com/repos/acme/demo/contents/a.txt")).status).toBe(502);
     expect(await broken.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
+    // Nor one that breaks off while it is being read.
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => (controller.enqueue(new TextEncoder().encode('{"name":')), controller.error(new Error("reset"))) }), json));
+    expect((await broken.send("https://api.github.com/repos/acme/demo/contents/a.txt")).status).toBe(502);
+    expect(await broken.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }, { kind: "other", status: 502 }]);
     // Read with no credential it is what anyone is told.
     const open = await proxyFor({ repository: "acme/demo", unlent: true });
     answers.push(() => Response.json({ name: "a.txt", download_url: "https://raw.githubusercontent.com/acme/demo/main/a.txt" }, json));
@@ -426,6 +430,9 @@ describe("GitHub's API over the proxy", () => {
     // None at all, known to be all there is: the first page, counted none by GitHub.
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await (await send(search("nothing like it"))).json()).toEqual({ total_count: 0, incomplete_results: false, items: [] });
+    // Which search each page was of, and which page: the same search for the pages of "dst", another for the other words.
+    const pages = await recorded("searchPage");
+    expect(pages.map((each: any) => [each.of.split("\n")[0], each.page, each.more])).toEqual([["repo:acme/demo dst", 1, true], ["repo:acme/demo dst", 2, false], ["repo:acme/demo dst", 3, false], ["repo:acme/demo dst", 1, false], ["repo:acme/demo nothing like it", 2, false], ["repo:acme/demo nothing like it", 1, false]]);
     // The first page, with more after it; the last; and one that was all there is and held nothing.
     expect(await recorded("noteGithubRead")).toEqual([
       { kind: "search", status: 200, read: true, more: true },

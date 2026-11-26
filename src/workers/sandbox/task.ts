@@ -121,7 +121,19 @@ export interface TaskState {
    * there were others; `none`, pages that were all there is and held nothing; `incomplete`, ones
    * answered and not known to be complete (one refused or never answered is in its status alone). "Looked and found none" is `none` with nothing incomplete or failed.
    */
-  github_reads?: { search: { by_status: Record<string, number>; read: number; more: number; none: number; incomplete: number }; other: { by_status: Record<string, number> } };
+  github_reads?: {
+    search: {
+      by_status: Record<string, number>;
+      read: number;
+      more: number;
+      none: number;
+      incomplete: number;
+      /** Each search by itself (the same query, sorted and paged the same way): which of its pages were read, whether one of them was its last, whether any was not complete. No more than a few dozen are told apart; `others` says there were more. */
+      each?: Record<string, { pages: number[]; last: boolean; incomplete: boolean }>;
+      others?: true;
+    };
+    other: { by_status: Record<string, number> };
+  };
   /** When the current `starting` phase began. Startup is timed from here, not from task creation. */
   starting_since: number;
   /** Reports not yet acknowledged by the Brain, in order. Delivered at least once. */
@@ -257,6 +269,8 @@ const TASK_SCRIPT = `echo $$ >${PID_PATH}
 code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
+
+const MAX_SEARCHES_TOLD_APART = 40;
 
 const SYSTEM_PROMPT = `You are running unattended inside a sandbox; nobody is watching the terminal.
 Your final answer is the result of the task. It goes to the agent that gave you the task, which tells people; you cannot message anyone, post comments or open pull requests yourself, so put everything they need in that answer. Aim for under 6,000 characters, most important first: beyond ${MAX_RESULT_TEXT.toLocaleString("en-US")} it is cut off.
@@ -731,13 +745,23 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
-  async noteGithubRead(kind: "search" | "other", status: number, seen: { incomplete?: boolean; read?: boolean; more?: boolean; none?: boolean }): Promise<void> {
+  async noteGithubRead(kind: "search" | "other", status: number, seen: { incomplete?: boolean; read?: boolean; more?: boolean; none?: boolean; of?: string; page?: number }): Promise<void> {
     const state = this.#state();
     if (!state) return;
     const reads = state.github_reads ?? { search: { by_status: {}, read: 0, more: 0, none: 0, incomplete: 0 }, other: { by_status: {} } };
     const key = status === 0 ? "failed" : String(status);
     reads[kind].by_status[key] = (reads[kind].by_status[key] ?? 0) + 1;
     if (kind === "search") for (const each of ["incomplete", "read", "more", "none"] as const) if (seen[each]) reads.search[each] += 1;
+    if (kind === "search" && seen.read && seen.of !== undefined) {
+      const each = (reads.search.each ??= {});
+      if (!(seen.of in each) && Object.keys(each).length >= MAX_SEARCHES_TOLD_APART) reads.search.others = true;
+      else {
+        const one = (each[seen.of] ??= { pages: [], last: false, incomplete: false });
+        if (!one.pages.includes(seen.page ?? 1) && one.pages.length < 200) one.pages.push(seen.page ?? 1);
+        if (!seen.more) one.last = true;
+        if (seen.incomplete) one.incomplete = true;
+      }
+    }
     state.github_reads = reads;
     this.#save(state);
   }
