@@ -54,7 +54,7 @@ function bench(state: DurableObjectState) {
     fateOf: (async () => "none") as (noteId: string) => Promise<"taken" | "closed" | "none">,
     /** What the sandbox was told for a task at work, and what it says to that. */
     told: [] as [string, { id: string; text: string }][],
-    tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" }>,
+    tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" } | { state: "refused"; error: string }>,
     /** Tasks the sandbox has already taken, by id, as they stand there. */
     took: {} as Record<string, { phase: string; error?: string }>,
     /** What a task left for a later one to go on from, by task id; nothing for one that left nothing or whose leavings are gone. */
@@ -833,11 +833,10 @@ describe("tasks, by themselves", () => {
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           store.sql.exec("UPDATE tasks SET status = 'needs_input' WHERE id = ?", b.task_id);
           expect(((await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "do not push yet")) as { note: string }).note).toContain("does not take back what it is waiting to do");
-          // A worker that cannot be told anything.
-          worker.tell = async () => {
-            throw new Error("too long");
-          };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("too long");
+          // Turned away by the worker for a reason of its own: said as that, and nothing is kept as perhaps taken.
+          worker.tell = async () => ({ state: "refused", error: "that is too long to add" });
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("nothing was added: that is too long to add");
+          expect(store.rows("SELECT 1 FROM task_notes WHERE call_id = 'call_t3'")).toEqual([]);
         });
       });
 
@@ -848,7 +847,7 @@ describe("tasks, by themselves", () => {
           worker.tell = async () => {
             throw new Error("connection reset");
           };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).rejects.toThrow("it may or may not have been taken. Do not send it again as something new");
           expect(store.rows("SELECT state FROM task_notes WHERE call_id = 'call_t1'")).toEqual([{ state: "sent" }]);
           // The work ends. The call is made again: asked what became of it, not sent again.
           await tasks.event(a.task_id, 1, "result", { text: "done" });
@@ -864,13 +863,13 @@ describe("tasks, by themselves", () => {
 
           // One the worker never had: nothing was added, said as that.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("may or may not have been taken");
           await tasks.event(b.task_id, 1, "result", { text: "done" });
           worker.fateOf = async () => "none";
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).toMatchObject({ ok: false, state: "closed" });
           // One whose fate cannot be found out: said to be not known, with no advice to do it over.
           const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("may or may not have been taken");
           await tasks.event(c.task_id, 1, "result", { text: "done" });
           worker.fateOf = async () => {
             throw new Error("unreachable");
@@ -878,7 +877,7 @@ describe("tasks, by themselves", () => {
           await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("may or may not have been taken into account; do not hand it over again on a guess");
           // While the work is still at it, the same call made again is simply sent again by its id.
           const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null })) as { task_id: string };
-          await expect(tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).rejects.toThrow("connection reset");
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).rejects.toThrow("may or may not have been taken");
           worker.tell = async () => ({ state: "taken" });
           expect(await tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).toMatchObject({ ok: true, state: "taken" });
         });
@@ -903,6 +902,11 @@ describe("tasks, by themselves", () => {
           expect(told).toContain("One thing added to it while it was at work could not be confirmed to have reached it before it ended (added at 04:05 UTC)");
           // How many and when, never what: this is the conversation's record, which everyone there shares.
           expect(told).toContain("Do not repeat here what was added");
+          // Of work that did not end well, nothing is said of going on from it (it cannot be gone on from).
+          const f = (await tasks.dispatch(RUN, SESSION_KEY, "call_f", "sandbox", "F", "f", { repository: null })) as { task_id: string };
+          await tasks.event(f.task_id, 1, "failed", { error: "boom", notes_not_read: [{ id: "x", at: 1 }] });
+          expect(events().at(-1)!.text).toContain("could not be confirmed to have reached it");
+          expect(events().at(-1)!.text).not.toContain("goes on from this piece");
           // Nothing of the kind where everything was read.
           const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
           await tasks.event(b.task_id, 1, "result", { text: "ok" });

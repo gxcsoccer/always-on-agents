@@ -696,7 +696,18 @@ export class Tasks implements Wakes {
         if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
         // Written down before it is sent: an answer that is lost leaves this, and the call made again goes by it.
         if (!kept) this.#s.sql.exec("INSERT INTO task_notes (call_id, task_id, state, at) VALUES (?, ?, 'sent', ?)", callId, taskId, Date.now());
-        const answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+        let answer: { state: "taken" } | { state: "closed" } | { state: "refused"; error: string };
+        try {
+          answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+        } catch {
+          // Sent, and no answer: it may have been taken. Said as exactly that; the record stays as sent, and this same call made again finds out.
+          throw new Error("this was sent to the work and no answer came back: it may or may not have been taken. Do not send it again as something new, and do not hand it over as another piece of work, on a guess. Tell the person it was passed on but could not be confirmed; if it did not reach the work, that will be said when the work ends");
+        }
+        if (answer.state === "refused") {
+          // Not taken, for a reason of its own: nothing is owed an answer later.
+          this.#s.sql.exec("DELETE FROM task_notes WHERE call_id = ? AND state = 'sent'", callId);
+          throw new Error(`nothing was added: ${answer.error}`);
+        }
         settle(answer.state);
         if (answer.state === "closed") return closed;
       }
@@ -1324,5 +1335,5 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   const unread = Array.isArray(body.notes_not_read) ? (body.notes_not_read as { at?: unknown }[]) : [];
   if (unread.length === 0) return told;
   const when = unread.map((note) => (typeof note?.at === "number" ? new Date(note.at).toISOString().slice(11, 16) : "")).filter((at) => at !== "");
-  return `${told}\n${unread.length === 1 ? "One thing" : `${unread.length} things`} added to it while it was at work could not be confirmed to have reached it before it ended${when.length > 0 ? ` (added at ${when.join(", ")} UTC)` : ""}: take it that the work took no account of ${unread.length === 1 ? "it" : "them"}. Tell the person whose work it was, and ask whether they still want it done, as something that goes on from this piece. Do not repeat here what was added.`
+  return `${told}\n${unread.length === 1 ? "One thing" : `${unread.length} things`} added to it while it was at work could not be confirmed to have reached it before it ended${when.length > 0 ? ` (added at ${when.join(", ")} UTC)` : ""}: take it that the work took no account of ${unread.length === 1 ? "it" : "them"}. Tell the person whose work it was, and ask whether they still want it done${kind === "result" ? ", as something that goes on from this piece" : ""}. Do not repeat here what was added.`
 }
