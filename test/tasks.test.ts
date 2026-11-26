@@ -49,6 +49,9 @@ function bench(state: DurableObjectState) {
     /** Set to have the sandbox give no answer to being stopped. */
     cancelFails: false,
     /** Something that happens while the sandbox is being asked to stop. */
+    /** What the sandbox says became of a note, when asked without being given anything. */
+    fates: [] as string[],
+    fateOf: (async () => "none") as (noteId: string) => Promise<"taken" | "closed" | "none">,
     /** What the sandbox was told for a task at work, and what it says to that. */
     told: [] as [string, { id: string; text: string }][],
     tell: (async () => ({ state: "taken" })) as (taskId: string, note: { id: string; text: string }) => Promise<{ state: "taken" } | { state: "closed" }>,
@@ -64,7 +67,7 @@ function bench(state: DurableObjectState) {
     answer: (async (decision: "allow" | "deny") => ({ ok: true, decision })) as (...args: any[]) => Promise<any>,
     fate: {} as Record<string, unknown>,
   };
-  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
+  const slots = { leases: [] as [string, string, string | undefined][], acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
   const amended: unknown[][] = [];
   const background: Promise<unknown>[] = [];
   const woken: number[] = [];
@@ -82,6 +85,7 @@ function bench(state: DurableObjectState) {
       },
       snapshot: async () => worker.left[taskId] ?? null,
       tell: async (note: { id: string; text: string }) => (worker.told.push([taskId, note]), worker.tell(taskId, note)),
+      told: async (noteId: string) => (worker.fates.push(noteId), worker.fateOf(noteId)),
       status: async () => worker.took[taskId] ?? { error: "no such task" },
       claimed: async () => {
         worker.asked.push(taskId);
@@ -109,8 +113,8 @@ function bench(state: DurableObjectState) {
     },
     registry: () =>
       ({
-        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.acquire()),
-        releaseTaskSlot: async (taskId: string) => (await slots.release(), void slots.released.push(taskId)),
+        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number, lease?: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.leases.push(["take", taskId, lease]), slots.acquire()),
+        releaseTaskSlot: async (taskId: string, lease?: string) => (await slots.release(), slots.leases.push(["back", taskId, lease]), void slots.released.push(taskId)),
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
     deciders: () => settings.deciders,
@@ -780,11 +784,12 @@ describe("tasks, by themselves", () => {
           expect(worker.told).toEqual([[a.task_id, { id: "call_t1", text: "also fix the footer" }]]);
           // Recorded without what was said.
           expect(audited("task.told")).toEqual([{ actor: "alice", task_id: a.task_id, call: "call_t1", length: 19 }]);
-          // The same call made again: asked of the worker by the same id, and recorded once.
-          await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also fix the footer");
-          expect(worker.told).toHaveLength(2);
-          expect(worker.told[1][1].id).toBe("call_t1");
+          // The same call made again: what became of it is known here; it is not sent again, and is recorded once.
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also fix the footer")).toMatchObject({ ok: true, state: "taken" });
+          expect(worker.told).toHaveLength(1);
           expect(audited("task.told")).toHaveLength(1);
+          // And not for another piece of work.
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", "t_other", "x")).rejects.toThrow();
 
           // Not someone else's, not in a step that is nobody's own, not from another conversation, not one there is none of.
           const before = worker.told.length;
@@ -833,6 +838,59 @@ describe("tasks, by themselves", () => {
             throw new Error("too long");
           };
           await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", b.task_id, "x")).rejects.toThrow("too long");
+        });
+      });
+
+      it("does not say that nothing was added when the work took it and only the answer was lost: made again after the work ended, the call is told what became of it, and nothing is sent again", async () => {
+        await within(async ({ tasks, worker, audited, store }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
+          // The worker takes it; the answer never gets back.
+          worker.tell = async () => {
+            throw new Error("connection reset");
+          };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).rejects.toThrow("connection reset");
+          expect(store.rows("SELECT state FROM task_notes WHERE call_id = 'call_t1'")).toEqual([{ state: "sent" }]);
+          // The work ends. The call is made again: asked what became of it, not sent again.
+          await tasks.event(a.task_id, 1, "result", { text: "done" });
+          const sent = worker.told.length;
+          worker.fateOf = async () => "taken";
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer")).toMatchObject({ ok: true, state: "taken" });
+          expect(worker.told).toHaveLength(sent);
+          expect(worker.fates).toEqual(["call_t1"]);
+          expect(audited("task.told")).toHaveLength(1);
+          // And from then on it is known here: the worker is not asked again.
+          await tasks.tell(RUN, SESSION_KEY, "call_t1", a.task_id, "also the footer");
+          expect(worker.fates).toHaveLength(1);
+
+          // One the worker never had: nothing was added, said as that.
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null })) as { task_id: string };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).rejects.toThrow("connection reset");
+          await tasks.event(b.task_id, 1, "result", { text: "done" });
+          worker.fateOf = async () => "none";
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t2", b.task_id, "x")).toMatchObject({ ok: false, state: "closed" });
+          // One whose fate cannot be found out: said to be not known, with no advice to do it over.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null })) as { task_id: string };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("connection reset");
+          await tasks.event(c.task_id, 1, "result", { text: "done" });
+          worker.fateOf = async () => {
+            throw new Error("unreachable");
+          };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t3", c.task_id, "x")).rejects.toThrow("may or may not have been taken into account; do not hand it over again on a guess");
+          // While the work is still at it, the same call made again is simply sent again by its id.
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null })) as { task_id: string };
+          await expect(tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).rejects.toThrow("connection reset");
+          worker.tell = async () => ({ state: "taken" });
+          expect(await tasks.tell(RUN, SESSION_KEY, "call_t4", d.task_id, "x")).toMatchObject({ ok: true, state: "taken" });
+        });
+      });
+
+      it("keeps and tells only which notes were not read and when, whatever a worker sends with its ending", async () => {
+        await within(async ({ tasks, kept, events }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", { repository: null })) as { task_id: string };
+          await tasks.event(a.task_id, 1, "result", { text: "ok", notes_not_read: [{ id: "n1", at: 5, text: "something private" }] });
+          expect(JSON.stringify(kept(a.task_id))).not.toContain("something private");
+          expect(JSON.stringify(await tasks.status(a.task_id))).not.toContain("something private");
+          expect(JSON.stringify(events())).not.toContain("something private");
         });
       });
 
@@ -1134,9 +1192,21 @@ describe("tasks, by themselves", () => {
           expect(kept(d.task_id).status).toBe("queued");
           expect(slots.released).toContain(d.task_id);
           const begun = worker.started.length;
+          // What was given back is the taking that was asked for (the same lease, however often it was asked); the next asking is another.
+          const of = slots.leases.filter((each) => each[1] === d.task_id);
+          const first = of.find((each) => each[0] === "take")![2];
+          expect(first).toMatch(/^[0-9a-f-]{36}$/);
+          expect(of.filter((each) => each[0] === "take").every((each) => each[2] === first)).toBe(true);
+          expect(of.find((each) => each[0] === "back")![2]).toBe(first);
+          store.setMeta("limits", JSON.stringify({ scope_active_tasks: 3 }));
+          due(store);
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("running");
+          const again = slots.leases.filter((each) => each[1] === d.task_id && each[0] === "take").at(-1)![2];
+          expect(again).not.toBe(first);
           await tasks.cancel(SESSION_KEY, d.task_id);
-          expect(worker.started).toHaveLength(begun);
           expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          void begun;
         });
       });
 

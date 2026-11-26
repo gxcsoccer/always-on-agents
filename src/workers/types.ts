@@ -79,6 +79,12 @@ export interface Worker {
    * A worker without this cannot be told anything once it is at work.
    */
   tell?(env: Env, id: string, note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" }>;
+  /**
+   * What became of a note given earlier with `tell`, by its id, without giving anything now:
+   * `taken`, `closed` (it was turned away), or `none` (the worker never had it). For finding out
+   * after an answer to `tell` was lost and the work has since ended. Needed by any worker that has `tell`.
+   */
+  told?(env: Env, id: string, noteId: string): Promise<"taken" | "closed" | "none">;
   /** Starts a piece of work. The same `work.id` again is the same piece of work, not a second one. */
   start?(env: Env, work: Work): Promise<Started>;
   /**

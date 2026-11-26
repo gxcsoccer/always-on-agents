@@ -513,6 +513,13 @@ export class TaskSandbox extends DurableObject<Env> {
     return { state: "taken" };
   }
 
+  /** What became of a note, by its id; changes nothing. */
+  async told(noteId: string): Promise<"taken" | "closed" | "none"> {
+    const state = this.#state();
+    if (state?.notes?.some((each) => each.id === noteId)) return "taken";
+    return state?.notes_refused?.includes(noteId) ? "closed" : "none";
+  }
+
   /** Called through Outbound when the container reports or asks. The reply goes back to the container. */
   async callback(kind: string, token: string, body: unknown): Promise<{ ok: boolean; decision?: string; reason?: string; notes?: { id: string; text: string }[] }> {
     const state = this.#state();
