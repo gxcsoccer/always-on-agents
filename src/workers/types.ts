@@ -69,6 +69,23 @@ export interface Worker {
    * with the hand-over tool; a worker that does not say so is never asked to.
    */
   goes_on?: true;
+  /**
+   * Hands a piece of work under way something more that its person says, to be taken into account
+   * from its next step on. `taken`: the worker has it and will bring it before its agent at the
+   * next point where that can be done (taken is not read: what was not read by the time the work
+   * ends is said in its ending). `closed`: this run of the work takes no more (it has ended, or is
+   * about to); it can be put after it instead. `refused`: it will not take this one, for the
+   * reason it gives (too long, too many). The same `note.id` again gets the same answer.
+   * Throwing means only that it is not known whether it was taken.
+   * A worker without this cannot be told anything once it is at work.
+   */
+  tell?(env: Env, id: string, note: { id: string; text: string }): Promise<{ state: "taken" } | { state: "closed" } | { state: "refused"; error: string }>;
+  /**
+   * What became of a note given earlier with `tell`, by its id, without giving anything now:
+   * `taken`, `closed` (it was turned away), or `none` (the worker still has its whole record of the work, and never had it). Where it can no longer say (its record is gone), it throws. For finding out
+   * after an answer to `tell` was lost and the work has since ended. Needed by any worker that has `tell`.
+   */
+  told?(env: Env, id: string, noteId: string): Promise<"taken" | "closed" | "none">;
   /** Starts a piece of work. The same `work.id` again is the same piece of work, not a second one. */
   start?(env: Env, work: Work): Promise<Started>;
   /**

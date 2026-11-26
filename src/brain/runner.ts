@@ -924,7 +924,7 @@ export class Runner {
       if (carrying.has(String(item.name))) return true;
       if (item.name === "hand_over") return acting.has(String(args(item).worker));
       // By its id: theirs unless it is a task, which is the conversation's.
-      if (item.name === "work_status" || item.name === "cancel_work") return !task(args(item).work_id);
+      if (item.name === "work_status" || item.name === "cancel_work" || item.name === "tell_work") return !task(args(item).work_id);
       if (item.name === "cancel_request") return carrying.has(String(this.#b.requests.record(String(args(item).request_id ?? ""))?.tool));
       return false;
     };
@@ -1214,7 +1214,7 @@ export class Runner {
     const workers = workersIn(acting, this.#b.toolsOf, this.#b.workers());
     const carrying = new Set(workers.flatMap((each) => (each.tool ? [each.tool] : [])));
     // (Nor where its worker is not among them: such a tool is a worker's way in and nothing else.)
-    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true })), carrying.size > 0 ? REPLACES : undefined);
+    const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined);
     const own = [...TOOLS, ...handing];
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     return all.filter((each) => this.mayUse(runId, each.name));

@@ -29,6 +29,7 @@ export interface ToolHost {
   handOver(callId: string, worker: string, title: string, brief: string, options: Record<string, unknown>, continueFrom: string | null, replaces: string | null): Promise<unknown>;
   workStatus(workId: string): Promise<unknown>;
   cancelWork(callId: string, workId: string): Promise<unknown>;
+  tellWork(callId: string, workId: string, message: string): Promise<unknown>;
   dispatchTask(callId: string, title: string, brief: string, repository: string | null): Promise<unknown>;
   taskStatus(taskId: string): Promise<unknown>;
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
@@ -121,7 +122,7 @@ export const TOOLS: ToolDefinition[] = [
  * parameters is written here. `worker` is one of them by name; each worker's own options are
  * parameters of `hand_over`, null for a worker they are not for. None where there is no worker.
  */
-export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean }[], replaces: unknown): ToolDefinition[] {
+export function workTools(workers: { name: string; description: string; acts_as: "agent" | "person"; options?: Record<string, unknown>; continues: boolean; tells?: boolean }[], replaces: unknown): ToolDefinition[] {
   // How work stands can be asked, and work stopped, also where nothing new can be handed over (a worker taken out of the deployment still has what it was given).
   const standing = [
     tool("work_status", "Look up how a piece of work you handed over stands.", { work_id: string }),
@@ -153,6 +154,16 @@ export function workTools(workers: { name: string; description: string; acts_as:
       },
     ),
     ...standing,
+    // Only where there is a worker that can be told something once it is at work.
+    ...(workers.some((each) => each.tells)
+      ? [
+          tool(
+            "tell_work",
+            `Add something the person says to a piece of work that is under way, so that it takes it into account from its next step on: a detail, a correction, something more on the same thing. It is passed on, not done: say so. Not for something that is to come after the work (hand that over to go on from it), nor to take back something it is waiting for approval to do (refuse that, or stop the work). Only ${workers.filter((each) => each.tells).map((each) => each.name).join(", ")} can be told.`,
+            { work_id: string, message: { type: "string", description: "What they said, in full and as they meant it: the worker has not seen this conversation." } },
+          ),
+        ]
+      : []),
   ];
 }
 
@@ -209,6 +220,8 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
       return host.workStatus(text(a.work_id, "work_id", 200));
     case "cancel_work":
       return host.cancelWork(call.call_id, text(a.work_id, "work_id", 200));
+    case "tell_work":
+      return host.tellWork(call.call_id, text(a.work_id, "work_id", 200), text(a.message, "message", 4_000));
     // The names work was handed over under before there was one set of tools: still carried out,
     // for a call made under them that is made again, and no longer offered.
     case "dispatch_task":

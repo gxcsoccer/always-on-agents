@@ -79,13 +79,15 @@ function fixture() {
     exec: async (_argv: string[]) => process,
   };
   const ctx = { storage: { kv, setAlarm: ok }, container, waitUntil: (work: Promise<unknown>) => void background.push(work), id: { name: "fixture" }, exports: { Outbound: () => ({}), DirectoryBackupGateway: {} } };
-  const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string) => void reported.push(kind) }) } };
+  const bodies: any[] = [];
+  const env = { BRAIN: { getByName: () => ({ taskEvent: async (_id: string, _seq: number, kind: string, body: unknown) => (bodies.push(body), void reported.push(kind)) }) } };
   restoring.now = undefined;
   Object.assign(backups, { taken: 0, restored: [], deleted: [], there: new Set<string>(), whileTaking: undefined, deleteFails: false });
   return {
     task: new TaskSandbox(ctx as never, env as never),
     container,
     reported,
+    bodies,
     background,
     records,
     process,
@@ -255,6 +257,203 @@ describe("a sandbox task started again from a checkpoint while its earlier run's
     expect(now.checkpoint?.final).toBeUndefined();
     expect(now.stale_checkpoints).toEqual([{ id: "taken-1" }]);
     expect(await task.snapshot()).toBeNull();
+  });
+});
+
+describe("a sandbox task that is told something while it is at work", () => {
+  /** As the agent's process would fetch: what it holds, and whether this is its last fetch. */
+  const fetch = (it: ReturnType<typeof fixture>, have: string[], final = false, run?: string) => {
+    const state = it.records.get("state");
+    return it.task.callback("notes", state.token, { run: run ?? state.run, have, final }) as Promise<{ ok: boolean; notes?: { id: string; text: string }[] }>;
+  };
+
+  it("takes it, hands it to the agent's process as often as that asks while its session does not hold it, and says the same to the same note again", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    const run = it.records.get("state").run;
+    expect(typeof run).toBe("string");
+    // The process was given which run it is.
+    expect(await it.task.tell({ id: "n1", text: "also the footer" })).toEqual({ state: "taken" });
+    expect(await it.task.tell({ id: "n1", text: "also the footer" })).toEqual({ state: "taken" });
+    expect(it.records.get("state").notes).toHaveLength(1);
+    // Fetched, and the answer lost: fetched again, it is there still.
+    expect(await fetch(it, [])).toEqual({ ok: true, notes: [{ id: "n1", text: "also the footer" }] });
+    expect(await fetch(it, [])).toEqual({ ok: true, notes: [{ id: "n1", text: "also the footer" }] });
+    expect(it.records.get("state").notes[0].held).toBeUndefined();
+    // Its session holds it: not given again, and known to have reached the session.
+    expect(await fetch(it, ["n1"])).toEqual({ ok: true, notes: [] });
+    expect(it.records.get("state").notes[0].held).toBe(run);
+    // The fetching leaves no trace in the record of what happened to the task.
+    expect(it.records.get("state").inbox.some((entry: any) => entry.kind === "notes")).toBe(false);
+    // Too long, or too many: turned away as that, with nothing dropped to make room.
+    expect(await it.task.tell({ id: "long", text: "x".repeat(4_001) })).toMatchObject({ state: "refused", error: expect.stringContaining("too long") });
+    for (let n = 2; n <= 20; n++) await it.task.tell({ id: `n${n}`, text: "more" });
+    expect(await it.task.tell({ id: "n21", text: "more" })).toMatchObject({ state: "refused", error: expect.stringContaining("put anything more after it") });
+    expect(it.records.get("state").notes).toHaveLength(20);
+  });
+
+  it("closes at the last fetch that has nothing to give, and not before: what comes first is given, what comes after is told that no more is taken", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    // A last fetch that has something to give does not close.
+    await it.task.tell({ id: "a", text: "A" });
+    expect(await fetch(it, [], true)).toEqual({ ok: true, notes: [{ id: "a", text: "A" }] });
+    expect(await it.task.tell({ id: "b", text: "B" })).toEqual({ state: "taken" });
+    // The answer with A was lost and the last fetch comes again: A and B, still open.
+    expect((await fetch(it, [], true)).notes?.map((note) => note.id)).toEqual(["a", "b"]);
+    // Both are in the session and nothing is left: closed. What comes now is told so, the same each time.
+    expect(await fetch(it, ["a", "b"], true)).toEqual({ ok: true, notes: [] });
+    expect(await it.task.tell({ id: "c", text: "C" })).toEqual({ state: "closed" });
+    expect(await it.task.tell({ id: "c", text: "C" })).toEqual({ state: "closed" });
+    expect(await it.task.tell({ id: "a", text: "A" })).toEqual({ state: "taken" });
+    expect(it.records.get("state").notes.map((note: any) => note.id)).toEqual(["a", "b"]);
+  });
+
+  it("answers only the process that is the task's now: one from before a recovery is given nothing and closes nothing; while it is being brought back, notes are taken", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    const old = it.records.get("state").run;
+    await it.task.tell({ id: "a", text: "A" });
+    // Its container is lost and it is being brought back: said meanwhile, taken.
+    const state = it.records.get("state");
+    state.phase = "starting";
+    state.run = "the-new-run";
+    it.records.set("state", state);
+    expect(await it.task.tell({ id: "b", text: "B" })).toEqual({ state: "taken" });
+    // The old process's last fetch comes late: nothing for it, and the run is not closed by it.
+    expect(await fetch(it, ["a", "b"], true, old)).toEqual({ ok: false });
+    expect(it.records.get("state").notes_closed).toBeUndefined();
+    expect(await it.task.tell({ id: "c", text: "C" })).toEqual({ state: "taken" });
+    // The new process, from a copy of the session that held A only: B and C.
+    state.phase = "running";
+    it.records.set("state", { ...it.records.get("state"), phase: "running" });
+    expect((await fetch(it, ["a"])).notes?.map((note) => note.id)).toEqual(["b", "c"]);
+  });
+
+  it("does not hand out a note at the last fetch when the task has no step left to take: it ends as it was going to, and says the note was not read", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain", bounds: { model_calls: 3 } });
+    it.records.set("state", { ...it.records.get("state"), model_calls: 3 });
+    await it.task.tell({ id: "late", text: "one more thing" });
+    // Not at a fetch after a step either: bringing it in would make the agent take a step it cannot take.
+    expect(await fetch(it, [])).toEqual({ ok: true, notes: [] });
+    expect(it.records.get("state").notes_closed).toBeUndefined();
+    expect(await fetch(it, [], true)).toEqual({ ok: true, notes: [] });
+    expect(await it.task.tell({ id: "later", text: "x" })).toEqual({ state: "closed" });
+    ended(it.container, { code: "0", events: DONE });
+    await it.task.alarm();
+    await Promise.all(it.background);
+    expect(await it.task.status()).toMatchObject({ phase: "succeeded" });
+    expect(it.bodies.at(-1)).toMatchObject({ text: "done", notes_not_read: [{ id: "late", at: expect.any(Number) }] });
+    // What was said stays with the task: only that something was, and when, goes out with the ending.
+    expect(JSON.stringify(it.bodies.at(-1))).not.toContain("one more thing");
+  });
+
+  it("is closed as soon as its process is known to have exited, before the last copy is taken; and whatever its ending, says which notes were not read", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    await it.task.tell({ id: "read", text: "seen" });
+    await fetch(it, ["read"]);
+    await it.task.tell({ id: "unread", text: "never fetched" });
+    ended(it.container, { code: "0", events: DONE });
+    let during: unknown;
+    backups.whileTaking = async () => {
+      during = await it.task.tell({ id: "during", text: "said while the copy was taken" });
+    };
+    await it.task.alarm();
+    await Promise.all(it.background);
+    expect(during).toEqual({ state: "closed" });
+    expect(it.bodies.at(-1).notes_not_read.map((note: any) => note.id)).toEqual(["unread"]);
+    expect(JSON.stringify(it.bodies.at(-1))).not.toContain("never fetched");
+
+    // One that fails says so too.
+    const bad = fixture();
+    await bad.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    await bad.task.tell({ id: "x", text: "not reached" });
+    ended(bad.container, { code: "1", events: [] });
+    await bad.task.alarm();
+    await Promise.all(bad.background);
+    expect(bad.reported.at(-1)).toBe("failed");
+    expect(bad.bodies.at(-1)).toMatchObject({ notes_not_read: [{ id: "x" }] });
+    // And one that ended takes no more.
+    expect(await bad.task.tell({ id: "y", text: "z" })).toEqual({ state: "closed" });
+  });
+
+  it("from the moment it starts being brought back after its container was lost: answers nothing the old process asks, takes notes again, and counts as read only what the new process's session says it holds", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    const old = it.records.get("state").run;
+    await it.task.tell({ id: "a", text: "A" });
+    // The old process's session held A, and it made its last fetch: closed for that run.
+    expect(await fetch(it, ["a"], true)).toEqual({ ok: true, notes: [] });
+    expect(await it.task.tell({ id: "early", text: "x" })).toEqual({ state: "closed" });
+    // The container is lost; it is brought back from a checkpoint taken before A was in the session.
+    const lost = it.records.get("state");
+    lost.checkpoint = { record: { id: "cp" }, at: Date.now() - 60_000, took_ms: 10 };
+    it.records.set("state", lost);
+    it.container.running = false;
+    let during: unknown;
+    let late: unknown;
+    it.restoring = async () => {
+      // While it is being restored: something said is taken; the old process's fetch is not answered.
+      during = await it.task.tell({ id: "b", text: "B" });
+      late = await fetch(it, ["a", "b"], true, old);
+    };
+    await it.task.alarm();
+    await Promise.all(it.background);
+    expect(during).toEqual({ state: "taken" });
+    expect(late).toEqual({ ok: false });
+    const now = it.records.get("state");
+    expect(now.phase).toBe("running");
+    expect(now.run).not.toBe(old);
+    expect(now.notes_closed).toBeUndefined();
+    // The new process's session holds neither: both are handed out. It ends before saying it holds them.
+    expect((await fetch(it, [])).notes?.map((note) => note.id)).toEqual(["a", "b"]);
+    ended(it.container, { code: "1", events: [] });
+    await it.task.alarm();
+    await Promise.all(it.background);
+    // A was read by the run before; this run's session never said so: it is among those not confirmed.
+    expect(it.bodies.at(-1).notes_not_read.map((note: any) => note.id)).toEqual(["a", "b"]);
+  });
+
+  it("says what became of a note while its record is kept, and that it cannot say once the record is gone: never that a note it took was not added", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    await it.task.tell({ id: "a", text: "A" });
+    expect(await it.task.told("a")).toBe("taken");
+    expect(await it.task.told("never")).toBe("none");
+    // Its record is cleared away, as it is a day after it ended.
+    it.records.delete("state");
+    await expect(it.task.told("a")).rejects.toThrow("no longer kept");
+    await expect(it.task.told("never")).rejects.toThrow("no longer kept");
+  });
+
+  it("takes nothing for a task that was at work before processes were given runs: its container's process never fetches, so nothing would read it", async () => {
+    const it = fixture();
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    // As a task started by the version before this one stands when this one is deployed over it.
+    const old = it.records.get("state");
+    delete old.run;
+    delete old.notes_closed;
+    it.records.set("state", old);
+    expect(await it.task.tell({ id: "a", text: "A" })).toEqual({ state: "closed" });
+    expect(it.records.get("state").notes).toBeUndefined();
+    // One that is only just being started (and will be given a run) does take.
+    it.records.set("state", { ...it.records.get("state"), phase: "starting", notes_refused: [] });
+    expect(await it.task.tell({ id: "b", text: "B" })).toEqual({ state: "taken" });
+  });
+
+  it("gives the process a run of its own each time it is started, before it is started", async () => {
+    const it = fixture();
+    const given: (string | undefined)[] = [];
+    it.container.exec = async (argv: string[], options?: any) => {
+      if (argv[0] === "/bin/sh" && argv.includes("agent")) given.push(options?.env?.TASK_RUN);
+      return it.process;
+    };
+    await it.task.start({ id: "fixture", prompt: "hello", brain: "brain" });
+    expect(given).toHaveLength(1);
+    expect(given[0]).toBe(it.records.get("state").run);
+    expect(given[0]).toMatch(/^[0-9a-f-]{36}$/);
   });
 });
 

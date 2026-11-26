@@ -642,6 +642,96 @@ export class Tasks implements Wakes {
     return { task_id: String(task.id), status: String(task.status), ...(task.status === "unconfirmed" ? { note: UNCONFIRMED_NOTE } : {}), ...(after ? { note: queuedNote(after) } : {}) };
   }
 
+  /**
+   * Tells a piece of work under way something more its person says. Only theirs to do, in a step
+   * that is theirs alone, in the conversation it was handed over in: the same as going on from it.
+   * That is a check of who is speaking; it gives the work nothing it could not do before.
+   *
+   * The worker is asked by the id of this call, and answers the same if asked again: so a call
+   * made again is told what became of it the first time, whatever has become of the work since.
+   */
+  async tell(run: RunRow, sessionKey: string, callId: string, taskId: string, message: string): Promise<unknown> {
+    const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+    const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+    const asker = people.length === 1 ? people[0] : null;
+    if (task && task.session_key === sessionKey && asker === null) throw new Error("something can be added to work under way only in answer to the one person whose work it is, and this step was not started by a message of theirs alone; nothing was added");
+    if (!task || task.session_key !== sessionKey || task.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(taskId)} of this person's here to add anything to; nothing was added`);
+    // (What can be done instead depends on how it stands: only work that ended well can be gone on from.)
+    const closedAs = (status: unknown) => ({
+      ok: false,
+      work_id: taskId,
+      state: "closed",
+      note:
+        TERMINAL_TASK.has(String(status)) && status !== "succeeded"
+          ? "It takes nothing more: it has ended, and not well, so there is nothing of it to go on from either. Nothing was added. Tell the person so; whether to have this done as something new is theirs to say."
+          : "It takes nothing more now: it has ended, or is about to. Nothing was added. If they still want this, put it after that piece (hand it over to go on from it), and tell them that is what you did.",
+    });
+    const stands = () => this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status;
+    // What became of this very call, if it was made before: known here, whatever has become of the work or its worker since.
+    const kept = this.#s.rows<{ task_id: string; state: string }>("SELECT task_id, state FROM task_notes WHERE call_id = ?", callId)[0];
+    if (kept && kept.task_id !== taskId) throw new Error("this call was first made for another piece of work; nothing was added");
+    const settle = (state: "taken" | "closed") => {
+      this.#s.transaction(() => {
+        this.#s.sql.exec("UPDATE task_notes SET state = ? WHERE call_id = ?", state, callId);
+        if (state === "taken" && this.#s.rows("SELECT 1 FROM audit WHERE action = 'task.told' AND json_extract(detail, '$.call') = ?", callId).length === 0) this.#s.audit(asker ?? "(automation)", "task.told", { task_id: taskId, call: callId, length: message.length });
+      });
+    };
+    if (kept?.state === "closed") return closedAs(stands());
+    if (kept?.state !== "taken") {
+      if (!kept) {
+        // Something new is added only to work that is at it.
+        if (task.status === "queued") throw new Error("that piece of work has not begun yet (it waits for another to end), so there is nothing at work to tell. If what they want of it has changed, call it off and hand it over again as they now want it");
+        if (task.status === "dispatching" || task.status === "unconfirmed") throw new Error("it is not known yet that this piece of work has begun, so nothing can be added to it at this moment; try again shortly");
+        if (TERMINAL_TASK.has(String(task.status))) return closedAs(stands());
+      }
+      let worker: Worker;
+      try {
+        worker = this.#b.workerOf(String(task.worker));
+      } catch {
+        throw new Error(kept ? "this was sent to the work once and the answer never came; its worker is no longer part of this deployment, so whether it was taken cannot be found out. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess" : "the worker of this piece of work is no longer part of this deployment, so nothing can be added to it");
+      }
+      const ended = TERMINAL_TASK.has(String(this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0]?.status));
+      if (kept && ended) {
+        // Sent once, the answer lost, and the work has ended since: nothing is given now. What became of it is asked.
+        let fate: "taken" | "closed" | "none";
+        try {
+          if (!worker.told) throw new Error("no way to ask");
+          fate = await within(worker.told(this.#b.env, taskId, callId));
+        } catch {
+          throw new Error("this was sent to the work once and the answer never came; the work has ended, and whether it was taken cannot be found out just now. Tell the person that it may or may not have been taken into account; do not hand it over again on a guess");
+        }
+        settle(fate === "taken" ? "taken" : "closed");
+        if (fate !== "taken") return closedAs(stands());
+      } else {
+        if (!worker.tell) throw new Error(`the worker "${worker.name}" cannot be told anything more once it is at work; put this after it instead (hand it over to go on from that piece)`);
+        // Written down before it is sent: an answer that is lost leaves this, and the call made again goes by it.
+        if (!kept) this.#s.sql.exec("INSERT INTO task_notes (call_id, task_id, state, at) VALUES (?, ?, 'sent', ?)", callId, taskId, Date.now());
+        let answer: { state: "taken" } | { state: "closed" } | { state: "refused"; error: string };
+        try {
+          answer = await within(worker.tell(this.#b.env, taskId, { id: callId, text: message }));
+        } catch {
+          // Sent, and no answer: it may have been taken. Said as exactly that; the record stays as sent, and this same call made again finds out.
+          throw new Error("this was sent to the work and no answer came back: it may or may not have been taken. Do not send it again as something new, and do not hand it over as another piece of work, on a guess. Tell the person that you tried to pass it on and could not confirm that it arrived");
+        }
+        if (answer.state === "refused") {
+          // Not taken, for a reason of its own: nothing is owed an answer later.
+          this.#s.sql.exec("DELETE FROM task_notes WHERE call_id = ? AND state = 'sent'", callId);
+          throw new Error(`nothing was added: ${answer.error}`);
+        }
+        settle(answer.state);
+        if (answer.state === "closed") return closedAs(stands());
+      }
+    }
+    // Read again after the wait.
+    const now = this.#s.rows<Row>("SELECT status FROM tasks WHERE id = ?", taskId)[0];
+    return {
+      ok: true,
+      work_id: taskId,
+      state: "taken",
+      note: `It has this and will see it when the step it is on is done; it is not read yet. Tell the person it was passed on, not that it was done. If it ends without having read it, you will be told.${now?.status === "needs_input" ? " It is waiting for an approval just now: this does not take back what it is waiting to do. If they want that not done, the approval is to be refused, or the work called off." : ""}`,
+    };
+  }
+
   async status(taskId: string): Promise<unknown> {
     const task = this.#s.rows<Row>("SELECT id, title, status, pending, last_progress, result, created_at, updated_at FROM tasks WHERE id = ?", taskId)[0];
     if (!task) throw new Error(`no task ${taskId} in this conversation's scope`);
@@ -932,6 +1022,8 @@ export class Tasks implements Wakes {
    */
   async event(taskId: string, seq: number, kind: WorkerEventKind, report: Record<string, unknown>): Promise<{ ok: boolean }> {
     let body = report;
+    // Of notes that were not read, only which and when is kept and told: never their words, whatever a worker sends.
+    if (Array.isArray(body.notes_not_read)) body = { ...body, notes_not_read: (body.notes_not_read as { id?: unknown; at?: unknown }[]).map((note) => ({ id: String(note?.id ?? ""), ...(typeof note?.at === "number" ? { at: note.at } : {}) })) };
     const outcome: { known: boolean; wake: boolean; terminal: boolean; spent?: number } = this.#s.transaction(() => {
       const task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
       if (!task) return { known: false, wake: false, terminal: false };
@@ -1228,7 +1320,7 @@ function questionCode(): string {
   return [...crypto.getRandomValues(new Uint8Array(4))].map((byte) => alphabet[byte % alphabet.length]).join("");
 }
 
-function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
+function renderEnding(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
   const head = `Task ${task.id} "${task.title}"`;
   if (kind === "needs_input") {
     const what = String(body.what ?? describeRequest(body));
@@ -1239,4 +1331,19 @@ function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string
   if (kind === "failed") return `${head} failed: ${String(body.error ?? "").slice(0, 1_000)}`;
   // The Brain's own finding says why; a worker's report of a lost task means that where it ran stopped under it.
   return typeof body.error === "string" && body.error === NOT_KNOWN ? `${head} was lost: ${NOT_KNOWN}. Tell the person so; do not say that it ran, or that it did not.` : `${head} was lost: it stopped where it was running and could not be restored.`;
+}
+
+/**
+ * A worker's report, as the model is told of it. With an ending comes what was said to the work
+ * while it was under way and did not reach it: told as that, in so many words, so that it is
+ * never taken to have been acted on.
+ */
+function renderWorkerEvent(task: Row, kind: WorkerEventKind, body: Record<string, unknown>): string {
+  const told = renderEnding(task, kind, body);
+  // Only how many, and when: what they said stays with whoever said it. This goes into the
+  // conversation's own record, which everyone there shares.
+  const unread = Array.isArray(body.notes_not_read) ? (body.notes_not_read as { at?: unknown }[]) : [];
+  if (unread.length === 0) return told;
+  const when = unread.map((note) => (typeof note?.at === "number" ? new Date(note.at).toISOString().slice(11, 16) : "")).filter((at) => at !== "");
+  return `${told}\n${unread.length === 1 ? "One thing" : `${unread.length} things`} added to it while it was at work could not be confirmed to have reached it before it ended${when.length > 0 ? ` (added at ${when.join(", ")} UTC)` : ""}: take it that the work took no account of ${unread.length === 1 ? "it" : "them"}. Tell the person whose work it was, and ask whether they still want it done${kind === "result" ? ", as something that goes on from this piece" : ""}. Do not repeat here what was added.`
 }

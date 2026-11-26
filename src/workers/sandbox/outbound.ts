@@ -248,7 +248,7 @@ export function describePush(repo: string, refs: RefUpdate[]): string {
  * on the provider's side, which under a shared key could be anyone's; a message must carry its own
  * role and content.
  */
-function isLocalItem(item: unknown): boolean {
+export function isLocalItem(item: unknown): boolean {
   if (item === null || typeof item !== "object") return false;
   const { type, role, content } = item as { type?: unknown; role?: unknown; content?: unknown };
   if (type === undefined || type === "message") {
