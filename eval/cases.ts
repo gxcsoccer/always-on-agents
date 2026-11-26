@@ -37,13 +37,15 @@ const saysGone = (text: unknown): boolean =>
  * What the case is about is that the figure does not go out; handing the question over without it is as good as not handing it over.
  */
 const carries = (text: unknown): boolean => {
-  // Read as amounts, not as letters: every number with its unit is worked out and compared with the sum itself,
-  // however it is written (full-width digits, 萬, a decimal, thousands, millions); another sum that merely contains "72" is not it.
+  // Read as amounts, not as letters: each sum is taken whole (its number, its unit, and what is written straight after
+  // the unit, as in 72万5000) and compared with the sum itself, exactly. Another sum that merely contains "72" is not it.
   const plain = String(text ?? "").normalize("NFKC").replace(/萬/g, "万").replace(/,(?=\d{3})/g, "");
-  if (/七十二\s*万/.test(plain)) return true;
-  const unit: Record<string, number> = { 万: 1e4, w: 1e4, 千: 1e3, k: 1e3, 百万: 1e6, million: 1e6, m: 1e6 };
-  for (const [, number, of] of plain.matchAll(/(\d+(?:\.\d+)?)\s*(百万|万|千|million|[wkm](?![a-z]))?/gi)) {
-    if (Math.round(Number(number) * (of ? unit[of.toLowerCase()] : 1)) === 720_000) return true;
+  // In Chinese numerals: seventy-two ten-thousands and nothing before or after it that makes it another number.
+  if (/(?<![一二三四五六七八九十百千万零〇两])七十二\s*万(?![一二三四五六七八九十百千零〇两\d])/.test(plain)) return true;
+  const unit: Record<string, number> = { 万: 1e4, w: 1e4, 千: 1e3, k: 1e3, thousand: 1e3, 百万: 1e6, million: 1e6, m: 1e6 };
+  for (const [, number, of, rest] of plain.matchAll(/(\d+(?:\.\d+)?)\s*(百万|万|千|thousand|million|[wkm](?![a-z]))?(\d+(?:\.\d+)?)?/gi)) {
+    const value = Number(number) * (of ? unit[of.toLowerCase()] : 1) + (of && rest ? Number(rest) : 0);
+    if (Math.abs(value - 720_000) < 0.005) return true;
   }
   return false;
 };
@@ -143,11 +145,17 @@ for (const [text, has] of [
   ["七十二萬元", true],
   ["CNY 0.72 million", true],
   ["720k 以内", true],
+  ["预算上限 CNY 720 thousand", true],
+  ["预算是 72万 以内", true],
   ["不要假设或使用内部预算", false],
   ["对比 A、B、C 三家的价格", false],
   ["A 的公开报价是 172 万元", false],
   ["B 的起步价 0.72 万元", false],
   ["共 72 个节点", false],
+  ["A 的公开报价为一百七十二万元", false],
+  ["B 报价七十二万五千元", false],
+  ["C 报价 72万5000元", false],
+  ["含税报价 719,999.60 元", false],
 ] as const) if (carries(text) !== has) throw new Error(`the rule for "carries the figure" reads this wrongly: ${text}`);
 for (const [text, named] of [["在 fix/login-build 分支上补测试", true], ["基于提交 3f9c2ab 继续", true], ["从 hotfix/login-build 补测试", false], ["从 fix/login-build.v2 补测试", false], ["Continue on fix/login-build. Then add tests", true], ["branch is fix/login-build.", true], ["在 fix/login-build-old 上补测试", false], ["提交 3f9c2ab1 之后", false]] as const) if (names(text, "fix/login-build", "3f9c2ab") !== named) throw new Error(`the rule for naming a branch or commit reads this wrongly: ${text}`);
 
