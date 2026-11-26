@@ -112,6 +112,8 @@ export interface TaskState {
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
   github_token?: { token: string; expires_at: number; source: string; installation?: string };
+  /** That no such credential was to be had for the repository, and when that was found. */
+  github_public_none?: { repo: string; at: number };
   /** One that is allowed nothing but to be the installation's: for what anyone may read of a public repository. */
   github_public_token?: { token: string; expires_at: number; source: string; installation?: string };
   /** One that can only read, for GitHub's API. Kept apart: the one above can write. */
@@ -273,6 +275,7 @@ code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
+const NONE_KEPT_MS = 10 * 60_000;
 const MAX_SEARCHES_TOLD_APART = 40;
 const MAX_PAGES_KEPT = 200;
 
@@ -756,11 +759,27 @@ export class TaskSandbox extends DurableObject<Env> {
   async githubReadToken(open = false): Promise<string | undefined> {
     const by = await this.#lend("read");
     if (by !== undefined || !open) return by;
+    // Not to be had for this repository (it is not one any installation of the tenant's covers,
+    // most often: somebody else's public repository), as was found a little while ago: not asked
+    // for again with every read.
+    const repo = await this.repository();
+    const none = this.#state()?.github_public_none;
+    if (none && none.repo === repo && Date.now() - none.at < NONE_KEPT_MS) return undefined;
+    let lent: string | undefined;
     try {
-      return await this.#lend("public");
+      lent = await this.#lend("public");
     } catch {
+      // Could not be asked just now: read with none this time, and asked again the next.
       return undefined;
     }
+    if (lent === undefined) {
+      const state = this.#state();
+      if (state && repo) {
+        state.github_public_none = { repo, at: Date.now() };
+        this.#save(state);
+      }
+    }
+    return lent;
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */

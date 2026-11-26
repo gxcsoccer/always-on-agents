@@ -179,6 +179,12 @@ describe("the repository credential a task is lent", () => {
     expect(await stub.githubReadToken(true)).toBeUndefined();
     const elsewhere = await taskFrom("lend3:chat:oc_not_linked", "https://github.com/acme/demo");
     expect(await elsewhere.githubReadToken(true)).toBeUndefined();
+    // That none was to be had is kept for a while, so that it is not asked for with every read; and not kept of a read that is by right alone.
+    const noted = () => runInDurableObject(elsewhere, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none);
+    expect(await noted()).toMatchObject({ repo: "acme/demo" });
+    const byRight = await taskFrom("lend3:chat:oc_other_one", "https://github.com/acme/demo");
+    expect(await byRight.githubReadToken()).toBeUndefined();
+    expect(await runInDurableObject(byRight, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none)).toBeUndefined();
   });
 
   it("keeps count of what the proxy saw of its reads of GitHub's API, searches apart from the rest", async () => {
