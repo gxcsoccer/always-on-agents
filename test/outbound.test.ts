@@ -347,6 +347,16 @@ describe("GitHub's API over the proxy", () => {
     // Asked for as the file itself: that is its content, passed on.
     answers.push(() => new Response("hi", { headers: { "content-type": "application/vnd.github.raw" } }));
     expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw" } })).text()).toBe("hi");
+    // A directory asked for as an object lists its files inside it; a licence has one too.
+    answers.push(() => Response.json({ type: "dir", download_url: null, entries: [{ name: "a.txt", download_url: signed, _links: { self: "x" } }] }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/", { headers: { accept: "application/vnd.github.object+json" } })).json()).toEqual({ type: "dir", download_url: null, entries: [{ name: "a.txt", download_url: null, _links: { self: "x" } }] });
+    answers.push(() => Response.json({ name: "LICENSE", download_url: signed, license: { key: "mit" } }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/license")).json()).toEqual({ name: "LICENSE", download_url: null, license: { key: "mit" } });
+    // The file itself, under GitHub's own name for "raw": plain text, and a file that is JSON with such a field of its own. Bytes, as they are.
+    answers.push(() => new Response("hello, world\n", { headers: { "content-type": "application/vnd.github.raw+json; charset=utf-8" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/a.txt", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe("hello, world\n");
+    answers.push(() => new Response('{"download_url":"kept, it is the file\'s own"}', { headers: { "content-type": "application/vnd.github.raw+json; charset=utf-8" } }));
+    expect(await (await send("https://api.github.com/repos/acme/demo/contents/b.json", { headers: { accept: "application/vnd.github.raw+json" } })).text()).toBe('{"download_url":"kept, it is the file\'s own"}');
     // Read with no credential it is what anyone is told.
     const open = await proxyFor({ repository: "acme/demo", unlent: true });
     answers.push(() => Response.json({ name: "a.txt", download_url: "https://raw.githubusercontent.com/acme/demo/main/a.txt" }, json));
@@ -369,6 +379,10 @@ describe("GitHub's API over the proxy", () => {
     // The next page of such a search, as GitHub gives its address: the same query again, not wrapped once more.
     expect((await sent("repo:acme/demo (dst OR timezone)", "&page=2")).get("q")).toBe("repo:acme/demo (dst OR timezone)");
     expect((await sent("")).get("q")).toBe("repo:acme/demo");
+    // Text in quotes is what is looked for, as it is: its brackets and its "repo:" are not the query's.
+    expect((await sent('"panic("')).get("q")).toBe('repo:acme/demo "panic("');
+    expect((await sent('"repo:acme/secret is mentioned" dst')).get("q")).toBe('repo:acme/demo "repo:acme/secret is mentioned" dst');
+    expect((await sent('"a) OR (b" OR timezone repo:x/y')).get("q")).toBe('repo:acme/demo ("a) OR (b" OR timezone)');
     const last = await sent("dst", "&per_page=50&sort=updated&advanced_search=false");
     expect(last.get("per_page")).toBe("50");
     expect(last.get("sort")).toBe("updated");
@@ -379,9 +393,9 @@ describe("GitHub's API over the proxy", () => {
 
     // What is no longer a query once the places it names are taken out is not sent as one.
     const before = forwarded.length;
-    for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone"]) expect((await send(search(q))).status, q).toBe(400);
+    for (const q of ["dst OR repo:acme/secret", "repo:a/b OR timezone", "(org:acme) dst", "dst AND OR timezone", "dst NOT user:x", "(dst OR timezone", "dst) OR (timezone", "panic("]) expect((await send(search(q))).status, q).toBe(400);
     expect(forwarded).toHaveLength(before);
-    expect((await recorded("noteGithubRead")).slice(-7)).toEqual(Array(7).fill({ kind: "search", status: 400, incomplete: true }));
+    expect((await recorded("noteGithubRead")).slice(-8)).toEqual(Array(8).fill({ kind: "search", status: 400, incomplete: true }));
   });
 
   it("passes a search on whole where all of it is the repository's, page after page", async () => {
@@ -394,12 +408,24 @@ describe("GitHub's API over the proxy", () => {
     expect(first.headers.get("set-cookie")).toBeNull();
     answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [found("acme/demo", 3)] }));
     expect(((await (await send(search("dst", "&page=2"))).json()) as { items: unknown[] }).items).toHaveLength(1);
-    // None at all, known to be all there is.
+    // A page past the last: empty, of a search that found three. Not "none found".
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [] }));
+    expect(((await (await send(search("dst", "&page=3"))).json()) as { items: unknown[] }).items).toHaveLength(0);
+    // The same said of a first page: GitHub's count is not none, so neither is this.
+    answers.push(() => Response.json({ total_count: 3, incomplete_results: false, items: [] }));
+    await send(search("dst"));
+    // And a later page of a search that did find nothing says nothing either.
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    await send(search("nothing like it", "&page=2"));
+    // None at all, known to be all there is: the first page, counted none by GitHub.
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
     expect(await (await send(search("nothing like it"))).json()).toEqual({ total_count: 0, incomplete_results: false, items: [] });
     // The first page, with more after it; the last; and one that was all there is and held nothing.
     expect(await recorded("noteGithubRead")).toEqual([
       { kind: "search", status: 200, read: true, more: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
+      { kind: "search", status: 200, read: true },
       { kind: "search", status: 200, read: true },
       { kind: "search", status: 200, read: true, none: true },
     ]);

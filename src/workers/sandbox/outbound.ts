@@ -170,14 +170,22 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // Wherever the query says to look, it is this repository: what it names is taken out and
       // this one put in, over the whole of what is left (in brackets where that has "or", "not"
       // or brackets of its own). What comes back is gone through as well, below.
-      const asked = (url.searchParams.get("q") ?? "").replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ").replace(/\s+/g, " ").trim();
+      // What is in quotes is the text being looked for, kept as it is: a bracket or a "repo:" there is not the query's own.
+      const parts = (url.searchParams.get("q") ?? "").split(/("[^"]*")/);
+      const asked = parts
+        .map((part, at) => (at % 2 === 1 ? part : part.replace(/-?\b(?:repo|org|user):[^\s()]*/gi, " ")))
+        .join("")
+        .replace(/\s+/g, " ")
+        .trim();
+      // Its shape, with each quoted text as one plain word.
+      const shape = asked.replace(/"[^"]*"/g, "w");
       // What is left may no longer be a query: an "or" with nothing on one side of it, empty brackets.
-      if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(asked) || !balanced(asked)) {
+      if (/^(?:OR|AND)\b|\b(?:OR|AND|NOT)$|\(\s*(?:OR|AND)\b|\b(?:OR|AND|NOT)\s*\)|\b(?:OR|AND|NOT)\s+(?:OR|AND)\b|\(\s*\)/.test(shape) || !balanced(shape)) {
         await this.#task.noteGithubRead(kind, 400, { incomplete: true });
-        return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched\n", { status: 400 });
+        return new Response("this search is not a query once the repositories, organisations and users it names are taken out (the search is of this task's repository only); nothing was searched. Text to look for that has brackets in it goes in double quotes\n", { status: 400 });
       }
       // Already in brackets as a whole (a next page of a search made here): not wrapped again.
-      const whole = /\b(?:OR|AND|NOT)\b|[()]/.test(asked) && !enclosed(asked) ? `(${asked})` : asked;
+      const whole = /\b(?:OR|AND|NOT)\b|[()]/.test(shape) && !enclosed(shape) ? `(${asked})` : asked;
       target.searchParams.set("q", `repo:${own} ${whole}`.trim());
       // Brackets and "or" mean what they say only where this is asked for; without it GitHub
       // answers such a query with nothing found and calls that complete. Always, whatever the guest sent.
@@ -221,11 +229,16 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       // A file or a directory of the repository comes with an address to download it from, which
       // for a private one works for a while for whoever holds it. Read with a credential, it is
       // taken out; the content itself, which the task was given anyway, stays.
-      if (token && answer.ok && request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/(?:contents(?:\/|$)|readme(?:\/|$))/i.test(url.pathname) && (answer.headers.get("content-type") ?? "").includes("json")) {
-        const listed = (await answer.json().catch(() => undefined)) as unknown;
-        if (listed === undefined) return new Response("GitHub's answer could not be read\n", { status: 502 });
-        const without = (each: unknown) => (each && typeof each === "object" && !Array.isArray(each) ? { ...(each as Record<string, unknown>), download_url: null } : each);
-        return passed(answer, JSON.stringify(Array.isArray(listed) ? listed.map(without) : without(listed)));
+      // Only where it is that description (JSON) that was asked for: asked for as the file itself, the bytes are passed on as they are, whatever they hold.
+      if (token && answer.ok && request.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/(?:contents|readme|license)(?:\/|$)/i.test(url.pathname) && /^application\/json\b/i.test(answer.headers.get("content-type") ?? "")) {
+        const text = await answer.text();
+        let listed: unknown;
+        try {
+          listed = JSON.parse(text);
+        } catch {
+          return new Response("GitHub's answer could not be read\n", { status: 502 });
+        }
+        return passed(answer, JSON.stringify(withoutDownloads(listed)));
       }
       return passed(answer, answer.body);
     }
@@ -242,9 +255,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // count is left out rather than made up.
     const mixed = items.length !== rows.length;
     const incomplete = mixed || found.incomplete_results !== false;
-    // What this page was: read; whether there is more after it; whether it was all there is and that was nothing.
+    // What this page was: read; whether there is more after it; and whether the search found nothing at all, which only its
+    // first page can say, by GitHub's own count of none (a page past the last is empty too, of a search that found plenty).
     const more = /rel="next"/.test(answer.headers.get("link") ?? "");
-    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: !incomplete && !more && items.length === 0 });
+    const first = (url.searchParams.get("page") ?? "1") === "1";
+    await this.#task.noteGithubRead(kind, answer.status, { incomplete, read: true, more, none: first && !incomplete && !more && items.length === 0 && found.total_count === 0 });
     const { total_count: total, ...rest } = found;
     return passed(answer, JSON.stringify({ ...rest, ...(mixed ? {} : { total_count: total }), incomplete_results: incomplete, items }));
   }
@@ -284,6 +299,13 @@ function passed(answer: Response, body: BodyInit | null): Response {
     if (value !== null) headers.set(name, value);
   }
   return new Response(body, { status: answer.status, headers });
+}
+
+/** A description of a file, a directory or a licence, with every address it could be downloaded from taken out, however deep it is listed. */
+function withoutDownloads(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutDownloads);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, each]) => [key, key === "download_url" ? null : withoutDownloads(each)]));
 }
 
 /** Whether every bracket in a query is closed, and none closed that was not opened. */
