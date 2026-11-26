@@ -9,28 +9,32 @@
  *
  * See docs/design/reply-format.zh-CN.md.
  */
+import type { Principal } from "../events";
 import type { BrainStore, InboxRow, RunRow } from "./store";
 
-/** No more than this many people by one message. */
+/** No more than this many people of one thing, by however many messages. */
 export const MAX_REMINDED = 5;
 
 export interface RemindersHost {
   /** The messages a run rests on: its own, or the ones the request it carries on was made in. */
   basis(runId: string): InboxRow[];
+  /** The request a run carries on, if it carries one on. */
+  carrying(runId: string): string | undefined;
+  /** Whether this person's word counts here, coming through that connector (a connector the deployment trusts, and a person it knows). */
+  isDecider(principal: Principal, source: string): boolean;
 }
 
 /**
  * A person named with the platform's own mention in one message, as the connector noted it: who
- * it is, and the name as it stands in the text where that name stands for nobody else there
- * (said by the connector, which saw everyone the message named).
+ * it is, and the name that stands in the text for them. The connector gives everyone the message
+ * named; whether a name means one person is told here, over all of them.
  */
-export type Named = { id: string; name?: string };
+export type Named = { id: string; name: string };
 
 /** What is kept of where and by whom a thing was asked, with a task or a timer, to go by when it comes back. */
 export type Asked = { by: string; named: Named[]; place: string };
 
-const named = (noted: unknown): Named[] =>
-  Array.isArray(noted) ? noted.filter((each) => typeof each?.id === "string" && each.id !== "").map((each) => ({ id: each.id as string, ...(typeof each.name === "string" && each.name !== "" ? { name: each.name as string } : {}) })) : [];
+const named = (noted: unknown): Named[] => (Array.isArray(noted) ? noted.filter((each): each is Named => typeof each?.id === "string" && each.id !== "" && typeof each?.name === "string") : []);
 
 /**
  * The place a message is written in or sent to, as the connector addresses it, without what is
@@ -88,9 +92,10 @@ export class Reminders {
    */
   #writer(event: InboxRow): string | undefined {
     if (event.kind !== "message" || event.text === null || event.data === null || !event.reply_to) return undefined;
-    const principal = JSON.parse(event.principal) as { kind?: unknown; id?: unknown; explicit?: unknown };
+    const principal = JSON.parse(event.principal) as Principal;
     const data = JSON.parse(event.data) as { group?: unknown; card?: unknown; routed_from?: unknown };
-    return principal.kind === "human" && principal.explicit === true && typeof principal.id === "string" && data.group === true && data.card === undefined && data.routed_from === undefined ? principal.id : undefined;
+    // (Through a connector whose word on who wrote it counts here, as for anything else a person's word decides.)
+    return this.#b.isDecider(principal, event.source) && principal.explicit === true && typeof principal.id === "string" && data.group === true && data.card === undefined && data.routed_from === undefined ? principal.id : undefined;
   }
 
   /**
@@ -109,7 +114,9 @@ export class Reminders {
     let about: { event: string; by: string; named: Named[]; sessionKey: string; place: string; timer?: string } | undefined;
     const said = this.#from(events);
     const [only] = events;
-    if (said) about = { event: `message:${said.first}`, by: said.by, named: said.named, sessionKey: said.sessionKey, place: said.place };
+    // (The answer of a request that had to wait is a thing of its own: what was said when it was asked, with whoever that reminded, was about its being asked.)
+    const carried = said ? this.#b.carrying(run.id) : undefined;
+    if (said) about = { event: carried ? `request:${carried}` : `message:${said.first}`, by: said.by, named: said.named, sessionKey: said.sessionKey, place: said.place };
     else if (events.length === 1 && only.source === "worker" && ["worker.result", "worker.failed", "worker.lost"].includes(only.kind)) {
       // A task that has had its end, well or not: one thing, however it ended.
       // (Whose task: as the Brain wrote it on the event; who asked for it, whom they named and where: as kept with the task when it was made.)
@@ -134,11 +141,12 @@ export class Reminders {
     // Named by them: by who they are, always; by the name only where it means one person.
     const ids = new Set(about.named.map((each) => each.id));
     const names = new Map<string, Set<string>>();
-    // (A name the connector gave with one person, and that two of their messages gave with different people, means neither.)
-    for (const each of about.named) if (each.name !== undefined) names.set(each.name.toLowerCase(), new Set([...(names.get(each.name.toLowerCase()) ?? []), each.id]));
+    // (Over everyone named in all the messages the request was made in: a name two of them bear, in one message or in two, means neither.)
+    for (const each of about.named) if (each.name !== "") names.set(each.name.toLowerCase(), new Set([...(names.get(each.name.toLowerCase()) ?? []), each.id]));
     const who = (asked: string): string | undefined => {
       const ref = asked.trim();
-      if (ref === "") return undefined;
+      // (Never everyone at once, whatever the place calls that.)
+      if (ref === "" || ref.toLowerCase() === "all") return undefined;
       if (ref.toLowerCase() === by.toLowerCase()) return by;
       const meant = names.get(ref.toLowerCase());
       if (meant?.size === 1) return [...meant][0];
@@ -147,6 +155,8 @@ export class Reminders {
       // Someone who has written to the agent in this conversation themselves: looked for by who
       // they are, however long ago and whatever else of theirs is kept here since (answers of
       // theirs brought in from elsewhere, say), through all that is still kept of it.
+      // (A name is not who someone is: only those the one who asked named are found by a name.)
+      if (ref.startsWith("@")) return undefined;
       for (let before = Number.MAX_SAFE_INTEGER; ; ) {
         const page = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND text IS NOT NULL AND data IS NOT NULL AND reply_to IS NOT NULL AND lower(json_extract(principal, '$.id')) = ? AND id < ? ORDER BY id DESC LIMIT 100", sessionKey, ref.toLowerCase(), before);
         for (const each of page) {
@@ -163,7 +173,7 @@ export class Reminders {
   /**
    * Who a message of this run, to be sent to `target`, reminds, of those the model asked for: in
    * the order asked, each once, none who was already reminded of this thing, and no more than a
-   * few. Taken for this thing in the same step, so it has to be called in one transaction with
+   * few of one thing by all its messages together. Taken for this thing in the same step, so it has to be called in one transaction with
    * keeping the message. A timer set to stop once it has reminded stops here, and that it has is
    * written on it, so that a firing of it already waiting reminds nobody.
    */
@@ -171,11 +181,13 @@ export class Reminders {
     const may = asked.length > 0 ? this.of(run, target) : undefined;
     if (!may) return [];
     const reminded: string[] = [];
+    // (Of one thing, not of one message: a run made to send message after message reminds no more people by it.)
+    const left = MAX_REMINDED - this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM reminded WHERE event = ?", may.event)[0].n;
     for (const each of asked) {
+      if (reminded.length >= left) break;
       const id = may.who(each);
       if (id === undefined || reminded.includes(id) || this.#s.rows("SELECT 1 FROM reminded WHERE event = ? AND person = ?", may.event, id).length > 0) continue;
       reminded.push(id);
-      if (reminded.length === MAX_REMINDED) break;
     }
     for (const id of reminded) this.#s.sql.exec("INSERT INTO reminded (event, person, at) VALUES (?, ?, ?)", may.event, id, Date.now());
     if (reminded.length > 0 && may.timer) {

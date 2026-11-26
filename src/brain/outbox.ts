@@ -96,6 +96,7 @@ export class Outbox implements Wakes {
     const target = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target ?? this.#s.meta("default_target");
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
+    const already = this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", idem).length > 0;
     this.#s.sql.exec(
       "INSERT OR IGNORE INTO outbox (idem, run_id, target, text, next_at, created_at, ask, review, continuation, interaction, reads, authored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       idem,
@@ -116,7 +117,8 @@ export class Outbox implements Wakes {
     // (Only where that is this conversation's own place, or the place a request came from: where the
     // scope's last known place stands in for it, it is not known to be of this conversation, and nobody is reminded there.)
     const own = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target;
-    const mention = bound?.mention && own === target && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
+    // (And only for a message kept just now: one kept before is as it was kept, whether it reminded anyone or not.)
+    const mention = bound?.mention && !already && own === target && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
     if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);

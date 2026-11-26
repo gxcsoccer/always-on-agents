@@ -75,7 +75,11 @@ export class BrainAgent extends DurableObject<Env> {
     super(ctx, env);
     this.#store = new BrainStore(ctx);
     this.#timers = new Timers(this.#store);
-    this.#reminders = new Reminders(this.#store, { basis: (runId) => this.#requests.basis(runId) });
+    this.#reminders = new Reminders(this.#store, {
+      basis: (runId) => this.#requests.basis(runId),
+      carrying: (runId) => this.#requests.continuationOf(runId)?.id,
+      isDecider: (principal, source) => this.#isDecider(principal, source),
+    });
     this.#marks = new Marks(this.#store, { unmark: (source, event, mark) => unreceived(this.env, source, this.#store.scope(), event, mark) });
     const brain = this;
     this.#revisions = new Revisions(this.#store, {
@@ -380,7 +384,9 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("UPDATE work SET state = 'unknown' WHERE state = 'open' AND id NOT IN (SELECT id FROM tasks) AND id NOT IN (SELECT id FROM continuations) AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM continuations WHERE ended_at IS NOT NULL AND ended_at < ?", old);
       this.#store.sql.exec("DELETE FROM runs WHERE status != 'running' AND ended_at < ?", old);
-      this.#store.sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ?", old);
+      // (By when it last was due, not by when it was set: one set long ago that has only now fired
+      // for the last time is still gone by, by the run its firing starts, for whom it may remind.)
+      this.#store.sql.exec("DELETE FROM timers WHERE status != 'active' AND created_at < ? AND due_at < ?", old, old);
       this.#store.sql.exec("DELETE FROM task_events WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM tasks WHERE status IN ('succeeded', 'failed', 'lost', 'cancelled') AND updated_at < ?", old);
       this.#store.sql.exec("DELETE FROM task_bounds WHERE task_id NOT IN (SELECT id FROM tasks)");

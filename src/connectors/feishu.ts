@@ -300,18 +300,18 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
-  // Each person once, by who they are. Their name as it stands in the text is given with them only
-  // where it stands for nobody else in this message: worked out over everyone the chat lists,
-  // before anything is left out, so that a name can never come to look like one person's by
-  // the other having been dropped.
-  const people = new Map<string, string>(
-    mentions
-      .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id)
-      .map((each: any) => [each.id.open_id as string, token(each.name)]),
-  );
-  const borne = new Map<string, number>();
-  for (const name of people.values()) borne.set(name.toLowerCase(), (borne.get(name.toLowerCase()) ?? 0) + 1);
-  const mentioned = [...people].map(([id, name]) => (borne.get(name.toLowerCase()) === 1 ? { id, name } : { id })).slice(0, MAX_MENTIONED);
+  // Each person once, by who they are, with the name that stands in the text for them: everyone
+  // the chat lists, none left out. Whether a name stands for one person is not settled here: it
+  // is for whoever goes by this to tell, over all of it (and over the other messages of the same
+  // request), and that can only be told while everyone is still there.
+  const mentioned = [
+    ...new Map(
+      mentions
+        // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.)
+        .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && each.tenant_key === sender.tenant_key)
+        .map((each: any) => [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }]),
+    ).values(),
+  ];
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
@@ -375,9 +375,6 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     },
   };
 }
-
-/** How many people named in one message are kept of it. (Far more than a message names; whether a name stands for one person is settled before any are left out.) */
-const MAX_MENTIONED = 500;
 
 /** A display name squeezed into one token, so no word of it can be read as part of the message. */
 const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;
@@ -701,9 +698,20 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // Whom it reminds, as the Brain settled it: the chat's own mention of each, put before the
   // words. Only where several people talk, and never from anything in the words themselves,
   // which stay as inert as ever. (The same markup is a mention in a post and in plain text.)
-  const reminds = chatId && !card && current ? (message.mention ?? []).filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id)).map((id) => `<at user_id="${id}"></at>`).join(" ") : "";
+  // (The last line of defence, whatever was kept: only in a place of several people, as itself
+  // and for everyone there to see; each a person by their id, and never everyone at once.)
+  const reminds =
+    scope.kind === "chat" && chatId && !only && !card && current
+      ? (message.mention ?? [])
+          .filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all")
+          .map((id) => `<at user_id="${id}"></at>`)
+          .join(" ")
+      : "";
   const words = current && message.authored ? quiet(message.text) : message.text;
-  const worded = reminds ? `${reminds} ${words}` : words;
+  // On a line of their own where the words begin as a heading, a list, a quotation, a table or a
+  // block of code would: put on the same line, the words would no longer begin that way, and
+  // would be shown with their marks.
+  const worded = reminds ? `${reminds}${/^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>|\||`{3,}|~{3,}|\s{4})/.test(words) ? "\n\n" : " "}${words}` : words;
   const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: worded }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;

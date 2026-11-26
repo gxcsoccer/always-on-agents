@@ -146,6 +146,9 @@ export class Runner {
   #askerOf(event: InboxRow): string | null {
     // The result of a task that something was to follow, for the person who asked: taken up alone, as anything done for one person is.
     if (this.#thenOf(event)) return `event:${event.id}`;
+    // So with the end of a task, and the firing of a timer, of which it is kept who asked for it:
+    // a message about it may remind them, and whose thing a run is about has to be one thing.
+    if (this.#asked(event)) return `event:${event.id}`;
     if (this.#b.toolsOf(event.source).length === 0) return null;
     const principal = JSON.parse(event.principal) as Principal;
     const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
@@ -867,6 +870,14 @@ export class Runner {
     const seen = data.github_reads && typeof data.github_reads === "object" ? { github_reads: data.github_reads } : undefined;
     const on = typeof data.repository === "string" && data.repository !== "" ? data.repository : (then.repository ?? undefined);
     return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(on ? { on } : {}), until: (typeof data.first_at === "number" ? data.first_at : events[0].received_at) + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}), conditions } : undefined;
+  }
+
+  /** Whether an event is the end of a task, or the firing of a timer, that was asked for by someone the Brain has kept (see Reminders). */
+  #asked(event: InboxRow): boolean {
+    const id = String((JSON.parse(event.principal) as Principal).id ?? "");
+    if (event.source === "worker" && ["worker.result", "worker.failed", "worker.lost"].includes(event.kind)) return this.#s.rows("SELECT 1 FROM task_asked WHERE task_id = ?", id).length > 0;
+    if (event.source === "timer" && event.kind === "timer") return typeof (JSON.parse(this.#s.rows<{ data: string | null }>("SELECT data FROM timers WHERE id = ?", id)[0]?.data ?? "{}") as { by?: unknown }).by === "string";
+    return false;
   }
 
   /** What was to follow the task an event is the good end of, if anything was and it has not been taken back. */

@@ -45,8 +45,14 @@ function bench(state: DurableObjectState) {
     store.sql.exec("INSERT INTO runs (id, session_id, status, started_at) VALUES (?, ?, 'running', 1)", id, session(key));
     return store.rows<RunRow>("SELECT * FROM runs WHERE id = ?", id)[0];
   };
-  const reminders = new Reminders(store, { basis: (runId) => store.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId) });
-  return { store, message, run, reminders };
+  /** Runs that carry a request on, by the request; and connectors whose word on who wrote something does not count here. */
+  const settings = { carrying: {} as Record<string, string>, untrusted: [] as string[] };
+  const reminders = new Reminders(store, {
+    basis: (runId) => store.rows<InboxRow>("SELECT * FROM inbox WHERE run_id = ? ORDER BY id", runId),
+    carrying: (runId) => settings.carrying[runId],
+    isDecider: (principal, source) => principal.kind === "human" && principal.unlinked !== true && !settings.untrusted.includes(source),
+  });
+  return { store, message, run, reminders, settings };
 }
 
 const within = <T>(use: (all: ReturnType<typeof bench>) => T | Promise<T>, scope = "chat:oc_1"): Promise<T> =>
@@ -101,28 +107,62 @@ describe("who a message may remind", () => {
     });
   });
 
-  it("reminds no more than a few by one message, and the ones left out keep their turn", async () => {
+  it("reminds no more than a few people of one thing, by however many messages", async () => {
     await within(({ message, run, reminders }) => {
       const many = Array.from({ length: MAX_REMINDED + 2 }, (_, n) => `ou_p${n}`);
       for (const each of many) message(each, "hello");
       message(ANN, "tell everyone", { run: "r1" });
       const asked = run("r1");
-      expect(reminders.claim(asked, many, HERE)).toEqual(many.slice(0, MAX_REMINDED));
-      // In another message of the same thing: those not yet reminded, and none of those who were.
-      expect(reminders.claim(asked, many, HERE)).toEqual(many.slice(MAX_REMINDED));
+      // Two by one message, then the rest asked for by another: only as many as are left of the few.
+      expect(reminders.claim(asked, many.slice(0, 2), HERE)).toEqual(many.slice(0, 2));
+      expect(reminders.claim(asked, many, HERE)).toEqual(many.slice(2, MAX_REMINDED));
+      // A run made to send message after message reminds nobody more of it.
+      expect(reminders.claim(asked, many, HERE)).toEqual([]);
+      expect(reminders.claim(asked, [ANN], HERE)).toEqual([]);
+      // Of another thing, a few again.
+      message(ANN, "and of this", { run: "r2" });
+      expect(reminders.claim(run("r2"), many, HERE)).toEqual(many.slice(0, MAX_REMINDED));
+    });
+  });
+
+  it("takes the answer of a request that had to wait for a thing of its own, and nobody's word through a connector that is not trusted here", async () => {
+    await within(({ message, run, reminders, settings }) => {
+      message(ANN, "do it, and tell me", { run: "r1" });
+      const asked = run("r1");
+      // Told when it was asked that it has to wait.
+      expect(reminders.claim(asked, [ANN], HERE)).toEqual([ANN]);
+      // The run that carries it on rests on the same message of hers: its answer reminds her all the same, once.
+      message(ANN, "do it, and tell me", { run: "resumed" });
+      settings.carrying.resumed = "call_9";
+      const carried = run("resumed");
+      expect(reminders.of(carried, HERE)!.event).toBe("request:call_9");
+      expect(reminders.claim(carried, [ANN], HERE)).toEqual([ANN]);
+      expect(reminders.claim(carried, [ANN], HERE)).toEqual([]);
+
+      // Written through a connector whose word on who wrote it does not count: not hers to ask by, and no sign that she wrote here.
+      message("ou_zed", "hello", { source: "elsewhere" });
+      message("ou_yan", "tell zed and me", { run: "r3", source: "elsewhere" });
+      settings.untrusted.push("elsewhere");
+      expect(reminders.of(run("r3"), HERE)).toBeUndefined();
+      message(ANN, "tell zed", { run: "r4" });
+      expect(reminders.claim(run("r4"), ["ou_zed", "all", "@ou_zed"], HERE)).toEqual([]);
     });
   });
 
   it("takes a name that would mean two people for neither, and one person named twice for one", async () => {
     await within(({ message, run, reminders }) => {
-      // As the connector notes it: a name is given with a person only where it stands for nobody else in that message.
-      message(ANN, "tell @Li and @Li, and @Wu", { run: "r1", data: { group: true, mentioned: [{ id: "ou_li1" }, { id: "ou_li2" }, { name: "@Wu", id: "ou_wu" }, { name: "@NoId" }] } });
+      // Everyone the message named, each with their name: a name two of them bear means neither.
+      message(ANN, "tell @Li and @Li, and @Wu", { run: "r1", data: { group: true, mentioned: [{ name: "@Li", id: "ou_li1" }, { name: "@Li", id: "ou_li2" }, { name: "@Wu", id: "ou_wu" }, { name: "@Wu", id: "ou_wu" }, { name: "@NoId" }, { id: "ou_noname" }] } });
       // The name that means two is no way of saying either; who they are still is.
-      expect(reminders.claim(run("r1"), ["@Li", "@Wu", "@NoId", "ou_li2"], HERE)).toEqual(["ou_wu", "ou_li2"]);
+      expect(reminders.claim(run("r1"), ["@Li", "@Wu", "@NoId", "ou_noname", "ou_li2"], HERE)).toEqual(["ou_wu", "ou_li2"]);
       // Two messages of one request that give one name with different people: that name means neither.
       message(ANN, "tell @Sam", { run: "r2", data: { group: true, mentioned: [{ name: "@Sam", id: "ou_sam1" }] } });
       message(ANN, "and @Sam", { run: "r2", data: { group: true, mentioned: [{ name: "@Sam", id: "ou_sam2" }] } });
       expect(reminders.claim(run("r2"), ["@Sam", "ou_sam1"], HERE)).toEqual(["ou_sam1"]);
+      // Two of that name in one message, and one of them again alone in another: still neither by the name.
+      message(ANN, "tell @Kim and @Kim", { run: "r3", data: { group: true, mentioned: [{ name: "@Kim", id: "ou_kim1" }, { name: "@Kim", id: "ou_kim2" }] } });
+      message(ANN, "I mean @Kim", { run: "r3", data: { group: true, mentioned: [{ name: "@Kim", id: "ou_kim1" }] } });
+      expect(reminders.claim(run("r3"), ["@Kim", "ou_kim2"], HERE)).toEqual(["ou_kim2"]);
     });
   });
 
