@@ -678,7 +678,8 @@ function unsearched(reads: unknown): string | undefined {
   if (!search || typeof search !== "object") return undefined;
   const by = Object.entries(search.by_status ?? {}).map(([status, count]) => [status, Number(count) || 0] as const);
   if (by.reduce((sum, [, count]) => sum + count, 0) === 0) return undefined;
-  if (by.some(([status, count]) => count > 0 && !/^2/.test(status))) return "was refused or failed at least once";
+  // (A query that was not accepted as written, 400 or 422, was no search at all: what it was put right into is what counts.)
+  if (by.some(([status, count]) => count > 0 && !/^2/.test(status) && status !== "400" && status !== "422")) return "was refused or failed at least once";
   if (Number(search.incomplete) > 0) return "was not complete";
   const [read, more] = [Number(search.read) || 0, Number(search.more) || 0];
   if (read === 0) return "was never read";

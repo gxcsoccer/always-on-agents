@@ -1389,7 +1389,10 @@ export class Runner {
       // In the order things came, but for what is to be done for a person who has said something
       // since: that waits until their words are taken up (which are themselves in this line, so
       // it does not wait for ever), and nobody else's turn is passed over for it.
-      const first = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT ?", MAX_EVENTS_PER_RUN * 4).find((each) => !this.#waitsForWords(each));
+      // (So many waiting for words that those words are not among the ones looked at: the words themselves, then.)
+      const first =
+        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' ORDER BY id LIMIT ?", MAX_EVENTS_PER_RUN * 4).find((each) => !this.#waitsForWords(each)) ??
+        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE status = 'pending' AND kind = 'message' ORDER BY id LIMIT 1")[0];
       if (!first) return undefined;
       if (first.kind !== "request.ready") {
         // The very messages looked at are the ones taken up: what arrives meanwhile waits its turn.

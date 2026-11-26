@@ -178,6 +178,13 @@ export class RunTools {
         const folded = carried ? undefined : (JSON.parse(this.#s.meta(`waited:${slot}`) ?? "null") as { request: string } | null)?.request;
         // (What follows a task shares its call with every other result of the request's tasks: one
         // that waited and has since ended is not still waiting, and is answered further down by what became of it.)
+        // Which call it is: by a digest, so that none of what is to be written is kept here beside it.
+        // Another thing than the one the request has had done, or has under way, is refused before
+        // anything else is said of it: also while that one still waits for the person.
+        const { replaces: _, ...mine } = args;
+        const wanted = after ? await digestOf([name, mine]) : "";
+        const held = after ? this.#s.rows<{ tool: string; digest: string; result: string | null }>("SELECT tool, digest, result FROM request_acts WHERE request = ?", after.request)[0] : undefined;
+        if (held && (held.tool !== name || held.digest !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
         const waited = this.#s.rows<{ status: string }>("SELECT status FROM continuations WHERE id = ?", slot)[0];
         const ended = after !== undefined && waited !== undefined && !["waiting", "resuming", "answering"].includes(waited.status);
         if (!carried && !ended && (folded !== undefined || waited !== undefined)) {
@@ -242,10 +249,6 @@ export class RunTools {
         if (after) {
           if (Date.now() > after.until) throw new Error("what was to follow this work was not done in time, and is not done now; nothing was sent. The person can ask again");
           if (unheard(this.#s, String(session.session_key), acting.person)) throw new Error("the person has written since, and that is taken up first; nothing was done in their name. If they still want it, it is done when they say so");
-          // Which call it is: by a digest, so that none of what is to be written is kept here beside it.
-          const wanted = await digestOf([name, given]);
-          const held = this.#s.rows<{ tool: string; digest: string; result: string | null }>("SELECT tool, digest, result FROM request_acts WHERE request = ?", after.request)[0];
-          if (held && (held.tool !== name || held.digest !== wanted)) throw new Error("one thing is done in the person's name for what they asked, and it has been done or is under way; nothing more was sent. Tell them how that one stands");
           // The very call again, and it has had its end: said again as it was said, and not done again, whatever the tool still keeps of it.
           if (held?.result != null) return JSON.parse(held.result) as unknown;
           // Asked for before, kept waiting, and ended without being done (called off, out of time): that was its end.
@@ -446,7 +449,7 @@ export class RunTools {
         const may = acting ? thenable(acting, this.#b.toolsOf) : [];
         const unknown = then.filter((each) => !may.includes(each));
         if (unknown.length > 0) throw new Error(`${unknown.join(", ")} cannot be named to follow this work: ${may.length > 0 ? `only ${may.join(", ")} can here` : "nothing can be done in a person's name from this run"}; nothing was handed over`);
-        const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds }, ...(typeof own.repository === "string" ? { on: own.repository } : {}) } : undefined;
+        const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds } } : undefined;
         const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom, following)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
