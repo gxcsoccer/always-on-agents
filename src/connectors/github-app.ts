@@ -43,11 +43,17 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
     // 422 means this installation does not cover a repository of that name; another one might.
     if (response.status === 422 || response.status === 404) continue;
     if (!response.ok) throw new Error(`GitHub refused to issue a token: ${response.status}`);
-    const body = (await response.json()) as { token: string; expires_at: string; repositories?: { full_name?: string }[] };
+    const body = (await response.json()) as { token: string; expires_at: string; repositories?: { full_name?: string; private?: unknown; visibility?: unknown }[] };
     // The request names the repository without its owner. Check the token is for the one we mean:
     // two owners can each have a repository of the same name.
     // and it must be for that repository alone.
     if (body.repositories?.length !== 1 || body.repositories[0].full_name?.toLowerCase() !== repo.toLowerCase()) continue;
+    // One for what anyone may read is for a repository anyone may read: GitHub says with the token
+    // whether it is. Of one that is not public it would be given nothing of the issues anyway, but
+    // how it is turned away (and against which count) would tell a private repository that is
+    // there from one that is not. None, then, and the read is as a stranger's. (One made private
+    // after this is no longer answered for by GitHub itself.)
+    if (to === "public" && (body.repositories[0].private !== false || (body.repositories[0].visibility !== undefined && body.repositories[0].visibility !== "public"))) continue;
     // Which installation it came from is kept with it: that installation may be given to another tenant later.
     return { token: body.token, expires_at: Date.parse(body.expires_at), installation };
   }

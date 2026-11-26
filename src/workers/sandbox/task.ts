@@ -759,6 +759,12 @@ export class TaskSandbox extends DurableObject<Env> {
   async githubReadToken(open = false): Promise<string | undefined> {
     const by = await this.#lend("read");
     if (by !== undefined || !open) return by;
+    // (Only while the task is at work and is somebody's: at any other time nothing is lent, and that says nothing of the repository.)
+    const lending = () => {
+      const state = this.#state();
+      return state !== undefined && state.brain !== undefined && (ACTIVE.has(state.phase) || state.phase === "starting");
+    };
+    if (!lending()) return undefined;
     // Not to be had for this repository (it is not one any installation of the tenant's covers,
     // most often: somebody else's public repository), as was found a little while ago: not asked
     // for again with every read.
@@ -772,7 +778,7 @@ export class TaskSandbox extends DurableObject<Env> {
       // Could not be asked just now: read with none this time, and asked again the next.
       return undefined;
     }
-    if (lent === undefined) {
+    if (lent === undefined && lending()) {
       const state = this.#state();
       if (state && repo) {
         state.github_public_none = { repo, at: Date.now() };

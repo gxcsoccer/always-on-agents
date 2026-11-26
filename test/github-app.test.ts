@@ -44,11 +44,13 @@ describe("a token for one repository", () => {
     await registry.linkGithubInstallation("4242", "tok");
     const { pkcs8 } = await keyPair();
     const asked: Record<string, unknown>[] = [];
+    /** What GitHub says of the repository with the token. */
+    let described: Record<string, unknown> = { private: false, visibility: "public" };
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input as RequestInfo, init);
       expect(request.url).toBe("https://api.github.com/app/installations/4242/access_tokens");
       asked.push((await request.json()) as Record<string, unknown>);
-      return Response.json({ token: `t${asked.length}`, expires_at: new Date(Date.now() + 3_600_000).toISOString(), repositories: [{ full_name: "acme/demo" }] }, { status: 201 });
+      return Response.json({ token: `t${asked.length}`, expires_at: new Date(Date.now() + 3_600_000).toISOString(), repositories: [{ full_name: "acme/demo", ...described }] }, { status: 201 });
     });
     const withApp = { ...(env as any), GITHUB_APP_ID: "1", GITHUB_APP_PRIVATE_KEY: pem("PRIVATE KEY", pkcs8) };
     expect((await githubTokenFor(withApp, "tok", "acme/demo"))?.token).toBe("t1");
@@ -60,12 +62,22 @@ describe("a token for one repository", () => {
       { repositories: ["demo"], permissions: { contents: "read", pull_requests: "read", issues: "read" } },
       { repositories: ["demo"], permissions: { metadata: "read" } },
     ]);
+    // One for what anyone may read is not given for a repository that is not public, or not said to be: the others are, whatever it is.
+    for (const not of [{ private: true, visibility: "private" }, { private: false, visibility: "internal" }, {}, { private: "false" }]) {
+      described = not;
+      expect(await githubTokenFor(withApp, "tok", "acme/demo", "public"), JSON.stringify(not)).toBeUndefined();
+    }
+    described = { private: true, visibility: "private" };
+    expect((await githubTokenFor(withApp, "tok", "acme/demo", "read"))?.token).toBeDefined();
+    described = { private: false };
+    expect((await githubTokenFor(withApp, "tok", "acme/demo", "public"))?.token).toBeDefined();
+    const before = asked.length;
     // With no App there is the deployment's token to write with (local development), and nothing that only reads.
     const without = { ...(env as any), GITHUB_APP_ID: "", GITHUB_APP_PRIVATE_KEY: "" };
     expect((await githubTokenFor(without, "tok", "acme/demo"))?.token).toBe("test-github-token");
     expect(await githubTokenFor(without, "tok", "acme/demo", "read")).toBeUndefined();
     expect(await githubTokenFor(without, "tok", "acme/demo", "public")).toBeUndefined();
-    expect(asked).toHaveLength(3);
+    expect(asked).toHaveLength(before);
     vi.unstubAllGlobals();
   });
 });
