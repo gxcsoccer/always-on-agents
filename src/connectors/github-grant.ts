@@ -729,11 +729,20 @@ async function attempt(kind: Kind, context: ToolContext, args: Record<string, un
           return [...found.whole.map((one) => ({ ...one, index: from + at, plain: true })), ...found.bare.map((bare) => ({ repo: of(each.text), number: bare, index: from + at, plain: false }))];
         });
       const now = pointsOf(0, context.said.length);
-      const points = now.length > 0 ? now : pointsOf(context.said.length, own.length);
+      // Going on from before: within the repository they name now, if they name one; and it is
+      // the one they pointed at last, in the latest of their earlier messages that points at
+      // anything there. Not whichever of the things they spoke of the call happens to name.
+      const here = new Set(context.said.flatMap((each) => reposIn(each.text)));
+      const before = pointsOf(context.said.length, own.length).filter((each) => here.size === 0 || (each.repo !== undefined && here.has(each.repo)));
+      const last = before.filter((each) => each.index === Math.max(...before.map((one) => one.index)));
+      const points = now.length > 0 ? now : last;
       const meant = points.find((each) => each.repo === repo && each.number === number);
-      if (!meant) {
+      // (Several at once, in that last message, and it is not plain which of them is gone on with.)
+      const several = now.length === 0 && new Set(last.map((each) => `${each.repo}#${each.number}`)).size > 1;
+      if (!meant || several) {
         if (points.some((each) => each.number === number && each.repo === undefined)) return { error: `the person named more than one repository, and it is not plain which of them #${number} is in; nothing was posted. Ask them which one they mean (as owner/name#${number}, or by its address)` };
-        return { error: `that is not the issue or pull request the person pointed at ${now.length > 0 ? "this time" : "themselves"} (they say which as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
+        if (several) return { error: "the person pointed at more than one issue or pull request before, and it is not plain which of them they mean now; nothing was posted. Ask them which one (as owner/name#number, or by its address)" };
+        return { error: `that is not the issue or pull request the person pointed at ${now.length > 0 ? "this time" : "last"} (they say which as owner/name#${number}, or by its address); nothing was posted. Ask them which one they mean` };
       }
       relied(meant.index);
       if (!meant.plain) relied(named);

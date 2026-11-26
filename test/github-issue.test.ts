@@ -857,8 +857,26 @@ describe("commenting on GitHub as the person who asked", () => {
     expect((await asked(`换成 ${PRIVATE} 的 #7，评论：我这边也遇到了`, PUBLIC, 7)).error).toContain("is not the issue or pull request the person pointed at this time");
     expect(await asked(`换成 ${PRIVATE} 的 #7，评论：我这边也遇到了`, PRIVATE, 7)).toMatchObject({ posted: true, repo: "acme/core", number: 7 });
     expect(world.commentWrites.map((each) => `${each.repo}#${each.number}`)).toEqual([`${PUBLIC}#9`, `${PRIVATE}#7`]);
-    // Pointing at nothing this time, she goes on from what she said: the one she named a moment ago.
+    // Pointing at nothing this time, she goes on from what she said: the one she pointed at last, and no earlier one.
+    expect((await asked("就在那下面再评论一句：我这边也遇到了", PUBLIC, 9)).error).toContain("is not the issue or pull request the person pointed at last");
     expect(await asked("就在那下面再评论一句：我这边也遇到了", PRIVATE, 7)).toMatchObject({ posted: true, number: 7 });
+    const sent = world.commentWrites.length;
+    // Another repository named now, and no number: nothing she pointed at in the one before is hers to go on with there.
+    expect((await asked(`换到 ${PUBLIC} 那边评论：我这边也遇到了`, PRIVATE, 7)).error).toContain("is not the issue or pull request the person pointed at last");
+    expect(world.commentWrites).toHaveLength(sent);
+    // Two spoken of one after the other, then "that one": the later of them.
+    for (const number of [7, 9]) {
+      model.replies([say("")]);
+      await alone.says(`再看看 ${PUBLIC}#${number}`);
+    }
+    expect((await asked("就在那条下面评论：我这边也遇到了", PUBLIC, 7)).error).toContain("is not the issue or pull request the person pointed at last");
+    expect(world.commentWrites).toHaveLength(sent);
+    expect(await asked("就在那条下面评论：我这边也遇到了", PUBLIC, 9)).toMatchObject({ posted: true, number: 9 });
+    // Two at once, then "that one": not plain which.
+    model.replies([say("")]);
+    await alone.says(`${PUBLIC}#7 和 ${PUBLIC}#9 好像是一回事`);
+    expect((await asked("就在那条下面评论：我这边也遇到了", PUBLIC, 9)).error).toContain("more than one issue or pull request before");
+    expect(world.commentWrites).toHaveLength(sent + 1);
   });
 
   it("notifies only those the person mentioned themselves in what they asked, in a comment as in an issue", async () => {
@@ -871,7 +889,7 @@ describe("commenting on GitHub as the person who asked", () => {
     // A plain message of several lines. She types one name out; mentions a colleague of the chat, who is a person there
     // and not an account on GitHub; quotes a line that names someone; and shows a name in code.
     model.replies([comments(PUBLIC, 7, written)], ...done("好了"));
-    await alone.says(`在 ${PUBLIC}#7 评论：谢谢 @octo-cat 和 @_user_1 的排查，写法见 \`@in-span\`\n> @quoted-one 之前说过`, colleague);
+    await alone.says(`在 ${PUBLIC}#7 评论：谢谢 @octo-cat 和 @_user_1 的排查，写法见 \`@in-span\`\n> @quoted-one 之前说过\n这一行接着上面的引用，@stranger 也在里面`, colleague);
     expect(world.commentWrites[0].body.body).toMatch(sent);
     // The same in a message with formatting: her words, a block of code, the colleague.
     model.replies([comments(PUBLIC, 7, written)], ...done("好了"));

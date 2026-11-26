@@ -241,6 +241,11 @@ describe("a code review on GitHub", () => {
     // Names left as they are: the ones given, however they are cased.
     expect(inert("cc @Ann and @bob", new Set(["ann"]))).toBe("cc @Ann and `@bob`");
     // What a writer mentions themselves: not in code, nor in what they quote.
+    // A quotation goes on over the lines that follow it, with or without the mark, until a blank line; then it is the writer again.
+    expect([...mentionsOf("> @first said\nand @second agreed\n> @third too\n\nthanks @Mine")]).toEqual(["mine"]);
+    // A block of code opened inside a quotation ends with the quotation: what follows is prose, and notifies.
+    expect(inert("> ```\n> @in quoted code\n@after the quotation")).toBe("> ```\n> @in quoted code\n`@after` the quotation");
+    expect(inert("> ```\n> @in quoted code\n> ```\n> and @quoted prose")).toBe("> ```\n> @in quoted code\n> ```\n> and `@quoted` prose");
     expect([...mentionsOf("thanks @Ann\n> @quoted said so\n`@in-span` and\n```\n@fenced\n```\n\n    @indented\n\n- cc @acme/Team")]).toEqual(["ann", "acme/team"]);
   });
 
