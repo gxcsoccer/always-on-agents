@@ -19,13 +19,16 @@ const body = (req) => new Promise((resolve) => { let s = ""; req.on("data", (c) 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
 
 // ---- the model: says "ok" to everything; records what it was sent ----
-const model = { calls: [], fail: false };
+const model = { calls: [], fail: false, tool: false };
 const modelServer = createServer(async (req, res) => {
   const q = await body(req);
   model.calls.push(q.messages ?? q.input ?? q);
   if (model.fail) { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { message: "no" } })); }
   res.writeHead(200, { "content-type": "text/event-stream" });
-  for (const [delta, reason] of [[{ role: "assistant", content: `ok ${model.calls.length}` }, null], [{}, "stop"]]) {
+  // Asked to, it first runs a command (once), as an agent at work would.
+  const first = model.tool && model.calls.length === 1;
+  const said = first ? [[{ role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo at-work" }) } }] }, null], [{}, "tool_calls"]] : [[{ role: "assistant", content: `ok ${model.calls.length}` }, null], [{}, "stop"]];
+  for (const [delta, reason] of said) {
     res.write(`data: ${JSON.stringify({ id: "x", object: "chat.completion.chunk", created: 1, model: "fake", choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`);
   }
   res.end("data: [DONE]\n\n");
@@ -39,7 +42,7 @@ const taskServer = createServer(async (req, res) => {
   if (task.down) return req.socket.destroy();
   const answer = () => {
     if (q.run !== task.run) return { ok: false };
-    const missing = task.onlyFinal && !q.final ? [] : task.taken.filter((n) => !q.have.includes(n.id));
+    const missing = task.spent || (task.onlyFinal && !q.final) ? [] : task.taken.filter((n) => !q.have.includes(n.id));
     if (q.final && missing.length === 0) task.closed = true;
     return { ok: true, notes: missing };
   };
@@ -68,7 +71,7 @@ function pi(sessions, { resume = false, run = "r1", provider = "probe", prompt =
     child.on("close", (code) => resolve({ code, out, err, ms: Date.now() - started, settled: (out.match(/"type":"agent_settled"/g) ?? []).length }));
   });
 }
-const reset = (over = {}) => { Object.assign(task, { taken: [], closed: false, run: "r1", fetches: [], hangFirst: 0, down: false, onlyFinal: false }, over); model.calls = []; model.fail = false; };
+const reset = (over = {}) => { Object.assign(task, { taken: [], closed: false, run: "r1", fetches: [], hangFirst: 0, down: false, onlyFinal: false, spent: false }, over); model.calls = []; model.fail = false; model.tool = false; };
 /** How often each note's text is in each request to the model. */
 const seen = (...texts) => model.calls.map((messages) => texts.map((text) => JSON.stringify(messages).split(text).length - 1));
 const results = [];
@@ -125,6 +128,17 @@ reset({ taken: [{ id: "i", text: "NOTE-IOTA" }] });
 model.fail = true;
 r = await pi(fresh());
 check("I the step fails at the model: nothing is fetched for it, and nothing is asked of the model again for a note's sake", task.fetches.length === 0 && seen("NOTE-IOTA").every((c) => c[0] === 0), { calls: model.calls.length, fetches: task.fetches });
+
+// K. The agent is running a command when the note is there: it is in the very next request, with the command's result, and costs no request of its own.
+reset({ taken: [{ id: "k", text: "NOTE-KAPPA" }] });
+model.tool = true;
+r = await pi(fresh());
+check("K a note taken while the agent runs a command: in the next request, together with the command's result; no request more than without it", r.code === 0 && model.calls.length === 2 && JSON.stringify(seen("NOTE-KAPPA")) === "[[0],[1]]" && JSON.stringify(model.calls[1]).includes("at-work") && task.closed, { calls: model.calls.length, seen: seen("NOTE-KAPPA"), fetches: task.fetches, err: r.err.slice(0, 300) });
+
+// L. The task has no step left to give: it hands nothing out, and the agent ends as it would have, with its own last reply.
+reset({ taken: [{ id: "l", text: "NOTE-LAMBDA" }], spent: true });
+r = await pi(fresh());
+check("L a task with no step left hands nothing out: one request, the agent ends well, the run is closed", r.code === 0 && r.settled === 1 && model.calls.length === 1 && task.closed && seen("NOTE-LAMBDA").every((c) => c[0] === 0), { calls: model.calls.length, fetches: task.fetches });
 
 // J. What goes to a Responses-style model for a note in the session (for the sandbox's outbound check).
 reset({ taken: [{ id: "a", text: "NOTE-ALPHA" }], run: "r3" });
