@@ -13,27 +13,28 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, dropGrant, githubCreateIssue, grantCallback, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
+import { authorisationRevoked, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 export const githubConnector: Connector = {
   name: "github",
   // Also plugged into the chat connector: what a person there can have done on GitHub in their own name.
   serves: ["feishu"],
-  tools: [githubCreateIssue],
+  tools: [githubCreateIssue, githubDisconnect],
   holds: grantHolds,
   offers: grantOffers,
   invitation: grantInvitation,
   async http(request, env, path) {
     if (path[0] === "webhook" && request.method === "POST") return handleGithubWebhook(request, env);
     if (path[0] === "oauth" && path[1] === "callback" && path.length === 2 && request.method === "GET") return grantCallback(request, env);
+    if (path[0] === "oauth" && path[1] === "confirm" && path.length === 2 && request.method === "POST") return grantConfirm(request, env);
     return json({ error: "not found" }, 404);
   },
   async admin({ method, path, body }, env) {
     // One person's authorisation to act as them on GitHub: whether it stands, and taking it away (here only).
     if (path[0] === "github" && path[1] === "grants" && path.length === 6 && (method === "GET" || method === "DELETE")) {
       const name = await grantName({ tenant: path[2], chat_app_id: path[3], tenant_key: path[4], open_id: path[5] });
-      if (method === "DELETE") await dropGrant(env, name);
+      if (method === "DELETE") await env.GITHUB_GRANTS.getByName(name).drop();
       return json(await env.GITHUB_GRANTS.getByName(name).status());
     }
     if (path[0] !== "tenants" || method !== "POST") return undefined;

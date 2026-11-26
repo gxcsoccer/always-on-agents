@@ -35,6 +35,8 @@ const world = {
   dropAnswers: 0,
   /** GitHub does not answer a listing of issues. */
   listingDown: false,
+  /** GitHub gives no answer to a renewal. */
+  renewalsDown: false,
   duringWrite: undefined as undefined | (() => unknown),
   renewals: 0,
   /** How long an access token lasts, in seconds. */
@@ -56,6 +58,7 @@ function installWorld() {
   world.writes.length = 0;
   world.dropAnswers = 0;
   world.listingDown = false;
+  world.renewalsDown = false;
   world.duringWrite = undefined;
   world.renewals = 0;
   world.lasts = 28_800;
@@ -94,6 +97,7 @@ function installWorld() {
       const form = new URLSearchParams(String(init?.body));
       if (form.get("client_id") !== "test-client-id" || form.get("client_secret") !== "test-client-secret") return Response.json({ error: "incorrect_client_credentials" });
       if (form.get("grant_type") === "refresh_token") {
+        if (world.renewalsDown) return Response.json({ message: "unavailable" }, { status: 503 });
         world.renewals++;
         const account = world.refreshes.get(form.get("refresh_token") ?? "");
         // What renews a token is taken once, and what it renewed is no good from then on.
@@ -203,15 +207,20 @@ function someone(tenant = TENANT, app = APP, org = ORG) {
 }
 
 const linkOn = (card: any) => new URL(card.elements.find((e: any) => e.tag === "action").actions[0].url);
-/** The person goes through GitHub's page as some account, and comes back. */
-async function consent(authorize: URL, account: number): Promise<Response> {
+/** The person goes through GitHub's page as some account, comes back, and says on the page they are shown that the account is to be used. */
+async function consent(authorize: URL, account: number, confirms = true): Promise<Response> {
   const back = new URL(authorize.searchParams.get("redirect_uri")!);
   back.searchParams.set("state", authorize.searchParams.get("state")!);
   const code = `code${Math.random().toString(36).slice(2)}`;
   world.codes.set(code, { account, challenge: authorize.searchParams.get("code_challenge")!, redirect: authorize.searchParams.get("redirect_uri")! });
   back.searchParams.set("code", code);
-  return (exports as any).default.fetch(new Request(back));
+  const shown: Response = await (exports as any).default.fetch(new Request(back));
+  if (shown.status !== 200 || !confirms) return shown;
+  const html = await shown.text();
+  expect(html).toContain(`@${loginOf(account)}`);
+  return confirm(authorize.searchParams.get("state")!, /name="confirm" value="([^"]+)"/.exec(html)![1]);
 }
+const confirm = (state: string, word: string): Promise<Response> => (exports as any).default.fetch(new Request("https://agent.test/v1/github/oauth/confirm", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ state, confirm: word }) }));
 const toolOutputs = (asked: any = modelCalls.at(-1)): any[] => {
   const input = asked.input as any[];
   return input.slice(input.map((each) => each.role).lastIndexOf("user") + 1).filter((each) => each.type === "function_call_output").map((each) => JSON.parse(each.output)).filter((each) => JSON.stringify(each) !== '{"ok":true}');
@@ -298,6 +307,10 @@ describe("opening an issue on GitHub as the person who asked", () => {
     model.replies([opens(PRIVATE)], ...done("哪个仓库？"));
     await alone.says("提个 issue：重连后消息重复");
     expect(toolOutputs()[0].error).toContain("has not named that repository");
+    // Nor is a name that only contains it, or is contained in it, hers for that repository.
+    model.replies([opens("acme/sit")], ...done("哪个仓库？"));
+    await alone.says("提个 issue：重连后消息重复");
+    expect(toolOutputs()[0].error).toContain("has not named that repository");
     // One she named, which is not this tenant's: whatever her own account can reach there.
     model.replies([opens("other/thing")], ...done("不行"));
     await alone.says("在 other/thing 提个 issue：重连后消息重复");
@@ -349,7 +362,7 @@ describe("opening an issue on GitHub as the person who asked", () => {
     await registry().linkChatRepo(TENANT, "oc_core", PRIVATE);
     const there = ann.at("oc_core");
     model.replies([opens(PRIVATE, "又一个")], ...done("好了"));
-    await there.says("提个 issue：又一个");
+    await there.says(`在 ${PRIVATE} 提个 issue：又一个`);
     expect(toolOutputs()).toEqual([expect.objectContaining({ created: true, url: world.issues.at(-1)!.html_url })]);
   });
 
@@ -504,5 +517,90 @@ describe("opening an issue on GitHub as the person who asked", () => {
     expect(taken.status).toBe(202);
     expect(await taken.json()).toEqual({ revoked: 1 });
     expect((await (await admin("GET", `github/grants/two/cli_two/org_two/${other.openId}`)).json()) as any).toMatchObject({ authorised: false });
+  });
+});
+
+describe("whose GitHub account it is", () => {
+  it("is not taken from whoever merely opens the link: nothing is kept to act with until the one at the browser says so, with a word only their page has", async () => {
+    const mallory = someone();
+    const alone = mallory.at();
+    model.replies([opens(PUBLIC)], [say("")]);
+    await alone.says(`在 ${PUBLIC} 提个 issue：重连后消息重复`);
+    const authorize = linkOn(alone.cards()[0]);
+    // She hands her link to someone else, whose browser GitHub sends straight back.
+    const victim = 9_001;
+    const shown = await consent(authorize, victim, false);
+    expect(shown.status).toBe(200);
+    expect(await shown.text()).toContain("如果这次请求不是你自己在聊天里发起的");
+    // Nothing to act with, and she cannot say yes in their place: she has the link, not the word.
+    expect((await mallory.stored()).grant).toBeUndefined();
+    expect((await confirm(authorize.searchParams.get("state")!, "a".repeat(43))).status).toBe(400);
+    await alone.later();
+    expect((await mallory.stored()).grant).toBeUndefined();
+    expect(world.writes).toEqual([]);
+    expect(await registry().githubGrantsOf(String(victim))).toEqual([]);
+  });
+
+  it("is one account for a person until they give it up themselves, which they can do in their own chat", async () => {
+    const ann = await (async (p) => (await authorised(p), p))(someone());
+    const alone = ann.at();
+    // The token is turned away, and she comes back as another account: not taken.
+    for (const [token, each] of world.tokens) world.tokens.set(token, { ...each, good: false });
+    world.refreshes.clear();
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const kept = (await state.storage.get<any>("grant"))!;
+      await state.storage.put("grant", { ...kept, grant: { ...kept.grant, expires_at: Date.now() } });
+    });
+    model.replies([opens(PUBLIC, "换号")], [say("")]);
+    await alone.says(`在 ${PUBLIC} 提个 issue：换号`);
+    expect((await consent(linkOn(alone.cards().at(-1)), 9_002)).status).toBe(403);
+    await alone.settle();
+    expect(world.issues.map((each) => each.title)).not.toContain("换号");
+    // She gives the first one up, and the other can then be hers.
+    const asked = modelCalls.length;
+    model.replies([call("github_disconnect", {})], ...done("已取消"));
+    await alone.says("取消 GitHub 授权");
+    expect(offered(modelCalls[asked])).toContain("github_disconnect");
+    expect(await registry().githubGrantsOf(String(ann.account))).toEqual([]);
+    model.replies([opens(PUBLIC, "换号之后")], [say("")]);
+    await alone.says(`在 ${PUBLIC} 提个 issue：换号之后`);
+    model.replies(...done("建好了"));
+    expect((await consent(linkOn(alone.cards().at(-1)), 9_002)).status).toBe(200);
+    await alone.settle();
+    expect(world.issues.at(-1)).toMatchObject({ title: "换号之后", user: { id: 9_002 } });
+  });
+
+  it("keeps what it holds when GitHub cannot be asked to renew it, and says that as what it is", async () => {
+    const ann = await (async (p) => (await authorised(p), p))(someone());
+    const alone = ann.at();
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const kept = (await state.storage.get<any>("grant"))!;
+      await state.storage.put("grant", { ...kept, grant: { ...kept.grant, expires_at: Date.now() } });
+    });
+    world.renewalsDown = true;
+    const before = world.writes.length;
+    model.replies([opens(PUBLIC, "连不上")], ...done("稍后再试"));
+    await alone.says(`在 ${PUBLIC} 提个 issue：连不上`);
+    expect(toolOutputs()[0].error).toContain("could not be asked just now");
+    expect(world.writes).toHaveLength(before);
+    expect(alone.cards()).toHaveLength(1);
+    expect((await ann.stored()).grant).toBeDefined();
+    world.renewalsDown = false;
+    model.replies([opens(PUBLIC, "连上了")], ...done("好了"));
+    await alone.says(`在 ${PUBLIC} 提个 issue：连上了`);
+    expect(world.issues.at(-1)!.title).toBe("连上了");
+  });
+
+  it("finds an issue it could not confirm, when asked about that call again, and never sends it again", async () => {
+    const ann = await (async (p) => (await authorised(p), p))(someone());
+    const grant = await ann.grant();
+    await grant.begin(ann.who, "call-lost", { repo: PUBLIC, repo_id: 101, private: false, title: "找回", body: "正文" }, "b");
+    world.dropAnswers = 1;
+    world.listingDown = true;
+    expect(await grant.post("call-lost")).toMatchObject({ stage: "lost" });
+    expect(await grant.post("call-lost")).toMatchObject({ stage: "lost" });
+    world.listingDown = false;
+    expect(await grant.post("call-lost")).toMatchObject({ stage: "posted", issue: { url: world.issues.at(-1)!.html_url } });
+    expect(world.writes.filter((each) => each.body.title === "找回")).toHaveLength(1);
   });
 });

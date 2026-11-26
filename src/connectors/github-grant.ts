@@ -63,6 +63,8 @@ export interface Op {
   created_at: number;
   deadline: number;
   generation: number;
+  /** The GitHub account it was sent as, by number, once it was sent. */
+  account?: number;
   /** The conversation it was asked in, by the scope name of its Brain. */
   brain?: string;
 }
@@ -71,12 +73,18 @@ const ENDED: Op["stage"][] = ["posted", "lost", "failed"];
 interface Stored {
   who: Who;
   generation: number;
-  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat" } }[];
+  pending: { nonce: string; verifier: string; redirect: string; expires_at: number; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat" }; held?: Held }[];
   /** `refresh`: absent where the App's tokens do not run out. `account`: whose it is on GitHub, by number. */
   grant?: { access: string; refresh?: string; version: string; expires_at: number; refresh_expires_at?: number; since: number; account: number; login: string };
+  /** The GitHub account that is this person's in the tenant, by number: from when they first authorised as it until they give it up, whatever becomes of the tokens meanwhile. */
+  bound?: number;
   /** Word owed of a change, to each conversation that waits on this person's authorisation, until each has heard. */
   owed?: { event: string; attempts: number; to: string[] };
 }
+
+/** What GitHub gave for an invitation someone came back through, kept until that someone has said the account is to be used: `confirm` is known to their browser alone. */
+type Held = Pick<NonNullable<Stored["grant"]>, "access" | "refresh" | "version" | "expires_at" | "refresh_expires_at" | "account" | "login"> & { confirm: string };
+type Acting = { token: string; version: string; account: number; login: string };
 
 type Issued = { access_token: string; expires_in?: number; refresh_token?: string; refresh_token_expires_in?: number };
 
@@ -92,8 +100,8 @@ function tokensOf(issued: Issued, now: number) {
 
 export class GithubGrant extends DurableObject<Env> {
   /** Renewals and sends under way in this instance: a second asker waits for the first, and nothing is done twice. */
-  #renewing?: Promise<string | undefined>;
-  #posting = new Map<string, Promise<Op | "unauthorised" | undefined>>();
+  #renewing?: Promise<Acting | "later" | undefined>;
+  #posting = new Map<string, Promise<Op | "unauthorised" | "later" | undefined>>();
 
   /** Makes an invitation for this person to authorise, for one request. */
   async invite(who: Who, redirect: string, generation: number, what: { brain: string; call: string; text: string; where: "private" | "chat" }): Promise<"superseded" | "full" | { nonce: string; expires_at: number; generation: number }> {
@@ -140,23 +148,59 @@ export class GithubGrant extends DurableObject<Env> {
     return { who: stored.who, verifier: found.verifier, redirect: found.redirect, generation: stored.generation };
   }
 
-  /** Keeps what an authorisation produced, unless the grant was taken away since it began. */
-  async install(nonce: string, generation: number, issued: Issued, account: { id: number; login: string }): Promise<boolean> {
+  /**
+   * Keeps, aside, what GitHub gave for an invitation someone came back through. Nothing is acted
+   * with yet: whoever came back is first shown which account it is and asked whether it is to be
+   * used (they may have been handed someone else's link). Gives what their browser has to bring back.
+   */
+  async hold(nonce: string, generation: number, issued: Issued, account: { id: number; login: string }): Promise<string | undefined> {
     const key = await this.#key();
     const version = random(16);
     const access = await seal(key, issued.access_token, version);
     const refresh = issued.refresh_token ? await seal(key, issued.refresh_token, version) : undefined;
     const stored = await this.#load();
     const through = stored?.pending.find((each) => each.nonce === nonce);
-    if (!stored || stored.generation !== generation || through?.state !== "taken") return false;
+    if (!stored || stored.generation !== generation || through?.state !== "taken" || through.held) return undefined;
+    through.held = { access, ...(refresh ? { refresh } : {}), version, ...tokensOf(issued, Date.now()), account: account.id, login: account.login, confirm: random(32) };
+    void this.ctx.storage.put("grant", stored);
+    return through.held.confirm;
+  }
+
+  /**
+   * The person said the account is to be used: it becomes theirs in this tenant, if it is nobody
+   * else's there and they have no other, and what was held becomes their grant. "another": it is
+   * not theirs to have. Nothing where there is nothing held under that word (any more).
+   */
+  async install(nonce: string, confirm: string): Promise<"done" | "another" | undefined> {
+    const held = (stored: Stored | undefined) => {
+      const through = stored?.pending.find((each) => each.nonce === nonce);
+      return stored && through?.state === "taken" && through.held && through.held.confirm === confirm && through.expires_at + INVITATION_KEPT_MS > Date.now() ? through : undefined;
+    };
+    const before = await this.#load();
+    const first = held(before);
+    if (!before || !first?.held) return undefined;
+    const name = await grantName(before.who);
+    const account = String(first.held.account);
+    const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name, before.who.open_id);
+    if (!claimed) return "another";
+    // As things are now: the grant may have been taken away while that was asked.
+    const stored = await this.#load();
+    const through = held(stored);
+    if (!stored || !through?.held || stored.generation !== before.generation) {
+      if (claimed === "new") await registry(this.env).releaseGithubPerson(name, account);
+      return undefined;
+    }
+    const { confirm: _spent, ...grant } = through.held;
     const now = Date.now();
+    delete through.held;
     through.state = "done";
     through.at = now;
-    stored.grant = { access, ...(refresh ? { refresh } : {}), version, ...tokensOf(issued, now), since: now, account: account.id, login: account.login };
-    stored.owed = this.#owed(stored, version);
+    stored.grant = { ...grant, since: now };
+    stored.bound = grant.account;
+    stored.owed = this.#owed(stored, grant.version);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(now);
-    return true;
+    return "done";
   }
 
   /** An invitation someone came back through came to nothing. Says how it stands after this. */
@@ -165,6 +209,7 @@ export class GithubGrant extends DurableObject<Env> {
     const through = stored?.pending.find((each) => each.nonce === nonce);
     if (!stored || !through || through.state !== "taken") return through?.state === "done" || through?.state === "refused" ? through.state : undefined;
     through.state = "refused";
+    delete through.held;
     stored.owed = this.#owed(stored, `refused:${nonce}`);
     void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(Date.now());
@@ -183,19 +228,22 @@ export class GithubGrant extends DurableObject<Env> {
     return { state: "holds", since: shown.state === "done" && shown.at ? Math.min(shown.at, stored.grant.since) : stored.grant.since };
   }
 
-  /** Which generation this is, and whether there is a token to act with now (renewed, if it had run out and can be). */
-  async standing(): Promise<{ generation: number; authorised: boolean }> {
+  /** Which generation this is, and whether there is a token to act with now (renewed, if it had run out): "later" where that cannot be told just now. */
+  async standing(): Promise<{ generation: number; authorised: boolean | "later" }> {
     const stored = await this.#load();
-    return { generation: stored?.generation ?? 1, authorised: (await this.#token()) !== undefined };
+    const held = await this.#token();
+    return { generation: stored?.generation ?? 1, authorised: held === "later" ? "later" : held !== undefined };
   }
 
-  /** Forgets the tokens and closes every open invitation. Only here: GitHub's own record of the authorisation is the person's to remove. */
+  /** Forgets the tokens and closes every open invitation, and the account is no longer this person's here. Only here: GitHub's own record of the authorisation is the person's to remove. */
   async drop(): Promise<void> {
     const stored = await this.#load();
     if (!stored) return;
     const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
-    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, owed });
+    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
     void this.ctx.storage.setAlarm(Date.now());
+    // That account, and no other they may have come to hold since.
+    if (stored.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(stored.who), String(stored.bound));
   }
 
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
@@ -234,8 +282,9 @@ export class GithubGrant extends DurableObject<Env> {
    * Creates the issue of one call, once: as the person, in the repository it was asked for, with
    * the title and body it was kept with. Asked again while that is under way, it is the same
    * sending. "unauthorised": there is no token to act with (any more); nothing was created.
+   * "later": whether there is one cannot be told just now; nothing was created, and it can be asked again.
    */
-  post(call: string): Promise<Op | "unauthorised" | undefined> {
+  post(call: string): Promise<Op | "unauthorised" | "later" | undefined> {
     const under = this.#posting.get(call);
     if (under) return under;
     const going = this.#post(call).finally(() => this.#posting.delete(call));
@@ -243,9 +292,9 @@ export class GithubGrant extends DurableObject<Env> {
     return going;
   }
 
-  async #post(call: string): Promise<Op | "unauthorised" | undefined> {
+  async #post(call: string): Promise<Op | "unauthorised" | "later" | undefined> {
     const op = await this.op(call);
-    if (!op || ENDED.includes(op.stage)) return op;
+    if (!op || op.stage === "posted" || op.stage === "failed") return op;
     const end = async (stage: Op["stage"], more: Partial<Op> = {}) => {
       const now: Op = { ...op, ...more, stage };
       await this.ctx.storage.put(`op:${call}`, now);
@@ -254,15 +303,16 @@ export class GithubGrant extends DurableObject<Env> {
     const stands = async () => (await this.#load())?.generation === op.generation;
     const mark = await markOf(this.ctx.id.toString(), call);
     // It was being sent once already (this instance was interrupted): it may be there.
-    if (op.stage === "posting") {
+    // Or it was left as not known: looked for again, and never sent again. Not found is still not known.
+    if (op.stage === "posting" || op.stage === "lost") {
       const held = await this.#token();
-      const found = held ? await this.#find(held, op, mark) : undefined;
+      const found = held && held !== "later" && (op.account === undefined || op.account === held.account) ? await this.#find(held, op, mark) : undefined;
       return found ? end("posted", { issue: found }) : end("lost");
     }
     if (!(await stands())) return end("failed", { why: "changed" });
     if (Date.now() >= op.deadline) return end("failed", { why: "late" });
     const held = await this.#token();
-    if (!held) return "unauthorised";
+    if (!held || held === "later") return held ?? "unauthorised";
     // The name still means the repository it was asked for, and the person can see it.
     let seen: Response;
     try {
@@ -277,6 +327,8 @@ export class GithubGrant extends DurableObject<Env> {
     // The last thing before the send: what it was asked under still stands, and its time is not up.
     if (!(await stands())) return end("failed", { why: "changed" });
     if (Date.now() >= op.deadline) return end("failed", { why: "late" });
+    // As which account: what is looked for later is this account's and no other's.
+    op.account = held.account;
     await this.ctx.storage.put(`op:${call}`, { ...op, stage: "posting" } satisfies Op);
     let sent: Response | undefined;
     try {
@@ -297,64 +349,64 @@ export class GithubGrant extends DurableObject<Env> {
   }
 
   /** The issue of one call, if it is there: in that repository, by this person, carrying that call's mark. Nothing where it is not found, or could not be looked for. */
-  async #find(held: { token: string; account: number; login: string }, op: Op, mark: string): Promise<Op["issue"] | undefined> {
+  async #find(held: Acting, op: Op, mark: string): Promise<Op["issue"] | undefined> {
     try {
       const listed = await github(held.token, `/repos/${op.repo}/issues?${new URLSearchParams({ creator: held.login, state: "all", since: new Date(op.created_at - 60_000).toISOString(), per_page: "100" })}`);
       if (!listed.ok) return undefined;
       const issues = (await listed.json()) as { number?: unknown; html_url?: unknown; body?: unknown; user?: { id?: unknown }; pull_request?: unknown; repository_url?: unknown }[];
-      const found = (Array.isArray(issues) ? issues : []).find((each) => !each.pull_request && each.user?.id === held.account && typeof each.body === "string" && each.body.includes(mark));
+      const found = (Array.isArray(issues) ? issues : []).find((each) => !each.pull_request && each.user?.id === held.account && typeof each.body === "string" && each.body.trimEnd().endsWith(mark));
       return found && typeof found.number === "number" && typeof found.html_url === "string" ? { number: found.number, url: found.html_url } : undefined;
     } catch {
       return undefined;
     }
   }
 
-  /** The token to act with now. Renewed first where it has run out and can be: one renewal at a time, since GitHub takes what renews a token once only. */
-  async #token(): Promise<{ token: string; version: string; account: number; login: string } | undefined> {
-    const stored = await this.#load();
-    const grant = stored?.grant;
+  /**
+   * The token to act with now, and whose it is. Renewed first where it has run out and can be:
+   * one renewal at a time, since GitHub takes what renews a token once only. "later": it could not
+   * be renewed just now, and what is held is kept.
+   */
+  async #token(): Promise<Acting | "later" | undefined> {
+    const grant = (await this.#load())?.grant;
     if (!grant) return undefined;
-    const of = (token: string, now = grant) => ({ token, version: now.version, account: now.account, login: now.login });
     try {
       // (Still good by itself, as against only renewable.)
-      if (grant.expires_at - EXPIRY_MARGIN_MS > Date.now()) return of(await open(await this.#key(), grant.access, grant.version));
+      if (grant.expires_at - EXPIRY_MARGIN_MS > Date.now()) return { token: await open(await this.#key(), grant.access, grant.version), version: grant.version, account: grant.account, login: grant.login };
     } catch {
       return undefined;
     }
     if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return undefined;
     this.#renewing ??= this.#renew(grant.version).finally(() => (this.#renewing = undefined));
-    const token = await this.#renewing;
-    const now = (await this.#load())?.grant;
-    return token && now ? of(token, now) : undefined;
+    return this.#renewing;
   }
 
-  async #renew(version: string): Promise<string | undefined> {
+  async #renew(version: string): Promise<Acting | "later" | undefined> {
     const stored = await this.#load();
     const grant = stored?.grant;
     if (!stored || !grant?.refresh || grant.version !== version || !this.env.GITHUB_CLIENT_ID || !this.env.GITHUB_CLIENT_SECRET) return undefined;
     const key = await this.#key();
-    let issued: (Partial<Issued> & { error?: string }) | null;
-    try {
-      const response = await fetch(TOKEN, { method: "POST", headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: this.env.GITHUB_CLIENT_ID, client_secret: this.env.GITHUB_CLIENT_SECRET, grant_type: "refresh_token", refresh_token: await open(key, grant.refresh, grant.version) }), signal: AbortSignal.timeout(20_000) });
-      issued = (await response.json().catch(() => null)) as typeof issued;
-      // No answer worth the name: what is held may still be good, and is kept.
-      if (!response.ok || !issued) return undefined;
-    } catch {
-      return undefined;
-    }
+    const client = { id: this.env.GITHUB_CLIENT_ID, secret: this.env.GITHUB_CLIENT_SECRET };
+    const issued = await (async (): Promise<(Partial<Issued> & { error?: unknown }) | null> => {
+      const response = await fetch(TOKEN, { method: "POST", headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: client.id, client_secret: client.secret, grant_type: "refresh_token", refresh_token: await open(key, grant.refresh!, grant.version) }), signal: AbortSignal.timeout(20_000) });
+      return response.ok ? response.json() : null;
+    })().catch(() => null);
+    const renewed = issued && typeof issued.access_token === "string" && issued.access_token !== "" ? (issued as Issued) : undefined;
+    // Only GitHub saying that what was held is no good ends it. Anything else is no answer about that: it is kept.
+    if (!renewed && issued?.error !== "bad_refresh_token") return "later";
+    // Everything that takes time is done first; then the record is read and written in one step,
+    // as it stands then: a grant taken away, or replaced, meanwhile is not written over.
+    const next = random(16);
+    const sealed = renewed ? { access: await seal(key, renewed.access_token, next), refresh: renewed.refresh_token ? await seal(key, renewed.refresh_token, next) : undefined } : undefined;
     const after = await this.#load();
     if (!after?.grant || after.grant.version !== version || after.generation !== stored.generation) return undefined;
-    if (typeof issued.access_token !== "string" || !issued.access_token) {
-      // GitHub said no to what was held: it is of no use any more.
+    if (!renewed || !sealed) {
       delete after.grant;
       void this.ctx.storage.put("grant", after);
       return undefined;
     }
-    const next = random(16);
-    const now = Date.now();
-    after.grant = { ...after.grant, access: await seal(key, issued.access_token, next), refresh: issued.refresh_token ? await seal(key, issued.refresh_token, next) : undefined, version: next, ...tokensOf(issued as Issued, now) };
-    await this.ctx.storage.put("grant", after);
-    return issued.access_token;
+    after.grant = { ...after.grant, ...sealed, version: next, ...tokensOf(renewed, Date.now()) };
+    void this.ctx.storage.put("grant", after);
+    return { token: renewed.access_token, version: next, account: after.grant.account, login: after.grant.login };
   }
 
   /** Forgets a token GitHub turned away, if it is still the one held. */
@@ -491,9 +543,14 @@ async function createIssue(context: ToolContext, args: Record<string, unknown>):
     const body = String(args.body ?? "").trim();
     if (!title || title.length > MAX_TITLE) return { error: `give the issue a title of at most ${MAX_TITLE} characters` };
     if (body.length > MAX_BODY) return { error: `the body is too long: at most ${MAX_BODY} characters` };
-    // Which repository is the person's to say, not the model's: named in their own words, or the one this chat is set up to work on.
-    const named = [...context.said, ...context.recent].some((each) => each.text.toLowerCase().includes(repo));
-    if (!named && !(scope.kind === "chat" && (await registry(env).chatRepo(scope.tenant, scope.id)) === repo)) return { error: "the person has not named that repository themselves; nothing was created. Ask them which repository they mean (as owner/name)" };
+    // Which repository is the person's to say, not the model's: named whole in their own words (owner/name, or its address on GitHub).
+    const names = (text: string) => [...text.matchAll(/(?<![\w.-])([\w.-]+\/[\w.-]+)/g)].some((found) => found[1].replace(/(\.git|\.)+$/i, "").toLowerCase() === repo);
+    const said = context.said.findIndex((each) => names(each.text));
+    const earlier = said < 0 ? context.recent.findIndex((each) => names(each.text)) : -1;
+    // The message that named it is part of what this request rests on.
+    if (said >= 0) context.relied?.("said", said);
+    else if (earlier >= 0) context.relied?.("recent", earlier);
+    else return { error: "the person has not named that repository themselves; nothing was created. Ask them which repository they mean (as owner/name)" };
   }
   // Where several people talk: only in a chat the chat service says, now, is the organisation's own. Asked on every call.
   if (scope.kind === "chat") {
@@ -515,8 +572,10 @@ async function createIssue(context: ToolContext, args: Record<string, unknown>):
   const op = kept ?? (await grant.begin(who, context.callId, { repo, repo_id: repository.id, private: repository.private, title: String(args.title).trim(), body: String(args.body ?? "").trim() }, scopeName(scope)));
   if (op === "full") return { error: "too many issues were asked for and are still being kept track of for this person; nothing was created. Try again later" };
   if (op.generation !== standing.generation) return CHANGED;
-  const done = ENDED.includes(op.stage) ? op : standing.authorised ? await grant.post(context.callId) : "unauthorised";
+  // (One left as not known is looked for again, where there is a token to look with.)
+  const done = op.stage === "posted" || op.stage === "failed" ? op : standing.authorised === "later" ? "later" : standing.authorised || op.stage === "lost" ? await grant.post(context.callId) : "unauthorised";
   if (done === undefined) return CHANGED;
+  if (done === "later") return { error: "GitHub could not be asked just now whether the person's authorisation still stands; nothing was created, and nothing about their authorisation was changed. They can ask again in a little while" };
   if (done === "unauthorised") {
     if (Date.now() >= op.deadline) return { error: WHY.late };
     const invitation = await grant.invite(who, redirect, standing.generation, { brain: scopeName(scope), call: context.callId, text: context.said.map((each) => each.text.trim()).filter(Boolean).join(" ") || op.title, where: scope.kind === "chat" ? "chat" : "private" });
@@ -530,10 +589,25 @@ async function createIssue(context: ToolContext, args: Record<string, unknown>):
   // Where several people talk, a link into a repository the others may not be able to see is the
   // person's alone: unless this chat is set up to work on that repository. As things are now.
   if (scope.kind === "chat" && repository.private && (await registry(env).chatRepo(scope.tenant, scope.id)) !== repo) {
-    return { created: true, direct: { text: `${made.repo}#${made.number}\n${made.url}` }, note: "The issue was created as the person. The repository is not public and this chat is not set up for it, so its link was sent to them directly and is not given here: say that, and nothing more about it." };
+    return { created: true, direct: { text: `${made.repo}#${made.number}\n${made.url}` }, note: "The issue was created as the person. The repository is not public and this chat is not set up for it, so its link is being sent to them directly and is not given here: say that, and nothing more about it." };
   }
   return { created: true, ...made, note: "The issue was created as the person, in their name. Give them the link." };
 }
+
+export const githubDisconnect: ConnectorTool = {
+  name: "github_disconnect",
+  description: "Takes away, here, the person's authorisation to act on GitHub as them: when they ask for that outright. They are asked to authorise again the next time they want something done as them.",
+  effect: "act",
+  optional: true,
+  parameters: {},
+  run: async (context) => {
+    const { env, origin, scope } = context;
+    const app = await registry(env).feishuApp(origin.app_id ?? "");
+    if (scope.kind !== "user" || !app || app.tenant !== scope.tenant || !origin.tenant_key) return { error: "this can only be done by the person, in their own chat with the agent" };
+    await env.GITHUB_GRANTS.getByName(await grantName({ tenant: scope.tenant, chat_app_id: app.app_id, tenant_key: origin.tenant_key, open_id: context.person })).drop();
+    return { ok: true, note: "Their authorisation is no longer used here, and what was kept of it is gone. GitHub still lists the app as authorised until they remove it there themselves (Settings → Applications → Authorized GitHub Apps): tell them both." };
+  },
+};
 
 /** Whether a condition of this connector's holds: the person's authorisation, for the request that was shown one invitation. */
 export async function grantHolds(env: Env, scope: Scope, condition: string, generation: number): Promise<Holds | undefined> {
@@ -547,7 +621,7 @@ export async function grantHolds(env: Env, scope: Scope, condition: string, gene
 export async function grantOffers(env: Env, event: InboundEvent): Promise<string[]> {
   const appId = (event.data?.origin as { app_id?: unknown } | undefined)?.app_id;
   if ((event.data?.direct !== true && event.data?.group !== true) || typeof appId !== "string" || !setUp(env)) return [];
-  return (await registry(env).feishuApp(appId)) ? [githubCreateIssue.name] : [];
+  return (await registry(env).feishuApp(appId)) ? [githubCreateIssue.name, githubDisconnect.name] : [];
 }
 
 export async function grantInvitation(env: Env, interaction: string): Promise<Invitation | null | undefined> {
@@ -555,16 +629,10 @@ export async function grantInvitation(env: Env, interaction: string): Promise<In
   return found ? env.GITHUB_GRANTS.getByName(found[1]).card(found[1], found[2]) : undefined;
 }
 
-/** Takes a person's authorisation away here: their tokens are forgotten, and their GitHub account is free to be someone's again. */
-export async function dropGrant(env: Env, name: string): Promise<void> {
-  await env.GITHUB_GRANTS.getByName(name).drop();
-  await registry(env).releaseGithubPerson(name);
-}
-
 /** The person took their authorisation of the App away on GitHub: every grant of that account, in every tenant, is over. */
 export async function authorisationRevoked(env: Env, account: number): Promise<number> {
   const names = await registry(env).githubGrantsOf(String(account));
-  await Promise.all(names.map((each) => dropGrant(env, each)));
+  await Promise.all(names.map((each) => env.GITHUB_GRANTS.getByName(each).drop()));
   return names.length;
 }
 
@@ -593,17 +661,39 @@ export async function grantCallback(request: Request, env: Env): Promise<Respons
     const asked = await github(issued.access_token, "/user");
     const account = (asked.ok ? await asked.json().catch(() => null) : null) as { id?: unknown; login?: unknown } | null;
     if (!account || typeof account.id !== "number" || typeof account.login !== "string") return await refused("identity_unknown");
-    // One GitHub account is one person in a tenant: not someone else's already, by the operator's word or by an authorisation of theirs.
-    if (!(await registry(env).claimGithubPerson(invitation.who.tenant, String(account.id), state[1], invitation.who.open_id))) return await refused("another_person", page("这个 GitHub 账号已经对应到另一个人", "在这个组织里，这个 GitHub 账号已经属于另一位成员，所以这次授权没有生效。请用你自己的 GitHub 账号重新操作，或联系管理员。", 403));
-    if (!(await grant.install(state[2], invitation.generation, issued as Issued, { id: account.id, login: account.login }))) return await refused("superseded");
-    return succeeded;
+    if (!/^[A-Za-z0-9-]{1,39}$/.test(account.login)) return await refused("identity_unknown");
+    // Nothing is acted with yet. Whoever is at this browser may have been handed someone else's
+    // link, and GitHub does not ask again once the App is authorised: they are shown the account
+    // and asked. What they send back carries a word only this page was given.
+    const confirm = await grant.hold(state[2], invitation.generation, issued as Issued, { id: account.id, login: account.login });
+    if (!confirm) return await refused("superseded");
+    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
   } catch {
     return await refused("interrupted");
   }
 }
 
-/** A page with fixed words only: nothing from the request is ever written into it. */
-function page(title: string, body: string, status = 200): Response {
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:18vh auto;padding:0 1.5rem;color:#1f2329}h1{font-size:1.4rem}p{line-height:1.7;color:#51565d}</style></head><body><h1>${title}</h1><p>${body}</p></body></html>`;
-  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'", "x-content-type-options": "nosniff" } });
+/** The person at the browser said the account is to be used. */
+export async function grantConfirm(request: Request, env: Env): Promise<Response> {
+  const form = await request.formData().catch(() => null);
+  const state = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{20,100})$/.exec(String(form?.get("state") ?? ""));
+  const confirm = String(form?.get("confirm") ?? "");
+  if (!state || !/^[A-Za-z0-9_-]{20,100}$/.test(confirm) || !setUp(env)) return page("这个链接无法使用", "请回到聊天里，重新向我发起请求。", 400);
+  const grant = env.GITHUB_GRANTS.getByName(state[1]);
+  try {
+    const how = await grant.install(state[2], confirm);
+    if (how === "done") return page("授权成功", "现在可以回到聊天里。如果你刚才的请求还在等待，我会接着处理，不用再发一遍。");
+    if (how === undefined) return page("这个链接已经用过或已失效", "请回到聊天里，重新向我发起请求。", 400);
+    console.log(JSON.stringify({ github_authorisation_refused: "another_person" }));
+    await grant.refuse(state[2]);
+    return page("这个 GitHub 账号不能用在这里", "在这个组织里，这个 GitHub 账号已经属于另一位成员，或者你已经授权过另一个 GitHub 账号。要换账号，请先在聊天里让我取消原来的授权；否则请用你自己的账号重新操作，或联系管理员。", 403);
+  } catch {
+    return page("授权没有成功", "请回到聊天里，需要的话再跟我说一遍。如果一直不成功，请联系管理员。", 400);
+  }
+}
+
+/** A page of this module's own words: nothing from the request is written into it but what was checked letter by letter first. */
+function page(title: string, body: string, status = 200, form = ""): Response {
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:18vh auto;padding:0 1.5rem;color:#1f2329}h1{font-size:1.4rem}p{line-height:1.7;color:#51565d}button{font-size:1rem;padding:.6rem 1.2rem;border:0;border-radius:.4rem;background:#1f2329;color:#fff}</style></head><body><h1>${title}</h1><p>${body}</p>${form}</body></html>`;
+  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'", "x-content-type-options": "nosniff" } });
 }

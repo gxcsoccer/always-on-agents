@@ -297,23 +297,24 @@ export class Registry extends DurableObject<Env> {
   /**
    * Notes that a GitHub account (by GitHub's number for it) authorised as one person of a tenant,
    * whose grant is kept under `grant`. False, and nothing noted, where the account is someone
-   * else's there already: by the operator's word (which is never written over here), or by an
-   * authorisation of theirs. One step, so two people cannot both come to hold one account.
+   * else's there already (by the operator's word, which is never written over here, or by an
+   * authorisation of theirs), or where this person holds another account: that one has to be
+   * given up first. "same": it was theirs already. One step, so two cannot both come to hold one.
    */
-  async claimGithubPerson(tenant: string, account: string, grant: string, user: string): Promise<boolean> {
+  async claimGithubPerson(tenant: string, account: string, grant: string, user: string): Promise<"new" | "same" | false> {
     const sql = this.ctx.storage.sql;
     const linked = await this.resolveIdentity(tenant, "github", account);
     if (linked !== null && linked !== user) return false;
     const held = sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0];
-    if (held && held.grant_name !== grant) return false;
-    // The person may have authorised as another account before: that one is theirs no longer.
-    sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
+    if (held) return held.grant_name === grant ? "same" : false;
+    if (sql.exec("SELECT 1 FROM github_people WHERE grant_name = ?", grant).toArray().length > 0) return false;
     sql.exec("INSERT INTO github_people (tenant, account, grant_name) VALUES (?, ?, ?)", tenant, account, grant);
-    return true;
+    return "new";
   }
 
-  async releaseGithubPerson(grant: string): Promise<void> {
-    this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
+  /** That account is no longer the person's whose grant this is: that one, and no other they hold since. */
+  async releaseGithubPerson(grant: string, account: string): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
   }
 
   /** Every grant given as one GitHub account, in whichever tenant. */
