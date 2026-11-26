@@ -1279,7 +1279,7 @@ export class Runner {
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
         ...this.#s
-          .rows<{ id: string; worker: string; title: string; status: string; after: string | null }>("SELECT id, worker, title, status, (SELECT from_id FROM task_follows WHERE task_id = tasks.id) AS after FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input', 'queued') ORDER BY created_at")
+          .rows<{ id: string; worker: string; title: string; status: string; after: string | null }>("SELECT id, worker, title, status, (SELECT from_id FROM task_follows WHERE task_id = tasks.id) AS after FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input', 'queued') AND session_key = ? ORDER BY created_at", session?.session_key ?? "")
           .map((each) => ({
             id: each.id,
             worker: each.worker,

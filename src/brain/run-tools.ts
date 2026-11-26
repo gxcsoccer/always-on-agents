@@ -106,7 +106,10 @@ export class RunTools {
    * was an index has its row made now; one that never waited has only its row.
    */
   async #work(run: RunRow, sessionKey: string, id: string): Promise<{ task: true } | { task: false; worker: string; state: string; standing: string; waits?: "authorisation" | "result"; handed: boolean }> {
-    if (this.#s.rows("SELECT 1 FROM tasks WHERE id = ?", id).length > 0) return { task: true };
+    // A task is its conversation's: one of another conversation in the same scope is not there to be asked about or stopped from here.
+    const task = this.#s.rows<{ session_key: string }>("SELECT session_key FROM tasks WHERE id = ?", id)[0];
+    if (task && task.session_key !== sessionKey) throw new Error(`there is no piece of work ${JSON.stringify(id)} in this conversation`);
+    if (task) return { task: true };
     const record = this.#b.requests.record(id);
     if (record) this.#b.requests.indexed(id);
     const row = this.#s.rows<{ worker: string; state: string; session_key: string; person: string | null; condition: string | null; generation: number | null; handed: number }>("SELECT worker, state, session_key, person, condition, generation, handed FROM work WHERE id = ?", id)[0];
