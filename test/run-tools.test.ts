@@ -69,6 +69,7 @@ function bench(state: DurableObjectState) {
       basis: () => (settings.event ? [settings.event] : settings.basis.map((id) => ({ id }))) as never,
       endRequest: note("endRequest"),
       noteSource: note("noteSource"),
+      putOff: note("putOff"),
       wait: (...args: unknown[]) => (calls.push(["wait", ...args]), { waiting: "kept" }),
       draft: (...args: unknown[]) => (calls.push(["draft", ...args]), { ok: true as const }),
     } as RunToolsHost["requests"],
@@ -370,9 +371,33 @@ describe("a run's tools", () => {
         tool.answer = async (context) => (context.after?.done ? { done: true } : { posted: "again" });
         expect(await tools().connectorTool("c4", "feishu_read_document", { url: "u" })).toEqual({ done: true });
 
+        // She has said something that is not taken up, seen before the tool is even called: put off the same way, and not given longer for it.
+        settings.following = { ...settings.following!, request: "req3" };
+        settings.event = { ...settings.event!, source_id: "t1:1:again:r0", received_at: 2_000, data: JSON.stringify({ task_id: "t1", first_at: 1_000 }) };
+        store.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, data, status, received_at) VALUES ('feishu', 'om_unread', 'message', ?, ?, 'how is it going?', '{}', 'pending', 1)", SESSION_KEY, JSON.stringify({ kind: "human", id: "ou_1", explicit: true }));
+        const calls = tool.given.length;
+        expect(await tools().connectorTool("c6", "feishu_read_document", { url: "u" })).toMatchObject({ put_off: true, error: expect.stringContaining("put off until it has been") });
+        expect(tool.given).toHaveLength(calls);
+        expect(store.rows<{ data: string }>("SELECT data FROM inbox WHERE source_id = 't1:1:again:r0:again:r1'").map((each) => JSON.parse(each.data).first_at)).toEqual([1_000]);
+        expect(store.rows("SELECT 1 FROM request_acts WHERE request = 'req3'")).toEqual([]);
+        store.sql.exec("DELETE FROM inbox WHERE source_id = 'om_unread'");
+
         // Past the time it was to be done by: not done.
         settings.following = { ...settings.following!, request: "req2", until: Date.now() - 1 };
         await expect(tools().connectorTool("c5", "feishu_read_document", { url: "u" })).rejects.toThrow("was not done in time");
+      });
+    });
+
+    it("puts a request it is carrying on back to waiting where the tool says it is put off, whatever the request was kept for", async () => {
+      await within(async ({ tools, tool, outside, store, settings, of }) => {
+        settings.carried = { id: "req9", status: "resuming", call_id: "c1", tool: "feishu_read_document", args: JSON.stringify({ url: "u" }), generation: 1, claimed_at: Date.now() };
+        tool.answer = async () => ({ held: true, error: "put off" });
+        expect(await tools().connectorTool("c1", "feishu_read_document", {})).toEqual({ error: "put off", put_off: true });
+        expect(of("putOff")).toEqual([["req9", "r1"]]);
+        // Nothing was read, nothing is kept anew, and the run does nothing more.
+        expect(of("wait")).toEqual([]);
+        expect(outside.has("c1")).toBe(false);
+        expect(store.rows("SELECT closed FROM runs WHERE id = 'r1'")).toEqual([{ closed: "waited" }]);
       });
     });
 

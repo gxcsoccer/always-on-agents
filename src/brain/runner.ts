@@ -851,10 +851,10 @@ export class Runner {
     const conditions = Object.fromEntries(named.filter((each) => each.includes(":")).map((each) => [each.slice(0, each.indexOf(":")), each.slice(each.indexOf(":") + 1)]));
     const tools = [...new Set(named.map((each) => each.split(":")[0]))];
     // What the worker's host counted of the work, and what it says the work was on, as they came with the result (the event is the Brain's own row, made from the host's report).
-    const data = JSON.parse(events[0].data ?? "{}") as { github_reads?: unknown; repository?: unknown };
+    const data = JSON.parse(events[0].data ?? "{}") as { github_reads?: unknown; repository?: unknown; first_at?: unknown };
     const seen = data.github_reads && typeof data.github_reads === "object" ? { github_reads: data.github_reads } : undefined;
     const on = typeof data.repository === "string" && data.repository !== "" ? data.repository : (then.repository ?? undefined);
-    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(on ? { on } : {}), until: events[0].received_at + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}), conditions } : undefined;
+    return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(on ? { on } : {}), until: (typeof data.first_at === "number" ? data.first_at : events[0].received_at) + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}), conditions } : undefined;
   }
 
   /** What was to follow the task an event is the good end of, if anything was and it has not been taken back. */

@@ -402,6 +402,20 @@ export class Requests implements Wakes {
     return { target: places.at(-1), sure: places.length === 1 };
   }
 
+  /**
+   * Puts a request that was being carried on back to waiting as it was, to be taken up again:
+   * what it was to do is put off (the person has said something that comes first), not given up.
+   * Nothing of it is changed but that it waits again: where its way in was shown, what it waits
+   * on and how long, all stay; nothing is said to anyone. It is said to be ready at once, and is
+   * taken up when its turn comes, after their words.
+   */
+  putOff(id: string, by: string): void {
+    const record = this.#s.rows<Continuation>("SELECT * FROM continuations WHERE id = ? AND status = 'resuming'", id)[0];
+    if (!record) return;
+    this.#s.sql.exec("UPDATE continuations SET status = 'waiting', run_id = NULL, call_id = NULL, claimed_at = NULL, check_at = NULL WHERE id = ?", id);
+    this.hint(record, `put_off:${by}`);
+  }
+
   /** A reason to ask a waiting request's condition again. Never more than that. */
   hint(record: Continuation, event: string): void {
     const session = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", record.session_id)[0];

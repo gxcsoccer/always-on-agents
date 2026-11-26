@@ -682,6 +682,11 @@ function receipt(op: Op, name = op.repo): { open: Record<string, unknown>; alone
 function unsearched(reads: unknown): string | undefined {
   const search = (reads as { search?: { each?: Record<string, { pages?: unknown; last?: unknown; incomplete?: unknown }>; others?: unknown } } | undefined)?.search;
   const each = Object.values(search?.each ?? {});
+  // A search that was refused, or failed, or was never answered is in no page that was read: it
+  // is in the count of how the searches were answered. One such, and it was not all looked
+  // through. (A query not accepted as written, 400 or 422, was no search: what it was put right into is what counts.)
+  const by = Object.entries((search as { by_status?: Record<string, unknown> } | undefined)?.by_status ?? {});
+  if (by.some(([status, count]) => Number(count) > 0 && !/^2/.test(status) && status !== "400" && status !== "422")) return "made a search that was refused or failed";
   if (!search || each.length === 0) return "made no search of the repository's issues that was read";
   if (search.others) return "made more searches than were told apart";
   if (each.some((one) => one.incomplete === true)) return "made a search that was not complete";

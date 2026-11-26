@@ -46,7 +46,7 @@ export interface RunToolsHost {
   workers(): Worker[];
   /** Whether a piece of work done in a person's name still stands under what it was done under. */
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
-  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised" | "hint">;
+  readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised" | "putOff">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
 }
@@ -101,6 +101,18 @@ export class RunTools {
     const sources = answers.map((each) => eligibleSource(JSON.parse(each.reads) as Read[], acting, this.#b.toolsOf, each.person, kept));
     const one = sources.every((each) => each !== undefined && each.identity === sources[0]!.identity) ? sources[0] : undefined;
     return { answering: one ? { source: one.request } : {} };
+  }
+
+  /**
+   * Brings the event a run was started by once more, to be taken up again in its turn: for the
+   * result of a task whose following was put off. It keeps when it first came, so that what was
+   * to follow is not given longer to be done by being put off.
+   */
+  #again(run: RunRow): void {
+    const event = this.#b.requests.basis(run.id)[0];
+    if (!event) return;
+    const data = JSON.parse(event.data ?? "{}") as Record<string, unknown>;
+    this.#s.insertEvent({ source: event.source, source_id: `${event.source_id}:again:${run.id}`, kind: event.kind, session_key: event.session_key, principal: JSON.parse(event.principal) as never, text: event.text ?? "", data: { ...data, first_at: typeof data.first_at === "number" ? data.first_at : event.received_at } });
   }
 
   /** What of a request's one thing already waits, or is being carried on, is called off. */
@@ -248,7 +260,11 @@ export class RunTools {
         const receipt = request !== undefined && found.effect === "act";
         if (after) {
           if (Date.now() > after.until) throw new Error("what was to follow this work was not done in time, and is not done now; nothing was sent. The person can ask again");
-          if (unheard(this.#s, String(session.session_key), acting.person)) throw new Error("the person has written since, and that is taken up first; nothing was done in their name. If they still want it, it is done when they say so");
+          // Put off, not given up: the result is brought once more, after their words.
+          if (unheard(this.#s, String(session.session_key), acting.person)) {
+            this.#again(run);
+            return { put_off: true, error: "the person has said something that has not been taken up yet, so this is put off until it has been; nothing was done in their name so far. It comes round again by itself after that: do not do it another way, and do not tell them it failed" };
+          }
           // (The very call again, and it has had its end: the tool is asked what is still kept of it,
           // to say to whoever may be told now, and told that it is not to be done again.)
           // Asked for before, kept waiting, and ended without being done (called off, out of time): that was its end.
@@ -308,16 +324,13 @@ export class RunTools {
           if (typeof result === "object" && result !== null && (result as { held?: unknown }).held === true) {
             delete (result as { held?: unknown }).held;
             (result as { put_off?: true }).put_off = true;
-            if (after) {
-              const event = this.#b.requests.basis(run.id)[0];
-              if (event) this.#s.insertEvent({ source: event.source, source_id: `${event.source_id}:again:${run.id}`, kind: event.kind, session_key: event.session_key, principal: JSON.parse(event.principal) as never, text: event.text ?? "", data: JSON.parse(event.data ?? "{}") as Record<string, unknown> });
-            } else if (carried && request !== undefined) {
-              const again = this.#b.requests.wait(run, { connector: acting.connector, person: acting.person, origin: acting.origin, events: evidence() }, key, name, { on: "authorisation", subject: carried.subject, condition: carried.condition, generation: carried.generation, until: carried.until, request: JSON.parse(carried.args) as Record<string, unknown> });
+            if (after) this.#again(run);
+            // Any request carried on, whatever it was kept for: back to waiting as it was.
+            else if (carried) {
+              this.#b.requests.putOff(carried.id, run.id);
               waits = true;
               this.#b.outside.delete(callId);
-              const record = this.#b.requests.record(key);
-              if (record) this.#b.requests.hint(record, `held:${run.id}`);
-              return again;
+              this.#s.sql.exec("UPDATE runs SET closed = 'waited' WHERE id = ? AND closed IS NULL", run.id);
             }
           }
           const released = after !== undefined && typeof result === "object" && result !== null && (result as { untouched?: unknown }).untouched === true && this.#s.rows("SELECT 1 FROM continuations WHERE id = ?", key).length === 0;

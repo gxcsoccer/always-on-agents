@@ -1184,7 +1184,10 @@ describe("doing for a person what they asked to have done once some work has bee
     };
     // No word from where its requests went out; no search at all; one cut short; one not read to its last page; one with a page left out; more searches than were told apart.
     expect((await tried(undefined)).error).toContain("made no search of the repository's issues that was read");
-    expect((await tried({ search: { by_status: { "403": 2 }, read: 0, more: 0, none: 0, incomplete: 0 }, other: { by_status: { "200": 1 } } })).error).toContain("made no search");
+    expect((await tried({ search: { by_status: {}, read: 0, more: 0, none: 0, incomplete: 0 }, other: { by_status: { "200": 1 } } })).error).toContain("made no search");
+    // One search refused (in no page that was read), another read whole: not all looked through.
+    expect((await tried({ search: { by_status: { "403": 1, "200": 1 }, read: 1, more: 0, none: 1, incomplete: 0, each: { b: { pages: [1], last: true, incomplete: false } } }, other: { by_status: {} } })).error).toContain("made a search that was refused or failed");
+    expect((await tried({ search: { by_status: { failed: 1, "200": 1 }, read: 1, more: 0, none: 1, incomplete: 0, each: { b: { pages: [1], last: true, incomplete: false } } }, other: { by_status: {} } })).error).toContain("made a search that was refused or failed");
     expect((await tried(search({ a: { pages: [1], last: true, incomplete: true } }))).error).toContain("was not complete");
     expect((await tried(search({ a: { pages: [1], last: true, incomplete: false }, b: { pages: [1], last: false, incomplete: false } }))).error).toContain("was not read to its last page");
     expect((await tried(search({ a: { pages: [1, 3], last: true, incomplete: false } }))).error).toContain("not every page was read");
