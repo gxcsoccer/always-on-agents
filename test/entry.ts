@@ -69,7 +69,7 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; publicRepository?: boolean }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; noPublicToken?: boolean }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
@@ -92,9 +92,9 @@ export class FakeTask extends DurableObject {
   }
   /** As the real task: a credential that can only read, lent where the other is; none where the test says the task is not lent one. A test can have the lending fail, or the task end while it is asked. */
   async githubReadToken(open = false) {
-    const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; publicRepository?: boolean };
-    // (Lent none by right, and the repository public: one for what anyone may read, as the real task.)
-    if (policy.unlent && policy.publicRepository && open && (policy.repository ?? "")) return "test-read-token";
+    const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; noPublicToken?: boolean };
+    // (Lent none by right: for what anyone may read, one that is allowed nothing, as the real task; none where the test says such a one cannot be had.)
+    if (policy.unlent && open && (policy.repository ?? "")) return policy.noPublicToken ? undefined : "test-public-token";
     if (policy.lendingFails) throw new Error("GitHub refused to issue a token: 500");
     if (policy.endsWhileLending) {
       this.ctx.storage.kv.put("policy", { ...policy, ended: true });

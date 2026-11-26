@@ -279,22 +279,26 @@ describe("GitHub's API over the proxy", () => {
   });
 
   it("reads it with no credential at all where the task is lent none", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", unlent: true });
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     await send(issues, { headers: { authorization: "Bearer guessed" } });
     expect(forwarded[0].headers.get("authorization")).toBeNull();
   });
 
-  it("reads what anyone may read of a public repository with a credential where it is lent none by right, and the rest of it with none", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", unlent: true, publicRepository: true });
+  it("reads what anyone may read with a credential that is allowed nothing, where it is lent none by right, and the rest with none", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true });
     const read = async (url: string) => (await send(url), forwarded.at(-1)!.headers.get("authorization"));
     answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
-    expect(await read("https://api.github.com/search/issues?q=dst")).toBe("Bearer test-read-token");
-    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "pulls", "pulls/3/files", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-read-token");
+    expect(await read("https://api.github.com/search/issues?q=dst")).toBe("Bearer test-public-token");
+    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "pulls", "pulls/3/files", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
     // Its files, who works on it, what it is: only by right. As anyone would see them.
     for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
-    // Not public, and lent none by right: none for anything.
-    const closed = await proxyFor({ repository: "acme/demo", unlent: true });
-    await closed.send(issues);
+    // Lent one by right, it is that one for everything.
+    const lent = await proxyFor({ repository: "acme/demo" });
+    await lent.send(issues);
+    expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+    // Such a one cannot be had: read with none, as it would have been. Not a failure.
+    const none = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
+    expect((await none.send(issues)).status).toBe(200);
     expect(forwarded.at(-1)!.headers.get("authorization")).toBeNull();
   });
 

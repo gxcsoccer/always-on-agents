@@ -175,6 +175,10 @@ describe("the repository credential a task is lent", () => {
     const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
     expect(await stub.githubToken()).toBe("test-github-token");
     expect(await stub.githubReadToken()).toBeUndefined();
+    // Nor one that is allowed nothing, for what anyone may read: there is no App to issue it. Read with none, then; not a failure.
+    expect(await stub.githubReadToken(true)).toBeUndefined();
+    const elsewhere = await taskFrom("lend3:chat:oc_not_linked", "https://github.com/acme/demo");
+    expect(await elsewhere.githubReadToken(true)).toBeUndefined();
   });
 
   it("keeps count of what the proxy saw of its reads of GitHub's API, searches apart from the rest", async () => {

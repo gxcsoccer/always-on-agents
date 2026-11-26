@@ -195,8 +195,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     let token: string | undefined;
     try {
       // What anyone may read of a public repository (its issues and pull requests, and the search
-      // of them) is read with a credential also where the task is lent none by right: the same is
-      // seen either way. Anything else there (its files, who works on it) only by right.
+      // of them) is read with a credential also where the task is lent none by right: one that is
+      // allowed nothing, which GitHub answers for what is public and for nothing else. Anything
+      // else there (its files, who works on it, the repository's own description, which even
+      // that one would be given of a private repository) only by right.
       const open = "search" in api || /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname);
       token = await this.#task.githubReadToken(open);
     } catch {

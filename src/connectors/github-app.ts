@@ -20,7 +20,7 @@ const API = "https://api.github.com";
  * back to a broader credential. The deployment-wide GITHUB_TOKEN is used only when no App is
  * configured at all, which is the local-development setup.
  */
-export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ token: string; expires_at: number; installation?: string } | undefined> {
+export async function githubTokenFor(env: Env, tenant: string, repo: string, to: "write" | "read" | "public" = "write"): Promise<{ token: string; expires_at: number; installation?: string } | undefined> {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return undefined;
   // One that can only read is never the deployment's own token, which can do whatever it was made for.
   if (!env.GITHUB_APP_ID && !env.GITHUB_APP_PRIVATE_KEY) return env.GITHUB_TOKEN && to === "write" ? { token: env.GITHUB_TOKEN, expires_at: Date.now() + 60 * 60_000 } : undefined;
@@ -33,7 +33,12 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
       headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent", "content-type": "application/json" },
       // Narrowed to the one repository and to what the agent does: read and push code, comment.
       // Or, asked for to read with: the same three, to read only.
-      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { contents: to, pull_requests: to, issues: to } }),
+      // Or "public": allowed nothing but what every token of an installation is (to see that the
+      // repository is there). GitHub answers it for what anyone may read of a public repository
+      // (its issues, its pull requests, the search of them), counted as its own and not against
+      // an address shared with strangers; of a private one it gives it none of those. (Seen
+      // against GitHub itself on 2026-11-27.)
+      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: to === "public" ? { metadata: "read" } : { contents: to, pull_requests: to, issues: to } }),
     });
     // 422 means this installation does not cover a repository of that name; another one might.
     if (response.status === 422 || response.status === 404) continue;
@@ -58,12 +63,6 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
 export async function fromTheirs(source: string, installation: string | undefined, tenant: string, tenantOf: (installation: string) => Promise<string | null>): Promise<boolean> {
   if (installation === undefined) return source === "token";
   return (await tenantOf(installation)) === tenant;
-}
-
-/** Whether GitHub's own description of a repository says it is that repository and public: said outright, not left unsaid. */
-export function seenPublic(described: unknown, repo: string): boolean {
-  const seen = described as { private?: unknown; visibility?: unknown; full_name?: unknown } | null;
-  return Boolean(seen) && seen!.private === false && (seen!.visibility === undefined || seen!.visibility === "public") && typeof seen!.full_name === "string" && seen!.full_name.toLowerCase() === repo.toLowerCase();
 }
 
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */

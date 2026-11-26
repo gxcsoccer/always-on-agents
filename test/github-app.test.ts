@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 
-import { appJwt, githubTokenFor, pemToPkcs8, seenPublic } from "../src/connectors/github-app";
+import { appJwt, githubTokenFor, pemToPkcs8 } from "../src/connectors/github-app";
 
 const pem = (label: string, der: Uint8Array) => `-----BEGIN ${label}-----\n${btoa(String.fromCharCode(...der)).replace(/(.{64})/g, "$1\n")}\n-----END ${label}-----\n`;
 const fromBase64url = (text: string) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
@@ -53,23 +53,19 @@ describe("a token for one repository", () => {
     const withApp = { ...(env as any), GITHUB_APP_ID: "1", GITHUB_APP_PRIVATE_KEY: pem("PRIVATE KEY", pkcs8) };
     expect((await githubTokenFor(withApp, "tok", "acme/demo"))?.token).toBe("t1");
     expect((await githubTokenFor(withApp, "tok", "acme/demo", "read"))?.token).toBe("t2");
+    // And one that is allowed nothing: for what anyone may read.
+    expect((await githubTokenFor(withApp, "tok", "acme/demo", "public"))?.token).toBe("t3");
     expect(asked).toEqual([
       { repositories: ["demo"], permissions: { contents: "write", pull_requests: "write", issues: "write" } },
       { repositories: ["demo"], permissions: { contents: "read", pull_requests: "read", issues: "read" } },
+      { repositories: ["demo"], permissions: { metadata: "read" } },
     ]);
     // With no App there is the deployment's token to write with (local development), and nothing that only reads.
     const without = { ...(env as any), GITHUB_APP_ID: "", GITHUB_APP_PRIVATE_KEY: "" };
     expect((await githubTokenFor(without, "tok", "acme/demo"))?.token).toBe("test-github-token");
     expect(await githubTokenFor(without, "tok", "acme/demo", "read")).toBeUndefined();
-    expect(asked).toHaveLength(2);
+    expect(await githubTokenFor(without, "tok", "acme/demo", "public")).toBeUndefined();
+    expect(asked).toHaveLength(3);
     vi.unstubAllGlobals();
-  });
-});
-
-describe("whether a repository is public", () => {
-  it("is so only where GitHub says so outright, of that very repository", () => {
-    expect(seenPublic({ private: false, visibility: "public", full_name: "Acme/Demo" }, "acme/demo")).toBe(true);
-    expect(seenPublic({ private: false, full_name: "acme/demo" }, "acme/demo")).toBe(true);
-    for (const described of [null, {}, { full_name: "acme/demo" }, { private: true, full_name: "acme/demo" }, { private: false, visibility: "internal", full_name: "acme/demo" }, { private: "false", full_name: "acme/demo" }, { private: false, full_name: "acme/other" }, { private: false }]) expect(seenPublic(described, "acme/demo"), JSON.stringify(described)).toBe(false);
   });
 });
