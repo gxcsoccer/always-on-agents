@@ -798,7 +798,8 @@ export class Runner {
         const draft = this.#s.rows<{ notify: string | null }>("SELECT notify FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`)[0];
         // (Against where the answer goes: where the request came from.)
         const mention = draft?.notify && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length > 0 ? this.#b.reminders.claim(run, JSON.parse(draft.notify) as string[], carried.target) : [];
-        if (draft) this.#s.sql.exec("UPDATE outbox_reminds SET mention = ?, notify = NULL WHERE idem = ?", mention.length > 0 ? JSON.stringify(mention) : null, `answer:${carried.id}`);
+        if (draft && mention.length > 0) this.#s.sql.exec("UPDATE outbox_reminds SET mention = ?, notify = NULL WHERE idem = ?", JSON.stringify(mention), `answer:${carried.id}`);
+        else if (draft) this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ?", `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
       } else if (carried) {

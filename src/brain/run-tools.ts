@@ -405,7 +405,8 @@ export class RunTools {
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
         // (Whom a draft is to remind is kept with it as it was asked, and settled when the draft is let go: one written over or dropped takes nobody's turn.)
         this.#b.requests.draft(carried, run, text, true);
-        this.#s.sql.exec("INSERT INTO outbox_reminds (idem, notify) VALUES (?, ?) ON CONFLICT(idem) DO UPDATE SET notify = excluded.notify WHERE mention IS NULL", `answer:${carried.id}`, notify.length > 0 ? JSON.stringify(notify) : null);
+        // (Keeping the draft dropped whom the one before it was to remind: nothing is kept where this one is to remind nobody.)
+        if (notify.length > 0) this.#s.sql.exec("INSERT INTO outbox_reminds (idem, notify) VALUES (?, ?) ON CONFLICT(idem) DO UPDATE SET notify = excluded.notify WHERE mention IS NULL", `answer:${carried.id}`, JSON.stringify(notify));
         return notify.length === 0 ? { ok: true } : { ok: true, note: "whom it reminds is settled when it is sent" };
       },
       // A piece of work handed to a worker is called off as that, whichever of the two tools named it:

@@ -307,7 +307,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   const mentioned = [
     ...new Map(
       mentions
-        // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.)
+        // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.
+        // Those left out are not seen by whoever tells what a name means: a name one of them shares with someone kept is taken
+        // for that one's alone. It can only ever reach the one kept, whom the writer did name.)
         .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && each.tenant_key === sender.tenant_key)
         .map((each: any) => [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }]),
     ).values(),
@@ -708,10 +710,10 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
           .join(" ")
       : "";
   const words = current && message.authored ? quiet(message.text) : message.text;
-  // On a line of their own where the words begin as a heading, a list, a quotation, a table or a
-  // block of code would: put on the same line, the words would no longer begin that way, and
+  // On a line of their own where the words begin as a heading, a list, a quotation, a table, a
+  // rule or a block of code would: put on the same line, the words would no longer begin that way, and
   // would be shown with their marks.
-  const worded = reminds ? `${reminds}${/^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>|\||`{3,}|~{3,}|\s{4})/.test(words) ? "\n\n" : " "}${words}` : words;
+  const worded = reminds ? `${reminds}${/^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>|\||`{3,}|~{3,}|(?:[-*_][ \t]*){3,}$|\s{4}|\t)/m.test(words.split("\n", 1)[0]) ? "\n\n" : " "}${words}` : words;
   const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: worded }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
