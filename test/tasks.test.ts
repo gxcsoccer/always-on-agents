@@ -61,7 +61,7 @@ function bench(state: DurableObjectState) {
     answer: (async (decision: "allow" | "deny") => ({ ok: true, decision })) as (...args: any[]) => Promise<any>,
     fate: {} as Record<string, unknown>,
   };
-  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean> };
+  const slots = { leases: [] as [string, string, string | undefined][], acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
   const amended: unknown[][] = [];
   const background: Promise<unknown>[] = [];
   const woken: number[] = [];
@@ -105,8 +105,8 @@ function bench(state: DurableObjectState) {
     },
     registry: () =>
       ({
-        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.acquire()),
-        releaseTaskSlot: async (taskId: string) => void slots.released.push(taskId),
+        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number, lease?: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.leases.push(["take", taskId, lease]), slots.acquire()),
+        releaseTaskSlot: async (taskId: string, lease?: string) => (await slots.release(), slots.leases.push(["back", taskId, lease]), void slots.released.push(taskId)),
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
     deciders: () => settings.deciders,
@@ -704,9 +704,9 @@ describe("tasks, by themselves", () => {
         expect(worker.started).toHaveLength(before);
         expect(slots.released.length).toBeGreaterThan(0);
 
-        // Not one that has not ended, or did not end well; not another conversation's; not one there is none of. Nothing is written for any of these.
+        // Not one that did not end well; not another conversation's; not one there is none of. Nothing is written for any of these.
+        // (One that has not ended yet is waited for: see "work put after a piece that has not ended yet".)
         const written = store.rows("SELECT 1 FROM tasks").length;
-        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_6", "sandbox", "t", "b", { repository: null }, second.task_id)).rejects.toThrow("has not ended yet");
         task("t_failed", { status: "failed" });
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_7", "sandbox", "t", "b", { repository: null }, "t_failed")).rejects.toThrow("did not end well");
         task("t_elsewhere", { status: "succeeded", session_key: "thread:other" });
@@ -764,6 +764,495 @@ describe("tasks, by themselves", () => {
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_10", "probe", "t", "b", {}, "t_probe")).rejects.toThrow("cannot go on with an earlier piece of work");
         // And one worker's work is not another's to go on from.
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_11", "sandbox", "t", "b", { repository: null }, "t_probe")).rejects.toThrow("there is no piece of work");
+      });
+    });
+
+    describe("work put after a piece that has not ended yet", () => {
+      const REPO = { repository: "https://github.com/acme/app" };
+      const left = (id: string) => ({ record: { id: `kept-${id}` }, cwd: "/workspace/job/repo", repository: REPO.repository, until: Date.now() + 3_600_000 });
+      const due = (store: any) => store.sql.exec("UPDATE task_queued SET next_at = 0");
+
+      it("is written as waiting, takes no place and starts nothing; when the one before it ends well it is started from what that left, by the id it was given", async () => {
+        await within(async ({ tasks, store, kept, worker, slots, audited, timer, woken }) => {
+          const first = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "Fix", "fix it", REPO)) as { task_id: string };
+          const places = slots.acquired.length;
+          const begun = worker.started.length;
+          const second = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "Tests", "add tests", { repository: null }, first.task_id)) as { task_id: string; status: string; note?: string };
+          expect(second).toMatchObject({ status: "queued", note: expect.stringContaining("starts by itself") });
+          expect(kept(second.task_id)).toMatchObject({ status: "queued", worker: "sandbox", requested_by: "alice" });
+          // No place with the tenant, nothing started, no watchdog yet; it is in the index of work, and said in the record.
+          expect(slots.acquired).toHaveLength(places);
+          expect(worker.started).toHaveLength(begun);
+          expect(timer(second.task_id)).toBeUndefined();
+          expect(store.rows("SELECT state FROM work WHERE id = ?", second.task_id)).toEqual([{ state: "open" }]);
+          expect(audited("task.dispatched").at(-1)).toMatchObject({ task_id: second.task_id, continue_from: first.task_id, queued: true });
+          // The same call made again is told how it stands, and starts nothing.
+          expect(await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "Tests", "add tests", { repository: null }, first.task_id)).toMatchObject({ task_id: second.task_id, status: "queued" });
+          // While the first is at it, settling changes nothing.
+          due(store);
+          await tasks.settle();
+          expect(kept(second.task_id).status).toBe("queued");
+          expect(worker.started).toHaveLength(begun);
+
+          // The first ends well: the second is woken for at once, and started from what the first left.
+          worker.left[first.task_id] = left(first.task_id);
+          const before = woken.length;
+          await tasks.event(first.task_id, 1, "result", { text: "fixed" });
+          expect(woken.length).toBeGreaterThan(before);
+          await tasks.settle();
+          expect(kept(second.task_id).status).toBe("running");
+          expect(worker.started.at(-1)).toMatchObject({ id: second.task_id, prompt: "add tests", seed: { from: first.task_id, record: { id: `kept-${first.task_id}` } } });
+          expect(slots.acquired.at(-1)).toBe(`acme:${second.task_id}`);
+          expect(timer(second.task_id)).toMatchObject({ status: "active" });
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+          // Settling again starts nothing more.
+          const once = worker.started.length;
+          await tasks.settle();
+          expect(worker.started).toHaveLength(once);
+        });
+      });
+
+      it("is one line: a piece of work has one waiting behind it, and the next goes behind that one", async () => {
+        await within(async ({ tasks, kept, store, worker }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // Another after A is told where the end of the line is, and nothing is written for it.
+          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null }, a.task_id)).rejects.toThrow(`continue_from: "${b.task_id}"`);
+          expect(store.rows("SELECT 1 FROM tasks")).toHaveLength(2);
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c2", "sandbox", "C", "c", { repository: null }, b.task_id)) as { task_id: string; status: string };
+          expect(c.status).toBe("queued");
+          // B is called off before it began: done here at once, nothing asked of the worker, and what waited behind it ends too.
+          const stopped = worker.cancelled.length;
+          expect(await tasks.cancel(SESSION_KEY, b.task_id)).toMatchObject({ status: "cancelled" });
+          expect(worker.cancelled).toHaveLength(stopped);
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("failed");
+          expect(JSON.parse(kept(c.task_id).result).error).toContain("was to go on from");
+          // And something new can be put after A again.
+          expect(await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, a.task_id)).toMatchObject({ status: "queued" });
+        });
+      });
+
+      it("is not started, and its person is told, when the one before it does not end well, however that came about", async () => {
+        await within(async ({ tasks, kept, worker, events, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          const begun = worker.started.length;
+          const places = slots.acquired.length;
+          await tasks.event(a.task_id, 1, "failed", { error: "boom" });
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("failed");
+          expect(worker.started).toHaveLength(begun);
+          expect(slots.acquired).toHaveLength(places);
+          expect(events().at(-1)).toMatchObject({ kind: "worker.failed", data: expect.stringContaining(b.task_id) });
+        });
+      });
+
+      it("keeps waiting, and is not failed, while the tenant has no place free; and is failed where no task may be had at all", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => false;
+          const begun = worker.started.length;
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("queued");
+          expect(worker.started).toHaveLength(begun);
+          expect(store.rows<{ next_at: number }>("SELECT next_at FROM task_queued")[0].next_at).toBeGreaterThan(Date.now());
+          expect(tasks.nextWakeAt(Date.now())).not.toBeNull();
+          // A place comes free: it starts, with the time it may be taken by counted from now, not from when it was written.
+          slots.acquire = async () => true;
+          due(store);
+          store.sql.exec("UPDATE tasks SET created_at = created_at - ? WHERE id = ?", 60 * 60_000, b.task_id);
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("running");
+          expect((worker.started.at(-1) as any).accept_by).toBeGreaterThan(Date.now());
+        });
+      });
+
+      it("does not hold everything up for a start that is not answered, asks again with the same id, and is found out about once it may no longer be taken", async () => {
+        await within(async ({ tasks, kept, store, worker }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          worker.start = async () => {
+            throw new Error("connection reset");
+          };
+          const begun = worker.started.length;
+          await tasks.settle();
+          // Not answered: it stays as being started, to be asked again; it is not in any run, and is not left so for ever.
+          expect(kept(b.task_id).status).toBe("dispatching");
+          expect(worker.started).toHaveLength(begun + 1);
+          due(store);
+          await tasks.settle();
+          expect(worker.started).toHaveLength(begun + 2);
+          expect((worker.started.at(-1) as any).id).toBe(b.task_id);
+          // The same call made again by the model does not start it either: that is settle's alone.
+          expect(await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)).toMatchObject({ status: "dispatching" });
+          expect(worker.started).toHaveLength(begun + 2);
+          // Past the time by which it may be taken: kept as not confirmed, and found out about the usual way.
+          store.sql.exec("UPDATE task_queued SET started_at = started_at - ?, next_at = 0", 16 * 60_000);
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("unconfirmed");
+          expect(store.rows("SELECT 1 FROM unconfirmed WHERE task_id = ?", b.task_id)).toHaveLength(1);
+          // Answered at last on a later try: it runs.
+        });
+      });
+
+      it("is ended, with its person told, when the worker turns the start down; and one called off while a place was being asked for is not started", async () => {
+        await within(async ({ tasks, kept, store, worker, slots, events }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // What A left is not kept: the worker says so when B is started.
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("failed");
+          expect(JSON.parse(kept(b.task_id).result).error).toContain("no longer kept");
+          expect(slots.released).toContain(b.task_id);
+          expect(events().at(-1)).toMatchObject({ kind: "worker.failed" });
+
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          const begun = worker.started.length;
+          slots.acquire = async () => {
+            await tasks.cancel(SESSION_KEY, d.task_id).catch(() => undefined);
+            return true;
+          };
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("cancelled");
+          expect(worker.started).toHaveLength(begun);
+          expect(slots.released).toContain(d.task_id);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+        });
+      });
+
+      it("is carried on after the Brain was replaced while a place was being asked for: the place is asked for again by its id, and only then is it started and watched", async () => {
+        await within(async ({ tasks, kept, store, worker, slots, timer }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          // As it was kept at the moment the place was being asked for: out of waiting, not yet let through.
+          const mid = () => {
+            store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", b.task_id);
+            store.sql.exec("UPDATE task_queued SET started_at = NULL, next_at = 0 WHERE task_id = ?", b.task_id);
+          };
+          mid();
+          // The tenant is full: it is not started on the strength of having been taken out of waiting. It waits again.
+          slots.acquire = async () => false;
+          const begun = worker.started.length;
+          let asked = slots.acquired.length;
+          await tasks.settle();
+          expect(slots.acquired.length).toBe(asked + 1);
+          expect(worker.started).toHaveLength(begun);
+          expect(kept(b.task_id).status).toBe("queued");
+          expect(timer(b.task_id)).toBeUndefined();
+          // Much later, with a place free: asked for, let through from now, watched, started.
+          mid();
+          store.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", Date.now() - 16 * 60_000, b.task_id);
+          slots.acquire = async () => true;
+          asked = slots.acquired.length;
+          await tasks.settle();
+          expect(slots.acquired.length).toBe(asked + 1);
+          expect(kept(b.task_id).status).toBe("running");
+          expect(worker.started).toHaveLength(begun + 1);
+          expect((worker.started.at(-1) as any).accept_by).toBeGreaterThan(Date.now());
+          expect(timer(b.task_id)).toMatchObject({ status: "active" });
+          // No answer about the place at all: it stays as it is, and is asked for again; nothing is started meanwhile.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null }, b.task_id)) as { task_id: string };
+          worker.left[b.task_id] = left(b.task_id);
+          await tasks.event(b.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("registry unreachable");
+          };
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("dispatching");
+          expect(worker.started).toHaveLength(begun + 1);
+          slots.acquire = async () => true;
+          due(store);
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("running");
+        });
+      });
+
+      it("is not started on an asking for a place that was never answered, once it may no longer be: the limit there has become none, or its hour has run out", async () => {
+        for (const how of ["none", "late"] as const) {
+          await within(async ({ tasks, kept, store, worker, slots, events }) => {
+            const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+            const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+            worker.left[a.task_id] = left(a.task_id);
+            await tasks.event(a.task_id, 1, "result", { text: "ok" });
+            slots.acquire = async () => {
+              throw new Error("registry unreachable");
+            };
+            await tasks.settle();
+            expect(kept(b.task_id).status).toBe("dispatching");
+            // Meanwhile what let it be started no longer holds; the registry answers again, and has room.
+            if (how === "none") store.setMeta("limits", JSON.stringify({ scope_active_tasks: 0 }));
+            else store.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", Date.now() - 61 * 60_000, a.task_id);
+            slots.acquire = async () => true;
+            const begun = worker.started.length;
+            due(store);
+            await tasks.settle();
+            expect(worker.started).toHaveLength(begun);
+            expect(kept(b.task_id).status).toBe("failed");
+            expect(JSON.parse(kept(b.task_id).result).error).toContain(how === "none" ? "the limit set for this place is none" : "no place came free for it in an hour");
+            // A place the unanswered asking may have taken is given back.
+            expect(slots.released).toContain(b.task_id);
+            expect(events().at(-1)).toMatchObject({ kind: "worker.failed" });
+          });
+        }
+      });
+
+      it("writes down that a place is owed back before anything else can go wrong, and does not let a piece through on a place that is on its way out", async () => {
+        await within(async ({ tasks, kept, store, worker, slots, host }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // What A left is not kept, so B's start is refused; and the Brain fails right after ending B (the wake-up throws).
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          const wake = host.wakeBy;
+          host.wakeBy = async () => {
+            throw new Error("the Brain was replaced");
+          };
+          await tasks.settle().catch(() => undefined);
+          host.wakeBy = wake;
+          expect(kept(b.task_id).status).toBe("failed");
+          // Nothing was given back yet, but it is owed, and is given back on the next pass.
+          expect(slots.released).not.toContain(b.task_id);
+          expect(store.rows("SELECT task_id FROM task_releases")).toEqual([{ task_id: b.task_id }]);
+          store.sql.exec("UPDATE task_releases SET next_at = 0");
+          await tasks.settle();
+          expect(slots.released).toContain(b.task_id);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+
+          // A place was granted and the answer lost; then there is no room here; then it is called off while it waits: the place is given back.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("dispatching");
+          slots.acquire = async () => true;
+          const others = ["x1", "x2"].map((id) => `t_${id}`);
+          for (const id of others) store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, 'running', 0, 0)", id, id, SESSION_KEY);
+          store.setMeta("limits", JSON.stringify({ scope_active_tasks: 2 }));
+          due(store);
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("queued");
+          expect(slots.released).toContain(d.task_id);
+          const begun = worker.started.length;
+          // What was given back is the taking that was asked for (the same lease, however often it was asked); the next asking is another.
+          const of = slots.leases.filter((each) => each[1] === d.task_id);
+          const first = of.find((each) => each[0] === "take")![2];
+          expect(first).toMatch(/^[0-9a-f-]{36}$/);
+          expect(of.filter((each) => each[0] === "take").every((each) => each[2] === first)).toBe(true);
+          expect(of.find((each) => each[0] === "back")![2]).toBe(first);
+          store.setMeta("limits", JSON.stringify({ scope_active_tasks: 3 }));
+          due(store);
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("running");
+          const again = slots.leases.filter((each) => each[1] === d.task_id && each[0] === "take").at(-1)![2];
+          expect(again).not.toBe(first);
+          await tasks.cancel(SESSION_KEY, d.task_id);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          void begun;
+        });
+      });
+
+      it("comes back to a place it could not give back at a time set afresh each time, never at once over and over", async () => {
+        await within(async ({ tasks, store, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.release = async () => {
+            throw new Error("registry unreachable");
+          };
+          await tasks.settle();
+          const next = () => store.rows<{ next_at: number }>("SELECT next_at FROM task_releases WHERE task_id = ?", b.task_id)[0].next_at;
+          for (let n = 0; n < 3; n++) {
+            store.sql.exec("UPDATE task_releases SET next_at = 0");
+            await tasks.settle();
+            // Still owed, and due in a while: the Brain is not woken for it at once.
+            expect(next()).toBeGreaterThan(Date.now() + 10_000);
+            expect(tasks.nextWakeAt(Date.now())).toBeGreaterThan(Date.now() + 10_000);
+          }
+        });
+      });
+
+      it("owes back the taking a waiting piece asked for, by its lease, when it is called off or ends with that asking perhaps still on its way", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const leaseOf = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "take").at(-1)?.[2];
+          const backs = (id: string) => slots.leases.filter((each) => each[1] === id && each[0] === "back").map((each) => each[2]);
+          // Called off while it is being started: the asking for a place was never answered (it may yet arrive).
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("dispatching");
+          const asked = leaseOf(b.task_id);
+          expect(asked).toMatch(/^[0-9a-f-]{36}$/);
+          slots.acquire = async () => true;
+          await tasks.cancel(SESSION_KEY, b.task_id);
+          expect(kept(b.task_id).status).toBe("cancelled");
+          // Owed by that lease at once (written before anything was awaited), and given back by it on the next pass.
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", b.task_id)).toEqual([{ lease: asked }]);
+          store.sql.exec("UPDATE task_releases SET next_at = 0");
+          await tasks.settle();
+          expect(backs(b.task_id)).toContain(asked);
+          expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Ended some other way while out of waiting, found so by a later pass (as after the Brain was replaced): owed the same.
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", REPO)) as { task_id: string };
+          const d = (await tasks.dispatch(RUN, SESSION_KEY, "call_d", "sandbox", "D", "d", { repository: null }, c.task_id)) as { task_id: string };
+          worker.left[c.task_id] = left(c.task_id);
+          await tasks.event(c.task_id, 1, "result", { text: "ok" });
+          slots.acquire = async () => {
+            throw new Error("the answer was lost");
+          };
+          await tasks.settle();
+          const lease = leaseOf(d.task_id);
+          store.sql.exec("UPDATE tasks SET status = 'cancelled' WHERE id = ?", d.task_id);
+          store.sql.exec("UPDATE task_queued SET next_at = 0");
+          await tasks.settle();
+          expect(backs(d.task_id)).toContain(lease);
+          expect(store.rows("SELECT 1 FROM task_queued")).toEqual([]);
+
+          // Called off while it waits again after an asking that was never answered.
+          slots.acquire = async () => true;
+          const e = (await tasks.dispatch(RUN, SESSION_KEY, "call_e", "sandbox", "E", "e", REPO)) as { task_id: string };
+          const f = (await tasks.dispatch(RUN, SESSION_KEY, "call_f", "sandbox", "F", "f", { repository: null }, e.task_id)) as { task_id: string };
+          await tasks.settle();
+          store.sql.exec("UPDATE task_queued SET lease = 'left-over' WHERE task_id = ?", f.task_id);
+          await tasks.cancel(SESSION_KEY, f.task_id);
+          expect(store.rows("SELECT lease FROM task_releases WHERE task_id = ?", f.task_id)).toEqual([{ lease: "left-over" }]);
+          // And asked how it stands, a waiting piece says what it waits for.
+          const g = (await tasks.dispatch(RUN, SESSION_KEY, "call_g", "sandbox", "G", "g", { repository: null }, e.task_id)) as { task_id: string };
+          expect(await tasks.status(g.task_id)).toMatchObject({ status: "queued", queued_after: e.task_id });
+        });
+      });
+
+      it("does not wait on a place being given back either: that is written down, tried within the pass's time, and tried again by its id", async () => {
+        await within(async ({ tasks, kept, store, worker, slots }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          // What A left is not kept, so B's start is turned down; and the registry is slow to take the place back.
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          vi.useFakeTimers();
+          try {
+            slots.release = () => new Promise(() => undefined);
+            const began = Date.now();
+            const pass = tasks.settle();
+            await vi.advanceTimersByTimeAsync(9_000);
+            await pass;
+            expect(Date.now() - began).toBeLessThan(9_500);
+            expect(kept(b.task_id).status).toBe("failed");
+            expect(store.rows("SELECT task_id FROM task_releases")).toEqual([{ task_id: b.task_id }]);
+            expect(tasks.nextWakeAt(Date.now())).not.toBeNull();
+            // It answers on a later pass: given back, and no longer owed.
+            slots.release = async () => undefined;
+            store.sql.exec("UPDATE task_releases SET next_at = 0");
+            const again = tasks.settle();
+            await vi.advanceTimersByTimeAsync(100);
+            await again;
+            expect(slots.released).toContain(b.task_id);
+            expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+      });
+
+      it("gives the one behind it an end to its waiting when it is let through, so that a line does not wait on a time set before", async () => {
+        await within(async ({ tasks, kept, store, worker }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const b = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+          const c = (await tasks.dispatch(RUN, SESSION_KEY, "call_c", "sandbox", "C", "c", { repository: null }, b.task_id)) as { task_id: string };
+          const next = () => store.rows<{ next_at: number }>("SELECT next_at FROM task_queued WHERE task_id = ?", c.task_id)[0].next_at;
+          await tasks.settle();
+          const while_waiting = next();
+          worker.left[a.task_id] = left(a.task_id);
+          await tasks.event(a.task_id, 1, "result", { text: "ok" });
+          await tasks.settle();
+          expect(kept(b.task_id).status).toBe("running");
+          await tasks.settle();
+          // C now waits until a little past the latest B could still be running, by B's own watchdog.
+          const watched = store.rows<{ due_at: number }>("SELECT due_at FROM timers WHERE id = ?", `watch_${b.task_id}`)[0].due_at;
+          expect(next()).toBe(watched + 5 * 60_000);
+          expect(next()).not.toBe(while_waiting);
+          // B never ends: past that moment C gives up.
+          store.sql.exec("UPDATE timers SET due_at = ? WHERE id = ?", Date.now() - 6 * 60_000, `watch_${b.task_id}`);
+          due(store);
+          await tasks.settle();
+          expect(kept(c.task_id).status).toBe("failed");
+        });
+      });
+
+      it("does not keep the Brain from its conversations for workers that do not answer: one pass has a time of its own, and what it did not get to is looked at again soon", async () => {
+        await within(async ({ tasks, kept, store, worker, woken }) => {
+          const firsts: string[] = [];
+          for (const n of [1, 2, 3]) {
+            const a = (await tasks.dispatch(RUN, SESSION_KEY, `call_a${n}`, "sandbox", "A", "a", REPO)) as { task_id: string };
+            const b = (await tasks.dispatch(RUN, SESSION_KEY, `call_b${n}`, "sandbox", "B", "b", { repository: null }, a.task_id)) as { task_id: string };
+            worker.left[a.task_id] = left(a.task_id);
+            await tasks.event(a.task_id, 1, "result", { text: "ok" });
+            firsts.push(b.task_id);
+          }
+          vi.useFakeTimers();
+          try {
+            worker.start = () => new Promise(() => undefined);
+            const began = Date.now();
+            let over = false;
+            const pass = tasks.settle().then(() => (over = true));
+            await vi.advanceTimersByTimeAsync(8_500);
+            await pass;
+            expect(over).toBe(true);
+            expect(Date.now() - began).toBeLessThan(9_000);
+            // None was answered: all are as they were left, and the pass asked to be woken again soon.
+            expect(firsts.map((id) => kept(id).status).every((status) => status === "dispatching" || status === "queued")).toBe(true);
+            expect(woken.at(-1)).toBeLessThan(Date.now() + 20_000);
+            expect(tasks.nextWakeAt(Date.now())).not.toBeNull();
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+      });
+
+      it("is for the same person, worker and conversation as going on from finished work; has a bound on how many wait; and gives up waiting in the end", async () => {
+        await within(async ({ tasks, kept, store, settings, task }) => {
+          const a = (await tasks.dispatch(RUN, SESSION_KEY, "call_a", "sandbox", "A", "a", REPO)) as { task_id: string };
+          const alice = settings.deciders;
+          settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
+          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_x", "sandbox", "t", "b", { repository: null }, a.task_id)).rejects.toThrow("there is no piece of work");
+          settings.deciders = alice;
+          task("t_elsewhere", { status: "running", session_key: "thread:other" });
+          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_y", "sandbox", "t", "b", { repository: null }, "t_elsewhere")).rejects.toThrow("there is no piece of work");
+          // Five may wait in a conversation, in a line; a sixth is refused.
+          let tail = a.task_id;
+          for (let n = 0; n < 5; n++) tail = ((await tasks.dispatch(RUN, SESSION_KEY, `call_q${n}`, "sandbox", "t", "b", { repository: null }, tail)) as { task_id: string }).task_id;
+          await expect(tasks.dispatch(RUN, SESSION_KEY, "call_q5", "sandbox", "t", "b", { repository: null }, tail)).rejects.toThrow("already waiting");
+          // Those that wait do not count as tasks at it: something new is still taken (the limit of three is of those running).
+          expect(await tasks.dispatch(RUN, SESSION_KEY, "call_new", "sandbox", "t", "b", REPO)).toMatchObject({ status: "running" });
+          // The one before the first in line never ends: past the longest it could have run, the first gives up, and so the rest.
+          const first = store.rows<{ task_id: string }>("SELECT task_id FROM task_follows WHERE from_id = ?", a.task_id)[0].task_id;
+          store.sql.exec("UPDATE timers SET due_at = ? WHERE id = ?", Date.now() - 6 * 60_000, `watch_${a.task_id}`);
+          due(store);
+          await tasks.settle();
+          expect(kept(first).status).toBe("failed");
+          expect(JSON.parse(kept(first).result).error).toContain("waited");
+          expect(kept(tail).status).toBe("failed");
+        });
       });
     });
 

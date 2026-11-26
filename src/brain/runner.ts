@@ -743,7 +743,7 @@ export class Runner {
       // A task that never got past "dispatching" in this run will not be picked up by any run. Whether
       // its worker was asked, and took it, is not known here: it is kept as not confirmed and
       // found out by asking the worker (see Tasks.settle), which ends it and gives its place back.
-      for (const each of this.#s.rows<{ id: string }>("UPDATE tasks SET status = 'unconfirmed', updated_at = ? WHERE status = 'dispatching' AND session_key = (SELECT session_key FROM sessions WHERE id = ?) RETURNING id", Date.now(), run.session_id)) {
+      for (const each of this.#s.rows<{ id: string }>("UPDATE tasks SET status = 'unconfirmed', updated_at = ? WHERE status = 'dispatching' AND id NOT IN (SELECT task_id FROM task_queued) AND session_key = (SELECT session_key FROM sessions WHERE id = ?) RETURNING id", Date.now(), run.session_id)) {
         this.#s.sql.exec("INSERT OR IGNORE INTO unconfirmed (task_id, attempts, next_at) VALUES (?, 0, ?)", each.id, Date.now());
       }
       // For a request that was being carried on, this takes the place of its answer: one or the other.
@@ -1278,7 +1278,19 @@ export class Runner {
       // Only where this very call to the model is given the tool to hand work over with: by the same word that decides its tools.
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
       work: [
-        ...this.#s.rows<{ id: string; worker: string; title: string; status: string }>("SELECT id, worker, title, status FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input') ORDER BY created_at").map((each) => ({ id: each.id, worker: each.worker, title: each.title, state: each.status === "unconfirmed" ? "start not confirmed (it is not known yet whether it began; this is being checked and you will be told: do not hand the same work over again)" : each.status })),
+        ...this.#s
+          .rows<{ id: string; worker: string; title: string; status: string; after: string | null }>("SELECT id, worker, title, status, (SELECT from_id FROM task_follows WHERE task_id = tasks.id) AS after FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input', 'queued') ORDER BY created_at")
+          .map((each) => ({
+            id: each.id,
+            worker: each.worker,
+            title: each.title,
+            state:
+              each.status === "unconfirmed"
+                ? "start not confirmed (it is not known yet whether it began; this is being checked and you will be told: do not hand the same work over again)"
+                : each.status === "queued"
+                  ? `waiting for ${each.after} to end (it starts by itself from what that leaves; anything more for afterwards goes behind this one)`
+                  : each.status,
+          })),
         // Work that ended well in this conversation in the last day, of a worker that can go on from it: its files are kept that long.
         // Listed for the person who asked for it and for nobody else: it is theirs to go on from.
         ...(session ? this.#b.leftToGoOnFrom(runId, session.session_key) : [])

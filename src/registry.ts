@@ -89,6 +89,9 @@ export class Registry extends DurableObject<Env> {
     `);
     this.#addColumn("github_repos", "secret TEXT");
     this.#addColumn("task_slots", "until INTEGER");
+    this.#addColumn("task_slots", "lease TEXT");
+    // Takings that were given back, by their lease: so that an asking for one of them that arrives late takes nothing.
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS leases_returned (lease TEXT PRIMARY KEY, at INTEGER NOT NULL)");
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
     this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
     this.#addColumn("feishu_apps", "oauth_offline INTEGER NOT NULL DEFAULT 0");
@@ -371,12 +374,28 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Reserves a sandbox slot for a tenant, so one tenant's burst cannot take every container. */
-  async acquireTaskSlot(tenant: string, taskId: string, lifetimeMs?: number): Promise<boolean> {
+  /**
+   * `lease` names this taking of a place, for a caller that may take a place for the same task more
+   * than once (having given one back in between): a giving back that names a lease gives back that
+   * taking only, so one that arrives late cannot remove a place taken since.
+   */
+  async acquireTaskSlot(tenant: string, taskId: string, lifetimeMs?: number, lease?: string): Promise<boolean> {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
     // Each place lapses at a time fixed when it was taken (one from before that was kept: after the fixed time).
     sql.exec("DELETE FROM task_slots WHERE COALESCE(until, taken_at + ?) < ?", SLOT_TTL_MS, now);
-    if (sql.exec("SELECT 1 FROM task_slots WHERE task_id = ?", taskId).toArray().length > 0) return true;
+    // A taking that was already given back is over: an asking for it that arrives late (calls are not
+    // kept in order) neither takes a place nor makes a place taken since its own.
+    sql.exec("DELETE FROM leases_returned WHERE at < ?", now - 24 * 60 * 60_000);
+    if (lease !== undefined && sql.exec("SELECT 1 FROM leases_returned WHERE lease = ?", lease).toArray().length > 0) return false;
+    const held = sql.exec<{ lease: string | null }>("SELECT lease FROM task_slots WHERE task_id = ?", taskId).toArray()[0];
+    if (held) {
+      // The same taking asked for again, or a place from before takings were named: this taking's. One held under another lease stays that one's.
+      if (lease !== undefined && held.lease === null) sql.exec("UPDATE task_slots SET lease = ? WHERE task_id = ?", lease, taskId);
+      // Held under another lease: that taking has the place, not this one. (Said as no, so that whoever asked does not take the place for its own.)
+      if (lease !== undefined && held.lease !== null && held.lease !== lease) return false;
+      return true;
+    }
     const limits = this.#limits(tenant);
     const used = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM task_slots WHERE tenant = ?", tenant).one().n;
     if (used >= limits.tenant_sandboxes) return false;
@@ -384,12 +403,24 @@ export class Registry extends DurableObject<Env> {
     // How long it may run is what whoever takes the place says it has fixed for the task (the tenant's limit as it stands, if it
     // does not say), so that the place and the task go by one figure whatever is changed in between or later.
     const lifetime = typeof lifetimeMs === "number" && Number.isFinite(lifetimeMs) && lifetimeMs > 0 ? Math.min(lifetimeMs, MOST.task_minutes * 60_000) : limits.task_minutes * 60_000;
-    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until) VALUES (?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, lifetime + 60 * 60_000));
+    sql.exec("INSERT INTO task_slots (task_id, tenant, taken_at, until, lease) VALUES (?, ?, ?, ?, ?)", taskId, tenant, now, now + Math.max(SLOT_TTL_MS, lifetime + 60 * 60_000), lease ?? null);
     return true;
   }
 
-  async releaseTaskSlot(taskId: string): Promise<void> {
-    this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ?", taskId);
+  async releaseTaskSlot(taskId: string, lease?: string): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    const over = (which: string) => sql.exec("INSERT OR REPLACE INTO leases_returned (lease, at) VALUES (?, ?)", which, Date.now());
+    if (lease === undefined) {
+      // Whatever place the task has (it has ended, or was stopped). The taking it was is over too:
+      // an asking for that taking that arrives after this takes nothing for a task that is done.
+      const held = sql.exec<{ lease: string | null }>("SELECT lease FROM task_slots WHERE task_id = ?", taskId).toArray()[0];
+      if (held?.lease) over(held.lease);
+      sql.exec("DELETE FROM task_slots WHERE task_id = ?", taskId);
+      return;
+    }
+    // Of one taking only: a place taken since, under another lease, is left.
+    sql.exec("DELETE FROM task_slots WHERE task_id = ? AND lease = ?", taskId, lease);
+    over(lease);
   }
 
   #requireTenant(tenant: string) {

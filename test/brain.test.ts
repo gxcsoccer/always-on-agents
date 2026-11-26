@@ -186,6 +186,32 @@ describe("timers and memory", () => {
     expect(told).not.toMatch(/nobody is waiting/i);
   });
 
+  it("starts work that was put after a running piece, by itself and from what that piece left, once it has ended well", async () => {
+    const { stub } = brain();
+    model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
+    await stub.ingest(message("please fix the build"));
+    await wake(stub);
+    const first = toolOutputs().find((each: any) => each.work_id).work_id;
+    model.replies([call("hand_over", { worker: "sandbox", title: "Add tests", brief: "add tests for the fix", continue_from: first, repository: null }), call("send_message", { text: "等它修完就接着补测试。" })], [say("")]);
+    await stub.ingest(message("when that is done, add tests for it"));
+    await wake(stub);
+    const second = toolOutputs().at(-1).work_id ?? toolOutputs().find((each: any) => each.status === "queued").work_id;
+    expect(await task(second).calls()).toEqual([]);
+
+    // The first reports that it ended well. Nobody hands the second over again: it is started by the Brain itself.
+    model.replies([call("send_message", { text: "修好了，接着在补测试。" })], [say("")]);
+    await stub.taskEvent(first, 1, "result", { text: "Fixed." });
+    await wake(stub);
+    await wake(stub);
+    const started = (await task(second).calls()).filter((each: any) => each.method === "start");
+    expect(started).toHaveLength(1);
+    expect(started[0].args).toMatchObject({ id: second, prompt: "add tests for the fix", seed: { from: first, cwd: "/workspace/job/repo", repository: "https://github.com/acme/app" } });
+    const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT id, status FROM tasks ORDER BY created_at").toArray());
+    expect(kept).toEqual([{ id: first, status: "succeeded" }, { id: second, status: "running" }]);
+    // The model did not hand anything over in the step that told of the first's ending.
+    expect(toolOutputs().filter((each: any) => each.work_id)).toHaveLength(2);
+  });
+
   it("lists work the sandbox finished here as something that can be gone on from, and starts the next piece from what it left", async () => {
     const { stub } = brain();
     model.replies([call("hand_over", { worker: "sandbox", title: "Fix the build", brief: "do it", continue_from: null, repository: "https://github.com/acme/app" })], [say("")]);
@@ -266,22 +292,32 @@ describe("timers and memory", () => {
     const { work_id: id, status } = toolOutputs().at(-1);
     expect(status).toBe("running");
 
-    model.replies([call("work_status", { work_id: id })], [call("hand_over", { worker: "sandbox", title: "More", brief: "and this", continue_from: id, repository: null })], [call("cancel_work", { work_id: id })], [say("")]);
+    model.replies([call("work_status", { work_id: id })], [call("hand_over", { worker: "sandbox", title: "More", brief: "and this", continue_from: id, repository: null })], [call("cancel_work", { work_id: id })], [say("")], [say("")]);
     await stub.ingest(message("how is it going? stop it"));
     await wake(stub);
-    expect(modelCalls.at(-4).instructions).toContain(`- ${id} [sandbox] "Fix the build": running`);
+    expect(modelCalls.some((each: any) => String(each.instructions).includes(`- ${id} [sandbox] "Fix the build": running`))).toBe(true);
     const outputs = toolOutputs().slice(-3);
     expect(outputs[0]).toMatchObject({ status: "running" });
-    // The sandbox goes on only from a piece of work that has ended: one still running has left nothing yet. Said, and nothing started.
-    expect(outputs[1].error).toContain("has not ended yet, so there is nothing of it to go on from");
+    // Something more for a piece of work that has not ended is put after it: written, said to wait, and listed as waiting for it.
+    expect(outputs[1]).toMatchObject({ status: "queued", note: expect.stringContaining(`waits for ${id} to end`) });
+    const behind = outputs[1].work_id;
+    expect(modelCalls.some((each: any) => String(each.instructions).includes(`- ${behind} [sandbox] "More": waiting for ${id} to end`))).toBe(true);
+    expect(await task(behind).calls()).toEqual([]);
     expect(outputs[2]).toMatchObject({ ok: true, status: "cancelled" });
+    // The first was called off, so what waited behind it is not started; that is told in a step of its own.
+    await wake(stub);
+    await wake(stub);
+    expect(modelCalls.at(-1).input.some((each: any) => typeof each.content === "string" && each.content.includes(behind) && each.content.includes("was to go on from"))).toBe(true);
     // It does not take the place of a request that waits: said before anything is started.
     model.replies([call("hand_over", { worker: "sandbox", title: "t", brief: "b", continue_from: null, repository: null, replaces: "req_1" })], [say("")]);
     await stub.ingest(message("do this instead"));
     await wake(stub);
     expect(toolOutputs().at(-1).error).toContain("cannot take the place of a request that waits");
     const kept = await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT worker, state FROM work").toArray());
-    expect(kept).toEqual([{ worker: "sandbox", state: "cancelled" }]);
+    expect(kept).toEqual([
+      { worker: "sandbox", state: "cancelled" },
+      { worker: "sandbox", state: "failed" },
+    ]);
   });
 
   it("lets a person set standing instructions, and shows them to later runs", async () => {
@@ -1866,6 +1902,46 @@ describe("records and limits", () => {
     // No sandbox at all for the tenant: a place cannot be had.
     await admin("PUT", { tenant_sandboxes: 0 });
     expect(await registry.acquireTaskSlot(tenant, "t-x")).toBe(false);
+    // A place taken more than once for one task, with a giving back in between: each taking has a lease, and a giving back that
+    // arrives late (after the place was given back and taken afresh) removes nothing; without a lease, whatever is there is given back.
+    const fourth = third;
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L1")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L1");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L2")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L1");
+    // Still held under L2: asking again for it finds it, and takes no second place.
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT lease FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([{ lease: "L2" }]);
+    await registry.releaseTaskSlot("t-lease", "L2");
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    // An asking for a taking that was given back, arriving late: takes nothing, whether or not a place has been taken since.
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L2")).toBe(false);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(true);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L1")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(true);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT lease FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([{ lease: "L3" }]);
+    await registry.releaseTaskSlot("t-lease", "L3");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L4")).toBe(true);
+    // Given back by the task's id alone, as when it ends or is stopped: that taking is over as well, and another can still be had.
+    await registry.releaseTaskSlot("t-lease");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L4")).toBe(false);
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
+    // One taken without a lease is given back as before, and leaves nothing behind.
+    expect(await registry.acquireTaskSlot(fourth, "t-plain")).toBe(true);
+    await registry.releaseTaskSlot("t-plain");
+    expect(await registry.acquireTaskSlot(fourth, "t-plain")).toBe(true);
+    await registry.releaseTaskSlot("t-plain");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L3b")).toBe(true);
+    await registry.releaseTaskSlot("t-lease", "L3b");
+    // A place held under one lease is not said to be had by an asking under another that was never given back.
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M1")).toBe(true);
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M2")).toBe(false);
+    expect(await registry.acquireTaskSlot(fourth, "t-two", undefined, "M1")).toBe(true);
+    await registry.releaseTaskSlot("t-two");
+    expect(await registry.acquireTaskSlot(fourth, "t-lease", undefined, "L5")).toBe(true);
+    await registry.releaseTaskSlot("t-lease");
+    expect(await runInDurableObject(registry, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT 1 FROM task_slots WHERE task_id = 't-lease'").toArray())).toEqual([]);
 
     // A day of nothing: no call may begin, asked with something to set aside or with nothing ("may another begin?").
     const other = `${tenant}-zero`;

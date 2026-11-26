@@ -147,7 +147,7 @@ export function workTools(workers: { name: string; description: string; acts_as:
         worker: { type: "string", enum: workers.map((each) => each.name) },
         title: { type: "string", description: "A few words, shown to people." },
         brief: { type: "string", description: "What to do. The worker knows nothing of this conversation. For a worker that does things as the person: the person's own request in their words, plus only what is needed from here to understand it; no requirements, scope or format they did not state. For any other: everything it needs, and what you want back in its final answer." },
-        continue_from: { type: ["string", "null"], description: `The id of an earlier piece of work (listed under "Work handed over") that this goes on with, or null for something new.${continues.length < workers.length ? ` Only ${continues.length ? continues.join(", ") : "no worker here"} can go on with an earlier piece.` : ""}` },
+        continue_from: { type: ["string", "null"], description: `The id of an earlier piece of work (listed under "Work handed over") that this goes on with, or null for something new. It may be one that has not ended yet: this is then put after it, and starts by itself, from what that one leaves, when that has ended well (one line: if something already waits behind it, name that one).${continues.length < workers.length ? ` Only ${continues.length ? continues.join(", ") : "no worker here"} can go on with an earlier piece.` : ""}` },
         ...options,
         ...(replaces ? { replaces } : {}),
       },
