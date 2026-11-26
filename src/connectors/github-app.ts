@@ -60,6 +60,12 @@ export async function fromTheirs(source: string, installation: string | undefine
   return (await tenantOf(installation)) === tenant;
 }
 
+/** Whether GitHub's own description of a repository says it is that repository and public: said outright, not left unsaid. */
+export function seenPublic(described: unknown, repo: string): boolean {
+  const seen = described as { private?: unknown; visibility?: unknown; full_name?: unknown } | null;
+  return Boolean(seen) && seen!.private === false && (seen!.visibility === undefined || seen!.visibility === "public") && typeof seen!.full_name === "string" && seen!.full_name.toLowerCase() === repo.toLowerCase();
+}
+
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */
 export async function appJwt(appId: string, privateKeyPem: string, now = Date.now()): Promise<string> {
   const key = await crypto.subtle.importKey("pkcs8", pemToPkcs8(privateKeyPem).buffer as ArrayBuffer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);

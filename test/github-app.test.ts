@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 
-import { appJwt, githubTokenFor, pemToPkcs8 } from "../src/connectors/github-app";
+import { appJwt, githubTokenFor, pemToPkcs8, seenPublic } from "../src/connectors/github-app";
 
 const pem = (label: string, der: Uint8Array) => `-----BEGIN ${label}-----\n${btoa(String.fromCharCode(...der)).replace(/(.{64})/g, "$1\n")}\n-----END ${label}-----\n`;
 const fromBase64url = (text: string) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
@@ -63,5 +63,13 @@ describe("a token for one repository", () => {
     expect(await githubTokenFor(without, "tok", "acme/demo", "read")).toBeUndefined();
     expect(asked).toHaveLength(2);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("whether a repository is public", () => {
+  it("is so only where GitHub says so outright, of that very repository", () => {
+    expect(seenPublic({ private: false, visibility: "public", full_name: "Acme/Demo" }, "acme/demo")).toBe(true);
+    expect(seenPublic({ private: false, full_name: "acme/demo" }, "acme/demo")).toBe(true);
+    for (const described of [null, {}, { full_name: "acme/demo" }, { private: true, full_name: "acme/demo" }, { private: false, visibility: "internal", full_name: "acme/demo" }, { private: "false", full_name: "acme/demo" }, { private: false, full_name: "acme/other" }, { private: false }]) expect(seenPublic(described, "acme/demo"), JSON.stringify(described)).toBe(false);
   });
 });

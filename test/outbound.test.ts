@@ -284,6 +284,20 @@ describe("GitHub's API over the proxy", () => {
     expect(forwarded[0].headers.get("authorization")).toBeNull();
   });
 
+  it("reads what anyone may read of a public repository with a credential where it is lent none by right, and the rest of it with none", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true, publicRepository: true });
+    const read = async (url: string) => (await send(url), forwarded.at(-1)!.headers.get("authorization"));
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    expect(await read("https://api.github.com/search/issues?q=dst")).toBe("Bearer test-read-token");
+    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "pulls", "pulls/3/files", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-read-token");
+    // Its files, who works on it, what it is: only by right. As anyone would see them.
+    for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
+    // Not public, and lent none by right: none for anything.
+    const closed = await proxyFor({ repository: "acme/demo", unlent: true });
+    await closed.send(issues);
+    expect(forwarded.at(-1)!.headers.get("authorization")).toBeNull();
+  });
+
   it("writes nothing, and reads no other repository nor anything else there", async () => {
     const { send, recorded } = await proxyFor({ repository: "acme/demo" });
     expect((await send("https://api.github.com/repos/acme/demo/issues", { method: "POST", body: "{}" })).status).toBe(403);

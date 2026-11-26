@@ -194,7 +194,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     }
     let token: string | undefined;
     try {
-      token = await this.#task.githubReadToken();
+      // What anyone may read of a public repository (its issues and pull requests, and the search
+      // of them) is read with a credential also where the task is lent none by right: the same is
+      // seen either way. Anything else there (its files, who works on it) only by right.
+      const open = "search" in api || /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/|$)/i.test(url.pathname);
+      token = await this.#task.githubReadToken(open);
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
       return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });

@@ -21,7 +21,7 @@ import {
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../../env";
-import { fromTheirs, githubTokenFor } from "../../connectors/github-app";
+import { fromTheirs, githubTokenFor, seenPublic } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
 import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
@@ -112,6 +112,8 @@ export interface TaskState {
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
   github_token?: { token: string; expires_at: number; source: string; installation?: string };
+  /** Whether the repository was public when GitHub was last asked, and when that was. */
+  github_public?: { repo: string; is: boolean; at: number };
   /** One that can only read, for GitHub's API. Kept apart: the one above can write. */
   github_read_token?: { token: string; expires_at: number; source: string; installation?: string };
   /**
@@ -271,6 +273,7 @@ code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
+const PUBLIC_KEPT_MS = 60_000;
 const MAX_SEARCHES_TOLD_APART = 40;
 const MAX_PAGES_KEPT = 200;
 
@@ -742,8 +745,16 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** The same, for reading GitHub's API: lent by the same rule, and it can only read. None without an App: there is no token of the deployment's that only reads. */
-  async githubReadToken(): Promise<string | undefined> {
-    return this.#lend("read");
+  /**
+   * `open`: for a read of what anyone may read of a public repository (its issues, pull requests,
+   * their comments, the search of them), where the task is not lent a credential by right. There
+   * it is lent one all the same if the repository is one of the tenant's own installation and is
+   * public now: it shows nothing more than no credential would, and is not turned away for the
+   * few reads that many strangers share one address for. Asked of GitHub each time it is lent,
+   * give or take a minute: a repository made private is not read on.
+   */
+  async githubReadToken(open = false): Promise<string | undefined> {
+    return this.#lend("read", open);
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
@@ -773,7 +784,7 @@ export class TaskSandbox extends DurableObject<Env> {
     this.#save(state);
   }
 
-  async #lend(to: "write" | "read"): Promise<string | undefined> {
+  async #lend(to: "write" | "read", open = false): Promise<string | undefined> {
     const kept = to === "write" ? "github_token" : "github_read_token";
     const state = this.#state();
     const repo = await this.repository();
@@ -787,7 +798,9 @@ export class TaskSandbox extends DurableObject<Env> {
     // Lent in the repository's own conversation, or in a group chat an operator has linked to this
     // very repository. Looked up each time, so removing the link stops the lending at once.
     const entitled = async () => (kind === "repo" && rest.join(":").toLowerCase() === repo) || (kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo);
-    if (!(await entitled())) return undefined;
+    // (Or, to read what anyone may: decided below, once there is a credential to ask GitHub with.)
+    const anyone = open && to === "read";
+    if (!(await entitled()) && !anyone) return undefined;
     // Looking the link up took a moment; the task may have ended meanwhile.
     const still = this.#state();
     if (!still || (!ACTIVE.has(still.phase) && still.phase !== "starting")) return undefined;
@@ -798,16 +811,42 @@ export class TaskSandbox extends DurableObject<Env> {
     // no longer this one's to use, however long it would still be good for: asked each time.
     const theirs = async (installation?: string) => fromTheirs(source, installation, tenant, (id) => registry(this.env).tenantForGithubInstallation(id));
     const held = still[kept];
-    if (held && held.source === source && held.expires_at - Date.now() > 5 * 60_000 && (await theirs(held.installation))) return held.token;
-    const issued = await githubTokenFor(this.env, tenant, repo, to);
-    if (!issued) return undefined;
-    // Issuing took time. If the link was removed, the installation given away or the task ended meanwhile, the token is not handed over.
-    if (!(await entitled()) || !(await theirs(issued.installation))) return undefined;
-    const fresh = this.#state();
-    if (!fresh || (!ACTIVE.has(fresh.phase) && fresh.phase !== "starting")) return undefined;
-    fresh[kept] = { ...issued, source };
-    this.#save(fresh);
-    return issued.token;
+    let token = held && held.source === source && held.expires_at - Date.now() > 5 * 60_000 && (await theirs(held.installation)) ? held.token : undefined;
+    if (!token) {
+      const issued = await githubTokenFor(this.env, tenant, repo, to);
+      if (!issued) return undefined;
+      // Issuing took time. If the installation was given away or the task ended meanwhile, the token is not handed over.
+      if (!(await theirs(issued.installation))) return undefined;
+      const fresh = this.#state();
+      if (!fresh || (!ACTIVE.has(fresh.phase) && fresh.phase !== "starting")) return undefined;
+      fresh[kept] = { ...issued, source };
+      this.#save(fresh);
+      token = issued.token;
+    }
+    // By right, as things are now (the link may have been removed while that was done). Or, not by
+    // right: only for what anyone may read, and only while the repository is public.
+    if (await entitled()) return token;
+    return anyone && (await this.#public(repo, token)) ? token : undefined;
+  }
+
+  /** Whether the task's repository is public, as GitHub says now: asked with the credential that would be lent, and kept for a minute. Not known is not public. */
+  async #public(repo: string, token: string): Promise<boolean> {
+    const known = this.#state()?.github_public;
+    if (known && known.repo === repo && Date.now() - known.at < PUBLIC_KEPT_MS) return known.is;
+    let is: boolean;
+    try {
+      const seen = await fetch(`https://api.github.com/repos/${repo}`, { redirect: "manual", headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent" } });
+      if (!seen.ok) return false;
+      is = seenPublic(await seen.json().catch(() => null), repo);
+    } catch {
+      return false;
+    }
+    const state = this.#state();
+    if (state) {
+      state.github_public = { repo, is, at: Date.now() };
+      this.#save(state);
+    }
+    return is;
   }
 
   /** Counts a model call against the task's allowance. Returns false once it is used up. */
