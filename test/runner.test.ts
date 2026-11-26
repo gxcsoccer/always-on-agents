@@ -119,6 +119,7 @@ function bench(state: DurableObjectState) {
       // As the requests part has it: what the run noted it read, each thing once.
       readsOf: (runId: string) => [...new Map((JSON.parse(store.meta(`sources:${runId}`) ?? "[]") as { connector: string; tool: string; args: string; identity: string }[]).map((each) => [each.identity, { connector: each.connector, tool: each.tool, args: each.args, identity: each.identity }])).values()],
     } as unknown as RunnerHost["requests"],
+    reminders: { claim: (_run: unknown, asked: string[], target: unknown) => (log.push(["claim", asked, target]), []) } as never,
     outbox: {
       notify: (idem: string, sessionId: string, runId: string | null, text: string) => void log.push(["notify", idem, sessionId, runId, text]),
       notice: (which: string) => `notice:${which}`,
@@ -261,6 +262,37 @@ describe("the run loop, by itself", () => {
       });
       // Those two wait for her words; nothing else is passed over for them, and they are done after, each alone.
       expect(runs).toEqual([["result of t3", ""], ["do not post it after all"], ["result of t1"], ["result of t2"]]);
+    });
+
+    it("takes up alone the end of a task, and the firing of a timer, of which it is kept who asked for it", async () => {
+      const runs = await within(async ({ runner, store, event }) => {
+        const task = (id: string, asked: boolean) => {
+          store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES (?, ?, 'sandbox', 't', 'b', ?, ?, 'succeeded', 1, 1)", id, `op_${id}`, PRIVATE, PERSON);
+          if (asked) store.sql.exec("INSERT INTO task_asked (task_id, asked) VALUES (?, '{}')", id);
+        };
+        const from = (id: string, kind: string, text: string) => event(text, { source: "worker", kind, source_id: `${id}:${text}`, principal: { kind: "worker", id, explicit: false }, data: { task_id: id }, reply_to: null });
+        const fires = (id: string, text: string) => event(text, { source: "timer", kind: "timer", source_id: `${id}:${text}`, principal: { kind: "timer", id, explicit: false }, reply_to: null });
+        task("a", true);
+        task("b", true);
+        task("c", false);
+        store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, data, created_at) VALUES ('tmr_hers', 1, NULL, ?, 'n', ?, 1)", PRIVATE, JSON.stringify({ by: PERSON }));
+        store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES ('tmr_nobodys', 1, NULL, ?, 'n', 1)", PRIVATE);
+        // Its progress and its end, come together; the end of another; and what nothing is kept of, as before.
+        from("a", "worker.progress", "a going");
+        from("a", "worker.result", "a done");
+        from("b", "worker.failed", "b failed");
+        fires("tmr_hers", "hers");
+        from("c", "worker.result", "c done");
+        fires("tmr_nobodys", "nobody's");
+        const taken: string[][] = [];
+        for (let id = await runner.next(); id; id = await runner.next()) {
+          taken.push(store.rows<{ text: string }>("SELECT text FROM inbox WHERE run_id = ? ORDER BY id", id).map((each) => each.text));
+          store.sql.exec("UPDATE inbox SET status = 'done' WHERE run_id = ?", id);
+          store.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
+        }
+        return taken;
+      });
+      expect(runs).toEqual([["a going"], ["a done"], ["b failed"], ["hers"], ["c done", "nobody's"]]);
     });
 
     it("finds the words that are waited for however many things wait for them ahead in the line", async () => {

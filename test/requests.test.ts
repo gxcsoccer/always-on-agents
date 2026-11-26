@@ -790,6 +790,25 @@ describe("keeping a request that has to wait", () => {
         await use(all, () => all.sent("invite:grant_1.nonce"));
       });
 
+    it("drops whom a draft was to remind with the draft's words, whoever writes in their place", async () => {
+      await asking(({ requests, store, kept }) => {
+        store.sql.exec("UPDATE continuations SET status = 'resuming', run_id = 'r1' WHERE id = 'call_1'");
+        const carried = kept("call_1");
+        const active = store.rows<RunRow>("SELECT * FROM runs WHERE id = 'r1'")[0];
+        const reminds = () => store.rows<{ notify: string | null; mention: string | null }>("SELECT notify, mention FROM outbox_reminds WHERE idem = 'answer:call_1'");
+        requests.draft(carried, active, "the model's answer", true);
+        store.sql.exec("INSERT INTO outbox_reminds (idem, notify) VALUES ('answer:call_1', ?)", JSON.stringify(["ou_1"]));
+        expect(reminds()).toEqual([{ notify: JSON.stringify(["ou_1"]), mention: null }]);
+        // The system writes over it (it ran out of what it may spend, say): its notice reminds nobody.
+        requests.draft(carried, active, "a notice of the system's");
+        expect(reminds()).toEqual([]);
+        // Once it has been let go, whom it reminds is settled and stays with it.
+        store.sql.exec("INSERT INTO outbox_reminds (idem, mention) VALUES ('answer:call_1', ?)", JSON.stringify(["ou_1"]));
+        requests.draft(carried, active, "too late to change");
+        expect(reminds()).toEqual([{ notify: null, mention: JSON.stringify(["ou_1"]) }]);
+      });
+    });
+
     it("is put back to waiting as it was when carrying it on is put off: nothing said, nothing of it changed, and ready to be taken up again", async () => {
       await asking(({ requests, store, kept }) => {
         const before = kept("call_1");

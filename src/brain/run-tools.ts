@@ -11,6 +11,7 @@ import type { Env } from "../env";
 import type { Worker } from "../workers";
 import { chainLevels, type Target } from "../events";
 import type { Outbox } from "./outbox";
+import type { Reminders } from "./reminders";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, UNDER_WAY_NOTE, WAITING_NOTE } from "./requests";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
@@ -48,6 +49,8 @@ export interface RunToolsHost {
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised" | "putOff">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
+  /** Who a message may remind: see Reminders. */
+  readonly reminders: Pick<Reminders, "claim" | "asked">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
 }
 
@@ -375,15 +378,36 @@ export class RunTools {
           if (!waits && !receipt) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE run_id = ?", run.id);
         }
       },
-      sendMessage: (callId, text) => {
+      sendMessage: (callId, text, notify = []) => {
         const carried = this.#b.requests.continuationOf(run.id);
+        // How many of those asked for are reminded, and no more than that: not who, nor why not.
+        const told = (reminded: number) => (notify.length === 0 ? { ok: true } : { ok: true, reminded, not_reminded: notify.length - reminded });
         if (!carried) {
-          return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, { authored: true });
+          // Sent the same call again (the run was replayed), it is the message already kept, with whoever that reminds.
+          if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `msg:${callId}`).length > 0) return told((JSON.parse(this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", `msg:${callId}`)[0]?.mention ?? "[]") as string[]).length);
+          // Who it reminds is settled, and taken for this thing, in the step that keeps the message.
+          return this.#s.transaction(() => {
+            let reminded = 0;
+            // (Decided against where the message really goes, which is worked out as it is kept.)
+            this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, {
+              authored: true,
+              mention: (target) => {
+                const ids = this.#b.reminders.claim(run, notify, target);
+                reminded = ids.length;
+                return ids;
+              },
+            });
+            return told(reminded);
+          });
         }
         // Everything such a run says belongs to the request it carries on. That request has one
         // answer, kept as a draft until the run ends; one that is waiting again has none.
         if (carried.status !== "resuming") return { ok: true, note: "nothing was sent: the request is not being answered now" };
-        return this.#b.requests.draft(carried, run, text, true);
+        // (Whom a draft is to remind is kept with it as it was asked, and settled when the draft is let go: one written over or dropped takes nobody's turn.)
+        this.#b.requests.draft(carried, run, text, true);
+        // (Keeping the draft dropped whom the one before it was to remind: nothing is kept where this one is to remind nobody.)
+        if (notify.length > 0) this.#s.sql.exec("INSERT INTO outbox_reminds (idem, notify) VALUES (?, ?) ON CONFLICT(idem) DO UPDATE SET notify = excluded.notify WHERE mention IS NULL", `answer:${carried.id}`, JSON.stringify(notify));
+        return notify.length === 0 ? { ok: true } : { ok: true, note: "whom it reminds is settled when it is sent" };
       },
       // A piece of work handed to a worker is called off as that, whichever of the two tools named it:
       // what is said of it then (stopped, or only no longer waited for) is the same either way.
@@ -424,7 +448,7 @@ export class RunTools {
         return { ok: true, deleted: existed };
       },
 
-      setTimer: (callId, delaySeconds, note, repeat) => {
+      setTimer: (callId, delaySeconds, note, repeat, stopAfterReminding = false) => {
         if (delaySeconds < 5 || delaySeconds > 366 * 86_400) throw new Error("delay_seconds must be between 5 and one year");
         if (repeat !== null && repeat < 60) throw new Error("repeat_every_seconds must be at least 60");
         const id = `tmr_${callId.replace(/[^A-Za-z0-9]/g, "").slice(-24)}`;
@@ -432,7 +456,10 @@ export class RunTools {
           throw new Error("too many active timers; cancel one first");
         }
         const due = Date.now() + delaySeconds * 1_000;
-        sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, created_at) VALUES (?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, Date.now());
+        // Who set it and whom they named, for when it fires: it may remind them then.
+        const asked = this.#b.reminders.asked(run.id);
+        const kept = asked ? JSON.stringify({ ...asked, ...(stopAfterReminding && repeat !== null ? { stop_after_reminding: true } : {}) }) : null;
+        sql.exec("INSERT OR IGNORE INTO timers (id, due_at, every_s, session_key, note, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", id, due, repeat, session.session_key, note, kept, Date.now());
         // A replayed call set nothing new: it is told when the timer it set fires next, or, if
         // that timer has fired for the last time or been cancelled since, that it will not.
         const stored = this.#s.rows<{ due_at: number; status: string }>("SELECT due_at, status FROM timers WHERE id = ?", id)[0];

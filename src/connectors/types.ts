@@ -516,6 +516,12 @@ export interface OutboundMessage {
   /** When the message was written, in ms. */
   created_at?: number;
   /**
+   * The people this message is to remind, by their ids on this connector: decided by the Brain
+   * (see Reminders) and fixed when the message was kept. A channel that can mention people does
+   * so in its own way; whatever in `text` looks like a mention is only text.
+   */
+  mention?: string[];
+  /**
    * Set when the message is an approval question. `text` says the same in words; a connector that
    * can show something better than text (buttons, say) builds it from this.
    */

@@ -103,6 +103,47 @@ describe("the outbox, by itself", () => {
       });
     });
 
+    it("settles whom a message reminds once where it goes is known, keeps that with it, and reminds nobody where the scope's last known place stands in", async () => {
+      await within(({ outbox, store }) => {
+        const asked: string[] = [];
+        const mention = (target: string) => (asked.push(target), ["ou_1", "ou_2"]);
+        outbox.enqueue("m1", SESSION, null, "done", undefined, undefined, { authored: true, mention });
+        expect(asked).toEqual([TARGET]);
+        expect(store.rows("SELECT idem, mention FROM outbox_reminds")).toEqual([{ idem: "m1", mention: JSON.stringify(["ou_1", "ou_2"]) }]);
+        // The same message kept again is the one already kept: nobody is asked for a second time.
+        outbox.enqueue("m1", SESSION, null, "done", undefined, undefined, { authored: true, mention });
+        expect(asked).toHaveLength(1);
+        // Nobody to remind: nothing is kept beside it.
+        outbox.enqueue("m2", SESSION, null, "done", undefined, undefined, { authored: true, mention: () => [] });
+        expect(store.rows("SELECT 1 FROM outbox_reminds WHERE idem = 'm2'")).toEqual([]);
+        // A conversation with no place of its own, sent to the scope's last known one: that is not known to be this conversation's.
+        store.sql.exec("INSERT INTO sessions (id, session_key, target, created_at, updated_at) VALUES ('s2', 'ci', NULL, 1, 1)");
+        store.setMeta("default_target", PLAIN);
+        outbox.enqueue("m3", "s2", null, "done", undefined, undefined, { authored: true, mention });
+        expect(asked).toHaveLength(1);
+        expect(store.rows("SELECT 1 FROM outbox_reminds WHERE idem = 'm3'")).toEqual([]);
+      });
+    });
+
+    it("sends a message with the same people to remind at every attempt", async () => {
+      await within(async ({ outbox, delivered, channel, store }) => {
+        outbox.enqueue("m1", SESSION, null, "done", undefined, undefined, { authored: true, mention: () => ["ou_1", "ou_2"] });
+        // The first attempt fails; the next is the same message, to the same people.
+        let attempts = 0;
+        channel.m1 = () => {
+          if (++attempts === 1) throw new Error("not this time");
+        };
+        await outbox.flush();
+        store.sql.exec("UPDATE outbox SET next_at = 0 WHERE idem = 'm1'");
+        await outbox.flush();
+        expect(delivered.map((each) => each.message.mention)).toEqual([["ou_1", "ou_2"], ["ou_1", "ou_2"]]);
+        // One that reminds nobody says nothing of it.
+        outbox.enqueue("m2", SESSION, null, "plain");
+        await outbox.flush();
+        expect(delivered.at(-1)!.message.mention).toBeUndefined();
+      });
+    });
+
     it("keeps an approval question and a review as data beside the words", async () => {
       await within(({ outbox, row }) => {
         const ask = { code: "A1" } as never;

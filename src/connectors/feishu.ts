@@ -300,6 +300,21 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     text = `[a ${String(message.message_type)} message, which I cannot read yet]`;
   }
 
+  // Each person once, by who they are, with the name that stands in the text for them: everyone
+  // the chat lists, none left out. Whether a name stands for one person is not settled here: it
+  // is for whoever goes by this to tell, over all of it (and over the other messages of the same
+  // request), and that can only be told while everyone is still there.
+  const mentioned = [
+    ...new Map(
+      mentions
+        // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.
+        // Those left out are not seen by whoever tells what a name means: a name one of them shares with someone kept is taken
+        // for that one's alone. It can only ever reach the one kept, whom the writer did name.)
+        .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && each.tenant_key === sender.tenant_key)
+        .map((each: any) => [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }]),
+    ).values(),
+  ];
+
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
   const thread: string | undefined = message.thread_id || undefined;
@@ -336,6 +351,11 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // (whose name is put into the text for them), nor anything in code or in a quotation. For
         // a tool that writes somewhere a mention notifies. A message without this says of none.
         ...(handles.length ? { handles } : {}),
+        // The people the writer named here with the chat's own mention, each by the name that
+        // stands in the text for them and by who they are: taken from this very message as it was
+        // verified, and only those the chat says are people. For telling whom they meant to be
+        // told (see Reminders in the Brain). Where several people talk.
+        ...(group && mentioned.length ? { mentioned } : {}),
         message_id: message.message_id,
         chat_id: message.chat_id,
         chat_type: message.chat_type,
@@ -677,10 +697,27 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   const card = message.ask ? approvalCard(message.ask, scope.kind === "chat" ? "chat" : "user") : invitation;
   const current = message.encoding !== 0;
   const envelope = (msgType: string, content: string) => (messageId ? { msg_type: msgType, content, uuid, reply_in_thread: thread === "1" } : { receive_id: to.id, msg_type: msgType, content, uuid });
-  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: quiet(message.text) }]] } })) : undefined;
+  // Whom it reminds, as the Brain settled it: the chat's own mention of each, put before the
+  // words. Only where several people talk, and never from anything in the words themselves,
+  // which stay as inert as ever. (The same markup is a mention in a post and in plain text.)
+  // (The last line of defence, whatever was kept: only in a place of several people, as itself
+  // and for everyone there to see; each a person by their id, and never everyone at once.)
+  const reminds =
+    scope.kind === "chat" && chatId && !only && !card && current
+      ? (message.mention ?? [])
+          .filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all")
+          .map((id) => `<at user_id="${id}"></at>`)
+          .join(" ")
+      : "";
+  const words = current && message.authored ? quiet(message.text) : message.text;
+  // On a line of their own where the words begin as a heading, a list, a quotation, a table, a
+  // rule or a block of code would: put on the same line, the words would no longer begin that way, and
+  // would be shown with their marks.
+  const worded = reminds ? `${reminds}${/^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>|\||`{3,}|~{3,}|(?:[-*_][ \t]*){3,}$|\s{4}|\t)/m.test(words.split("\n", 1)[0]) ? "\n\n" : " "}${words}` : words;
+  const post = !card && current && message.authored ? envelope("post", JSON.stringify({ zh_cn: { content: [[{ tag: "md", text: worded }]] } })) : undefined;
   // Feishu takes a post of up to 30 KB, measured as the request is sent.
   const fits = post !== undefined && new TextEncoder().encode(JSON.stringify(post)).length <= MAX_POST_BYTES;
-  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: current && message.authored ? quiet(message.text) : message.text }));
+  const body = card ? envelope("interactive", JSON.stringify(card)) : fits ? post! : envelope("text", JSON.stringify({ text: worded }));
 
   const response = only
     ? await fetch(`${API}/ephemeral/v1/send`, {

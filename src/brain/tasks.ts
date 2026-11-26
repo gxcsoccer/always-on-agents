@@ -83,6 +83,8 @@ export interface TasksHost {
   registry(): Pick<ReturnType<typeof registry>, "acquireTaskSlot" | "releaseTaskSlot" | "recordUsage">;
   /** The people whose word counts in this run. */
   deciders(runId: string): Principal[];
+  /** Who asked, whom they named and where, of the messages a run rests on (see Reminders): none where the run is not one person's alone. */
+  askedIn(runId: string): { by: string; named: { id: string; name: string }[]; place: string } | undefined;
   /** Whether this person's word counts here. */
   isDecider(principal: Principal, source: string): boolean;
   /** Whether this source can say what one of its messages says now. */
@@ -273,6 +275,9 @@ export class Tasks implements Wakes {
         if (from !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_follows (task_id, from_id) VALUES (?, ?)", id, from);
         this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
+        // Who asked for it, whom they named in asking, and where: they may be reminded there when it has ended.
+        const asked = requestedBy !== null ? this.#b.askedIn(run.id) : undefined;
+        if (asked && asked.by === requestedBy) this.#s.sql.exec("INSERT OR IGNORE INTO task_asked (task_id, asked) VALUES (?, ?)", id, JSON.stringify(asked));
         // What the person's request said was to be done for them after it, and the messages it
         // was made in: kept with the task from the start, under the run that hands it over.
         // What it works on: what it was given, or, going on from another, what that one worked on.

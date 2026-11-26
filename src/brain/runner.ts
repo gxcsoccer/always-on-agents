@@ -17,6 +17,7 @@ import { type Item, ModelError, type ModelRequest, type ModelResponse, type Tool
 import type { registry } from "../registry";
 import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
 import type { Outbox } from "./outbox";
+import type { Reminders } from "./reminders";
 import { buildInstructions } from "./prompt";
 import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools, eligibleSource, standingOf, thenable, toolsIn, unheard, workersIn } from "./run-tools";
@@ -89,6 +90,8 @@ export interface RunnerHost {
   under(target: Target): string | undefined;
   readonly requests: Pick<Requests, "continuationOf" | "draft" | "mayNotDisclose" | "endRequest" | "guards" | "over" | "basis" | "resumed" | "cancellable" | "askedFor" | "resume" | "readsOf" | "record" | "indexed" | "promised" | "told">;
   readonly outbox: Pick<Outbox, "notify" | "notice" | "scrub">;
+  /** Who a message may remind: see Reminders. */
+  readonly reminders: Pick<Reminders, "claim">;
   readonly tools: Pick<RunTools, "for">;
 }
 
@@ -143,6 +146,9 @@ export class Runner {
   #askerOf(event: InboxRow): string | null {
     // The result of a task that something was to follow, for the person who asked: taken up alone, as anything done for one person is.
     if (this.#thenOf(event)) return `event:${event.id}`;
+    // So with the end of a task, and the firing of a timer, of which it is kept who asked for it:
+    // a message about it may remind them, and whose thing a run is about has to be one thing.
+    if (this.#asked(event)) return `event:${event.id}`;
     if (this.#b.toolsOf(event.source).length === 0) return null;
     const principal = JSON.parse(event.principal) as Principal;
     const data = event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {};
@@ -788,9 +794,19 @@ export class Runner {
       if (carried?.status === "resuming") {
         // A run that stopped without answering has not answered: the person is told so.
         if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length === 0) this.#b.requests.draft(carried, run, this.#b.outbox.notice("notAnswered", run.session_id));
+        // Whom the answer reminds is settled now that it is let go, and taken for the thing in this same step.
+        const draft = this.#s.rows<{ notify: string | null }>("SELECT notify FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`)[0];
+        // (Against where the answer goes: where the request came from.)
+        const mention = draft?.notify && this.#s.rows("SELECT 1 FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`).length > 0 ? this.#b.reminders.claim(run, JSON.parse(draft.notify) as string[], carried.target) : [];
+        if (draft && mention.length > 0) this.#s.sql.exec("UPDATE outbox_reminds SET mention = ?, notify = NULL WHERE idem = ?", JSON.stringify(mention), `answer:${carried.id}`);
+        else if (draft) this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ?", `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE outbox SET status = 'pending', next_at = ? WHERE idem = ? AND status = 'draft'", now, `answer:${carried.id}`);
         this.#s.sql.exec("UPDATE continuations SET status = 'answering' WHERE id = ?", carried.id);
-      } else if (carried) this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
+      } else if (carried) {
+        this.#s.sql.exec("DELETE FROM outbox WHERE idem = ? AND status = 'draft'", `answer:${carried.id}`);
+        // With whom it was to remind: a draft that is dropped reminds nobody.
+        this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
+      }
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
@@ -855,6 +871,14 @@ export class Runner {
     const seen = data.github_reads && typeof data.github_reads === "object" ? { github_reads: data.github_reads } : undefined;
     const on = typeof data.repository === "string" && data.repository !== "" ? data.repository : (then.repository ?? undefined);
     return tools.length > 0 ? { acting, tools, request: then.request, task: then.task_id, made, ...(on ? { on } : {}), until: (typeof data.first_at === "number" ? data.first_at : events[0].received_at) + FOLLOWS_WITHIN_MS, ...(seen ? { seen } : {}), conditions } : undefined;
+  }
+
+  /** Whether an event is the end of a task, or the firing of a timer, that was asked for by someone the Brain has kept (see Reminders). */
+  #asked(event: InboxRow): boolean {
+    const id = String((JSON.parse(event.principal) as Principal).id ?? "");
+    if (event.source === "worker" && ["worker.result", "worker.failed", "worker.lost"].includes(event.kind)) return this.#s.rows("SELECT 1 FROM task_asked WHERE task_id = ?", id).length > 0;
+    if (event.source === "timer" && event.kind === "timer") return typeof (JSON.parse(this.#s.rows<{ data: string | null }>("SELECT data FROM timers WHERE id = ?", id)[0]?.data ?? "{}") as { by?: unknown }).by === "string";
+    return false;
   }
 
   /** What was to follow the task an event is the good end of, if anything was and it has not been taken back. */
