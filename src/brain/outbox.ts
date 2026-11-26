@@ -113,7 +113,10 @@ export class Outbox implements Wakes {
       bound?.authored ? 1 : 0,
     );
     // Whom it reminds: settled now that where it goes is known, and kept with it once, for every attempt at sending it.
-    const mention = bound?.mention && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
+    // (Only where that is this conversation's own place, or the place a request came from: where the
+    // scope's last known place stands in for it, it is not known to be of this conversation, and nobody is reminded there.)
+    const own = bound?.continuation?.target ?? bound?.target ?? this.#s.rows<Row>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target;
+    const mention = bound?.mention && own === target && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
     if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
