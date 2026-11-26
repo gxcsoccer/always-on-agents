@@ -109,7 +109,7 @@ const SHOWN = {
 
 /** Stable text first, volatile text last, so the provider can cache the prefix across runs. */
 export function buildInstructions(parts: PromptParts): string {
-  const sections = [BASE, SITUATION[parts.situation], `Where you are\n${SCOPE[parts.scope.kind]}${parts.shows ? `\n${parts.shows.markdown ? SHOWN.markdown : SHOWN.plain} ${parts.shows.reminds ? SHOWN.reminds : SHOWN.silent}` : ""}`];
+  const sections = [BASE, SITUATION[parts.situation], `Where you are\n${SCOPE[parts.scope.kind]}${parts.shows ? `${SCOPE[parts.scope.kind].includes("\n\n") ? "\n\n" : "\n"}${parts.shows.markdown ? SHOWN.markdown : SHOWN.plain} ${parts.shows.reminds ? SHOWN.reminds : SHOWN.silent}` : ""}`];
   // The deployment's own words, so they stand with the stable text and before anything a conversation wrote.
   if (parts.guidance) sections.push(`Where to hand work (this deployment's guidance)\n${parts.guidance}`);
   sections.push(`Standing instructions from the people here (instructions.md)\n${loaded(parts.instructions, MAX_LOADED_INSTRUCTIONS, "instructions.md", "(none yet)")}`);

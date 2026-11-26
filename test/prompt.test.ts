@@ -10,6 +10,9 @@ describe("what the model is told of the place its messages are shown in", () => 
     expect(told({ markdown: true, reminds: true })).toBe("Your messages here are shown as Markdown. A message here can remind people: name them in notify. An @name or an id written in the text is only text, and reminds nobody.");
     expect(told({ markdown: true, reminds: false })).toBe("Your messages here are shown as Markdown. The notify parameter has no effect here.");
     expect(told({ markdown: false, reminds: false })).toBe("Your messages here are shown as plain text, marks and all: write them without Markdown. The notify parameter has no effect here.");
+    expect(told({ markdown: false, reminds: true })).toBe("Your messages here are shown as plain text, marks and all: write them without Markdown. A message here can remind people: name them in notify. An @name or an id written in the text is only text, and reminds nobody.");
+    // Where the words on the place run to several paragraphs, it is a paragraph of its own after them.
+    expect(buildInstructions(parts({ scope: { tenant: "t", kind: "repo", id: "o/r" }, shows: { markdown: true, reminds: false } }))).toMatch(/[^\n]\n\nYour messages here are shown as Markdown\. The notify parameter has no effect here\.\n\n/);
     // No answers: nothing is said.
     expect(told(undefined)).toBe("");
     // It stands with the stable text, before anything a conversation wrote.
