@@ -112,6 +112,10 @@ export interface TaskState {
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
   github_token?: { token: string; expires_at: number; source: string; installation?: string };
+  /** That no such credential was to be had for the repository, and when that was found. */
+  github_public_none?: { repo: string; at: number };
+  /** One that is allowed nothing but to be the installation's: for what anyone may read of a public repository. */
+  github_public_token?: { token: string; expires_at: number; source: string; installation?: string };
   /** One that can only read, for GitHub's API. Kept apart: the one above can write. */
   github_read_token?: { token: string; expires_at: number; source: string; installation?: string };
   /**
@@ -271,6 +275,7 @@ code=$?
 printf '%s\\n' "$code" >${EXIT_CODE_PATH}.tmp && mv ${EXIT_CODE_PATH}.tmp ${EXIT_CODE_PATH}
 node /opt/agent/report.mjs exit "$code" >>${REPORT_LOG_PATH} 2>&1`;
 
+const NONE_KEPT_MS = 10 * 60_000;
 const MAX_SEARCHES_TOLD_APART = 40;
 const MAX_PAGES_KEPT = 200;
 
@@ -511,7 +516,7 @@ export class TaskSandbox extends DurableObject<Env> {
   async status(): Promise<TaskState | { error: string }> {
     const state = this.#state();
     if (!state) return { error: "no such task" };
-    return { ...state, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined, github_read_token: state.github_read_token ? { ...state.github_read_token, token: "(hidden)" } : undefined };
+    return { ...state, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined, github_read_token: state.github_read_token ? { ...state.github_read_token, token: "(hidden)" } : undefined, github_public_token: state.github_public_token ? { ...state.github_public_token, token: "(hidden)" } : undefined };
   }
 
   /**
@@ -742,8 +747,48 @@ export class TaskSandbox extends DurableObject<Env> {
   }
 
   /** The same, for reading GitHub's API: lent by the same rule, and it can only read. None without an App: there is no token of the deployment's that only reads. */
+  /**
+   * Beside it, for a read of what anyone may read of a public repository (its issues, pull requests,
+   * their comments, the search of them), where the task is not lent a credential by right. There
+   * it is lent one that is allowed nothing: GitHub answers it for what is public, counted as the
+   * installation's own and not against an address many strangers share, and gives it nothing of
+   * a repository that is not public. So nothing here has to know whether the repository is
+   * public, now or a minute ago. Where such a one cannot be had, none: the read is anonymous, as
+   * it would have been.
+   */
   async githubReadToken(): Promise<string | undefined> {
     return this.#lend("read");
+  }
+
+  /** The one that is allowed nothing (see above), for a task that is lent none by right. */
+  async githubPublicToken(): Promise<string | undefined> {
+    // (Only while the task is at work and is somebody's: at any other time nothing is lent, and that says nothing of the repository.)
+    const lending = () => {
+      const state = this.#state();
+      return state !== undefined && state.brain !== undefined && (ACTIVE.has(state.phase) || state.phase === "starting");
+    };
+    if (!lending()) return undefined;
+    // Not to be had for this repository (it is not one any installation of the tenant's covers,
+    // most often: somebody else's public repository), as was found a little while ago: not asked
+    // for again with every read.
+    const repo = await this.repository();
+    const none = this.#state()?.github_public_none;
+    if (none && none.repo === repo && Date.now() - none.at < NONE_KEPT_MS) return undefined;
+    let lent: string | undefined;
+    try {
+      lent = await this.#lend("public");
+    } catch {
+      // Could not be asked just now: read with none this time, and asked again the next.
+      return undefined;
+    }
+    if (lent === undefined && lending()) {
+      const state = this.#state();
+      if (state && repo) {
+        state.github_public_none = { repo, at: Date.now() };
+        this.#save(state);
+      }
+    }
+    return lent;
   }
 
   /** What the proxy saw of one read of GitHub's API. `status` 0: it was never answered. */
@@ -773,8 +818,8 @@ export class TaskSandbox extends DurableObject<Env> {
     this.#save(state);
   }
 
-  async #lend(to: "write" | "read"): Promise<string | undefined> {
-    const kept = to === "write" ? "github_token" : "github_read_token";
+  async #lend(to: "write" | "read" | "public"): Promise<string | undefined> {
+    const kept = to === "write" ? "github_token" : to === "read" ? "github_read_token" : "github_public_token";
     const state = this.#state();
     const repo = await this.repository();
     if (!state || !repo) return undefined;
@@ -782,11 +827,12 @@ export class TaskSandbox extends DurableObject<Env> {
     // it gets no credentials: lending stops when the task does.
     if (!ACTIVE.has(state.phase) && state.phase !== "starting") return undefined;
     // A task with no Brain is a development probe; it gets the development token or nothing.
-    if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY || to === "read" ? undefined : this.env.GITHUB_TOKEN || undefined;
+    if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY || to !== "write" ? undefined : this.env.GITHUB_TOKEN || undefined;
     const [tenant, kind, ...rest] = state.brain.split(":");
     // Lent in the repository's own conversation, or in a group chat an operator has linked to this
     // very repository. Looked up each time, so removing the link stops the lending at once.
-    const entitled = async () => (kind === "repo" && rest.join(":").toLowerCase() === repo) || (kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo);
+    // (One that is allowed nothing is lent to any task of the tenant's, for its repository.)
+    const entitled = async () => to === "public" || (kind === "repo" && rest.join(":").toLowerCase() === repo) || (kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo);
     if (!(await entitled())) return undefined;
     // Looking the link up took a moment; the task may have ended meanwhile.
     const still = this.#state();

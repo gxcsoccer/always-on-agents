@@ -279,9 +279,109 @@ describe("GitHub's API over the proxy", () => {
   });
 
   it("reads it with no credential at all where the task is lent none", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", unlent: true });
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     await send(issues, { headers: { authorization: "Bearer guessed" } });
     expect(forwarded[0].headers.get("authorization")).toBeNull();
+  });
+
+  it("reads what anyone may read with a credential that is allowed nothing, where it is lent none by right, and the rest with none", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", unlent: true });
+    const read = async (url: string) => (await send(url), forwarded.at(-1)!.headers.get("authorization"));
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    expect(await read("https://api.github.com/search/issues?q=dst")).toBe("Bearer test-public-token");
+    for (const path of ["issues?state=all", "issues/7", "issues/7/comments", "issues/comments", "issues/comments/55", "pulls", "pulls/3", "pulls/3/comments", "pulls/comments", "Issues/7"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBe("Bearer test-public-token");
+    // Its files, who works on it, what it is: only by right. As anyone would see them.
+    for (const path of ["contents/README.md", "collaborators", "", "commits", "issuesx", "pulls-and-more"]) expect(await read(`https://api.github.com/repos/acme/demo${path ? `/${path}` : ""}`), path).toBeNull();
+    // Nor anything else under them: only what is named. Nor a listing narrowed by anything but the plain ways.
+    for (const path of ["issues/7/timeline", "issues/7/events", "issues/events", "issues/7/issue-field-values", "issues/7/labels", "issues/7/reactions", "issues/7/comments/9", "pulls/3/files", "pulls/3/reviews", "pulls/3/commits", "issues/x", "issues?state=open&field=priority", "pulls?custom=1"]) expect(await read(`https://api.github.com/repos/acme/demo/${path}`), path).toBeNull();
+    answers.push(() => Response.json({ total_count: 0, incomplete_results: false, items: [] }));
+    expect(await read("https://api.github.com/search/issues?q=dst&fields=x")).toBeNull();
+    // What only some may see of an issue is taken out of what is read that way, in a listing, in one issue and in a search.
+    const json = { headers: { "content-type": "application/json; charset=utf-8" } };
+    answers.push(() => Response.json([{ number: 7, title: "t", issue_field_values: [{ name: "priority", value: "secret" }], user: { login: "a" } }], json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/issues?state=all")).json()).toEqual([{ number: 7, title: "t", user: { login: "a" } }]);
+    answers.push(() => Response.json({ number: 7, issue_field_values: [{ value: "secret" }], sub: { issue_fields: 1, kept: 2 } }, json));
+    expect(await (await send("https://api.github.com/repos/acme/demo/issues/7")).json()).toEqual({ number: 7, sub: { kept: 2 } });
+    answers.push(() => Response.json({ total_count: 1, incomplete_results: false, items: [{ number: 7, repository_url: "https://api.github.com/repos/acme/demo", issue_field_values: [{ value: "secret" }] }] }));
+    expect(JSON.stringify(await (await send("https://api.github.com/search/issues?q=dst")).json())).not.toContain("secret");
+    // An answer that is not a description that can be gone through is not passed on as it is.
+    const noted = await proxyFor({ repository: "acme/demo", unlent: true });
+    answers.push(() => new Response("raw", { headers: { "content-type": "text/plain" } }));
+    expect((await noted.send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    expect(await noted.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }]);
+    // The same where it breaks off on its way after its headers have come: told, and counted once.
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => (controller.enqueue(new TextEncoder().encode("ra")), controller.error(new Error("reset"))) }), { headers: { "content-type": "text/plain" } }));
+    expect((await noted.send("https://api.github.com/repos/acme/demo/issues/7")).status).toBe(502);
+    expect(await noted.recorded("noteGithubRead")).toEqual([{ kind: "other", status: 502 }, { kind: "other", status: 502 }]);
+    // Asked for in another form than a description (a pull request as its diff): read as a stranger would, and passed on as it is.
+    for (const accept of ["application/vnd.github.diff", "application/vnd.github.patch", "text/html", "application/vnd.github+json, application/vnd.github.diff"]) {
+      answers.push(() => new Response("diff --git a/x b/x", { headers: { "content-type": "application/vnd.github.diff" } }));
+      const answer = await send("https://api.github.com/repos/acme/demo/pulls/3", { headers: { accept } });
+      expect(forwarded.at(-1)!.headers.get("authorization"), accept).toBeNull();
+      expect(await answer.text()).toBe("diff --git a/x b/x");
+    }
+    for (const accept of ["application/vnd.github+json", "application/json", "*/*", "application/vnd.github.raw+json; charset=utf-8", "application/vnd.github.v3+json"]) {
+      answers.push(() => Response.json({ number: 3 }, json));
+      await send("https://api.github.com/repos/acme/demo/pulls/3", { headers: { accept } });
+      expect(forwarded.at(-1)!.headers.get("authorization"), accept).toBe("Bearer test-public-token");
+    }
+    // Lent one by right, it is that one for everything, and what it is given is passed on whole.
+    const lent = await proxyFor({ repository: "acme/demo" });
+    await lent.send(issues);
+    expect(forwarded.at(-1)!.headers.get("authorization")).toBe("Bearer test-read-token");
+    answers.push(() => Response.json([{ number: 7, issue_field_values: [{ value: "theirs to see" }] }], json));
+    expect(JSON.stringify(await (await lent.send("https://api.github.com/repos/acme/demo/issues/7/timeline")).json())).toContain("theirs to see");
+    // Turned away as the installation: asked again as a stranger, and that is the answer the task gets.
+    const refused = await proxyFor({ repository: "acme/demo", unlent: true });
+    for (const status of [403, 401, 422]) {
+      const before = forwarded.length;
+      answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status, headers: { "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4990" } }));
+      answers.push(() => Response.json({ message: "Not Found" }, { status: 404, headers: { "x-ratelimit-limit": "60", "x-ratelimit-remaining": "59" } }));
+      const answer = await refused.send(issues);
+      expect(answer.status).toBe(404);
+      expect(answer.headers.get("x-ratelimit-limit")).toBe("60");
+      expect(await answer.text()).not.toContain("integration");
+      expect(forwarded.slice(before).map((each) => each.headers.get("authorization"))).toEqual(["Bearer test-public-token", null]);
+    }
+    // What a stranger then gets is passed on as a stranger's: whatever it is, with nothing taken out of it.
+    answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    answers.push(() => new Response("as it is", { headers: { "content-type": "text/plain" } }));
+    expect(await (await refused.send(issues)).text()).toBe("as it is");
+    // Not there, said to the credential: that is what a stranger is told too, and it is not asked again.
+    const once404 = forwarded.length;
+    answers.push(() => Response.json({ message: "Not Found" }, { status: 404, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send("https://api.github.com/repos/acme/demo/issues/999999")).status).toBe(404);
+    expect(forwarded).toHaveLength(once404 + 1);
+    // Told to slow down is told as that, and not asked again: by the allowance being used up, by a time to wait, or only in words (with allowance left and no time named).
+    const before = forwarded.length;
+    answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    answers.push(() => Response.json({ message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." }, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    const secondary = await refused.send(issues);
+    expect(secondary.status).toBe(403);
+    expect(((await secondary.json()) as { message: string }).message).toContain("secondary rate limit");
+    answers.push(() => Response.json({ message: "wait" }, { status: 403, headers: { "retry-after": "60", "x-ratelimit-remaining": "10" } }));
+    expect((await refused.send(issues)).headers.get("retry-after")).toBe("60");
+    expect(forwarded).toHaveLength(before + 3);
+    // Turned away with no words to say why (none sent, or they could not be read): left at that, and asked once only.
+    const once = forwarded.length;
+    answers.push(() => new Response(null, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    answers.push(() => new Response(new ReadableStream({ start: (controller) => controller.error(new Error("reset")) }), { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(once + 2);
+    // Asked for by its headers alone, it is asked as a stranger from the start: once, with no credential.
+    answers.push(() => new Response(null, { status: 403, headers: { "x-ratelimit-remaining": "4990" } }));
+    expect((await refused.send(issues, { method: "HEAD" })).status).toBe(403);
+    expect(forwarded.slice(once + 2).map((each) => [each.method, each.headers.get("authorization")])).toEqual([["HEAD", null]]);
+    // By right, a refusal is what it is: nothing is asked a second time.
+    answers.push(() => Response.json({ message: "Resource not accessible by integration" }, { status: 403 }));
+    expect((await lent.send(issues)).status).toBe(403);
+    expect(forwarded).toHaveLength(before + 7);
+    // Such a one cannot be had: read with none, as it would have been. Not a failure.
+    const none = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
+    expect((await none.send(issues)).status).toBe(200);
+    expect(forwarded.at(-1)!.headers.get("authorization")).toBeNull();
   });
 
   it("writes nothing, and reads no other repository nor anything else there", async () => {
@@ -466,7 +566,7 @@ describe("GitHub's API over the proxy", () => {
   });
 
   it("says how a read went when it did not go well, never as nothing found", async () => {
-    const { send, recorded } = await proxyFor({ repository: "acme/demo", unlent: true });
+    const { send, recorded } = await proxyFor({ repository: "acme/demo", unlent: true, noPublicToken: true });
     answers.push(() => Response.json({ message: "API rate limit exceeded" }, { status: 403, headers: { "x-ratelimit-remaining": "0" } }));
     const limited = await send(search("dst"));
     expect(limited.status).toBe(403);

@@ -175,6 +175,16 @@ describe("the repository credential a task is lent", () => {
     const stub = await taskFrom("lend3:repo:acme/demo", "https://github.com/acme/demo");
     expect(await stub.githubToken()).toBe("test-github-token");
     expect(await stub.githubReadToken()).toBeUndefined();
+    // Nor one that is allowed nothing, for what anyone may read: there is no App to issue it. Read with none, then; not a failure.
+    expect(await stub.githubPublicToken()).toBeUndefined();
+    const elsewhere = await taskFrom("lend3:chat:oc_not_linked", "https://github.com/acme/demo");
+    expect(await elsewhere.githubPublicToken()).toBeUndefined();
+    // That none was to be had is kept for a while, so that it is not asked for with every read; and not kept of a read that is by right alone.
+    const noted = () => runInDurableObject(elsewhere, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none);
+    expect(await noted()).toMatchObject({ repo: "acme/demo" });
+    const byRight = await taskFrom("lend3:chat:oc_other_one", "https://github.com/acme/demo");
+    expect(await byRight.githubReadToken()).toBeUndefined();
+    expect(await runInDurableObject(byRight, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none)).toBeUndefined();
   });
 
   it("keeps count of what the proxy saw of its reads of GitHub's API, searches apart from the rest", async () => {
@@ -224,6 +234,28 @@ describe("the repository credential a task is lent", () => {
     await registry().linkGithubInstallation("777", "lend4");
     await keep("github_read_token", "read-issued-earlier");
     expect(await stub.githubReadToken()).toBe("read-issued-earlier");
+    // The one that is allowed nothing, kept from the same installation, goes the same way: lent for what anyone may read
+    // to a task that is lent nothing by right, never for anything else, and not once the installation is another tenant's.
+    const open = await taskFrom("lend4:chat:oc_not_linked", "https://github.com/acme/demo");
+    const keepPublic = () =>
+      runInDurableObject(open, (_instance: unknown, state: DurableObjectState) => {
+        const task = state.storage.kv.get("state") as any;
+        state.storage.kv.put("state", { ...task, github_public_token: { token: "public-issued-earlier", expires_at: Date.now() + 3_600_000, source: "token", installation: "777" } });
+      });
+    await keepPublic();
+    expect(await open.githubPublicToken()).toBe("public-issued-earlier");
+    expect(await open.githubReadToken()).toBeUndefined();
+    expect(await open.githubToken()).toBeUndefined();
+    await registry().linkGithubInstallation("777", "lend5");
+    expect(await open.githubPublicToken()).toBeUndefined();
+    await registry().linkGithubInstallation("777", "lend4");
+    // A task that is not at work is lent nothing, and that is not taken for there being none to be had.
+    await runInDurableObject(open, (_instance: unknown, state: DurableObjectState) => {
+      const task = state.storage.kv.get("state") as any;
+      state.storage.kv.put("state", { ...task, phase: "idle", github_public_none: undefined, github_public_token: undefined });
+    });
+    expect(await open.githubPublicToken()).toBeUndefined();
+    expect(await runInDurableObject(open, (_instance: unknown, state: DurableObjectState) => (state.storage.kv.get("state") as any).github_public_none)).toBeUndefined();
     // One kept as issued through an App with no word of which installation (an earlier version kept them so) is not known to be theirs still.
     const tenantOf = async (installation: string) => (installation === "777" ? "lend4" : null);
     expect(await fromTheirs("app:1", undefined, "lend4", tenantOf)).toBe(false);

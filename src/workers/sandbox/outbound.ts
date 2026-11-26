@@ -193,8 +193,32 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       target.searchParams.set("advanced_search", "true");
     }
     let token: string | undefined;
+    // Read with the credential that is allowed nothing, which the task has no right to: where
+    // that is turned away, what the task is told is what a stranger would be.
+    let optional = false;
     try {
+      // What anyone may read of a public repository (its issues and pull requests, and the search
+      // of them) is read with a credential also where the task is lent none by right: one that is
+      // allowed nothing, which GitHub answers for what is public and for nothing else. Anything
+      // else there (its files, who works on it, the repository's own description, which even
+      // that one would be given of a private repository) only by right.
+      // Just these: the list of issues or of pull requests, one of them, and the comments on
+      // it. Named one by one, so that nothing else under them comes to be read this way by being
+      // added there (what was changed on an issue, the values of its fields, the files of a pull
+      // request). And listed or searched only in the plain ways, which are the same for everyone:
+      // what else a listing can be narrowed by depends on who asks.
+      const plain = "search" in api ? SEARCHED_BY : LISTED_BY;
+      // (And only to read the thing itself: asked for by its headers alone, a refusal comes with
+      // no words to tell why, so that is asked as a stranger from the start.)
+      // (And asked for as a description, not in another form of it: a pull request as its diff
+      // is not something that can be gone through here, and is read as a stranger would.)
+      const described = (request.headers.get("accept") ?? "").split(",").map((each) => each.split(";")[0].trim().toLowerCase()).filter(Boolean).every((type) => /^(?:\*\/\*|application\/json|application\/vnd\.github(?:\.[\w.-]+)?\+json)$/.test(type));
+      const open = request.method === "GET" && described && ("search" in api || OPEN_TO_ANYONE.test(url.pathname)) && [...url.searchParams.keys()].every((name) => plain.has(name));
       token = await this.#task.githubReadToken();
+      if (token === undefined && open) {
+        token = await this.#task.githubPublicToken();
+        optional = token !== undefined;
+      }
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
       return new Response("a credential to read GitHub with could not be had just now; nothing was read\n", { status: 502 });
@@ -213,6 +237,28 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     try {
       // Manual: a redirect is not followed on the guest's behalf.
       answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+      // Turned away as the installation (not there for it, not allowed it): asked again as a
+      // stranger, and that answer is the one given. How GitHub turns an installation away says
+      // things a stranger is not told (that something not public is there). Being told to slow
+      // down is not that, and is passed on as it is.
+      // (Not "not found": no such credential is given for a repository that is not public, so
+      // that is what a stranger would be told too, and asking again could only turn it into
+      // being told to slow down.)
+      if (optional && [401, 403, 422].includes(answer.status)) {
+        // (GitHub also says "slow down" with a 403 that has allowance left and names no time to
+        // wait: then it is in the words of the answer, which are read for it.)
+        // (Where the words cannot be read, why it was turned away is not known: it is left at
+        // that answer, and not asked a second time.)
+        const said = await answer.text().catch(() => undefined);
+        const slowed = answer.headers.get("x-ratelimit-remaining") === "0" || answer.headers.has("retry-after") || said === undefined || said === "" || /rate limit|abuse detection/i.test(said);
+        if (slowed) answer = new Response(said ?? "", { status: answer.status, headers: answer.headers });
+        else {
+          // From here on it is a stranger's read, and what comes back is passed on as one.
+          optional = false;
+          headers.delete("authorization");
+          answer = await fetch(target, { method: request.method, headers, redirect: "manual" });
+        }
+      }
     } catch {
       await this.#task.noteGithubRead(kind, 0, {});
       return new Response("GitHub could not be reached; nothing was read\n", { status: 502 });
@@ -242,6 +288,27 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
         await this.#task.noteGithubRead(kind, answer.status, {});
         return passed(answer, JSON.stringify(withoutDownloads(listed)));
       }
+      // Read with the credential the task has no right to: what only some may see of an issue
+      // (the values of its fields) is taken out of the answer, whether or not GitHub would have
+      // given it. An answer that cannot be gone through is not passed on as it is.
+      if (optional && answer.ok && request.method === "GET" && /json/i.test(answer.headers.get("content-type") ?? "")) {
+        let listed: unknown;
+        try {
+          listed = JSON.parse(await answer.text());
+        } catch {
+          await this.#task.noteGithubRead(kind, 502, {});
+          return new Response("GitHub's answer could not be read\n", { status: 502 });
+        }
+        await this.#task.noteGithubRead(kind, answer.status, {});
+        return passed(answer, JSON.stringify(withoutFields(listed)));
+      }
+      // (Anything else read with that credential is not a description that can be gone through: not passed on, and counted as that.)
+      if (optional && answer.ok && request.method === "GET") {
+        // (Letting go of it can fail too, where it broke off on its way: counted and told all the same.)
+        await answer.body?.cancel().catch(() => undefined);
+        await this.#task.noteGithubRead(kind, 502, {});
+        return new Response("GitHub's answer is not one that can be passed on here\n", { status: 502 });
+      }
       // (A search asked for by its headers alone, or refused, read nothing: counted, and not as a search that was read.)
       await this.#task.noteGithubRead(kind, answer.status, {});
       return passed(answer, answer.body);
@@ -253,7 +320,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       await this.#task.noteGithubRead(kind, 502, {});
       return new Response("GitHub's answer to this search could not be read; it is not known what there is\n", { status: 502 });
     }
-    const items = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
+    const mine = rows.filter((each) => (each.repository_url as string).toLowerCase() === `https://api.github.com/repos/${own}`);
+    const items = optional ? (withoutFields(mine) as typeof mine) : mine;
     // Something of another repository came back: the query was not held to this one after all, so
     // neither the count nor the pages are of this repository alone. Said as not complete; the
     // count is left out rather than made up.
@@ -308,6 +376,20 @@ function passed(answer: Response, body: BodyInit | null): Response {
     if (value !== null) headers.set(name, value);
   }
   return new Response(body, { status: answer.status, headers });
+}
+
+/** What of a public repository's issues and pull requests is read with the credential that is allowed nothing: the list, one of them, the comments on one or on all. */
+const OPEN_TO_ANYONE = /^\/repos\/[^/]+\/[^/]+\/(?:issues|pulls)(?:\/\d+(?:\/comments)?|\/comments(?:\/\d+)?)?$/i;
+
+/** The ways of listing issues and pull requests, and of searching them, that are the same whoever asks. */
+const LISTED_BY = new Set(["state", "labels", "sort", "direction", "since", "per_page", "page", "milestone", "assignee", "creator", "mentioned", "head", "base"]);
+const SEARCHED_BY = new Set(["q", "sort", "order", "per_page", "page", "advanced_search"]);
+
+/** What GitHub says of issues, with the values of their fields taken out, however deep they are listed: those can be for some to see and not for others. */
+function withoutFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutFields);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !/^issue_field/i.test(key)).map(([key, each]) => [key, withoutFields(each)]));
 }
 
 /** A description of a file, a directory or a licence, with every address it could be downloaded from taken out, however deep it is listed. */

@@ -69,7 +69,7 @@ export class FakeTask extends DurableObject {
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
-  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean }) {
+  async configure(policy: { answerDelayMs?: number; answerUnheard?: boolean; forgotten?: boolean; repository?: string; verdicts?: { state: string; reason: string }[]; modelCalls?: number; ended?: boolean; tokenWithdrawnAfter?: number; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean; noPublicToken?: boolean }) {
     this.ctx.storage.kv.put("policy", policy);
   }
   #policy() {
@@ -99,6 +99,11 @@ export class FakeTask extends DurableObject {
       return undefined;
     }
     return (policy.repository ?? "") && !policy.unlent ? "test-read-token" : undefined;
+  }
+  /** As the real task: one that is allowed nothing, for what anyone may read; none where the test says such a one cannot be had. */
+  async githubPublicToken() {
+    const policy = this.#policy() as { repository?: string; noPublicToken?: boolean };
+    return (policy.repository ?? "") && !policy.noPublicToken ? "test-public-token" : undefined;
   }
   async noteGithubRead(kind: string, status: number, seen: Record<string, unknown>) {
     // (Which search a page was of, and which page, are kept apart for the tests that ask about them.)
