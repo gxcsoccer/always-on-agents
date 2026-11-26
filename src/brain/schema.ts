@@ -331,10 +331,10 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE IF NOT EXISTS task_follows (task_id TEXT PRIMARY KEY, from_id TEXT NOT NULL);`,
   // 35: a task put after one that has not ended yet, until it runs: what its worker is to be given,
   // when it was let through to be started (nothing before that), and when to look at it next.
-  `CREATE TABLE IF NOT EXISTS task_queued (task_id TEXT PRIMARY KEY, options TEXT NOT NULL, started_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL);`,
+  `CREATE TABLE IF NOT EXISTS task_queued (task_id TEXT PRIMARY KEY, options TEXT NOT NULL, started_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, lease TEXT);`,
   // 36: places with the tenant that are to be given back and were not yet known to have been: tried
   // again by the task's id, so that giving one back never has to be waited for where others wait behind it.
-  `CREATE TABLE IF NOT EXISTS task_releases (task_id TEXT PRIMARY KEY, next_at INTEGER NOT NULL);`,
+  `CREATE TABLE IF NOT EXISTS task_releases (task_id TEXT PRIMARY KEY, next_at INTEGER NOT NULL, lease TEXT);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

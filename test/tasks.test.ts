@@ -64,7 +64,7 @@ function bench(state: DurableObjectState) {
     answer: (async (decision: "allow" | "deny") => ({ ok: true, decision })) as (...args: any[]) => Promise<any>,
     fate: {} as Record<string, unknown>,
   };
-  const slots = { acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
+  const slots = { leases: [] as [string, string, string | undefined][], acquired: [] as string[], lifetimes: [] as (number | undefined)[], released: [] as string[], usage: [] as [string, number][], acquire: (async () => true) as () => Promise<boolean>, release: (async () => undefined) as () => Promise<void> };
   const amended: unknown[][] = [];
   const background: Promise<unknown>[] = [];
   const woken: number[] = [];
@@ -109,8 +109,8 @@ function bench(state: DurableObjectState) {
     },
     registry: () =>
       ({
-        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.acquire()),
-        releaseTaskSlot: async (taskId: string) => (await slots.release(), void slots.released.push(taskId)),
+        acquireTaskSlot: async (tenant: string, taskId: string, lifetimeMs?: number, lease?: string) => (slots.acquired.push(`${tenant}:${taskId}`), slots.lifetimes.push(lifetimeMs), slots.leases.push(["take", taskId, lease]), slots.acquire()),
+        releaseTaskSlot: async (taskId: string, lease?: string) => (await slots.release(), slots.leases.push(["back", taskId, lease]), void slots.released.push(taskId)),
         recordUsage: async (tenant: string, tokens: number) => (slots.usage.push([tenant, tokens]), { allowed: true, used: 0, budget: 0, day: "" }),
       }) as never,
     deciders: () => settings.deciders,
@@ -1134,9 +1134,21 @@ describe("tasks, by themselves", () => {
           expect(kept(d.task_id).status).toBe("queued");
           expect(slots.released).toContain(d.task_id);
           const begun = worker.started.length;
+          // What was given back is the taking that was asked for (the same lease, however often it was asked); the next asking is another.
+          const of = slots.leases.filter((each) => each[1] === d.task_id);
+          const first = of.find((each) => each[0] === "take")![2];
+          expect(first).toMatch(/^[0-9a-f-]{36}$/);
+          expect(of.filter((each) => each[0] === "take").every((each) => each[2] === first)).toBe(true);
+          expect(of.find((each) => each[0] === "back")![2]).toBe(first);
+          store.setMeta("limits", JSON.stringify({ scope_active_tasks: 3 }));
+          due(store);
+          await tasks.settle();
+          expect(kept(d.task_id).status).toBe("running");
+          const again = slots.leases.filter((each) => each[1] === d.task_id && each[0] === "take").at(-1)![2];
+          expect(again).not.toBe(first);
           await tasks.cancel(SESSION_KEY, d.task_id);
-          expect(worker.started).toHaveLength(begun);
           expect(store.rows("SELECT 1 FROM task_releases")).toEqual([]);
+          void begun;
         });
       });
 

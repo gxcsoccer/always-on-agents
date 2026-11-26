@@ -424,13 +424,22 @@ export class Tasks implements Wakes {
     // one not known to have been given back is tried again by its id on a later pass.
     // (Written down with nothing awaited before it, wherever a place may have been taken and will not be used:
     // so that the owing of it outlives this pass, whatever happens to the pass.)
-    const owe = (taskId: string) => this.#s.sql.exec("INSERT OR REPLACE INTO task_releases (task_id, next_at) VALUES (?, ?)", taskId, Date.now() + QUEUED_AGAIN_MS);
+    // Each asking for a place has a lease of its own, and what is owed back is that taking: a giving
+    // back that arrives late, after the place was given back and taken afresh, then removes nothing.
+    const owe = (taskId: string) => {
+      if (this.#s.rows("SELECT 1 FROM task_releases WHERE task_id = ?", taskId).length > 0) return;
+      const lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", taskId)[0]?.lease ?? null;
+      this.#s.sql.exec("INSERT INTO task_releases (task_id, next_at, lease) VALUES (?, ?, ?)", taskId, Date.now() + QUEUED_AGAIN_MS, lease);
+      // The next asking, if there is one, is another taking.
+      this.#s.sql.exec("UPDATE task_queued SET lease = NULL WHERE task_id = ?", taskId);
+    };
     const owed = (taskId: string) => this.#s.rows("SELECT 1 FROM task_releases WHERE task_id = ?", taskId).length > 0;
     const giveBack = async (taskId: string) => {
       owe(taskId);
       if (left() === 0) return;
       try {
-        await within(this.#b.registry().releaseTaskSlot(taskId), Math.min(left(), CONFIRM_CALL_MS));
+        const lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_releases WHERE task_id = ?", taskId)[0]?.lease ?? undefined;
+        await within(this.#b.registry().releaseTaskSlot(taskId, lease), Math.min(left(), CONFIRM_CALL_MS));
         this.#s.sql.exec("DELETE FROM task_releases WHERE task_id = ?", taskId);
       } catch {
         // Tried again later.
@@ -522,9 +531,15 @@ export class Tasks implements Wakes {
         }
         if (left() === 0) break;
         const bounds = this.#boundsOf(task);
+        // The lease of this taking: kept before the asking, and the same for every asking again until it is given back.
+        let lease = this.#s.rows<{ lease: string | null }>("SELECT lease FROM task_queued WHERE task_id = ?", row.task_id)[0]?.lease ?? null;
+        if (lease === null) {
+          lease = crypto.randomUUID();
+          this.#s.sql.exec("UPDATE task_queued SET lease = ? WHERE task_id = ?", lease, row.task_id);
+        }
         let place: boolean | undefined;
         try {
-          place = await within(this.#b.registry().acquireTaskSlot(scope.tenant, row.task_id, bounds.lifetime_ms), Math.min(left(), CONFIRM_CALL_MS));
+          place = await within(this.#b.registry().acquireTaskSlot(scope.tenant, row.task_id, bounds.lifetime_ms, lease), Math.min(left(), CONFIRM_CALL_MS));
         } catch {
           // Not known whether one was taken: asked for again, by the same id, on a later pass.
           place = undefined;
