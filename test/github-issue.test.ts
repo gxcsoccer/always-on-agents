@@ -34,6 +34,8 @@ const world = {
   commentWrites: [] as { repo: string; number: number; body: any; bearer: string }[],
   /** Issues nobody may comment on. */
   locked: new Set<string>(),
+  /** How GitHub answers when asked about an issue, where not as usual: by status. */
+  looked: new Map<string, number>(),
   /** Every creation asked of GitHub. */
   writes: [] as { repo: string; body: any; bearer: string }[],
   /** How many of the next creations GitHub takes without the answer coming back. */
@@ -66,6 +68,7 @@ function installWorld() {
   world.comments.length = 0;
   world.commentWrites.length = 0;
   world.locked.clear();
+  world.looked.clear();
   world.dropAnswers = 0;
   world.listingDown = false;
   world.reposDown = false;
@@ -135,6 +138,7 @@ function installWorld() {
       const where = world.repos.get(name);
       const issue = world.issues.find((each) => each.repo === name && each.number === number);
       if (!where || !issue || (!tenant && where.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
+      if (!one[3] && world.looked.has(`${name}#${number}`)) return new Response(null, { status: world.looked.get(`${name}#${number}`)!, headers: { location: "https://api.github.com/repositories/1/issues/1" } });
       if (!one[3]) return Response.json({ number, title: issue.title, html_url: issue.html_url, locked: world.locked.has(`${name}#${number}`) });
       if ((init?.method ?? "GET") === "GET") {
         if (world.listingDown) return Response.json({ message: "down" }, { status: 502 });
@@ -777,6 +781,14 @@ describe("commenting on GitHub as the person who asked", () => {
     await alone.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
     expect(toolOutputs()[0].error).toContain("did not let the person comment there");
     expect(toolOutputs()[0].error).toContain("nothing was posted");
+    world.locked.clear();
+    // Moved to somewhere else: not this one to comment on. There, and not hers to see: said as that, not as GitHub being out of reach.
+    for (const [status, said] of [[302, "no issue or pull request of that number"], [403, "did not let the person comment there"]] as const) {
+      world.looked.set(`${PUBLIC}#7`, status);
+      model.replies([comments(PUBLIC, 7)], [say("")]);
+      await alone.says(`在 ${PUBLIC}#7 评论：我这边也遇到了`);
+      expect(toolOutputs()[0].error).toContain(said);
+    }
     expect(world.comments).toEqual([]);
     expect(alone.cards()).toHaveLength(cards);
   });
