@@ -90,6 +90,8 @@ export class Registry extends DurableObject<Env> {
     this.#addColumn("github_repos", "secret TEXT");
     this.#addColumn("task_slots", "until INTEGER");
     this.#addColumn("task_slots", "lease TEXT");
+    // Takings that were given back, by their lease: so that an asking for one of them that arrives late takes nothing.
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS leases_returned (lease TEXT PRIMARY KEY, at INTEGER NOT NULL)");
     this.#addColumn("feishu_apps", "transport TEXT NOT NULL DEFAULT 'webhook'");
     this.#addColumn("feishu_apps", "oauth_v2 INTEGER NOT NULL DEFAULT 0");
     this.#addColumn("feishu_apps", "oauth_offline INTEGER NOT NULL DEFAULT 0");
@@ -382,9 +384,14 @@ export class Registry extends DurableObject<Env> {
     const now = Date.now();
     // Each place lapses at a time fixed when it was taken (one from before that was kept: after the fixed time).
     sql.exec("DELETE FROM task_slots WHERE COALESCE(until, taken_at + ?) < ?", SLOT_TTL_MS, now);
-    if (sql.exec("SELECT 1 FROM task_slots WHERE task_id = ?", taskId).toArray().length > 0) {
-      // The place it has is this taking's from now on.
-      if (lease !== undefined) sql.exec("UPDATE task_slots SET lease = ? WHERE task_id = ?", lease, taskId);
+    // A taking that was already given back is over: an asking for it that arrives late (calls are not
+    // kept in order) neither takes a place nor makes a place taken since its own.
+    sql.exec("DELETE FROM leases_returned WHERE at < ?", now - 24 * 60 * 60_000);
+    if (lease !== undefined && sql.exec("SELECT 1 FROM leases_returned WHERE lease = ?", lease).toArray().length > 0) return false;
+    const held = sql.exec<{ lease: string | null }>("SELECT lease FROM task_slots WHERE task_id = ?", taskId).toArray()[0];
+    if (held) {
+      // The same taking asked for again, or a place from before takings were named: this taking's. One held under another lease stays that one's.
+      if (lease !== undefined && held.lease === null) sql.exec("UPDATE task_slots SET lease = ? WHERE task_id = ?", lease, taskId);
       return true;
     }
     const limits = this.#limits(tenant);
@@ -401,7 +408,10 @@ export class Registry extends DurableObject<Env> {
   async releaseTaskSlot(taskId: string, lease?: string): Promise<void> {
     if (lease === undefined) this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ?", taskId);
     // Of one taking only: a place taken since, under another lease, is left.
-    else this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ? AND lease = ?", taskId, lease);
+    else {
+      this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id = ? AND lease = ?", taskId, lease);
+      this.ctx.storage.sql.exec("INSERT OR REPLACE INTO leases_returned (lease, at) VALUES (?, ?)", lease, Date.now());
+    }
   }
 
   #requireTenant(tenant: string) {
