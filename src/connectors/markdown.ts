@@ -112,8 +112,8 @@ const HIDDEN = "";
 export function emphasised(text: string): string {
   // Paragraph by paragraph: a code span or a link may run over the lines of one, and never past a blank line.
   const out: string[] = [];
-  // The block of code that is open: its fence, how many quotations it stands in, and how far in a fence that ends it may stand.
-  let fence: { char: string; length: number; quotes: number; from: number; to: number } | undefined;
+  // The block of code that is open: its fence, how many quotations it stands in, and what a line that ends it looks like before its fence.
+  let fence: { char: string; length: number; quotes: number; before: RegExp | undefined } | undefined;
   let lines: string[] = [];
   const flush = () => {
     if (lines.length > 0) out.push(paragraph(lines.join("\n")));
@@ -123,11 +123,11 @@ export function emphasised(text: string): string {
     // A block of code opened inside a quotation ends where the quotation does, closed or not: what follows a blank line after it is prose again.
     if (fence && fence.quotes > 0 && line.trim() === "") fence = undefined;
     if (fence) {
-      // What ends it is told narrowly: a fence of its kind and no shorter, with nothing after it, in as many quotations and
-      // no list item's mark before it, standing where the one that opened it stood (within three spaces). A line of the code
-      // that only looks like one (a list item's, or further in) does not end it. One left open leaves what follows as it is.
+      // What ends it is told narrowly, from the line itself: a fence of its kind and no shorter, with nothing after it, and
+      // before it only what its container puts there and up to three spaces. A line of the code that only looks like one
+      // (a list item's, or further in) does not end it. One left open leaves what follows as it is.
       const closing = /^([ >]*)(`{3,}|~{3,})[ \t]*$/.exec(line);
-      if (closing && closing[2][0] === fence.char && closing[2].length >= fence.length && closing[1].split(">").length - 1 === fence.quotes && closing[1].length >= fence.from && closing[1].length <= fence.to) fence = undefined;
+      if (closing && closing[2][0] === fence.char && closing[2].length >= fence.length && fence.before?.test(closing[1])) fence = undefined;
       out.push(line);
       continue;
     }
@@ -136,13 +136,18 @@ export function emphasised(text: string): string {
     const fenced = /^((?:\s*(?:>|(?:[-*+]|\d{1,9}[.)])(?=\s|$)))*)(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
     if (fenced && !(fenced[3][0] === "`" && fenced[4].includes("`"))) {
       flush();
-      // Where what its container holds begins, and so where a fence that ends it may stand: there, or up to three spaces
-      // further in. At the start of a line, that is the start. After a list item's mark, past the spaces after it (one to
-      // four; more than that, and one). After a quotation's mark, past it and the one space that may follow.
+      // What stands before a fence that ends it. At the start of a line: up to three spaces. In quotations and nothing else:
+      // each one's mark (up to three spaces before it, one space after it or none), wherever on the line it stands, and then up
+      // to three spaces. Under a list item and nothing else: as far in as what the item holds begins (past its mark and the one
+      // to four spaces after it; more than that, and one), and up to three spaces more. In both at once it cannot be told:
+      // nothing ends it but the end of the quotation.
       const marks = fenced[1];
+      const quotes = marks.split(">").length - 1;
+      const listed = /[-*+]|\d/.test(marks);
       const spaces = fenced[2].length;
-      const [from, to] = marks === "" ? [0, 3] : marks.endsWith(">") ? [marks.length, marks.length + 4] : [marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1), marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1) + 3];
-      fence = { char: fenced[3][0], length: fenced[3].length, quotes: marks.split(">").length - 1, from, to };
+      const within = marks.length + (spaces >= 1 && spaces <= 4 ? spaces : 1);
+      const before = marks === "" ? /^ {0,3}$/ : !listed ? new RegExp(`^(?: {0,3}> ?){${quotes}} {0,3}$`) : quotes === 0 ? new RegExp(`^ {${within},${within + 3}}$`) : undefined;
+      fence = { char: fenced[3][0], length: fenced[3].length, quotes, before };
       out.push(line);
     } else if (line.trim() === "") {
       flush();

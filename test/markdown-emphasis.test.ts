@@ -17,6 +17,8 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     ["- 一\n  - **嵌套：**内容", "- 一\n  - **嵌套**：内容"],
     ["- [ ] **待办：**写测试", "- [ ] **待办**：写测试"],
     ["请看 https://example.com/a?b=1 ，**结论：**通过。", "请看 https://example.com/a?b=1 ，**结论**：通过。"],
+    // In a quotation, a fence four spaces past its mark ends the block (one of them is the mark's own); five do not (see below).
+    ["  > ~~~md\n>    ~~~\n> **标题：**正文", "  > ~~~md\n>    ~~~\n> **标题**：正文"],
     // A fence closed as it was opened, in a quotation written without a space or in a list item; what follows is prose.
     [">~~~text\n>**代码：**不动\n>~~~\n\n**结论：**通过", ">~~~text\n>**代码：**不动\n>~~~\n\n**结论**：通过"],
     ["- ```\n  **代码：**不动\n  ```\n- **结论：**通过", "- ```\n  **代码：**不动\n  ```\n- **结论**：通过"],
@@ -92,6 +94,8 @@ describe("strong emphasis made to hold where full-width punctuation kept it from
     "-   ~~~\n  ~~~\n    **标题：**正文\n    ~~~",
     "- ~~~\n      ~~~\n  **标题：**正文\n  ~~~",
     "> ~~~\n>      ~~~\n> **标题：**正文\n> ~~~",
+    "  > ~~~md\n>     ~~~\n> **标题：**正文\n> ~~~",
+    "1. > ~~~\n   > ~~~\n   > **标题：**正文",
     "````md\n```\n**标题：**正文\n````",
     "~~~md\n```\n**标题：**正文\n~~~",
     "~~~md\n> ~~~\n**标题：**正文\n~~~",
