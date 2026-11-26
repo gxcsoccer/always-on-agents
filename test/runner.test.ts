@@ -40,6 +40,8 @@ function bench(state: DurableObjectState) {
   const settings = {
     /** What the connector says a replied-to message was: a value, or a function giving it. */
     quoted: undefined as any,
+    /** What the connector says a message comes to at an address. */
+    shows: undefined as undefined | ((target: { connector: string; address: Record<string, string> }) => { markdown: boolean; reminds: boolean } | undefined),
     /** The tenant's limits as the registry gives them, by how often it has been asked (the first time: 1). */
     limits: undefined as undefined | ((asked: number) => Record<string, number>),
     /** The pictures the connector can fetch, by key. */
@@ -78,6 +80,7 @@ function bench(state: DurableObjectState) {
     workers: () => settings.workers,
     leftToGoOnFrom: () => [],
     guidance: () => "",
+    shows: (target) => settings.shows?.(target),
     workStands: async () => true,
     pictures: async (connector, _event, refs) => (log.push(["pictures", connector, refs.map((each) => each.key)]), refs.map((each) => (settings.pictures ?? {})[each.key] ?? null)),
     quoted: async (connector, event) => (log.push(["quoted", connector, event.data?.replies_to]), typeof settings.quoted === "function" ? settings.quoted(event) : settings.quoted),
@@ -262,6 +265,27 @@ describe("the run loop, by itself", () => {
       });
       // Those two wait for her words; nothing else is passed over for them, and they are done after, each alone.
       expect(runs).toEqual([["result of t3", ""], ["do not post it after all"], ["result of t1"], ["result of t2"]]);
+    });
+
+    it("tells the model what its messages come to where the conversation is answered, in fixed words chosen by the connector's answers", async () => {
+      await within(async ({ go, event, model, asked, settings, store }) => {
+        const places: unknown[] = [];
+        settings.shows = (target) => (places.push(target), { markdown: false, reminds: true });
+        event("hello");
+        model.push(answer([says("hi")], 250));
+        await go();
+        // Asked of where this conversation is answered.
+        expect(places.at(-1)).toEqual(JSON.parse(store.rows<{ target: string }>("SELECT target FROM sessions")[0].target));
+        expect(asked.at(-1)!.instructions).toContain("Your messages here are shown as plain text, marks and all: write them without Markdown. A message here can remind people: name them in notify.");
+        // A connector that fails to answer, or a conversation with nowhere it is answered: the model is told nothing of the place.
+        settings.shows = () => {
+          throw new Error("no answer");
+        };
+        event("again");
+        model.push(answer([says("hi")], 250));
+        await go();
+        expect(asked.at(-1)!.instructions).not.toMatch(/Your messages here/);
+      });
     });
 
     it("takes up alone the end of a task, and the firing of a timer, of which it is kept who asked for it", async () => {
@@ -597,6 +621,8 @@ describe("the run loop, by itself", () => {
         expect(asked).toHaveLength(1);
         expect(asked[0].input).toHaveLength(1);
         expect(asked[0].instructions.length).toBeGreaterThan(0);
+        // Its connector says nothing of the place: neither does the prompt.
+        expect(asked[0].instructions).not.toMatch(/Your messages here|reminded from here|can remind people/);
         expect(asked[0].tools.map((each) => each.name)).toContain("send_message");
         expect(run(id)).toMatchObject({ status: "done", steps: 1, input_tokens: 240, output_tokens: 10 });
         expect(inbox()[0].status).toBe("done");

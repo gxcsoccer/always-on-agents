@@ -24,7 +24,7 @@ import { API, chatFactsFor, hex, tenantAccessToken, forgetTenantAccessToken } fr
 export { type ChatFacts, chatFacts } from "./feishu-api";
 import { type DocumentRef, authorisationHolds, documentOf, documentsIn, handleOauthCallback, invitationFor, linksIn, readDocument } from "./feishu-docs";
 import { grantOf } from "./feishu-grant";
-import { markOf, type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Picture, type PictureRef, type Quoted, type Receipt } from "./types";
+import { markOf, type ApprovalQuestion, type Connector, type Invitation, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Outcome, type Picture, type PictureRef, type Quoted, type Receipt, type Shows } from "./types";
 
 export const feishuConnector: Connector = {
   name: "feishu",
@@ -87,7 +87,7 @@ export const feishuConnector: Connector = {
   },
   // A bot's messages cannot be changed by anyone else, and a person's are read once: no `standing`.
   // Feishu drops a repeat of the same message within an hour.
-  channel: { deliver: deliverFeishu, amend: amendFeishu, closeInvitation: closeInvitationFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, pictures: picturesFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
+  channel: { shows: showsFeishu, deliver: deliverFeishu, amend: amendFeishu, closeInvitation: closeInvitationFeishu, received: receivedFeishu, unreceived: unreceivedFeishu, quoted: quotedFeishu, pictures: picturesFeishu, direct: directFeishu, aside: asideFeishu, under: underFeishu, dedupeMs: (target) => (target.address.visible_to ? 0 : 60 * 60_000) },
   tools: [readDocument],
   holds: (env, scope, condition, generation) => authorisationHolds(env, scope, condition, generation),
 };
@@ -791,6 +791,11 @@ const MAX_POST_BYTES = 29_000;
  */
 function quiet(text: string): string {
   return text.replace(/<(\/?)(at)(?=[\s>])/gi, "<\u200b$1$2");
+}
+
+/** The agent's words go out as Markdown; people are reminded where several talk, by a message all of them see (as `deliverFeishu` does it). */
+function showsFeishu(scope: Scope, target: Target): Shows {
+  return { markdown: true, reminds: scope.kind === "chat" && typeof target.address.chat_id === "string" && target.address.visible_to === undefined };
 }
 
 /** "Got it", as a reaction on the person's own message. Nothing is added to the chat. */

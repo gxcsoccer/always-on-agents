@@ -76,6 +76,8 @@ export interface RunnerHost {
   leftToGoOnFrom(runId: string, sessionKey: string): { id: string; worker: string; title: string }[];
   /** The deployment's guidance on which worker a piece of work goes to. */
   guidance(): string;
+  /** What a message sent to this address comes to there, where its connector says. */
+  shows(target: Target): { markdown: boolean; reminds: boolean } | undefined;
   /** Whether a piece of work done in a person's name still stands under what it was done under: see BrainAgent. */
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   /** Where the tenant's usage is kept. */
@@ -1333,6 +1335,17 @@ export class Runner {
     return acting !== undefined && toolsIn(acting, this.#b.toolsOf).some((each) => each.name === name && each.effect === "read");
   }
 
+  /** What a message comes to where this conversation is answered, as that place's connector says. */
+  #shows(sessionId: string | undefined): { markdown: boolean; reminds: boolean } | undefined {
+    const target = sessionId ? this.#s.rows<{ target: string | null }>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target : undefined;
+    if (!target) return undefined;
+    try {
+      return this.#b.shows(JSON.parse(target) as Target);
+    } catch {
+      return undefined;
+    }
+  }
+
   async #instructions(runId: string): Promise<string> {
     // A person who deliberately wrote to the agent is waiting for it; anything else merely happened.
     const waiting = this.#s.rows<{ principal: string }>("SELECT principal FROM inbox WHERE run_id = ? AND kind = 'message'", runId).some((event) => {
@@ -1371,6 +1384,7 @@ export class Runner {
       index: this.#s.rows<Row>("SELECT content FROM memory WHERE path = 'index.md'")[0]?.content,
       // Only where this very call to the model is given the tool to hand work over with: by the same word that decides its tools.
       guidance: this.#toolsFor(runId).some((each) => each.name === "hand_over") ? this.#b.guidance() : undefined,
+      shows: this.#shows(session?.id),
       work: [
         ...this.#s
           .rows<{ id: string; worker: string; title: string; status: string; after: string | null }>("SELECT id, worker, title, status, (SELECT from_id FROM task_follows WHERE task_id = tasks.id) AS after FROM tasks WHERE status IN ('dispatching', 'unconfirmed', 'running', 'needs_input', 'queued') AND session_key = ? ORDER BY created_at", session?.session_key ?? "")

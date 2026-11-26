@@ -365,6 +365,14 @@ export interface AdminRequest {
   body(): Promise<Record<string, any>>;
 }
 
+/** What a place shows of a message sent to it (see `Channel.shows`). */
+export interface Shows {
+  /** The words are shown as Markdown (headings, lists, emphasis, code); otherwise as the plain text they are. */
+  markdown: boolean;
+  /** People named with the message are reminded of it there. */
+  reminds: boolean;
+}
+
 export interface Channel {
   /**
    * Sends one message. Throwing means "not delivered, try again later"; it must be safe to repeat
@@ -428,6 +436,14 @@ export interface Channel {
    * channel has no such thing.
    */
   aside?(origin: Record<string, string>, person: string, from: Target): Target | undefined;
+  /**
+   * What a message sent to this address comes to there, as a few fixed answers: whether its words
+   * are shown as Markdown, and whether it can remind people (see `OutboundMessage.mention`). The
+   * Brain tells the model so in words of its own: a connector writes nothing into the prompt, and
+   * nothing a conversation or a platform said goes into these answers. Without it, the model is
+   * told nothing of the place.
+   */
+  shows?(scope: Scope, target: Target): Shows;
   /**
    * The message something sent to this address is written under, named as a message's
    * `data.replies_to` names it; undefined where it is under nothing. From the address alone.
