@@ -73,6 +73,8 @@ describe("who a message may remind", () => {
       expect(may.event).toMatch(/^message:\d+$/);
       // In the order asked for, each once, however they are written; the rest are left out.
       expect(reminders.claim(asked, [], HERE)).toEqual([]);
+      // The name she wrote for someone, for whoever is reminded by it; none for anyone else.
+      expect(reminders.named(asked, [CAROL, BOB, ANN], HERE)).toEqual({ [CAROL]: "@Carol" });
       expect(reminders.claim(asked, ["@carol", CAROL, "ou_dave", "ou_erin", "ou_frank", "ou_gail", "ou_hal", "all", "ou_nobody", BOB.toUpperCase(), ANN], HERE)).toEqual([CAROL, BOB, ANN]);
     });
   });

@@ -1609,6 +1609,16 @@ describe("reminding people where several talk", () => {
     model.replies([call("send_message", { text: "只有字 @Carol ou_colleague。", notify: null })], [say("")]);
     await here.says("那就这样");
     expect(last()).toBe("只有字 @Carol ou_colleague。");
+    // Where the words themselves name someone it reminds, by the name the one who asked wrote, the mention stands there and not a second time before the words.
+    // (A name given without its @ is the same name; a longer word that begins like it is another word; the one who asked has no such name and stays in front.)
+    model.replies([call("send_message", { text: "@Carol，该你了；@Caroline 不用。", notify: ["Carol", ann.openId] })], [say("")]);
+    await here.says("叫一下 @_user_2", [colleague]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at>，该你了；@Caroline 不用。`);
+    expect(toolOutputs().at(-1)).toEqual({ ok: true, reminded: 2, not_reminded: 0 });
+    // Not inside what is shown as code, where it would be shown as it is written and remind nobody: there the mention stays in front.
+    model.replies([call("send_message", { text: "运行 `ping @Carol` 就行。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫一下 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> 运行 `ping @Carol` 就行。');
     // The model was told what its messages come to in this chat, in the Brain's own words.
     expect(modelCalls.at(-1).instructions).toContain("Your messages here are shown as Markdown. A message here can remind people: name them in notify.");
     // Words that begin as a heading, a list, a table or a block of code keep their first line to themselves: the mention goes on a line before them.

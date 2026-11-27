@@ -702,15 +702,27 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // which stay as inert as ever. (The same markup is a mention in a post and in plain text.)
   // (The last line of defence, whatever was kept: only in a place of several people, as itself
   // and for everyone there to see; each a person by their id, and never everyone at once.)
-  const reminds =
-    scope.kind === "chat" && chatId && !only && !card && current
-      ? (message.mention ?? [])
-          .filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all")
-          .map((id) => `<at user_id="${id}"></at>`)
-          .join(" ")
-      : "";
+  const toRemind = scope.kind === "chat" && chatId && !only && !card && current ? (message.mention ?? []).filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all") : [];
+  const at = (id: string) => `<at user_id="${id}"></at>`;
   // (From the second encoding on, emphasis that full-width punctuation would have kept from holding is made to hold.)
-  const words = current && message.authored ? quiet((message.encoding ?? 0) >= 2 ? emphasised(message.text) : message.text) : message.text;
+  let words = current && message.authored ? quiet((message.encoding ?? 0) >= 2 ? emphasised(message.text) : message.text) : message.text;
+  // From the third encoding on: where the words name someone it reminds by the very name the one
+  // who asked wrote for them, the mention stands there, once, and not before the words as well.
+  // Not where anything in the words is shown as code: a mention inside that is shown as it is
+  // written and reminds nobody, so there every mention stays in front.
+  const inPlace = new Set<string>();
+  if ((message.encoding ?? 0) >= 3 && message.authored && !/[`~]/.test(words)) {
+    for (const id of toRemind) {
+      const name = message.mention_names?.[id];
+      if (!name || !/^@[\p{L}\p{N}_-]+$/u.test(name)) continue;
+      // The name as a whole: not the beginning of a longer one.
+      const found = new RegExp(`${name.replace(/[-]/g, "\\$&")}(?![\\p{L}\\p{N}_-])`, "u").exec(words);
+      if (!found) continue;
+      words = `${words.slice(0, found.index)}${at(id)}${words.slice(found.index + name.length)}`;
+      inPlace.add(id);
+    }
+  }
+  const reminds = toRemind.filter((id) => !inPlace.has(id)).map(at).join(" ");
   // On a line of their own where the words begin as a heading, a list, a quotation, a table, a
   // rule or a block of code would: put on the same line, the words would no longer begin that way, and
   // would be shown with their marks.

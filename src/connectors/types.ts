@@ -540,6 +540,12 @@ export interface OutboundMessage {
    */
   mention?: string[];
   /**
+   * For some of them, the name the one who asked wrote for the person (as the connector gave it
+   * when the message came). A channel may put its mention where the words name the person by it,
+   * and not a second time before them.
+   */
+  mention_names?: Record<string, string>;
+  /**
    * Set when the message is an approval question. `text` says the same in words; a connector that
    * can show something better than text (buttons, say) builds it from this.
    */

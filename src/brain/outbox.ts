@@ -6,6 +6,7 @@
  * hearing so (unverified). The Brain builds this part on its own database; what it needs from the
  * rest of the Brain it is handed (OutboxHost).
  */
+import { reminded } from "./reminders";
 import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Receipt, dedupeWindow } from "../connectors";
 import { type Target, isPrivateSession } from "../events";
 import type { Continuation, Requests } from "./requests";
@@ -77,7 +78,7 @@ export interface OutboxHost {
  * that (see `OutboundMessage.encoding`): 1 was the first a connector could choose by; 2 is where a
  * connector may put the words right as it writes them out (emphasis that would not have held).
  */
-const WIRE = 2;
+const WIRE = 3;
 
 export class Outbox implements Wakes {
   readonly #s: BrainStore;
@@ -109,7 +110,7 @@ export class Outbox implements Wakes {
     return { target: own ?? this.#s.meta("default_target") ?? undefined, own: own !== undefined };
   }
 
-  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: (target: string) => string[] }): { ok: true } {
+  enqueue(idem: string, sessionId: string, runId: string | null, text: string, ask?: ApprovalQuestion, review?: CodeReview, bound?: { continuation?: Continuation; interaction?: string; target?: string; authored?: boolean; mention?: (target: string) => string[]; names?: () => Record<string, string> }): { ok: true } {
     const { target, own } = this.whereTo(sessionId, bound);
     if (!target) throw new Error("there is nowhere to send a message in this conversation");
     const now = Date.now();
@@ -135,16 +136,20 @@ export class Outbox implements Wakes {
     // scope's last known place stands in for it, it is not known to be of this conversation, and nobody is reminded there.)
     // (And only for a message kept just now: one kept before is as it was kept, whether it reminded anyone or not.)
     const mention = bound?.mention && !already && own && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
-    if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
+    // (With the names some of them were named by, for a channel that puts its mention where the words name the person.)
+    const names = mention.length > 0 ? Object.fromEntries(Object.entries(bound?.names?.() ?? {}).filter(([id]) => mention.includes(id))) : {};
+    if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(Object.keys(names).length > 0 ? { ids: mention, names } : mention));
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
     return { ok: true };
   }
 
   /** Whom a kept message reminds. */
-  #reminds(idem: string): { mention?: string[] } {
+  #reminds(idem: string): { mention?: string[]; mention_names?: Record<string, string> } {
     const kept = this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", idem)[0]?.mention;
-    return kept ? { mention: JSON.parse(kept) as string[] } : {};
+    if (!kept) return {};
+    const { ids, names } = reminded(kept);
+    return { mention: ids, ...(Object.keys(names).length > 0 ? { mention_names: names } : {}) };
   }
 
   /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */

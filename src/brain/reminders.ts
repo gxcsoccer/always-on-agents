@@ -15,6 +15,12 @@ import type { BrainStore, InboxRow, RunRow } from "./store";
 /** No more than this many people of one thing, by however many messages. */
 export const MAX_REMINDED = 5;
 
+/** Whom a kept message reminds, as it is kept beside it: their ids, and for some the name they were named by. (Kept as the ids alone where there are no names.) */
+export function reminded(kept: string | null | undefined): { ids: string[]; names: Record<string, string> } {
+  const found = JSON.parse(kept ?? "[]") as string[] | { ids: string[]; names: Record<string, string> };
+  return Array.isArray(found) ? { ids: found, names: {} } : found;
+}
+
 export interface RemindersHost {
   /** The messages a run rests on: its own, or the ones the request it carries on was made in. */
   basis(runId: string): InboxRow[];
@@ -139,7 +145,7 @@ export class Reminders {
    * is, or where it was asked; it came up in another conversation, or another place, than the
    * one this message goes out in.
    */
-  of(run: RunRow, target: string | null | undefined): { event: string; who(asked: string): string | undefined; timer?: string } | undefined {
+  of(run: RunRow, target: string | null | undefined): { event: string; who(asked: string): string | undefined; name(id: string): string | undefined; timer?: string } | undefined {
     if (this.#s.scope().kind !== "chat") return undefined;
     const here = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", run.session_id)[0]?.session_key;
     const about = here === undefined ? undefined : this.#about(run.id);
@@ -158,7 +164,8 @@ export class Reminders {
       // (Never everyone at once, whatever the place calls that.)
       if (ref === "" || ref.toLowerCase() === "all") return undefined;
       if (ref.toLowerCase() === by.toLowerCase()) return by;
-      const meant = names.get(ref.toLowerCase());
+      // (By the name as they wrote it, with the chat's mark before it or without: the same name.)
+      const meant = names.get(ref.toLowerCase()) ?? (ref.startsWith("@") ? undefined : names.get(`@${ref.toLowerCase()}`));
       if (meant?.size === 1) return [...meant][0];
       const exact = [...ids].find((id) => id.toLowerCase() === ref.toLowerCase());
       if (exact) return exact;
@@ -177,7 +184,15 @@ export class Reminders {
         before = page.at(-1)!.id;
       }
     };
-    return { event: about.event, who, ...(about.timer ? { timer: about.timer } : {}) };
+    // The name the one who asked wrote for a person, where it means that one person: what the words of a message may name them by.
+    const name = (id: string): string | undefined => about.named.find((each) => each.id === id && each.name !== "" && names.get(each.name.toLowerCase())?.size === 1)?.name;
+    return { event: about.event, who, name, ...(about.timer ? { timer: about.timer } : {}) };
+  }
+
+  /** Of people a message of this run reminds, the name the one who asked wrote for each, where they wrote one. */
+  named(run: RunRow, ids: string[], target: string | null | undefined): Record<string, string> {
+    const may = ids.length > 0 ? this.of(run, target) : undefined;
+    return Object.fromEntries(ids.flatMap((id) => (may?.name(id) ? [[id, may.name(id)!]] : [])));
   }
 
   /**

@@ -137,6 +137,11 @@ describe("the outbox, by itself", () => {
         store.sql.exec("UPDATE outbox SET next_at = 0 WHERE idem = 'm1'");
         await outbox.flush();
         expect(delivered.map((each) => each.message.mention)).toEqual([["ou_1", "ou_2"], ["ou_1", "ou_2"]]);
+        // With the names the one who asked wrote for them, where there are any: kept with it, the same at every attempt.
+        outbox.enqueue("m4", SESSION, null, "@Carol done", undefined, undefined, { authored: true, mention: () => ["ou_1", "ou_2"], names: () => ({ ou_2: "@Carol" }) });
+        await outbox.flush();
+        expect(delivered.at(-1)!.message).toMatchObject({ mention: ["ou_1", "ou_2"], mention_names: { ou_2: "@Carol" } });
+        expect(delivered.filter((each) => each.message.idem === "m1").every((each) => each.message.mention_names === undefined)).toBe(true);
         // One that reminds nobody says nothing of it.
         outbox.enqueue("m2", SESSION, null, "plain");
         await outbox.flush();
@@ -845,8 +850,8 @@ describe("the outbox, by itself", () => {
         // Begun under the earlier version: attempted, with no word back, and no encoding on record.
         set("msg:old", { started: 1, uncertain: 1, wire: null });
         await outbox.flush();
-        expect(delivered.map((each) => [each.message.idem, each.message.encoding])).toEqual([["msg:new", 2], ["msg:old", 0]]);
-        expect(row("msg:new").wire).toBe(2);
+        expect(delivered.map((each) => [each.message.idem, each.message.encoding])).toEqual([["msg:new", 3], ["msg:old", 0]]);
+        expect(row("msg:new").wire).toBe(3);
         expect(row("msg:old").wire).toBe(0);
       });
     });
