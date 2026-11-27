@@ -101,6 +101,7 @@ describe("letting go of what waits in a scope", () => {
       ],
     });
     expect((await admin("GET", `scopes/${encodeURIComponent(name)}/timers`)).status).toBe(400);
+    expect((await admin("GET", `scopes/${encodeURIComponent(name)}/timers?ids=tmr_once,${"x".repeat(301)}`)).status).toBe(400);
     expect(await drop({ timers: named })).toEqual({ events: 0, timers: 0, timer_events: 2 });
     expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 0 });
     await wake(stub);
