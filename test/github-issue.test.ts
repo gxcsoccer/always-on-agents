@@ -1683,6 +1683,27 @@ describe("reminding people where several talk", () => {
     expect(await rowsOf(here.stub, "SELECT status FROM timers")).toEqual([{ status: "done" }]);
   });
 
+  it("reminds the one who asked at the end of something done in several steps, each a timer set when the one before it fired", async () => {
+    const ann = someone();
+    const here = ann.at("oc_steps");
+    const step = (text: string, more: boolean, notify: string[] | null = null) => [call("send_message", { text, notify }), ...(more ? [call("set_timer", { delay_seconds: 60, note: "下一个数", repeat_every_seconds: null, stop_after_reminding: null })] : [])];
+    const fire = async () => {
+      await rowsOf(here.stub, "UPDATE timers SET due_at = ? WHERE status = 'active'", Date.now() - 1);
+      await rest(here.stub);
+    };
+    model.replies(step("1", true), [say("")]);
+    await here.says("从 1 数到 4，数完提醒我");
+    for (const n of [2, 3]) {
+      model.replies(step(String(n), true), [say("")]);
+      await fire();
+      expect(last()).toBe(String(n));
+    }
+    model.replies(step("4，数完啦。", false, [ann.openId]), [say("")]);
+    await fire();
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 4，数完啦。`);
+  });
+
   it("reminds the one who set a timer long ago when it fires at last, however late, and nobody once it was called off", async () => {
     const ann = someone();
     const here = ann.at("oc_timer_old");

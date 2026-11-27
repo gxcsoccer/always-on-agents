@@ -287,4 +287,36 @@ describe("who a message may remind", () => {
       expect(reminders.asked("r_none")).toBeUndefined();
     });
   });
+
+  it("keeps whose thing it is through every step it is done in: a timer set by a timer's firing, a task handed over when a task ends", async () => {
+    await within(({ message, run, reminders, store }) => {
+      const kept = { by: ANN, named: [{ name: "@Carol", id: CAROL }], place: PLACE };
+      const fires = (id: string, runId: string) => message("", "next", { run: runId, source: "timer", kind: "timer", principal: { kind: "timer", id, explicit: false } });
+      const timer = (id: string, data: unknown, status = "done") => store.sql.exec("INSERT INTO timers (id, due_at, every_s, session_key, note, data, status, created_at) VALUES (?, 1, NULL, 'chat', 'n', ?, ?, 1)", id, data === undefined ? null : JSON.stringify(data), status);
+      // She asked for ten steps, ten seconds apart: each is a timer set in the run the one before it started.
+      timer("t1", reminders.asked((message(ANN, "count to ten, then tell me and @Carol", { run: "r0", data: { group: true, mentioned: [{ name: "@Carol", id: CAROL }] } }), "r0")));
+      for (let step = 1; step < 10; step++) {
+        fires(`t${step}`, `r${step}`);
+        expect(reminders.asked(`r${step}`), `step ${step}`).toEqual(kept);
+        timer(`t${step + 1}`, reminders.asked(`r${step}`));
+      }
+      // The last of them tells her, and the one she named.
+      fires("t10", "r10");
+      expect(reminders.claim(run("r10"), [ANN, "@Carol"], HERE)).toEqual([ANN, CAROL]);
+      // So with a task's end, well or not.
+      store.sql.exec("INSERT INTO tasks (id, op_id, worker, title, brief, session_key, requested_by, status, created_at, updated_at) VALUES ('k1', 'op_k1', 'sandbox', 't', 'b', 'chat', ?, 'failed', 1, 1)", ANN);
+      store.sql.exec("INSERT INTO task_asked (task_id, asked) VALUES ('k1', ?)", JSON.stringify(kept));
+      message("", "ended", { run: "rk", source: "worker", kind: "worker.failed", principal: { kind: "worker", id: "k1", explicit: false } });
+      expect(reminders.asked("rk")).toEqual(kept);
+      // Not from one of which nothing was kept, nor from one called off, nor from its mere progress.
+      timer("t_nobodys", undefined);
+      fires("t_nobodys", "rn");
+      expect(reminders.asked("rn")).toBeUndefined();
+      timer("t_off", kept, "cancelled");
+      fires("t_off", "ro");
+      expect(reminders.asked("ro")).toBeUndefined();
+      message("", "going", { run: "rp", source: "worker", kind: "worker.progress", principal: { kind: "worker", id: "k1", explicit: false } });
+      expect(reminders.asked("rp")).toBeUndefined();
+    });
+  });
 });

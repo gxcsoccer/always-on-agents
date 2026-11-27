@@ -64,12 +64,45 @@ export class Reminders {
 
   /**
    * What is noted when a task or a timer is made in a run, to be gone by when it comes back: who
-   * asked, whom they named, and where. From the run's own messages alone, and only where they
-   * are one person's own, written to the agent where several people talk.
+   * asked, whom they named, and where. From the run's own messages, where they are one person's
+   * own, written to the agent where several people talk; or, for a run that a task's end or a
+   * timer's firing started, what was kept with that task or timer: what a person asked for is
+   * still theirs however many steps it is done in, each set going by the one before.
    */
   asked(runId: string): Asked | undefined {
-    const from = this.#from(this.#b.basis(runId));
-    return from ? { by: from.by, named: from.named, place: from.place } : undefined;
+    const about = this.#about(runId);
+    return about ? { by: about.by, named: about.named, place: about.place } : undefined;
+  }
+
+  /** The thing a run is about, and whose it is: what its own messages say, or what was kept with the task or the timer that started it. */
+  #about(runId: string): { event: string; by: string; named: Named[]; sessionKey: string; place: string; timer?: string } | undefined {
+    const events = this.#b.basis(runId);
+    if (events.length === 0) return undefined;
+    let about: { event: string; by: string; named: Named[]; sessionKey: string; place: string; timer?: string } | undefined;
+    const said = this.#from(events);
+    const [only] = events;
+    // (The answer of a request that had to wait is a thing of its own: what was said when it was asked, with whoever that reminded, was about its being asked.)
+    const carried = said ? this.#b.carrying(runId) : undefined;
+    if (said) about = { event: carried ? `request:${carried}` : `message:${said.first}`, by: said.by, named: said.named, sessionKey: said.sessionKey, place: said.place };
+    else if (events.length === 1 && only.source === "worker" && ["worker.result", "worker.failed", "worker.lost"].includes(only.kind)) {
+      // A task that has had its end, well or not: one thing, however it ended.
+      // (Whose task: as the Brain wrote it on the event; who asked for it, whom they named and where: as kept with the task when it was made.)
+      const id = String((JSON.parse(only.principal) as { id?: unknown }).id ?? "");
+      const task = this.#s.rows<{ session_key: string; asked: string }>("SELECT t.session_key, a.asked FROM tasks t JOIN task_asked a ON a.task_id = t.id WHERE t.id = ?", id)[0];
+      const kept = task ? (JSON.parse(task.asked) as Partial<Asked>) : undefined;
+      if (task && typeof kept?.by === "string" && typeof kept.place === "string") about = { event: `task:${id}`, by: kept.by, named: named(kept.named), sessionKey: task.session_key, place: kept.place };
+    } else if (events.length === 1 && only.source === "timer" && only.kind === "timer") {
+      const id = String((JSON.parse(only.principal) as { id?: unknown }).id ?? "");
+      const timer = this.#s.rows<{ data: string | null; session_key: string; status: string }>("SELECT data, session_key, status FROM timers WHERE id = ?", id)[0];
+      // Called off since it fired: a firing of it that was already waiting reminds nobody.
+      if (timer?.status === "cancelled") return undefined;
+      const kept = JSON.parse(timer?.data ?? "{}") as Partial<Asked> & { stop_after_reminding?: unknown; reminded?: unknown };
+      // One set to stop once it has reminded has done so, at an earlier firing: no later one reminds, whenever it is taken up.
+      if (kept.stop_after_reminding === true && kept.reminded !== undefined) return undefined;
+      // Each time it fires is a thing of its own.
+      if (timer && typeof kept.by === "string" && typeof kept.place === "string") about = { event: `timer:${id}:${only.id}`, by: kept.by, named: named(kept.named), sessionKey: timer.session_key, place: kept.place, ...(kept.stop_after_reminding === true ? { timer: id } : {}) };
+    }
+    return about;
   }
 
   /** Whose words these are, whom they name and where they were written, where they are one person's own messages to the agent in one shared place. */
@@ -109,32 +142,7 @@ export class Reminders {
   of(run: RunRow, target: string | null | undefined): { event: string; who(asked: string): string | undefined; timer?: string } | undefined {
     if (this.#s.scope().kind !== "chat") return undefined;
     const here = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", run.session_id)[0]?.session_key;
-    const events = this.#b.basis(run.id);
-    if (here === undefined || events.length === 0) return undefined;
-    let about: { event: string; by: string; named: Named[]; sessionKey: string; place: string; timer?: string } | undefined;
-    const said = this.#from(events);
-    const [only] = events;
-    // (The answer of a request that had to wait is a thing of its own: what was said when it was asked, with whoever that reminded, was about its being asked.)
-    const carried = said ? this.#b.carrying(run.id) : undefined;
-    if (said) about = { event: carried ? `request:${carried}` : `message:${said.first}`, by: said.by, named: said.named, sessionKey: said.sessionKey, place: said.place };
-    else if (events.length === 1 && only.source === "worker" && ["worker.result", "worker.failed", "worker.lost"].includes(only.kind)) {
-      // A task that has had its end, well or not: one thing, however it ended.
-      // (Whose task: as the Brain wrote it on the event; who asked for it, whom they named and where: as kept with the task when it was made.)
-      const id = String((JSON.parse(only.principal) as { id?: unknown }).id ?? "");
-      const task = this.#s.rows<{ session_key: string; asked: string }>("SELECT t.session_key, a.asked FROM tasks t JOIN task_asked a ON a.task_id = t.id WHERE t.id = ?", id)[0];
-      const kept = task ? (JSON.parse(task.asked) as Partial<Asked>) : undefined;
-      if (task && typeof kept?.by === "string" && typeof kept.place === "string") about = { event: `task:${id}`, by: kept.by, named: named(kept.named), sessionKey: task.session_key, place: kept.place };
-    } else if (events.length === 1 && only.source === "timer" && only.kind === "timer") {
-      const id = String((JSON.parse(only.principal) as { id?: unknown }).id ?? "");
-      const timer = this.#s.rows<{ data: string | null; session_key: string; status: string }>("SELECT data, session_key, status FROM timers WHERE id = ?", id)[0];
-      // Called off since it fired: a firing of it that was already waiting reminds nobody.
-      if (timer?.status === "cancelled") return undefined;
-      const kept = JSON.parse(timer?.data ?? "{}") as Partial<Asked> & { stop_after_reminding?: unknown; reminded?: unknown };
-      // One set to stop once it has reminded has done so, at an earlier firing: no later one reminds, whenever it is taken up.
-      if (kept.stop_after_reminding === true && kept.reminded !== undefined) return undefined;
-      // Each time it fires is a thing of its own.
-      if (timer && typeof kept.by === "string" && typeof kept.place === "string") about = { event: `timer:${id}:${only.id}`, by: kept.by, named: named(kept.named), sessionKey: timer.session_key, place: kept.place, ...(kept.stop_after_reminding === true ? { timer: id } : {}) };
-    }
+    const about = here === undefined ? undefined : this.#about(run.id);
     // Where it came up and where this goes out are one conversation (the same topic of the same
     // chat) and one place as the connector addresses it (the same account, the same chat, for
     // everyone there to see).
