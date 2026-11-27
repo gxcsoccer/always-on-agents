@@ -310,7 +310,9 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
         // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.
         // Those left out are not seen by whoever tells what a name means: a name one of them shares with someone kept is taken
         // for that one's alone. It can only ever reach the one kept, whom the writer did name.)
-        .filter((each: any) => each?.mentioned_type === "user" && typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && each.tenant_key === sender.tenant_key)
+        // (And another bot of the chat the writer named: it is there for everyone in the chat to call on, whoever made it, so
+        // it is not held to the writer's organisation. Never the agent itself.)
+        .filter((each: any) => typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && ((each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot"))
         .map((each: any) => [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }]),
     ).values(),
   ];
