@@ -14,7 +14,7 @@ import type { registry } from "../registry";
 import { type RefUpdate, standingEligible } from "../workers/questions";
 import { type QuestionFate, clipResult } from "../workers/result";
 import type { Started, Worker } from "../workers";
-import type { Actor } from "../workers/types";
+import type { Actor, Prepared } from "../workers/types";
 import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
@@ -213,17 +213,32 @@ export class Tasks implements Wakes {
     // (see Worker.prepareStart). It may ask others, which takes time: so it comes first, and
     // everything that is looked at here afterwards (what it goes on from, who waits, how many
     // run) is looked at once it is back, with nothing awaited before the task is written.
-    let bound: unknown;
+    let bound: { record: Record<string, unknown>; by: string | null; options: Record<string, unknown> } | undefined;
     if (!task && offered?.start && offered.prepareStart) {
       const mine = own(offered, options);
       offered.accepts?.(mine, scope);
       const who = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
-      const prepared = await offered.prepareStart(this.#b.env, { scope, sessionKey, by: who.length === 1 ? who[0] : null, options: mine, continueFrom: from, ...(actor ? { actor } : {}) });
+      const by = who.length === 1 ? who[0] : null;
+      let prepared: Prepared | Error;
+      try {
+        prepared = await offered.prepareStart(this.#b.env, { scope, sessionKey, by, options: mine, continueFrom: from, ...(actor ? { actor } : {}) });
+      } catch (err) {
+        prepared = err instanceof Error ? err : new Error(String(err));
+      }
       // The same call may have been written meanwhile, by another making of it: then it is that
-      // task, with what was kept for it, whatever this look came to.
+      // task, with what was kept for it, whatever this look came to, also where it failed.
       if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) return this.dispatch(run, sessionKey, callId, name, title, brief, options, from, then);
+      if (prepared instanceof Error) throw prepared;
       if (prepared.kind === "refused") throw new Error(prepared.reason);
-      if (prepared.kind === "bound") bound = prepared.record;
+      if (prepared.kind === "bound") {
+        // What it is bound to has to be something that can be kept and read again as it was given.
+        const record = prepared.record;
+        if (record === null || typeof record !== "object" || Array.isArray(record)) throw new Error("the worker could not say what this work is allowed; nothing was started");
+        // And it was bound for the one who asked when it was looked at: whoever that is now has to be the same.
+        const now = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+        if (by === null || now.length !== 1 || now[0] !== by || (actor !== undefined && actor.person !== by)) throw new Error("who asked for this changed while it was being looked at; nothing was started. They can ask again");
+        bound = { record: record as Record<string, unknown>, by, options: mine };
+      }
     }
     /** Whether this is put after a piece of work that has not ended, to wait for it. */
     let waits = false;
@@ -310,7 +325,11 @@ export class Tasks implements Wakes {
         const on = typeof options.repository === "string" && options.repository !== "" ? options.repository : from !== null ? (this.#s.rows<{ repository: string }>("SELECT repository FROM task_on WHERE task_id = ?", from)[0]?.repository ?? null) : null;
         if (on !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_on (task_id, repository) VALUES (?, ?)", id, on);
         // What its worker bound it to, as the worker gave it: its own to read when the work is started, and nobody else's.
-        if (bound !== undefined) this.#s.sql.exec("INSERT OR IGNORE INTO task_lends (task_id, record) VALUES (?, ?)", id, JSON.stringify(bound));
+        // (With what it was asked with then: one that is bound is started with that, however the call is made again.)
+        if (bound !== undefined) {
+          if (bound.by !== requestedBy) throw new Error("who asked for this changed while it was being looked at; nothing was started. They can ask again");
+          this.#s.sql.exec("INSERT INTO task_lends (task_id, record, options) VALUES (?, ?, ?)", id, JSON.stringify(bound.record), JSON.stringify(bound.options));
+        }
         if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events, repository) VALUES (?, ?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events), on);
       });
       // (One that waits is watched from when it is let through to be started, not while it waits.)
@@ -333,6 +352,15 @@ export class Tasks implements Wakes {
       return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
     }
     options = own(worker, options);
+    // One that was bound is the work it was when it was bound: what it was asked with then, for
+    // the one who asked then, whatever this making of the call says.
+    const lent = this.#s.rows<{ options: string }>("SELECT options FROM task_lends WHERE task_id = ?", task.id)[0];
+    if (lent) {
+      const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+      if (people.length !== 1 || people[0] !== task.requested_by) throw new Error("this call was first made for someone else; nothing further was started");
+      options = JSON.parse(lent.options) as Record<string, unknown>;
+      brief = String(task.brief);
+    }
     // How far this task may go, as it was fixed when it was written (one written before that was
     // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
     const bounds = this.#boundsOf(task);

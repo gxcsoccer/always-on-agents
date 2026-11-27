@@ -25,10 +25,12 @@ export interface Actor {
 
 /**
  * What a worker says of a new piece of work before it is written: as ever; not to be started (in
- * words for the model, and whether asking again later may do); or bound to a record of the
- * worker's own, which the Brain keeps with the work and hands back when it is started.
+ * words for the model, which say whether asking again later may do); or bound to a record of the
+ * worker's own, which the Brain keeps with the work and hands back when it is started. The record
+ * is something that can be kept as JSON and read again, with a version of its own that the worker
+ * checks as it reads it: the Brain only keeps it.
  */
-export type Prepared = { kind: "ordinary" } | { kind: "refused"; reason: string; retryable: boolean } | { kind: "bound"; record: unknown };
+export type Prepared = { kind: "ordinary" } | { kind: "refused"; reason: string } | { kind: "bound"; record: Record<string, unknown> };
 
 /** One piece of work, as the Brain hands it over. `id` is the Brain's, kept before the worker is asked: the same id is the same piece of work. */
 export interface Work {

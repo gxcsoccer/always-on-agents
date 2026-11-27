@@ -527,8 +527,10 @@ export class RunTools {
         // before it is written: who, through which connector and verified origin, and what they
         // wrote, each with the message it is of. Never whoever a task's end or a timer stands for,
         // nor anything the model said: only the run's own acting, decided from what is stored.
-        const basis = this.#b.requests.basis(run.id);
-        const actor = acting
+        // (Put together only for a worker that looks: no other is told any of it.)
+        const looks = this.#b.workers().find((each) => each.name === name)?.prepareStart !== undefined;
+        const basis = looks ? this.#b.requests.basis(run.id) : [];
+        const actor = acting && looks
           ? {
               person: acting.person,
               connector: acting.connector,

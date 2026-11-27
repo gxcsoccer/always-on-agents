@@ -646,7 +646,7 @@ describe("tasks, by themselves", () => {
             await gate;
             return answer;
           },
-          start: async (_env, work) => (started.push({ id: work.id, lend: work.lend, by: work.by }), { state: "started" }),
+          start: async (_env, work) => (started.push({ id: work.id, lend: work.lend, by: work.by, brief: work.brief, options: work.options }), { state: "started" }),
           standing: async () => "there",
         };
         settings.workers = [];
@@ -654,7 +654,7 @@ describe("tasks, by themselves", () => {
         const actor = { person: "alice", connector: "chat", origin: { app: "a" }, said: [{ ref: 7, text: "look at acme/app" }], recent: [] };
 
         // Turned away: said to the model in the worker's words, and nothing is written, taken or started.
-        answer = { kind: "refused", reason: "that cannot be reached just now; ask again later", retryable: true };
+        answer = { kind: "refused", reason: "that cannot be reached just now; ask again later" };
         await expect(tasks.dispatch(RUN, SESSION_KEY, "call_r", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)).rejects.toThrow("that cannot be reached just now; ask again later");
         expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
         expect(slots.acquired).toEqual([]);
@@ -666,13 +666,13 @@ describe("tasks, by themselves", () => {
         answer = { kind: "ordinary" };
         const plain = (await tasks.dispatch(RUN, SESSION_KEY, "call_o", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string };
         expect(store.rows("SELECT 1 FROM task_lends")).toEqual([]);
-        expect(started.at(-1)).toEqual({ id: plain.task_id, lend: undefined, by: "alice" });
+        expect(started.at(-1)).toEqual({ id: plain.task_id, lend: undefined, by: "alice", brief: "b", options: { where: "acme/app" } });
 
         // Bound: what the worker gave is kept with the task as it is, and handed to it when it is started. Nothing of it is the model's.
         answer = { kind: "bound", record: { v: 1, leave: "to read acme/app" } };
         const bound = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string };
         expect(store.rows("SELECT task_id, record FROM task_lends")).toEqual([{ task_id: bound.task_id, record: JSON.stringify({ v: 1, leave: "to read acme/app" }) }]);
-        expect(started.at(-1)).toEqual({ id: bound.task_id, lend: { v: 1, leave: "to read acme/app" }, by: "alice" });
+        expect(started.at(-1)).toEqual({ id: bound.task_id, lend: { v: 1, leave: "to read acme/app" }, by: "alice", brief: "b", options: { where: "acme/app" } });
         // The same call made again is the task it made: the worker is not asked a second time, and nothing it would say now changes what was kept.
         answer = { kind: "bound", record: { v: 1, leave: "something else" } };
         const before = asked.length;
@@ -691,7 +691,73 @@ describe("tasks, by themselves", () => {
         expect(one.task_id).toBe(two.task_id);
         expect(store.rows("SELECT 1 FROM tasks WHERE op_id = 'call_2x'")).toHaveLength(1);
         expect(started.slice(count).filter((each: any) => each.id === one.task_id).length).toBeGreaterThanOrEqual(1);
-        expect(new Set(started.slice(count).map((each: any) => JSON.stringify(each.lend)))).toEqual(new Set([JSON.stringify({ v: 1, leave: "once" })]));
+        // (A start may be asked for more than once; each asking is for the very same work.)
+        expect(new Set(started.slice(count).map((each) => JSON.stringify(each)))).toEqual(new Set([JSON.stringify({ id: one.task_id, lend: { v: 1, leave: "once" }, by: "alice", brief: "b", options: { where: "acme/app" } })]));
+      });
+    });
+
+    it("starts work that was bound as the work it was when it was bound, for the one who asked then, and binds nothing it cannot keep or whose asker has changed", async () => {
+      await within(async ({ tasks, store, settings, slots }) => {
+        const started: any[] = [];
+        let answer: any;
+        let during: (() => void) | undefined;
+        let fails = false;
+        const careful: Worker = {
+          name: "careful",
+          description: "",
+          acts_as: "agent",
+          options: { where: { type: ["string", "null"] } },
+          prepareStart: async () => {
+            during?.();
+            if (fails) throw new Error("could not be asked");
+            return answer;
+          },
+          start: async (_env, work) => (started.push({ id: work.id, lend: work.lend, by: work.by, brief: work.brief, options: work.options }), { state: "started" }),
+          standing: async () => "there",
+        };
+        settings.workers = [];
+        settings.others = [careful];
+        const make = (call: string, brief = "b", where = "acme/app") => tasks.dispatch(RUN, SESSION_KEY, call, "careful", "t", brief, { where }) as Promise<{ task_id: string }>;
+
+        // What is not something that can be kept is not a binding: said, and nothing is written. Never taken for work as ever.
+        for (const record of [undefined, null, "leave", 3, ["a"]]) {
+          answer = { kind: "bound", record };
+          await expect(make(`call_bad_${String(record)}`)).rejects.toThrow("the worker could not say what this work is allowed; nothing was started");
+        }
+        expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
+        expect(slots.acquired).toEqual([]);
+
+        // Whoever asked is no longer the one person who asked, by the time the look is over: nothing is bound for anyone.
+        answer = { kind: "bound", record: { v: 1 } };
+        during = () => (settings.deciders = []);
+        await expect(make("call_gone")).rejects.toThrow("who asked for this changed while it was being looked at; nothing was started");
+        during = () => (settings.deciders = [{ kind: "human", id: "bob", explicit: true }]);
+        settings.deciders = [{ kind: "human", id: "alice", explicit: true }];
+        await expect(make("call_other")).rejects.toThrow("who asked for this changed while it was being looked at; nothing was started");
+        expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
+        during = undefined;
+        settings.deciders = [{ kind: "human", id: "alice", explicit: true }];
+
+        // Bound, and its start not heard of: the call made again, with other words and another place, is the work as it was bound.
+        const first = await make("call_fixed");
+        const again = await tasks.dispatch(RUN, SESSION_KEY, "call_fixed", "careful", "t", "another brief", { where: "acme/other" });
+        expect((again as { task_id: string }).task_id).toBe(first.task_id);
+        expect(started.filter((each) => each.id === first.task_id).every((each) => each.brief === "b" && each.options.where === "acme/app" && each.by === "alice")).toBe(true);
+        // Made again for someone else, it is not their call: nothing further is started.
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", first.task_id);
+        settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
+        const before = started.length;
+        await expect(make("call_fixed")).rejects.toThrow("this call was first made for someone else; nothing further was started");
+        expect(started).toHaveLength(before);
+        settings.deciders = [{ kind: "human", id: "alice", explicit: true }];
+
+        // The look fails after another making of the same call has been written: it is that task, not a failure.
+        const other = await make("call_late");
+        fails = true;
+        expect((await make("call_late")).task_id).toBe(other.task_id);
+        // With none written, the failure is the answer, and nothing is written.
+        await expect(make("call_fails")).rejects.toThrow("could not be asked");
+        expect(store.rows("SELECT 1 FROM tasks WHERE op_id = 'call_fails'")).toEqual([]);
       });
     });
 

@@ -58,7 +58,10 @@ function bench(state: DurableObjectState) {
     },
     outside,
     actingFor: () => settings.acting,
-    workers: () => [{ name: "probe", description: "", acts_as: "agent" as const, start: async () => ({ state: "started" as const }) }],
+    workers: () => [
+      { name: "probe", description: "", acts_as: "agent" as const, prepareStart: async () => ({ kind: "ordinary" as const }), start: async () => ({ state: "started" as const }) },
+      { name: "plain", description: "", acts_as: "agent" as const, start: async () => ({ state: "started" as const }) },
+    ],
     mayUse: () => settings.mayUse,
     following: () => settings.following,
     reminders: {
@@ -378,7 +381,10 @@ describe("a run's tools", () => {
       // Handed over for the one person the run acts for: what is known here of them goes along for the worker's own look, each thing they wrote with the message it is of.
       await t.handOver("c5", "probe", "title", "brief", {}, null, null, []);
       expect(of("dispatch").at(-1)).toEqual([run, SESSION_KEY, "c5", "probe", "title", "brief", {}, null, undefined, { person: "ou_1", connector: "feishu", origin: { app_id: "cli_1" }, said: [{ ref: 7, text: "read this" }], recent: [{ ref: 41, text: "earlier" }] }]);
-      calls.splice(calls.findIndex(([name, , , id]) => name === "dispatch" && id === "c5"), 1);
+      // A worker that does not look is told none of it.
+      await t.handOver("c6", "plain", "title", "brief", {}, null, null, []);
+      expect(of("dispatch").at(-1)).toEqual([run, SESSION_KEY, "c6", "plain", "title", "brief", {}, null, undefined, undefined]);
+      for (const id of ["c5", "c6"]) calls.splice(calls.findIndex(([name, , , call]) => name === "dispatch" && call === id), 1);
       // The tool from before there was more than one worker names none: the tasks part finds the one that is started from here.
       expect(of("dispatch")).toEqual([[run, SESSION_KEY, "c2", null, "title", "brief", { repository: null }]]);
       expect(of("status")).toEqual([["t1", "dm"]]);
