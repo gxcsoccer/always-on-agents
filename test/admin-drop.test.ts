@@ -30,7 +30,7 @@ describe("letting go of what waits in a scope", () => {
 
     // Stock is taken from what the scope says of itself: how much waits where, of what kind, and up to which event. No words.
     const waiting = (await stub.inspect()).waiting;
-    expect(waiting).toContainEqual({ session_key: "pr:1", source: "git", kind: "git.pull_request", events: 3, not_addressed: 2, up_to: expect.any(Number) });
+    expect(waiting).toContainEqual({ session_key: "pr:1", source: "git", kind: "git.pull_request", events: 3, not_addressed: 2, up_to: expect.any(Number), timer: null });
     const upTo = Math.max(...waiting.map((each: any) => each.up_to));
     // Another push arrives after stock was taken: the pull request was opened again.
     await stub.ingest(pushed("pr:2"));
@@ -89,7 +89,10 @@ describe("letting go of what waits in a scope", () => {
         state.storage.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('timer', ?, 'timer', 'pr:1', ?, 'look again', 'pending', 1)", `${id}:1`, JSON.stringify({ kind: "timer", id, explicit: false }));
       }
     });
-    expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 2 });
+    // Which timers have something in line is said by the scope, by their names: what they are then named by here.
+    const named = (await stub.inspect()).waiting.filter((each: any) => each.source === "timer").map((each: any) => each.timer).sort();
+    expect(named).toEqual(["tmr_cancelled", "tmr_once"]);
+    expect(await drop({ timers: named })).toEqual({ events: 0, timers: 0, timer_events: 2 });
     expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 0 });
     await wake(stub);
     expect(modelCalls).toHaveLength(0);

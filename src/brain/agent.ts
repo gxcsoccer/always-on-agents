@@ -591,7 +591,8 @@ export class BrainAgent extends DurableObject<Env> {
       inbox: { pending: count("inbox", "status = 'pending'"), claimed: count("inbox", "status = 'claimed'"), done: count("inbox", "status = 'done'"), dead: count("inbox", "status = 'dead'"), dropped: count("inbox", "status = 'dropped'") },
       // What waits, by where and of what kind, and up to which event: what an operator takes stock by. No words.
       // (`not_addressed`: how many of them nobody addressed to the agent, which is as many as can be dropped.)
-      waiting: this.#store.rows("SELECT session_key, source, kind, COUNT(*) AS events, SUM(COALESCE(json_extract(principal, '$.explicit'), 0) != 1) AS not_addressed, MAX(id) AS up_to FROM inbox WHERE status = 'pending' GROUP BY session_key, source, kind ORDER BY events DESC LIMIT 500"),
+      // (`timer`: for what a timer put in line, the timer's name: what it is cancelled or let go of by.)
+      waiting: this.#store.rows("SELECT session_key, source, kind, COUNT(*) AS events, SUM(COALESCE(json_extract(principal, '$.explicit'), 0) != 1) AS not_addressed, MAX(id) AS up_to, CASE WHEN source = 'timer' THEN json_extract(principal, '$.id') END AS timer FROM inbox WHERE status = 'pending' GROUP BY session_key, source, kind, timer ORDER BY events DESC LIMIT 500"),
       recent_events: this.#store.rows("SELECT id, source, kind, session_key, status, substr(text, 1, 160) AS text FROM inbox ORDER BY id DESC LIMIT 15"),
       // What each recent message carries besides its words, by name only; and, where it was written as a reply, how much of what it replies to was found.
       recent_shapes: this.#store.rows(
