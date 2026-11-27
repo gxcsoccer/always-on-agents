@@ -119,19 +119,25 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // A token is lent only for the repository this task was started on, and it is one issued for
     // this task's tenant and that repository alone. Anything else is reached anonymously, so a task
     // cannot read private code it was not given.
-    // Asked for by what it is for: what git reads with (cloning, fetching), or what a push goes out
-    // under. The two are lent apart, so that one can be lent where the other is not.
-    const token = own ? await (git.push ? this.#task.githubToken() : this.#task.githubFetchToken()) : undefined;
     // Only what git's own exchange needs is passed on, made here: nothing else the guest sent goes
     // out beside a credential.
     const headers = new Headers();
     for (const name of GIT_HEADERS) if (request.headers.has(name)) headers.set(name, request.headers.get(name)!);
-    if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
+    // A credential is asked for by what it is for (what git reads with, or what a push goes out
+    // under: the two are lent apart), and only where the request it is for is about to be sent.
+    // Asking takes a moment, and no credential is also what a task that has ended is given: such a
+    // one sends nothing, with a credential or without.
+    const credited = async (lent: () => Promise<string | undefined>): Promise<Response | undefined> => {
+      const token = own ? await lent() : undefined;
+      if (own && !(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+      if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
+      return undefined;
+    };
 
-    if (!git.push) return fetch(new Request(request, { headers, redirect: "manual" }));
+    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
     if (!own) return this.#refuse(request, url, "this task may only push to the repository it was started on");
     // Asking what the remote has is harmless; the push itself is the request that carries commits.
-    if (git.endpoint === "info/refs") return fetch(new Request(request, { headers, redirect: "manual" }));
+    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
 
     // A push is decided here, by what the request is, not by what the command looked like. The body
     // says exactly which refs would move to which commits, and that is what a person approves.
