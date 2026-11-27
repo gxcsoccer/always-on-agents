@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS inbox (
   text TEXT,
   data TEXT,
   reply_to TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending | claimed | done | dead
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending | claimed | done | dead | dropped (by an operator)
   run_id TEXT,
   received_at INTEGER NOT NULL,
   UNIQUE (source, source_id)

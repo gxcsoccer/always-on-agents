@@ -33,18 +33,18 @@ export class Marks implements Wakes {
    */
   keep(source: string, sourceId: string, mark: string): boolean {
     const row = this.#s.rows<{ status: string }>("UPDATE inbox SET mark = ?, mark_attempts = 0, mark_next_at = NULL WHERE source = ? AND source_id = ? RETURNING status", mark, source, sourceId)[0];
-    return row !== undefined && (row.status === "done" || row.status === "dead");
+    return row !== undefined && (row.status === "done" || row.status === "dead" || row.status === "dropped");
   }
 
   /** When a mark is next due to come off: now for one whose message was dealt with, or its next try. */
   nextWakeAt(now: number): number | null {
-    return this.#s.rows<{ at: number | null }>("SELECT MIN(COALESCE(mark_next_at, ?)) AS at FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead')", now)[0]?.at ?? null;
+    return this.#s.rows<{ at: number | null }>("SELECT MIN(COALESCE(mark_next_at, ?)) AS at FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead', 'dropped')", now)[0]?.at ?? null;
   }
 
   /** Takes off the marks of messages that have been dealt with and are due, asking the channel for each. */
   async clear(now: number): Promise<void> {
     const due = this.#s.rows<{ id: number; source: string; data: string | null; reply_to: string | null; mark: string; mark_attempts: number }>(
-      "SELECT id, source, data, reply_to, mark, mark_attempts FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead') AND COALESCE(mark_next_at, 0) <= ? ORDER BY id LIMIT ?",
+      "SELECT id, source, data, reply_to, mark, mark_attempts FROM inbox WHERE mark IS NOT NULL AND status IN ('done', 'dead', 'dropped') AND COALESCE(mark_next_at, 0) <= ? ORDER BY id LIMIT ?",
       now,
       BATCH,
     );

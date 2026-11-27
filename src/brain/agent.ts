@@ -367,8 +367,8 @@ export class BrainAgent extends DurableObject<Env> {
     this.#store.transaction(() => {
       // Old events lose their content but keep their identity for a year: the (source, source_id)
       // pair is what makes a replayed webhook a duplicate, and a signed webhook never expires.
-      this.#store.sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead') AND received_at < ? AND text IS NOT NULL", old);
-      this.#store.sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead') AND received_at < ?", now - RETAIN_AUDIT_MS);
+      this.#store.sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead', 'dropped') AND received_at < ? AND text IS NOT NULL", old);
+      this.#store.sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead', 'dropped') AND received_at < ?", now - RETAIN_AUDIT_MS);
       this.#store.sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn', 'reconciling', 'void', 'unverified') AND created_at < ?", old);
       // Before what the index of work points at is cleared: a row still open for something that has
       // ended (ended while a version without the index ran, say) is given its end, with the time
@@ -546,13 +546,52 @@ export class BrainAgent extends DurableObject<Env> {
     );
   }
 
+  /**
+   * An operator lets go of what waits here and will never be worth doing.
+   *
+   * Notifications: those of one source and kind that wait in the conversations named, no later
+   * than the event stock was taken at, and not addressed to the agent by anyone (a connector's
+   * word that something happened, whoever caused it). So a person's message, what a request or a task waits to be told, and
+   * anything that arrived since stock was taken all stay; asked twice, the second time drops
+   * nothing. They are kept as dropped: a repeat of the same delivery is still a duplicate.
+   *
+   * Timers: those named, but for a task's own watch, are cancelled; and what any of them has
+   * already put in line is dropped, whether the timer still runs or has ended since, so that none
+   * of them starts another run.
+   *
+   * Only what waits: an event a run has taken up is that run's, and is finished by it. How many
+   * were dropped is put on record, never what any of them said.
+   */
+  async drop(sessions: string[], timers: string[], which?: { source: string; kind: string; up_to: number }): Promise<{ events: number; timers: number; timer_events: number }> {
+    return this.#store.transaction(() => {
+      const events = !which
+        ? 0
+        : this.#store.rows(
+            "UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = ? AND kind = ? AND id <= ? AND COALESCE(json_extract(principal, '$.explicit'), 0) != 1 AND session_key IN (SELECT value FROM json_each(?)) RETURNING id",
+            which.source,
+            which.kind,
+            which.up_to,
+            JSON.stringify(sessions),
+          ).length;
+      const cancelled = this.#store.rows<{ id: string }>("UPDATE timers SET status = 'cancelled' WHERE status = 'active' AND id IN (SELECT value FROM json_each(?)) AND (data IS NULL OR json_extract(data, '$.task_id') IS NULL) RETURNING id", JSON.stringify(timers)).map((each) => each.id);
+      // What any of them has put in line, whether it still runs or has ended since (its last round, or its only one, is put in line as it ends).
+      // (Not a task's own watch, whose word is of another kind and is the task's.)
+      const fired = this.#store.rows("UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = 'timer' AND kind = 'timer' AND json_extract(principal, '$.id') IN (SELECT value FROM json_each(?)) RETURNING id", JSON.stringify(timers)).length;
+      this.#store.audit("(operator)", "admin.dropped", { sessions, ...(which ?? {}), timers, events, cancelled: cancelled.length, timer_events: fired });
+      return { events, timers: cancelled.length, timer_events: fired };
+    });
+  }
+
   async inspect(): Promise<Record<string, unknown>> {
     const count = (table: string, where = "1") => this.#store.rows<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`)[0].n;
     return {
       scope: this.#store.meta("scope"),
       alarm_at: await this.ctx.storage.getAlarm(),
       active_run: this.#runner.activeRun() ?? null,
-      inbox: { pending: count("inbox", "status = 'pending'"), claimed: count("inbox", "status = 'claimed'"), done: count("inbox", "status = 'done'"), dead: count("inbox", "status = 'dead'") },
+      inbox: { pending: count("inbox", "status = 'pending'"), claimed: count("inbox", "status = 'claimed'"), done: count("inbox", "status = 'done'"), dead: count("inbox", "status = 'dead'"), dropped: count("inbox", "status = 'dropped'") },
+      // What waits, by where and of what kind, and up to which event: what an operator takes stock by. No words.
+      // (`not_addressed`: how many of them nobody addressed to the agent, which is as many as can be dropped.)
+      waiting: this.#store.rows("SELECT session_key, source, kind, COUNT(*) AS events, SUM(COALESCE(json_extract(principal, '$.explicit'), 0) != 1) AS not_addressed, MAX(id) AS up_to FROM inbox WHERE status = 'pending' GROUP BY session_key, source, kind ORDER BY events DESC LIMIT 500"),
       recent_events: this.#store.rows("SELECT id, source, kind, session_key, status, substr(text, 1, 160) AS text FROM inbox ORDER BY id DESC LIMIT 15"),
       // What each recent message carries besides its words, by name only; and, where it was written as a reply, how much of what it replies to was found.
       recent_shapes: this.#store.rows(
