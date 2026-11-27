@@ -818,16 +818,20 @@ function plainWords(words: string): boolean {
 /**
  * Where, in such words, a name stands as a word of its own, at or after `from`: the first such
  * place, or -1. Whatever its case, as a name is found by whatever its case when people are named.
- * Not the beginning of a longer name, and not after a letter or figure of ASCII or one of the
- * marks a mail address is written with. Looked for by the name as it is, never as a pattern.
+ * Not the beginning of a longer name, and not after a letter or figure of ASCII or any mark a
+ * mail address may be written with before its "@" (a tilde among them: so also not a word struck
+ * through, which is where a name is taken back). Looked for by the name as it is, never as a pattern.
  */
 function spoken(words: string, name: string, from = 0): number {
   const wanted = name.toLowerCase();
   for (let at = words.indexOf("@", from); at >= 0; at = words.indexOf("@", at + 1)) {
     // (As many units as the name has: where case changes how many, it is not found, and the mention stays in front.)
     if (words.slice(at, at + name.length).toLowerCase() !== wanted) continue;
-    const before = at === 0 ? "" : words[at - 1];
-    if (/^[\p{L}\p{N}_-]/u.test(words.slice(at + name.length, at + name.length + 2)) || /[A-Za-z0-9._\/:=?&#%+\\-]/.test(before)) continue;
+    // What stands before it, past any marks of emphasis right before it (they are part of an address only where an address goes on before them).
+    let back = at;
+    while (back > 0 && (words[back - 1] === "*" || words[back - 1] === "_")) back--;
+    const before = back === 0 ? "" : words[back - 1];
+    if (/^[\p{L}\p{N}_-]/u.test(words.slice(at + name.length, at + name.length + 2)) || /[A-Za-z0-9.!#$%&'+\/=?^{}~:\\-]/.test(before)) continue;
     return at;
   }
   return -1;
