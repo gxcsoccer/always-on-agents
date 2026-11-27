@@ -152,6 +152,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const send = async (): Promise<Response> => {
       const current = await this.#task.githubToken();
       if (!current) return new Response(`this task is no longer allowed a credential for ${git.repo}\n`, { status: 403 });
+      // (Asking took a moment, and a credential held from before may be handed to a task that has ended since: such a one sends nothing, approved or not.)
+      if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
       headers.set("authorization", `Basic ${btoa(`x-access-token:${current}`)}`);
       return fetch(url, { method: "POST", headers, body, redirect: "manual" });
     };
