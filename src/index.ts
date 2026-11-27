@@ -82,6 +82,14 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     return json({ ok: true });
   }
 
+  // Which scopes there are: each says so of itself when it wakes (see Registry.noteScope).
+  // What is listed has said so since this was there to be told; one that is not listed may still be there, asleep.
+  if (path[0] === "scopes" && path.length === 1 && method === "GET") {
+    const given = (name: string) => url.searchParams.get(name);
+    if (given("tenant") === "" || given("kind") === "" || (given("limit") !== null && !(/^\d{1,3}$/.test(given("limit")!) && Number(given("limit")) >= 1 && Number(given("limit")) <= 500))) return json({ error: "tenant and kind, where given, are names; limit a number up to 500" }, 400);
+    const page = await registry(env).scopes({ ...(given("tenant") ? { tenant: given("tenant")! } : {}), ...(given("kind") ? { kind: given("kind")! } : {}), ...(given("after") ? { after: given("after")! } : {}), ...(given("limit") ? { limit: Number(given("limit")) } : {}) });
+    return new Response(JSON.stringify(page), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+  }
   if (path[0] === "scopes" && path[1]) {
     const brain = env.BRAIN.getByName(decodeURIComponent(path[1]));
     if (path.length === 2 && method === "GET") return json(await brain.inspect());

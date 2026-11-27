@@ -42,6 +42,10 @@ import { limitsFrom } from "../limits";
 const BATCH_WINDOW_MS = 2_000;
 /** How long finished records are kept before housekeeping removes them. */
 const RETAIN_RECORDS_MS = 30 * 86_400_000;
+/** How often, at most, a scope says to the registry that it is there. */
+const LISTED_EVERY_MS = 3_600_000;
+/** How soon, at the earliest, it is tried again where the registry could not be told. */
+const LISTED_RETRY_MS = 60_000;
 const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
@@ -215,6 +219,33 @@ export class BrainAgent extends DurableObject<Env> {
    * Accepts an event. The insert is the acknowledgement: once this returns, the event will be
    * handled even if everything else fails. A repeat of the same (source, source_id) is ignored.
    */
+  /**
+   * Says to the registry that this scope is there, so that an operator can ask which scopes there
+   * are. Each time it wakes (which it does for anything that has come to it, and for a timer of
+   * its own), once an hour at most. That it has been told is written down only once the registry
+   * has said so: one that is interrupted in between is told again at the next waking. Where the
+   * registry cannot be told, it is tried again no sooner than a minute later. Beside whatever else
+   * is done, and never in its way.
+   */
+  #listed(): void {
+    // Whatever goes wrong in this, also in getting ready to ask, the waking it stands beside goes on as if this were not here.
+    try {
+      const now = Date.now();
+      // (Woken without a name to say: nothing to tell.)
+      const name = this.ctx.id.name;
+      if (!name || now - Number(this.#store.meta("listed_at") ?? 0) < LISTED_EVERY_MS || now - Number(this.#store.meta("listed_tried") ?? 0) < LISTED_RETRY_MS) return;
+      this.#store.setMeta("listed_tried", String(now));
+      this.ctx.waitUntil(
+        registry(this.env)
+          .noteScope(name)
+          .then(() => this.#store.setMeta("listed_at", String(now)))
+          .catch(() => undefined),
+      );
+    } catch {
+      // Not told this time.
+    }
+  }
+
   async ingest(event: InboundEvent): Promise<{ accepted: true; duplicate: boolean }> {
     if (!event.source || !event.source_id || !event.kind || !event.session_key) throw new Error("event is missing a required field");
     // Larger than the longest comment any connector passes on, so a reply is stored whole: what it
@@ -290,6 +321,7 @@ export class BrainAgent extends DurableObject<Env> {
   // ------------------------------------------------------------------ the wake cycle
 
   async alarm(): Promise<void> {
+    this.#listed();
     try {
       this.#timers.fire(Date.now());
       this.#requests.deadlines(Date.now());

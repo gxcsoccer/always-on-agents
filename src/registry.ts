@@ -87,6 +87,7 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS github_repos (repo TEXT PRIMARY KEY, tenant TEXT NOT NULL, secret TEXT);
       CREATE TABLE IF NOT EXISTS github_people (tenant TEXT NOT NULL, account TEXT NOT NULL, grant_name TEXT NOT NULL, PRIMARY KEY (tenant, account));
       CREATE INDEX IF NOT EXISTS github_people_account ON github_people (account);
+      CREATE TABLE IF NOT EXISTS scopes (name TEXT PRIMARY KEY, tenant TEXT NOT NULL, kind TEXT NOT NULL, first_at INTEGER NOT NULL, noted_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
@@ -108,6 +109,31 @@ export class Registry extends DurableObject<Env> {
   }
 
   /** Creates the tenant if needed and issues a new API key. The key is returned once and not stored. */
+  /**
+   * A scope says that it is there: by its name, when something comes to it. Kept for an operator
+   * to ask which scopes there are, which nothing else can tell (a Brain is found by its name and
+   * by nothing else). Only the name and when: nothing of what is in the scope.
+   */
+  async noteScope(name: string): Promise<void> {
+    const [tenant, kind] = name.split(":");
+    if (!tenant || !kind || name.length > 500) return;
+    const now = Date.now();
+    this.ctx.storage.sql.exec("INSERT INTO scopes (name, tenant, kind, first_at, noted_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET noted_at = excluded.noted_at", name, tenant, kind, now, now);
+  }
+
+  /**
+   * The scopes that have said they are there, by name, a page at a time: all of them, or those of
+   * a tenant or a kind. `next` is where to go on from, where there are more. (By name, which does
+   * not change, so that every one of them is reached however many are told of meanwhile.)
+   */
+  async scopes(of: { tenant?: string; kind?: string; after?: string; limit?: number } = {}): Promise<{ scopes: { name: string; tenant: string; kind: string; first_at: number; noted_at: number }[]; next: string | null }> {
+    const limit = Math.max(1, Math.min(500, of.limit ?? 500));
+    const found = this.ctx.storage.sql
+      .exec<{ name: string; tenant: string; kind: string; first_at: number; noted_at: number }>("SELECT name, tenant, kind, first_at, noted_at FROM scopes WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR kind = ?2) AND name > ?3 ORDER BY name LIMIT ?4", of.tenant ?? null, of.kind ?? null, of.after ?? "", limit + 1)
+      .toArray();
+    return { scopes: found.slice(0, limit), next: found.length > limit ? found[limit - 1].name : null };
+  }
+
   async createTenant(id: string, name: string): Promise<{ tenant: Tenant; api_key: string }> {
     if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) throw new Error("tenant id must be lowercase letters, digits and hyphens");
     const sql = this.ctx.storage.sql;
