@@ -258,6 +258,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // The pictures in it, by the names Feishu gives them: fetched for the run that acts on the message, and never kept.
   let pictures: PictureRef[] = [];
   let handles: string[] = [];
+  /** Names the words show as mentions that the chat's own list of mentions does not account for. */
+  const shownBesides: string[] = [];
   if (message.message_type === "text") {
     try {
       text = String(JSON.parse(message.content).text ?? "");
@@ -272,6 +274,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // The bot's own is dropped: it only says the message is for the agent, which the event already
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
+    // (A placeholder the list does not know is shown as someone unknown: that name, too, is one the words show.)
+    if ((text.match(/@_user_\d+/g) ?? []).some((key) => !mentions.some((each: any) => each?.key === key))) shownBesides.push("@unknown");
     text = named(text, mentions, [app.bot_open_id]);
   } else if (message.message_type === "post") {
     // Words with formatting, links or pictures among them: the words and links are read as they
@@ -282,7 +286,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     } catch {
       return undefined;
     }
-    text = flat(content, mentions, [app.bot_open_id]);
+    text = flat(content, mentions, [app.bot_open_id], (name) => shownBesides.push(name));
     handles = [...mentionsOf(typed(content))].slice(0, 50);
     documents = linkedIn(content);
     pictures = picturesIn(content, message.message_id);
@@ -305,16 +309,20 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // is for whoever goes by this to tell, over all of it (and over the other messages of the same
   // request), and that can only be told while everyone is still there.
   // Who may be reminded: people of the writer's own organisation, as the writer has to be, and
-  // another bot of the chat (it is there for everyone in the chat to call on, whoever made it).
-  // Never the agent itself, and never "everyone", whatever is listed for that.
-  // Anyone else the message names is kept by the name alone, with no id: nobody to remind, but
-  // the name then stands for more than one of those named, and is taken for neither.
-  const someone = (each: any) => typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all";
-  const remindable = (each: any) => (each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot";
+  // another bot of the chat (it is there for everyone in the chat to call on, whoever made it),
+  // each by who they are. Never the agent itself, and never "everyone".
+  // Every other name the chat's own mentions show in the words (someone of another organisation,
+  // "everyone", one the chat says nothing of who it is, one the words name that the chat's list
+  // does not know) is kept by the name alone, with no id: nobody to remind, but a name it shares
+  // with someone who may be is then taken for neither. So what is shown as a mention and what a
+  // name is told by are one and the same list.
+  const idOf = (each: any) => (typeof each?.id === "string" ? each.id : each?.id?.open_id);
+  const remindable = (each: any) => typeof idOf(each) === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(idOf(each)) && idOf(each).toLowerCase() !== "all" && ((each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot");
   const mentioned = [
-    ...new Map(
-      mentions.filter(someone).map((each: any) => (remindable(each) ? [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }] : [`(${token(each.name)})`, { id: "", name: token(each.name) }]) as [string, { id: string; name: string }]),
-    ).values(),
+    ...new Map<string, { id: string; name: string }>([
+      ...mentions.filter((each: any) => idOf(each) !== app.bot_open_id).map((each: any): [string, { id: string; name: string }] => (remindable(each) ? [idOf(each), { id: idOf(each), name: token(each.name) }] : [`(${token(each.name)})`, { id: "", name: token(each.name) }])),
+      ...shownBesides.map((name): [string, { id: string; name: string }] => [`(${name})`, { id: "", name }]),
+    ]).values(),
   ];
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
@@ -595,7 +603,7 @@ function typed(post: any): string {
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */
-function flat(post: any, mentions: any[] = [], own: (string | null)[] = []): string {
+function flat(post: any, mentions: any[] = [], own: (string | null)[] = [], besides?: (name: string) => void): string {
   // Sometimes wrapped by language; then whichever comes first.
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
   const piece = (each: any): string => {
@@ -609,6 +617,8 @@ function flat(post: any, mentions: any[] = [], own: (string | null)[] = []): str
       const meant = mentions.find((mention) => mention?.key === each.user_id || (typeof idOf(mention) === "string" && idOf(mention) === each.user_id));
       const id = meant ? idOf(meant) : each.user_id;
       if (typeof id === "string" && own.includes(id)) return " ";
+      // (One the list does not know is shown by the name the piece itself carries: said to whoever asks, as a name shown besides the list's.)
+      if (!meant) besides?.(token(each.user_name));
       return `${token(meant?.name ?? each.user_name)} `;
     }
     if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? PICTURE : "[a video, which I cannot see yet]";
