@@ -262,6 +262,18 @@ describe("git over the proxy", () => {
     const unread = await proxyFor({ repository: "acme/demo" });
     expect((await push(unread.send, "acme/demo", "not a push")).status).toBe(403);
     expect(await unread.pushAsks()).toBe(0);
+    // (Too large by what it says of itself: turned away before a byte of it is read.)
+    const large = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "allow", reason: "ok" }] });
+    expect((await large.send("https://github.com/acme/demo.git/git-receive-pack", { method: "POST", body: pushBody(`${A} ${B} refs/heads/main`), headers: { "content-length": String(65 * 1024 * 1024) } })).status).toBe(403);
+    expect(await large.pushAsks()).toBe(0);
+    expect(await large.recorded("authorize")).toHaveLength(0);
+  });
+
+  it("does not send an approved push for a task that ended while the credential it goes out under was asked for, though one was handed over", async () => {
+    const { send, pushAsks } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "allow", reason: "ok" }], endsAsLent: true });
+    expect((await push(send)).status).toBe(403);
+    expect(await pushAsks()).toBe(1);
+    expect(forwarded).toHaveLength(0);
   });
 
   it("sends nothing for a task that ended while a credential was asked for, when git reads or asks what the remote has", async () => {

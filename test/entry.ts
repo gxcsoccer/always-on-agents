@@ -87,6 +87,9 @@ export class FakeTask extends DurableObject {
     const asked = ((this.ctx.storage.kv.get("token_asks") as number | undefined) ?? 0) + 1;
     this.ctx.storage.kv.put("token_asks", asked);
     if (this.#endsWhileLending()) return undefined;
+    // (Or end while it is asked for and be handed one all the same: one that was held from before, say.)
+    const policy = this.#policy() as { endsAsLent?: boolean };
+    if (policy.endsAsLent) this.ctx.storage.kv.put("policy", { ...policy, ended: true });
     const limit = (this.#policy() as { tokenWithdrawnAfter?: number }).tokenWithdrawnAfter;
     if (limit !== undefined && asked > limit) return undefined;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
