@@ -29,7 +29,9 @@ async function proxyFor(policy: Parameters<any>[0] = {}) {
   const recorded = async (method: string) => (await task(taskId).calls()).filter((c: any) => c.method === method).map((c: any) => c.args);
   /** How often the credential a push goes out under was asked for. */
   const pushAsks = () => task(taskId).tokenAsks() as Promise<number>;
-  return { send, recorded, pushAsks };
+  /** And how often what git reads with was. */
+  const fetchAsks = () => task(taskId).fetchAsks() as Promise<number>;
+  return { send, recorded, pushAsks, fetchAsks };
 }
 
 const pkt = (line: string) => (line.length + 4).toString(16).padStart(4, "0") + line;
@@ -263,9 +265,13 @@ describe("git over the proxy", () => {
   });
 
   it("sends nothing for a task that ended while a credential was asked for, when git reads or asks what the remote has", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", ended: true });
-    expect((await send(advert)).status).toBe(403);
-    expect((await send("https://github.com/acme/demo.git/info/refs?service=git-receive-pack")).status).toBe(403);
+    // At work at the door, and ended by the time the asking is over: each in a task of its own, since one that has ended is turned away at the door.
+    const reads = await proxyFor({ repository: "acme/demo", endsWhileLending: true });
+    expect((await reads.send(advert)).status).toBe(403);
+    expect(await reads.fetchAsks()).toBe(1);
+    const asks = await proxyFor({ repository: "acme/demo", endsWhileLending: true });
+    expect((await asks.send("https://github.com/acme/demo.git/info/refs?service=git-receive-pack")).status).toBe(403);
+    expect(await asks.pushAsks()).toBe(1);
     expect(forwarded).toHaveLength(0);
   });
 

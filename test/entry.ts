@@ -86,6 +86,7 @@ export class FakeTask extends DurableObject {
     // A test can have the credential withdrawn after it has been asked for a number of times.
     const asked = ((this.ctx.storage.kv.get("token_asks") as number | undefined) ?? 0) + 1;
     this.ctx.storage.kv.put("token_asks", asked);
+    if (this.#endsWhileLending()) return undefined;
     const limit = (this.#policy() as { tokenWithdrawnAfter?: number }).tokenWithdrawnAfter;
     if (limit !== undefined && asked > limit) return undefined;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
@@ -93,8 +94,20 @@ export class FakeTask extends DurableObject {
   async tokenAsks() {
     return (this.ctx.storage.kv.get("token_asks") as number | undefined) ?? 0;
   }
+  async fetchAsks() {
+    return (this.ctx.storage.kv.get("fetch_asks") as number | undefined) ?? 0;
+  }
+  /** A test can have the task end while a credential is asked for: it has ended by the time the asking is over, and is given none. */
+  #endsWhileLending(): boolean {
+    const policy = this.#policy() as { endsWhileLending?: boolean };
+    if (!policy.endsWhileLending) return false;
+    this.ctx.storage.kv.put("policy", { ...policy, ended: true });
+    return true;
+  }
   /** As the real task: what git reads the task's own repository with (cloning, fetching): asked for apart from what a push goes out under. The same by default; a test can say another, to tell the two apart. */
   async githubFetchToken() {
+    this.ctx.storage.kv.put("fetch_asks", ((this.ctx.storage.kv.get("fetch_asks") as number | undefined) ?? 0) + 1);
+    if (this.#endsWhileLending()) return undefined;
     const policy = this.#policy() as { repository?: string; fetchToken?: string };
     return (policy.repository ?? "") ? (policy.fetchToken ?? "test-github-token") : undefined;
   }
