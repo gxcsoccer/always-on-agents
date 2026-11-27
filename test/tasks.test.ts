@@ -743,18 +743,36 @@ describe("tasks, by themselves", () => {
         const again = await tasks.dispatch(RUN, SESSION_KEY, "call_fixed", "careful", "t", "another brief", { where: "acme/other" });
         expect((again as { task_id: string }).task_id).toBe(first.task_id);
         expect(started.filter((each) => each.id === first.task_id).every((each) => each.brief === "b" && each.options.where === "acme/app" && each.by === "alice")).toBe(true);
-        // Made again for someone else, it is not their call: nothing further is started.
-        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", first.task_id);
+        // Made again for someone else, it is not their call, however far it has got: they are not told how it stands, and nothing further is started.
+        expect(store.rows<{ status: string }>("SELECT status FROM tasks WHERE id = ?", first.task_id)[0].status).toBe("running");
         settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
         const before = started.length;
         await expect(make("call_fixed")).rejects.toThrow("this call was first made for someone else; nothing further was started");
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", first.task_id);
+        await expect(make("call_fixed")).rejects.toThrow("this call was first made for someone else; nothing further was started");
         expect(started).toHaveLength(before);
+        store.sql.exec("UPDATE tasks SET status = 'running' WHERE id = ?", first.task_id);
         settings.deciders = [{ kind: "human", id: "alice", explicit: true }];
 
-        // The look fails after another making of the same call has been written: it is that task, not a failure.
-        const other = await make("call_late");
+        // The look of one making fails after another making of the same call has been written: it is that task, not a failure.
+        let fail!: () => void;
+        let entered = 0;
+        const held = new Promise<void>((resolve) => (fail = resolve));
+        const realPrepare = careful.prepareStart!;
+        careful.prepareStart = async (...args) => {
+          // (The first making waits here, and then fails; the second goes through.)
+          if (++entered === 1) {
+            await held;
+            throw new Error("could not be asked");
+          }
+          return realPrepare(...args);
+        };
+        const slow = make("call_late");
+        const quick = await make("call_late");
+        fail();
+        expect((await slow).task_id).toBe(quick.task_id);
+        careful.prepareStart = realPrepare;
         fails = true;
-        expect((await make("call_late")).task_id).toBe(other.task_id);
         // With none written, the failure is the answer, and nothing is written.
         await expect(make("call_fails")).rejects.toThrow("could not be asked");
         expect(store.rows("SELECT 1 FROM tasks WHERE op_id = 'call_fails'")).toEqual([]);

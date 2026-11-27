@@ -198,7 +198,8 @@ export class Tasks implements Wakes {
     // And what it goes on from is what was written with it when that was found to be allowed: a call that says otherwise is not this call.
     const wrote = task ? (this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null) : null;
     if (task && from !== wrote) throw new Error("this call was first made for something else; nothing further was started");
-    if (task && wrote !== null) {
+    // (So with one that was bound to something for the one who asked: how it stands is theirs to be told, and nobody else's.)
+    if (task && (wrote !== null || this.#s.rows("SELECT 1 FROM task_lends WHERE task_id = ?", task.id).length > 0)) {
       const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
       if (people.length !== 1 || people[0] !== task.requested_by) throw new Error("this call was first made for someone else; nothing further was started");
     }
