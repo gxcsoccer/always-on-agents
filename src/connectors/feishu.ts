@@ -258,8 +258,8 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // The pictures in it, by the names Feishu gives them: fetched for the run that acts on the message, and never kept.
   let pictures: PictureRef[] = [];
   let handles: string[] = [];
-  /** Names the words show as mentions that the chat's own list of mentions does not account for. */
-  const shownBesides: string[] = [];
+  /** Every mention of the chat's own that the words show, but the agent's: the name it is shown by, and whose the chat says it is, if it says. */
+  const shown: { name: string; of?: any }[] = [];
   if (message.message_type === "text") {
     try {
       text = String(JSON.parse(message.content).text ?? "");
@@ -274,9 +274,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     // The bot's own is dropped: it only says the message is for the agent, which the event already
     // records. A person's display name is whatever they typed, so it is squeezed into one token and
     // no word of it can be read as part of the message ("Alice Approve" must not supply an "approve").
-    // (A placeholder the list does not know is shown as someone unknown: that name, too, is one the words show.)
-    if ((text.match(/@_user_\d+/g) ?? []).some((key) => !mentions.some((each: any) => each?.key === key))) shownBesides.push("@unknown");
-    text = named(text, mentions, [app.bot_open_id]);
+    text = named(text, mentions, [app.bot_open_id], (name, of) => shown.push({ name, of }));
   } else if (message.message_type === "post") {
     // Words with formatting, links or pictures among them: the words and links are read as they
     // are for a message replied to; a picture is marked where it stands and named for fetching.
@@ -286,7 +284,7 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
     } catch {
       return undefined;
     }
-    text = flat(content, mentions, [app.bot_open_id], (name) => shownBesides.push(name));
+    text = flat(content, mentions, [app.bot_open_id], (name, of) => shown.push({ name, of }));
     handles = [...mentionsOf(typed(content))].slice(0, 50);
     documents = linkedIn(content);
     pictures = picturesIn(content, message.message_id);
@@ -310,20 +308,21 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // request), and that can only be told while everyone is still there.
   // Who may be reminded: people of the writer's own organisation, as the writer has to be, and
   // another bot of the chat (it is there for everyone in the chat to call on, whoever made it),
-  // each by who they are. Never the agent itself, and never "everyone".
-  // Every other name the chat's own mentions show in the words (someone of another organisation,
-  // "everyone", one the chat says nothing of who it is, one the words name that the chat's list
-  // does not know) is kept by the name alone, with no id: nobody to remind, but a name it shares
-  // with someone who may be is then taken for neither. So what is shown as a mention and what a
-  // name is told by are one and the same list.
-  const idOf = (each: any) => (typeof each?.id === "string" ? each.id : each?.id?.open_id);
-  const remindable = (each: any) => typeof idOf(each) === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(idOf(each)) && idOf(each).toLowerCase() !== "all" && ((each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot");
-  const mentioned = [
-    ...new Map<string, { id: string; name: string }>([
-      ...mentions.filter((each: any) => idOf(each) !== app.bot_open_id).map((each: any): [string, { id: string; name: string }] => (remindable(each) ? [idOf(each), { id: idOf(each), name: token(each.name) }] : [`(${token(each.name)})`, { id: "", name: token(each.name) }])),
-      ...shownBesides.map((name): [string, { id: string; name: string }] => [`(${name})`, { id: "", name }]),
-    ]).values(),
-  ];
+  // each by who the chat's event says they are. Never the agent itself, and never "everyone".
+  // What is kept is what the words show: for every mention of the chat's own, the name it is
+  // shown by, with who it is where that is someone who may be reminded, and with no id where it
+  // is not (someone of another organisation, "everyone", one the chat does not say who it is).
+  // One with no id is nobody to remind, but a name it shares with someone who may be is then
+  // taken for neither. Each pair of a name and who it is once: one person shown by two names is
+  // kept under both, and what a name is told by is the very list of what is shown.
+  // (And everyone the chat lists, by the name it gives them, whether the words show them or not.)
+  const whose = (each: any): string => {
+    const id = each?.id?.open_id;
+    const may = typeof id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all" && id !== app.bot_open_id && ((each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot");
+    return may ? id : "";
+  };
+  const listed = mentions.filter((each: any) => each?.id?.open_id !== app.bot_open_id).map((each: any) => ({ name: token(each.name), of: each }));
+  const mentioned = [...new Map([...shown, ...listed].map((each) => [`${whose(each.of)} ${each.name}`, { id: whose(each.of), name: each.name }])).values()];
 
   // A topic thread is a conversation of its own. An ordinary reply to a message is not: it stays in
   // the chat's conversation, which is where people answer what the agent just said.
@@ -391,19 +390,22 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
 /** A display name squeezed into one token, so no word of it can be read as part of the message. */
 const token = (name: unknown) => `@${String(name ?? "").replace(/[^\p{L}\p{N}_-]/gu, "") || "someone"}`;
 
-/** The text of a message with its mention placeholders replaced, in one pass; the bot's own is dropped. */
-function named(text: string, mentions: any[], own: (string | null)[]): string {
-  const replacements = new Map<string, string>();
-  for (const mention of mentions) {
-    if (typeof mention.key !== "string" || !/^@_user_\d+$/.test(mention.key)) continue;
-    // An event carries the id as { open_id }; a message that was asked for, as the id itself, and a bot's as its app id.
-    const id = typeof mention.id === "string" ? mention.id : mention.id?.open_id;
-    replacements.set(mention.key, typeof id === "string" && own.includes(id) ? " " : token(mention.name));
-  }
+/** The text of a message with its mention placeholders replaced, in one pass; the bot's own is dropped. Each name it shows for one is told to `showed`, with whose the list says it is. */
+function named(text: string, mentions: any[], own: (string | null)[], showed?: (name: string, of?: any) => void): string {
+  const listed = new Map<string, any>();
+  for (const mention of mentions) if (typeof mention?.key === "string" && /^@_user_\d+$/.test(mention.key)) listed.set(mention.key, mention);
   // A placeholder with no entry in the mention list is kept visible as a mention of someone
   // unknown. Dropping it would turn a message addressed to somebody into one addressed to nobody.
   return text
-    .replace(/@_user_\d+/g, (key) => replacements.get(key) ?? "@unknown")
+    .replace(/@_user_\d+/g, (key) => {
+      const mention = listed.get(key);
+      // An event carries the id as { open_id }; a message that was asked for, as the id itself, and a bot's as its app id.
+      const id = typeof mention?.id === "string" ? mention.id : mention?.id?.open_id;
+      if (typeof id === "string" && own.includes(id)) return " ";
+      const name = mention ? token(mention.name) : "@unknown";
+      showed?.(name, mention);
+      return name;
+    })
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -603,7 +605,7 @@ function typed(post: any): string {
 }
 
 /** A rich-text message as plain words: its title, then its lines; links with where they lead. */
-function flat(post: any, mentions: any[] = [], own: (string | null)[] = [], besides?: (name: string) => void): string {
+function flat(post: any, mentions: any[] = [], own: (string | null)[] = [], showed?: (name: string, of?: any) => void): string {
   // Sometimes wrapped by language; then whichever comes first.
   const body = Array.isArray(post?.content) ? post : Object.values(post ?? {}).find((each: any) => Array.isArray(each?.content));
   const piece = (each: any): string => {
@@ -617,8 +619,8 @@ function flat(post: any, mentions: any[] = [], own: (string | null)[] = [], besi
       const meant = mentions.find((mention) => mention?.key === each.user_id || (typeof idOf(mention) === "string" && idOf(mention) === each.user_id));
       const id = meant ? idOf(meant) : each.user_id;
       if (typeof id === "string" && own.includes(id)) return " ";
-      // (One the list does not know is shown by the name the piece itself carries: said to whoever asks, as a name shown besides the list's.)
-      if (!meant) besides?.(token(each.user_name));
+      // (The name it is shown by, and whose the list says it is, are said together to whoever asks.)
+      showed?.(token(meant?.name ?? each.user_name), meant);
       return `${token(meant?.name ?? each.user_name)} `;
     }
     if (each?.tag === "img" || each?.tag === "media") return each.tag === "img" ? PICTURE : "[a video, which I cannot see yet]";

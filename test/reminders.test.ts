@@ -113,6 +113,18 @@ describe("who a message may remind", () => {
     });
   });
 
+  it("takes a name two of those named are shown by for neither, also where one of them has another name of their own", async () => {
+    await within(({ message, run, reminders }) => {
+      message(ANN, "remind @Helper @Assistant @Helper", { run: "r1", data: { group: true, mentioned: [{ id: "ou_helper_bot", name: "@Helper" }, { id: "ou_helper_bot", name: "@Assistant" }, { id: CAROL, name: "@Helper" }] } });
+      const asked = run("r1");
+      const may = reminders.of(asked, HERE)!;
+      expect(may.who("@Helper")).toBeUndefined();
+      expect(may.who("@Assistant")).toBe("ou_helper_bot");
+      // The words may name each by a name that is theirs alone, and by no other.
+      expect(reminders.claimed(asked, ["ou_helper_bot", CAROL], HERE)).toEqual({ ids: ["ou_helper_bot", CAROL], names: { ou_helper_bot: "@Assistant" } });
+    });
+  });
+
   it("finds someone who wrote here long ago, however much has been written since", async () => {
     await within(({ message, run, reminders }) => {
       message(BOB, "an early question of his");
