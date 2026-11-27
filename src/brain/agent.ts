@@ -26,6 +26,7 @@ import { firstWorker, guidance, workerKnown, workerNamed, workers } from "../wor
 import { migrate } from "./schema";
 import { BrainStore, type Row, type Wakes } from "./store";
 import { Outbox } from "./outbox";
+import { History } from "./history";
 import { Reminders } from "./reminders";
 import { Revisions } from "./revisions";
 import { quotes } from "./approval";
@@ -154,6 +155,7 @@ export class BrainAgent extends DurableObject<Env> {
       mayUse: (runId, name) => this.#runner.mayUse(runId, name),
       following: (runId) => this.#runner.following(runId),
       reminders: this.#reminders,
+      history: new History(this.#store, { stillStands: (event) => this.#revisions.stillStands(event) }),
       instructionEditors: (runId) => this.#instructionEditors(runId),
       toolsOf,
       direct,

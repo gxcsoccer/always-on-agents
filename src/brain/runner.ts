@@ -12,7 +12,7 @@ import type { ConnectorTool, Quoted } from "../connectors";
 import type { Picture, PictureRef } from "../connectors/types";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
-import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
+import { type ChainLevel, type Principal, type Target, chainLevels, isPrivateSession, privateSessionKey } from "../events";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
@@ -23,7 +23,7 @@ import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools, eligibleSource, standingOf, thenable, toolsIn, unheard, workersIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { workIs } from "./work";
-import { TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
+import { READ_HISTORY, TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
 
 // (How many times a run may ask the model is the tenant's limit: see ../limits.)
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
@@ -1293,6 +1293,10 @@ export class Runner {
     this.#s.sql.exec("DELETE FROM meta WHERE key LIKE 'shape:%' AND key NOT IN (SELECT 'shape:' || id FROM runs ORDER BY started_at DESC LIMIT 5)");
   }
 
+  #sessionKeyOf(runId: string): string {
+    return this.#s.rows<{ session_key: string }>("SELECT s.session_key FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?", runId)[0]?.session_key ?? "";
+  }
+
   #toolsFor(runId: string): ToolDefinition[] {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
@@ -1305,7 +1309,9 @@ export class Runner {
     const follows = acting && workers.some((each) => each.start !== undefined);
     const means = follows ? toolsIn(acting, this.#b.toolsOf).flatMap((each) => (each.follows ? Object.entries(each.conditions ?? {}).map(([condition, meaning]) => `- ${each.name}:${condition}: ${meaning}`) : [])).join("\n") : "";
     const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined, follows ? thenable(acting, this.#b.toolsOf) : [], means);
-    const own = [...TOOLS, ...handing];
+    // In a person's own conversation, what stands further back in it can be read: everything there is theirs.
+    // (Where several people talk, what one person had read for them is in what was said there: see docs/design/history-on-demand.zh-CN.md.)
+    const own = [...TOOLS, ...(isPrivateSession(this.#sessionKeyOf(runId)) ? [READ_HISTORY] : []), ...handing];
     // (What a hand-over may name as to follow it: what the run may do in the person's name itself.)
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     // The run a task's result starts acts for nobody. Where the person's request said, when it
