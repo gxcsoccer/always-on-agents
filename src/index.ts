@@ -86,6 +86,13 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     const brain = env.BRAIN.getByName(decodeURIComponent(path[1]));
     if (path.length === 2 && method === "GET") return json(await brain.inspect());
     if (path[2] === "memory" && method === "GET") return json({ content: await brain.readMemory(url.searchParams.get("path") ?? "") });
+    // Timers by name, also ones long ended: what each is for, before an operator lets go of anything of theirs.
+    if (path[2] === "timers" && path.length === 3 && method === "GET") {
+      const ids = (url.searchParams.get("ids") ?? "").split(",").filter((each) => each !== "");
+      // (A name that cannot be one is a mistake, and nothing is told for the rest: taking stock by a part would pass for the whole.)
+      if (ids.length === 0 || ids.length > 200 || ids.some((each) => each.length > 300)) return json({ error: "name the timers: ids=<id>,<id>" }, 400);
+      return json({ timers: await brain.timersNamed(ids) });
+    }
     // What waits there and will never be worth doing, let go of by name: see BrainAgent.drop.
     if (path[2] === "drop" && path.length === 3 && method === "POST") {
       const { sessions = [], timers = [], source, kind, up_to } = await body();
