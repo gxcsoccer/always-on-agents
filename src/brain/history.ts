@@ -8,6 +8,8 @@
  * message known here to have been edited or taken back since (a channel that does not tell of
  * that leaves nothing to know it by), not anything of another conversation.
  *
+ * Words are found as written, whatever their case in ASCII (SQLite folds no other letters).
+ *
  * It reads the Brain's own record and asks nobody outside, so it is not a read of outside text.
  */
 import { type Principal, type Scope, isPrivateSession } from "../events";
@@ -115,11 +117,13 @@ export class History {
       `SELECT * FROM (
          SELECT 'm' AS kind, id, received_at AS at, text, principal, data, NULL AS target FROM inbox
            WHERE kind = 'message' AND status = 'done' AND text IS NOT NULL AND text != '' AND session_key = (SELECT session_key FROM sessions WHERE id = ?1)
+             AND received_at >= ?2 AND (?3 IS NULL OR received_at <= ?3)
          UNION ALL
-         SELECT 's', s.outbox_id, s.sent_at, s.text, NULL, NULL, o.target FROM said s LEFT JOIN outbox o ON o.id = s.outbox_id WHERE s.session_id = ?1 AND s.text != ''
+         SELECT 's', s.outbox_id, s.sent_at, s.text, NULL, NULL, o.target FROM said s LEFT JOIN outbox o ON o.id = s.outbox_id WHERE s.session_id = ?1 AND s.text != '' AND s.sent_at >= ?2 AND (?3 IS NULL OR s.sent_at <= ?3)
            AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.subject = s.receipt_subject AND r.deleted = 1)
        )
-       WHERE at >= ?2 AND (?3 IS NULL OR at < ?3 OR (at = ?3 AND (kind < ?4 OR (kind = ?4 AND id < ?5)))) AND (?6 = '' OR instr(lower(text), lower(?6)) > 0)
+       -- (The bounds in time stand in each half as well, where its index can use them; here, the exact place to go on from.)
+       WHERE (?3 IS NULL OR at < ?3 OR (at = ?3 AND (kind < ?4 OR (kind = ?4 AND id < ?5)))) AND (?6 = '' OR instr(lower(text), lower(?6)) > 0)
        ORDER BY at DESC, kind DESC, id DESC LIMIT ?7`,
       sessionId,
       since,

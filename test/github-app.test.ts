@@ -93,6 +93,10 @@ describe("whether a task is lent a credential of the tenant's", () => {
       expect(await lends("lends:repo:acme/demo", "acme/demo")).toBe(true);
       expect(await lends("lends:repo:Acme/Demo", "acme/demo", "read")).toBe(true);
       expect(await lends("lends:repo:acme/demo", "acme/other")).toBe(false);
+      // However the repository's name is written; and none for no name at all.
+      expect(await lends("lends:repo:acme/demo", "Acme/Demo")).toBe(true);
+      expect(await lends("lends:repo:acme/demo", "")).toBe(false);
+      expect(await lends("lends:user:ou_ann", "", "public")).toBe(false);
       // A person's own conversation: none, whoever they are.
       expect(await lends("lends:user:ou_ann", "acme/demo")).toBe(false);
       // One that is allowed nothing: any task of the tenant's.
