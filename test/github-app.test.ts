@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 
-import { appJwt, githubTokenFor, pemToPkcs8 } from "../src/connectors/github-app";
+import { appJwt, githubTokenFor, lendsTo, pemToPkcs8 } from "../src/connectors/github-app";
 
 const pem = (label: string, der: Uint8Array) => `-----BEGIN ${label}-----\n${btoa(String.fromCharCode(...der)).replace(/(.{64})/g, "$1\n")}\n-----END ${label}-----\n`;
 const fromBase64url = (text: string) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
@@ -79,5 +79,31 @@ describe("a token for one repository", () => {
     expect(await githubTokenFor(without, "tok", "acme/demo", "public")).toBeUndefined();
     expect(asked).toHaveLength(before);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("whether a task is lent a credential of the tenant's", () => {
+  const registry = () => (env as any).REGISTRY.getByName("global");
+
+  it("is decided by where the task was started and for which repository; who asked for it changes nothing yet", async () => {
+    await registry().createTenant("lends", "lends");
+    for (const by of [undefined, "ou_ann"]) {
+      const lends = (scope: string, repo: string, to: "write" | "read" | "public" = "write") => lendsTo(env as any, { scope, ...(by ? { by } : {}) }, repo, to);
+      // The repository's own conversation, for that repository.
+      expect(await lends("lends:repo:acme/demo", "acme/demo")).toBe(true);
+      expect(await lends("lends:repo:Acme/Demo", "acme/demo", "read")).toBe(true);
+      expect(await lends("lends:repo:acme/demo", "acme/other")).toBe(false);
+      // A person's own conversation: none, whoever they are.
+      expect(await lends("lends:user:ou_ann", "acme/demo")).toBe(false);
+      // One that is allowed nothing: any task of the tenant's.
+      expect(await lends("lends:user:ou_ann", "acme/demo", "public")).toBe(true);
+      // A chat: only once an operator has linked it to that very repository.
+      await registry().linkChatRepo("lends", "oc_room", null);
+      expect(await lends("lends:chat:oc_room", "acme/demo")).toBe(false);
+      await registry().linkChatRepo("lends", "oc_room", "Acme/Demo");
+      expect(await lends("lends:chat:oc_room", "acme/demo")).toBe(true);
+      expect(await lends("lends:chat:oc_room", "acme/other")).toBe(false);
+      expect(await lends("lends:chat:oc_elsewhere", "acme/demo")).toBe(false);
+    }
   });
 });

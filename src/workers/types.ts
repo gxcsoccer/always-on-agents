@@ -22,6 +22,8 @@ export interface Work {
   options: Record<string, unknown>;
   /** The scope name of the Brain to report to. */
   brain: string;
+  /** The one person the Brain established asked for this, where there is one (not whoever is told of its end). A worker that lends a person's own authorisation goes by this. */
+  by?: string;
   /**
    * The latest moment the worker may first take this work, fixed when it was first written and
    * the same for every repeat of the start. A worker that would first take it later turns it

@@ -364,7 +364,7 @@ export class Tasks implements Wakes {
     const follows = this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null;
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
@@ -617,7 +617,7 @@ export class Tasks implements Wakes {
       if (left() === 0) break;
       let answer: Started | undefined;
       try {
-        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
+        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
       } catch {
         answer = undefined;
       }

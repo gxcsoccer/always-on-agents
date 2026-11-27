@@ -43,7 +43,7 @@ export const sandboxWorker: Worker = {
       if (repository !== undefined && (left.repository === undefined || same(repository) !== same(left.repository))) return { state: "refused", error: `that earlier piece of work was ${left.repository ? `on ${left.repository}` : "not on a repository"}: to go on with it leave repository null; for another repository hand this over as something new` };
       seed = { from: work.continue_from, record: left.record, cwd: left.cwd, ...(left.repository ? { repository: left.repository } : {}) };
     }
-    const started = await child.start({ id: work.id, prompt: work.brief, repository: seed ? undefined : repository, brain: work.brain, ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}), ...(seed ? { seed: seed as never } : {}) });
+    const started = await child.start({ id: work.id, prompt: work.brief, repository: seed ? undefined : repository, brain: work.brain, ...(work.by ? { requested_by: work.by } : {}), ...(work.accept_by !== undefined ? { accept_by: work.accept_by } : {}), ...(work.bounds ? { bounds: work.bounds } : {}), ...(seed ? { seed: seed as never } : {}) });
     return told(started);
   },
   tell: (env, id, note) => env.TASKS.getByName(id).tell(note),

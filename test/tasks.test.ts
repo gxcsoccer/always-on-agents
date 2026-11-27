@@ -200,7 +200,7 @@ describe("tasks, by themselves", () => {
         expect(JSON.parse(watch.data)).toEqual({ task_id: result.task_id });
         expect(watch.due_at).toBeGreaterThanOrEqual(before + (2 * 60 * 60 + 10 * 60) * 1_000);
         expect(slots.acquired).toEqual([`acme:${result.task_id}`]);
-        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName(), accept_by: expect.any(Number), bounds: { lifetime_ms: 120 * 60_000, model_calls: 400 } }]);
+        expect(worker.started).toEqual([{ id: result.task_id, prompt: "do it", repository: "https://github.com/acme/app", brain: store.scopeName(), requested_by: "alice", accept_by: expect.any(Number), bounds: { lifetime_ms: 120 * 60_000, model_calls: 400 } }]);
         expect(audited("task.dispatched")).toEqual([{ actor: "alice", task_id: result.task_id, title: "Fix the build", repository: "https://github.com/acme/app" }]);
       });
     });
