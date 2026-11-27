@@ -1630,10 +1630,17 @@ describe("reminding people where several talk", () => {
       await here.says("再叫 @_user_2", [colleague]);
       expect(last(), text).toBe(`<at user_id="ou_colleague"></at>${text.startsWith("|") ? "\n\n" : " "}${text}`);
     }
-    // In an address on one line and as a word on the next: the word is where the mention goes.
-    model.replies([call("send_message", { text: "见 https://x.test/@Carol\n\n@Carol 请看。", notify: ["@Carol"] })], [say("")]);
+    // Said of the whole of the words: a link's address may stand lines away from its text, and a line may be code by the lines around it.
+    // Where anything of the kind is in them, every word stays as it is written and the mention stays in front.
+    for (const text of ["见 https://x.test/@Carol\n\n@Carol 请看。", "[文档][r]\n\n[r]:\n  @Carol/guide\n\n请 @Carol。", "步骤：\n\n  \t@Carol run\n\n请 @Carol。"]) {
+      model.replies([call("send_message", { text, notify: ["@Carol"] })], [say("")]);
+      await here.says("再叫 @_user_2", [colleague]);
+      expect(last(), text).toBe(`<at user_id="ou_colleague"></at> ${text}`);
+    }
+    // With headings, lists and emphasis around it, a word is still a word.
+    model.replies([call("send_message", { text: "## 提醒\n\n- **@Carol**：请看。", notify: ["@Carol"] })], [say("")]);
     await here.says("再叫 @_user_2", [colleague]);
-    expect(last()).toBe('见 https://x.test/@Carol\n\n<at user_id="ou_colleague"></at> 请看。');
+    expect(last()).toBe('## 提醒\n\n- **<at user_id="ou_colleague"></at>**：请看。');
     // The model was told what its messages come to in this chat, in the Brain's own words.
     expect(modelCalls.at(-1).instructions).toContain("Your messages here are shown as Markdown. A message here can remind people: name them in notify.");
     // Words that begin as a heading, a list, a table or a block of code keep their first line to themselves: the mention goes on a line before them.

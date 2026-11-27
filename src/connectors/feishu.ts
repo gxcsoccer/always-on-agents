@@ -711,7 +711,7 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // Not where anything in the words is shown as code: a mention inside that is shown as it is
   // written and reminds nobody, so there every mention stays in front.
   const inPlace = new Set<string>();
-  if ((message.encoding ?? 0) >= 3 && message.authored && !/[`~]/.test(words) && !/^(?: {4}|\t)/m.test(words)) {
+  if ((message.encoding ?? 0) >= 3 && message.authored && plainWords(words)) {
     // (Each looked for in the words as they are now, before any mention is put into them; put in from the last backwards, so that no place moves.)
     const places = toRemind.flatMap((id) => {
       const name = message.mention_names?.[id];
@@ -795,11 +795,21 @@ function plainCard(invitation: Invitation): unknown {
 const MAX_POST_BYTES = 29_000;
 
 /**
- * Where, in words shown as Markdown, a name stands as a word of plain text: the first such place,
- * or -1. Not the beginning of a longer name; not part of an address (after a letter or figure of
- * ASCII, or one of the marks an address or a mail address is written with); and not on a line
- * that holds a link, an address, markup or a table, where what is shown is not what is written.
- * Looked for by the name as it is, never as a pattern.
+ * Whether words shown as Markdown hold nothing but plain text and the marks that leave a word a
+ * word (emphasis, headings, lists, quotations): no code (a backtick, a tilde, a line indented as
+ * code, by spaces or a tab), no link, address or markup (a bracket, an angle bracket, "://",
+ * "www."), no table. Said of the whole of them, not of a line: a link's address may stand lines
+ * away from its text, and what a line is can depend on the lines around it. Where this is not so,
+ * nothing is put into the words.
+ */
+function plainWords(words: string): boolean {
+  return !/[`~\[\]<>|]|:\/\/|www\./i.test(words) && !/^(?: {0,3}\t| {4})/m.test(words);
+}
+
+/**
+ * Where, in such words, a name stands as a word of its own: the first such place, or -1. Not the
+ * beginning of a longer name, and not after a letter or figure of ASCII or one of the marks a
+ * mail address is written with. Looked for by the name as it is, never as a pattern.
  */
 function spoken(words: string, name: string): number {
   for (let from = 0; ; ) {
@@ -807,10 +817,7 @@ function spoken(words: string, name: string): number {
     if (at < 0) return -1;
     from = at + name.length;
     const before = at === 0 ? "" : words[at - 1];
-    const after = words.slice(from, from + 2);
-    if (/^[\p{L}\p{N}_-]/u.test(after) || /[A-Za-z0-9._\/:=?&#%+\\-]/.test(before)) continue;
-    const line = words.slice(words.lastIndexOf("\n", at) + 1, (words.indexOf("\n", at) + 1 || words.length + 1) - 1);
-    if (/\]\(|[<>|\[\]]|:\/\/|www\./i.test(line)) continue;
+    if (/^[\p{L}\p{N}_-]/u.test(words.slice(from, from + 2)) || /[A-Za-z0-9._\/:=?&#%+\\-]/.test(before)) continue;
     return at;
   }
 }
