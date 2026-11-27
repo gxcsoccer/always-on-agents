@@ -51,6 +51,8 @@ describe("which scopes there are", () => {
     expect((await admin("scopes", false)).status).toBe(401);
     expect((await admin("scopes")).headers.get("cache-control")).toBe("no-store");
     expect((await admin("scopes?tenant=")).status).toBe(400);
+    // As many at once as it says, and no other number passes for one.
+    expect((await Promise.all(["0", "500", "501", "1000", "-1", "x"].map(async (limit) => (await admin(`scopes?limit=${limit}`)).status)))).toEqual([400, 200, 400, 400, 400, 400]);
   });
 
   it("is told of a scope once an hour at most, and again after that", async () => {
@@ -70,6 +72,24 @@ describe("which scopes there are", () => {
     await wake(stub);
     await vi.waitFor(async () => expect((await of(name))[0].noted_at).toBeGreaterThan(5));
     expect((await of(name))[0].first_at).toBe(5);
+  });
+
+  it("never stands in the way of the waking it is done beside: where the registry cannot be reached at all, what came is still dealt with", async () => {
+    const { name, stub } = brain("chat");
+    model.replies([say("")]);
+    await stub.ingest(message("hello", { session_key: "chat" }));
+    // Getting ready to tell the registry throws: what it notes for itself first cannot be written.
+    // (Whatever it has told so far is undone first, so that this waking is one at which it tells.)
+    await runInDurableObject(registry(), (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("DELETE FROM scopes WHERE name = ?", name));
+    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM meta WHERE key IN ('listed_at', 'listed_tried')");
+      state.storage.sql.exec("CREATE TRIGGER no_listing BEFORE INSERT ON meta WHEN NEW.key = 'listed_tried' BEGIN SELECT RAISE(ABORT, 'cannot be noted'); END");
+    });
+    await wake(stub);
+    // (It did try, and could not: nothing says it tried or told.)
+    expect(await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT key FROM meta WHERE key LIKE 'listed_%'").toArray())).toEqual([]);
+    expect((await stub.inspect()).inbox).toMatchObject({ pending: 0, done: 1 });
+    expect(await of(name)).toEqual([]);
   });
 
   it("is told at the next waking where telling was cut short, and no sooner than a minute after one that failed", async () => {

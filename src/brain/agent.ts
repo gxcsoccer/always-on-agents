@@ -228,15 +228,22 @@ export class BrainAgent extends DurableObject<Env> {
    * is done, and never in its way.
    */
   #listed(): void {
-    const now = Date.now();
-    if (now - Number(this.#store.meta("listed_at") ?? 0) < LISTED_EVERY_MS || now - Number(this.#store.meta("listed_tried") ?? 0) < LISTED_RETRY_MS) return;
-    this.#store.setMeta("listed_tried", String(now));
-    this.ctx.waitUntil(
-      registry(this.env)
-        .noteScope(this.#store.scopeName())
-        .then(() => this.#store.setMeta("listed_at", String(now)))
-        .catch(() => undefined),
-    );
+    // Whatever goes wrong in this, also in getting ready to ask, the waking it stands beside goes on as if this were not here.
+    try {
+      const now = Date.now();
+      // (Woken without a name to say: nothing to tell.)
+      const name = this.ctx.id.name;
+      if (!name || now - Number(this.#store.meta("listed_at") ?? 0) < LISTED_EVERY_MS || now - Number(this.#store.meta("listed_tried") ?? 0) < LISTED_RETRY_MS) return;
+      this.#store.setMeta("listed_tried", String(now));
+      this.ctx.waitUntil(
+        registry(this.env)
+          .noteScope(name)
+          .then(() => this.#store.setMeta("listed_at", String(now)))
+          .catch(() => undefined),
+      );
+    } catch {
+      // Not told this time.
+    }
   }
 
   async ingest(event: InboundEvent): Promise<{ accepted: true; duplicate: boolean }> {
