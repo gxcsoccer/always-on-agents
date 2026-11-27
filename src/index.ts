@@ -93,7 +93,7 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
       if (!names(sessions) || !names(timers) || sessions.length + timers.length === 0) return json({ error: "give the conversations whose waiting notifications are dropped (sessions) and the timers to cancel (timers), each a list of names" }, 400);
       // Which notifications, said exactly: of one source and kind, and no later than where stock was taken.
       const which = sessions.length === 0 ? undefined : { source, kind, up_to };
-      if (which && (typeof source !== "string" || typeof kind !== "string" || !Number.isInteger(up_to) || kind === "message" || ["timer", "request", "worker"].includes(source))) {
+      if (which && (typeof source !== "string" || typeof kind !== "string" || !Number.isSafeInteger(up_to) || up_to < 1 || kind === "message" || ["timer", "request", "worker"].includes(source))) {
         return json({ error: "with sessions, say which notifications: their source and kind (a connector's own, never people's messages or what the system tells itself) and up_to, the last event counted when stock was taken (see `waiting` in the scope's state)" }, 400);
       }
       return json(await brain.drop(sessions, timers, which as { source: string; kind: string; up_to: number } | undefined));

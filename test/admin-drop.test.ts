@@ -30,7 +30,7 @@ describe("letting go of what waits in a scope", () => {
 
     // Stock is taken from what the scope says of itself: how much waits where, of what kind, and up to which event. No words.
     const waiting = (await stub.inspect()).waiting;
-    expect(waiting).toContainEqual({ session_key: "pr:1", source: "git", kind: "git.pull_request", events: 3, up_to: expect.any(Number) });
+    expect(waiting).toContainEqual({ session_key: "pr:1", source: "git", kind: "git.pull_request", events: 3, not_addressed: 2, up_to: expect.any(Number) });
     const upTo = Math.max(...waiting.map((each: any) => each.up_to));
     // Another push arrives after stock was taken: the pull request was opened again.
     await stub.ingest(pushed("pr:2"));
@@ -80,6 +80,21 @@ describe("letting go of what waits in a scope", () => {
     ]);
   });
 
+  it("lets go of what a timer left in line even when the timer itself has already ended: its last round, or its only one", async () => {
+    const { name, stub } = brain("repo");
+    const drop = async (body: unknown) => (await admin("POST", `scopes/${encodeURIComponent(name)}/drop`, body)).json();
+    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => {
+      for (const [id, status] of [["tmr_once", "done"], ["tmr_cancelled", "cancelled"]]) {
+        state.storage.sql.exec("INSERT INTO timers (id, due_at, note, session_key, status, created_at) VALUES (?, 1, 'look again', 'pr:1', ?, 1)", id, status);
+        state.storage.sql.exec("INSERT INTO inbox (source, source_id, kind, session_key, principal, text, status, received_at) VALUES ('timer', ?, 'timer', 'pr:1', ?, 'look again', 'pending', 1)", `${id}:1`, JSON.stringify({ kind: "timer", id, explicit: false }));
+      }
+    });
+    expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 2 });
+    expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 0 });
+    await wake(stub);
+    expect(modelCalls).toHaveLength(0);
+  });
+
   it("leaves alone what a run has already taken up, and refuses what is asked for wrongly: people's words are never dropped this way", async () => {
     const { name, stub } = brain("repo");
     const drop = (body: unknown) => admin("POST", `scopes/${encodeURIComponent(name)}/drop`, body);
@@ -94,6 +109,8 @@ describe("letting go of what waits in a scope", () => {
       { sessions: ["pr:1"], source: "console", kind: "message", up_to: 5 },
       { sessions: ["pr:1"], source: "request", kind: "request.ready", up_to: 5 },
       { sessions: ["pr:1"], source: "timer", kind: "timer", up_to: 5 },
+      { sessions: ["pr:1"], source: "git", kind: "git.pull_request", up_to: 0 },
+      { sessions: ["pr:1"], source: "git", kind: "git.pull_request", up_to: 1.5 },
       { timers: [null] },
       { sessions: [], timers: [] },
     ]) {
