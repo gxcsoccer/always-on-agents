@@ -365,6 +365,9 @@ export const MIGRATIONS: string[] = [
   // 40: a conversation's record read back by time (see History): what people wrote there, and what the agent said there.
   `CREATE INDEX IF NOT EXISTS inbox_session ON inbox (session_key, received_at);
    CREATE INDEX IF NOT EXISTS said_session ON said (session_id, sent_at);`,
+  // 41: beside a message that reminds people, the name the one who asked wrote for some of them
+  // (by their ids): where the message's own words name the person, a channel puts its mention there.
+  `CREATE TABLE IF NOT EXISTS outbox_names (idem TEXT PRIMARY KEY, names TEXT NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

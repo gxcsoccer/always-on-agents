@@ -12,7 +12,7 @@ import type { Worker } from "../workers";
 import { chainLevels, type Target } from "../events";
 import { type History, readsHistory } from "./history";
 import type { Outbox } from "./outbox";
-import { type Reminders, reminded } from "./reminders";
+import type { Reminders } from "./reminders";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
 import { type Acting, HANDLING_LIMIT_MS, type Requests, UNDER_WAY_NOTE, WAITING_NOTE } from "./requests";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
@@ -52,7 +52,7 @@ export interface RunToolsHost {
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
   readonly history: Pick<History, "read">;
   /** Who a message may remind: see Reminders. */
-  readonly reminders: Pick<Reminders, "claim" | "asked" | "named">;
+  readonly reminders: Pick<Reminders, "claimed" | "asked">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
 }
 
@@ -386,7 +386,7 @@ export class RunTools {
         const told = (reminded: number) => (notify.length === 0 ? { ok: true } : { ok: true, reminded, not_reminded: notify.length - reminded });
         if (!carried) {
           // Sent the same call again (the run was replayed), it is the message already kept, with whoever that reminds.
-          if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `msg:${callId}`).length > 0) return told(reminded(this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", `msg:${callId}`)[0]?.mention).ids.length);
+          if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `msg:${callId}`).length > 0) return told((JSON.parse(this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", `msg:${callId}`)[0]?.mention ?? "[]") as string[]).length);
           // Who it reminds is settled, and taken for this thing, in the step that keeps the message.
           return this.#s.transaction(() => {
             let count = 0;
@@ -395,10 +395,10 @@ export class RunTools {
             this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, {
               authored: true,
               mention: (target) => {
-                const ids = this.#b.reminders.claim(run, notify, target);
-                count = ids.length;
-                names = this.#b.reminders.named(run, ids, target);
-                return ids;
+                const taken = this.#b.reminders.claimed(run, notify, target);
+                count = taken.ids.length;
+                names = taken.names;
+                return taken.ids;
               },
               names: () => names,
             });

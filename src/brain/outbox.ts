@@ -6,7 +6,6 @@
  * hearing so (unverified). The Brain builds this part on its own database; what it needs from the
  * rest of the Brain it is handed (OutboxHost).
  */
-import { reminded } from "./reminders";
 import { type ApprovalQuestion, type CodeReview, DeliveryDeferred, DeliveryRejected, DeliveryVoid, type OutboundMessage, type Receipt, dedupeWindow } from "../connectors";
 import { type Target, isPrivateSession } from "../events";
 import type { Continuation, Requests } from "./requests";
@@ -136,9 +135,9 @@ export class Outbox implements Wakes {
     // scope's last known place stands in for it, it is not known to be of this conversation, and nobody is reminded there.)
     // (And only for a message kept just now: one kept before is as it was kept, whether it reminded anyone or not.)
     const mention = bound?.mention && !already && own && this.#s.rows("SELECT 1 FROM outbox_reminds WHERE idem = ?", idem).length === 0 ? bound.mention(target) : [];
-    // (With the names some of them were named by, for a channel that puts its mention where the words name the person.)
-    const names = mention.length > 0 ? Object.fromEntries(Object.entries(bound?.names?.() ?? {}).filter(([id]) => mention.includes(id))) : {};
-    if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(Object.keys(names).length > 0 ? { ids: mention, names } : mention));
+    if (mention.length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_reminds (idem, mention) VALUES (?, ?)", idem, JSON.stringify(mention));
+    // (With the names some of them were named by, kept beside it, for a channel that puts its mention where the words name the person.)
+    if (mention.length > 0) this.names(idem, mention, bound?.names?.() ?? {});
     if (runId && this.#b.sawOutside(runId)) this.#s.sql.exec("UPDATE outbox SET private = 1 WHERE idem = ?", idem);
     if (runId) this.#b.requests.stampGuards(runId);
     return { ok: true };
@@ -148,8 +147,14 @@ export class Outbox implements Wakes {
   #reminds(idem: string): { mention?: string[]; mention_names?: Record<string, string> } {
     const kept = this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", idem)[0]?.mention;
     if (!kept) return {};
-    const { ids, names } = reminded(kept);
-    return { mention: ids, ...(Object.keys(names).length > 0 ? { mention_names: names } : {}) };
+    const names = this.#s.rows<{ names: string }>("SELECT names FROM outbox_names WHERE idem = ?", idem)[0]?.names;
+    return { mention: JSON.parse(kept) as string[], ...(names ? { mention_names: JSON.parse(names) as Record<string, string> } : {}) };
+  }
+
+  /** Keeps, beside a message, the names some of those it reminds were named by: one way for a message kept now and for an answer let go later. */
+  names(idem: string, ids: string[], names: Record<string, string>): void {
+    const kept = Object.fromEntries(Object.entries(names).filter(([id]) => ids.includes(id)));
+    if (Object.keys(kept).length > 0) this.#s.sql.exec("INSERT OR REPLACE INTO outbox_names (idem, names) VALUES (?, ?)", idem, JSON.stringify(kept));
   }
 
   /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */

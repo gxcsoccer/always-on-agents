@@ -61,9 +61,12 @@ function bench(state: DurableObjectState) {
     mayUse: () => settings.mayUse,
     following: () => settings.following,
     reminders: {
-      claim: (_run: unknown, asked: string[], target: unknown) => (calls.push(["claim", asked, target]), asked.filter((each) => settings.remindable.includes(each))),
+      claimed: (_run: unknown, asked: string[], target: unknown) => {
+        calls.push(["claim", asked, target]);
+        const ids = asked.filter((each) => settings.remindable.includes(each));
+        return { ids, names: Object.fromEntries(ids.filter((each) => each.startsWith("@")).map((each) => [each, each])) };
+      },
       asked: () => settings.asked,
-      named: (_run: unknown, ids: string[]) => Object.fromEntries(ids.filter((each) => each.startsWith("@")).map((each) => [each, each])),
     } as RunToolsHost["reminders"],
     instructionEditors: () => {
       if (settings.editors instanceof Error) throw settings.editors;

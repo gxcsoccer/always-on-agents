@@ -711,15 +711,16 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // Not where anything in the words is shown as code: a mention inside that is shown as it is
   // written and reminds nobody, so there every mention stays in front.
   const inPlace = new Set<string>();
-  if ((message.encoding ?? 0) >= 3 && message.authored && !/[`~]/.test(words)) {
-    for (const id of toRemind) {
+  if ((message.encoding ?? 0) >= 3 && message.authored && !/[`~]/.test(words) && !/^(?: {4}|\t)/m.test(words)) {
+    // (Each looked for in the words as they are now, before any mention is put into them; put in from the last backwards, so that no place moves.)
+    const places = toRemind.flatMap((id) => {
       const name = message.mention_names?.[id];
-      if (!name || !/^@[\p{L}\p{N}_-]+$/u.test(name)) continue;
-      // The name as a whole: not the beginning of a longer one.
-      const found = new RegExp(`${name.replace(/[-]/g, "\\$&")}(?![\\p{L}\\p{N}_-])`, "u").exec(words);
-      if (!found) continue;
-      words = `${words.slice(0, found.index)}${at(id)}${words.slice(found.index + name.length)}`;
-      inPlace.add(id);
+      const where = name && /^@[\p{L}\p{N}_-]+$/u.test(name) ? spoken(words, name) : -1;
+      return where < 0 ? [] : [{ id, where, length: name!.length }];
+    });
+    for (const each of places.sort((a, b) => b.where - a.where)) {
+      words = `${words.slice(0, each.where)}${at(each.id)}${words.slice(each.where + each.length)}`;
+      inPlace.add(each.id);
     }
   }
   const reminds = toRemind.filter((id) => !inPlace.has(id)).map(at).join(" ");
@@ -792,6 +793,27 @@ function plainCard(invitation: Invitation): unknown {
 
 /** Feishu's limit for a post, in bytes of the request, with a margin. */
 const MAX_POST_BYTES = 29_000;
+
+/**
+ * Where, in words shown as Markdown, a name stands as a word of plain text: the first such place,
+ * or -1. Not the beginning of a longer name; not part of an address (after a letter or figure of
+ * ASCII, or one of the marks an address or a mail address is written with); and not on a line
+ * that holds a link, an address, markup or a table, where what is shown is not what is written.
+ * Looked for by the name as it is, never as a pattern.
+ */
+function spoken(words: string, name: string): number {
+  for (let from = 0; ; ) {
+    const at = words.indexOf(name, from);
+    if (at < 0) return -1;
+    from = at + name.length;
+    const before = at === 0 ? "" : words[at - 1];
+    const after = words.slice(from, from + 2);
+    if (/^[\p{L}\p{N}_-]/u.test(after) || /[A-Za-z0-9._\/:=?&#%+\\-]/.test(before)) continue;
+    const line = words.slice(words.lastIndexOf("\n", at) + 1, (words.indexOf("\n", at) + 1 || words.length + 1) - 1);
+    if (/\]\(|[<>|\[\]]|:\/\/|www\./i.test(line)) continue;
+    return at;
+  }
+}
 
 /**
  * The agent's words as Feishu shows them, minus their one way of acting: Feishu's mention markup

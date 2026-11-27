@@ -1619,6 +1619,21 @@ describe("reminding people where several talk", () => {
     model.replies([call("send_message", { text: "运行 `ping @Carol` 就行。", notify: ["@Carol"] })], [say("")]);
     await here.says("再叫一下 @_user_2", [colleague]);
     expect(last()).toBe('<at user_id="ou_colleague"></at> 运行 `ping @Carol` 就行。');
+    // Two on one line, each where it is named. A name with a hyphen in it is a name like any other, in the words or not.
+    const hyphen = { key: "@_user_3", id: { open_id: "ou_hyphen" }, name: "Mary-Ann", mentioned_type: "user", tenant_key: ORG };
+    model.replies([call("send_message", { text: "@Carol、@Mary-Ann：请看。", notify: ["@Carol", "@Mary-Ann"] })], [call("send_message", { text: "请看。", notify: ["@Mary-Ann"] })], [say("")]);
+    await here.says("叫 @_user_2 和 @_user_3", [colleague, hyphen]);
+    expect(world.sent.filter((each) => each.type === "text").slice(-2).map((each) => String(each.content.text))).toEqual(['<at user_id="ou_colleague"></at>、<at user_id="ou_hyphen"></at>：请看。', "请看。"]);
+    // Not in an address, a link or a table, where what is shown is not what is written: there the mention stays in front, and the words stay as they are.
+    for (const text of ["见 [说明](https://x.test/@Carol) 。", "写信给 team@Carol 。", "| 谁 |\n| --- |\n| @Carol |", "见 https://x.test/u 和 @Carol"]) {
+      model.replies([call("send_message", { text, notify: ["@Carol"] })], [say("")]);
+      await here.says("再叫 @_user_2", [colleague]);
+      expect(last(), text).toBe(`<at user_id="ou_colleague"></at>${text.startsWith("|") ? "\n\n" : " "}${text}`);
+    }
+    // In an address on one line and as a word on the next: the word is where the mention goes.
+    model.replies([call("send_message", { text: "见 https://x.test/@Carol\n\n@Carol 请看。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('见 https://x.test/@Carol\n\n<at user_id="ou_colleague"></at> 请看。');
     // The model was told what its messages come to in this chat, in the Brain's own words.
     expect(modelCalls.at(-1).instructions).toContain("Your messages here are shown as Markdown. A message here can remind people: name them in notify.");
     // Words that begin as a heading, a list, a table or a block of code keep their first line to themselves: the mention goes on a line before them.

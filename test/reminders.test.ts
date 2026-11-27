@@ -74,8 +74,25 @@ describe("who a message may remind", () => {
       // In the order asked for, each once, however they are written; the rest are left out.
       expect(reminders.claim(asked, [], HERE)).toEqual([]);
       // The name she wrote for someone, for whoever is reminded by it; none for anyone else.
-      expect(reminders.named(asked, [CAROL, BOB, ANN], HERE)).toEqual({ [CAROL]: "@Carol" });
-      expect(reminders.claim(asked, ["@carol", CAROL, "ou_dave", "ou_erin", "ou_frank", "ou_gail", "ou_hal", "all", "ou_nobody", BOB.toUpperCase(), ANN], HERE)).toEqual([CAROL, BOB, ANN]);
+      // A name without the chat's mark before it is the same name; but never before who someone is.
+      expect(reminders.of(asked, HERE)!.who("carol")).toBe(CAROL);
+      // With the name she wrote for each, where she wrote one: told as they are taken.
+      expect(reminders.claimed(asked, ["@carol", CAROL, "ou_dave", "ou_erin", "ou_frank", "ou_gail", "ou_hal", "all", "ou_nobody", BOB.toUpperCase(), ANN], HERE)).toEqual({ ids: [CAROL, BOB, ANN], names: { [CAROL]: "@Carol" } });
+    });
+  });
+
+  it("takes a name given without its mark only where it is nobody by who they are, and tells the names of a timer that stops once it has reminded as it is taken", async () => {
+    await within(({ message, run, reminders, store }) => {
+      // Someone she named bears, for a name, what another person she named is by who they are.
+      message(ANN, "tell @ou_bob and @Bob", { run: "r1", data: { group: true, mentioned: [{ name: `@${BOB}`, id: CAROL }, { name: "@Bob", id: BOB }] } });
+      const asked = run("r1");
+      expect(reminders.of(asked, HERE)!.who(BOB)).toBe(BOB);
+      expect(reminders.of(asked, HERE)!.who("bob")).toBe(BOB);
+      expect(reminders.of(asked, HERE)!.who(`@${BOB}`)).toBe(CAROL);
+      // A timer set to stop once it has reminded: whose it was is told with the taking, not asked for afterwards.
+      store.sql.exec("INSERT INTO timers (id, due_at, note, session_key, status, data, created_at) VALUES ('tmr_1', 1, 'n', 'chat', 'active', ?, 1)", JSON.stringify({ by: ANN, named: [{ id: CAROL, name: "@Carol" }], place: PLACE, stop_after_reminding: true }));
+      message("", "", { run: "r2", kind: "timer", source: "timer", principal: { kind: "timer", id: "tmr_1", explicit: false }, data: null });
+      expect(reminders.claimed(run("r2"), ["@Carol"], HERE)).toEqual({ ids: [CAROL], names: { [CAROL]: "@Carol" } });
     });
   });
 
