@@ -630,6 +630,71 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("lets a worker look, before anything is written, at what the work will be allowed: turned away, as ever, or bound to something kept with the task", async () => {
+      await within(async ({ tasks, store, settings, slots }) => {
+        const asked: unknown[] = [];
+        const started: unknown[] = [];
+        let answer: any = { kind: "ordinary" };
+        let gate: Promise<void> | undefined;
+        const careful: Worker = {
+          name: "careful",
+          description: "Does something that may need leave.",
+          acts_as: "agent",
+          options: { where: { type: ["string", "null"] } },
+          prepareStart: async (_env, about) => {
+            asked.push(about);
+            await gate;
+            return answer;
+          },
+          start: async (_env, work) => (started.push({ id: work.id, lend: work.lend, by: work.by }), { state: "started" }),
+          standing: async () => "there",
+        };
+        settings.workers = [];
+        settings.others = [careful];
+        const actor = { person: "alice", connector: "chat", origin: { app: "a" }, said: [{ ref: 7, text: "look at acme/app" }], recent: [] };
+
+        // Turned away: said to the model in the worker's words, and nothing is written, taken or started.
+        answer = { kind: "refused", reason: "that cannot be reached just now; ask again later", retryable: true };
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_r", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)).rejects.toThrow("that cannot be reached just now; ask again later");
+        expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
+        expect(slots.acquired).toEqual([]);
+        expect(started).toEqual([]);
+        // What it is asked with: where, who (the one person who asked), what was asked for, and what the host knows of who asked.
+        expect(asked).toEqual([{ scope: store.scope(), sessionKey: SESSION_KEY, by: "alice", options: { where: "acme/app" }, continueFrom: null, actor }]);
+
+        // As ever: nothing is kept beside the task, and the work is started with nothing more.
+        answer = { kind: "ordinary" };
+        const plain = (await tasks.dispatch(RUN, SESSION_KEY, "call_o", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string };
+        expect(store.rows("SELECT 1 FROM task_lends")).toEqual([]);
+        expect(started.at(-1)).toEqual({ id: plain.task_id, lend: undefined, by: "alice" });
+
+        // Bound: what the worker gave is kept with the task as it is, and handed to it when it is started. Nothing of it is the model's.
+        answer = { kind: "bound", record: { v: 1, leave: "to read acme/app" } };
+        const bound = (await tasks.dispatch(RUN, SESSION_KEY, "call_b", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string };
+        expect(store.rows("SELECT task_id, record FROM task_lends")).toEqual([{ task_id: bound.task_id, record: JSON.stringify({ v: 1, leave: "to read acme/app" }) }]);
+        expect(started.at(-1)).toEqual({ id: bound.task_id, lend: { v: 1, leave: "to read acme/app" }, by: "alice" });
+        // The same call made again is the task it made: the worker is not asked a second time, and nothing it would say now changes what was kept.
+        answer = { kind: "bound", record: { v: 1, leave: "something else" } };
+        const before = asked.length;
+        expect(((await tasks.dispatch(RUN, SESSION_KEY, "call_b", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string }).task_id).toBe(bound.task_id);
+        expect(asked).toHaveLength(before);
+        expect(store.rows("SELECT record FROM task_lends WHERE task_id = ?", bound.task_id)).toEqual([{ record: JSON.stringify({ v: 1, leave: "to read acme/app" }) }]);
+
+        // The same call made twice at once, both still being looked at: one task, started once, with what the first to be written was given.
+        let open!: () => void;
+        gate = new Promise((resolve) => (open = resolve));
+        answer = { kind: "bound", record: { v: 1, leave: "once" } };
+        const count = started.length;
+        const both = Promise.all([tasks.dispatch(RUN, SESSION_KEY, "call_2x", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor), tasks.dispatch(RUN, SESSION_KEY, "call_2x", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)]);
+        open();
+        const [one, two] = (await both) as { task_id: string }[];
+        expect(one.task_id).toBe(two.task_id);
+        expect(store.rows("SELECT 1 FROM tasks WHERE op_id = 'call_2x'")).toHaveLength(1);
+        expect(started.slice(count).filter((each: any) => each.id === one.task_id).length).toBeGreaterThanOrEqual(1);
+        expect(new Set(started.slice(count).map((each: any) => JSON.stringify(each.lend)))).toEqual(new Set([JSON.stringify({ v: 1, leave: "once" })]));
+      });
+    });
+
     it("hands work to any worker that is started from here, by the contract alone: its own options, its own say on them, its own name on the record", async () => {
       await within(async ({ tasks, store, kept, settings, slots, worker }) => {
         // A worker that is nothing like the sandbox, and the only one this deployment has.

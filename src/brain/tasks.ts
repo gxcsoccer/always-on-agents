@@ -14,6 +14,7 @@ import type { registry } from "../registry";
 import { type RefUpdate, standingEligible } from "../workers/questions";
 import { type QuestionFate, clipResult } from "../workers/result";
 import type { Started, Worker } from "../workers";
+import type { Actor } from "../workers/types";
 import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
@@ -169,13 +170,19 @@ export class Tasks implements Wakes {
       .reverse();
   }
 
+  /** What a task's worker bound it to before it was written, as kept with it: handed back each time the task is started. */
+  #lendOf(taskId: string): { lend?: unknown } {
+    const kept = this.#s.rows<{ record: string }>("SELECT record FROM task_lends WHERE task_id = ?", taskId)[0]?.record;
+    return kept === undefined ? {} : { lend: JSON.parse(kept) as unknown };
+  }
+
   /**
    * Hands a piece of work to a worker the Brain starts, and says how it then stands. `name` is
    * the worker it is for; null where the call does not say (a tool call from before there was
    * more than one): then the worker the deployment names for that tool (`firstWorker`), while it is offered. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
-  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }): Promise<unknown> {
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }, actor?: Actor): Promise<unknown> {
     const scope = this.#s.scope();
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
@@ -202,6 +209,22 @@ export class Tasks implements Wakes {
     // that names no worker is the tool from before there were several: it goes to the worker the
     // deployment says that tool was for, if it still offers that one, and to no other.
     const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : this.#b.firstWorker();
+    // The worker's own look at a new piece of work, before anything is written, taken or started
+    // (see Worker.prepareStart). It may ask others, which takes time: so it comes first, and
+    // everything that is looked at here afterwards (what it goes on from, who waits, how many
+    // run) is looked at once it is back, with nothing awaited before the task is written.
+    let bound: unknown;
+    if (!task && offered?.start && offered.prepareStart) {
+      const mine = own(offered, options);
+      offered.accepts?.(mine, scope);
+      const who = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+      const prepared = await offered.prepareStart(this.#b.env, { scope, sessionKey, by: who.length === 1 ? who[0] : null, options: mine, continueFrom: from, ...(actor ? { actor } : {}) });
+      // The same call may have been written meanwhile, by another making of it: then it is that
+      // task, with what was kept for it, whatever this look came to.
+      if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) return this.dispatch(run, sessionKey, callId, name, title, brief, options, from, then);
+      if (prepared.kind === "refused") throw new Error(prepared.reason);
+      if (prepared.kind === "bound") bound = prepared.record;
+    }
     /** Whether this is put after a piece of work that has not ended, to wait for it. */
     let waits = false;
     // Going on from an earlier piece of work: it has to be this conversation's, this worker's, and
@@ -286,6 +309,8 @@ export class Tasks implements Wakes {
         // What it works on: what it was given, or, going on from another, what that one worked on.
         const on = typeof options.repository === "string" && options.repository !== "" ? options.repository : from !== null ? (this.#s.rows<{ repository: string }>("SELECT repository FROM task_on WHERE task_id = ?", from)[0]?.repository ?? null) : null;
         if (on !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_on (task_id, repository) VALUES (?, ?)", id, on);
+        // What its worker bound it to, as the worker gave it: its own to read when the work is started, and nobody else's.
+        if (bound !== undefined) this.#s.sql.exec("INSERT OR IGNORE INTO task_lends (task_id, record) VALUES (?, ?)", id, JSON.stringify(bound));
         if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events, repository) VALUES (?, ?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events), on);
       });
       // (One that waits is watched from when it is let through to be started, not while it waits.)
@@ -364,7 +389,7 @@ export class Tasks implements Wakes {
     const follows = this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null;
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), ...this.#lendOf(String(task.id)), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
@@ -617,7 +642,7 @@ export class Tasks implements Wakes {
       if (left() === 0) break;
       let answer: Started | undefined;
       try {
-        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
+        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), ...this.#lendOf(row.task_id), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
       } catch {
         answer = undefined;
       }
