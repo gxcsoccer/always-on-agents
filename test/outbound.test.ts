@@ -193,6 +193,7 @@ describe("git over the proxy", () => {
     await send("https://github.com/acme/demo.git/git-upload-pack", { method: "POST", body: "0000", headers: { "content-type": "application/x-git-upload-pack-request", "x-anything": "else" } });
     expect(forwarded.map((each) => each.headers.get("authorization"))).toEqual([`Basic ${btoa("x-access-token:test-fetch-token")}`, `Basic ${btoa("x-access-token:test-fetch-token")}`]);
     expect([...forwarded[0].headers.keys()].sort()).toEqual(["accept", "authorization", "git-protocol", "user-agent"]);
+    expect(forwarded[1].headers.get("content-length")).toBeNull();
     expect(forwarded[1].headers.get("content-type")).toBe("application/x-git-upload-pack-request");
     expect(forwarded[1].headers.get("x-anything")).toBeNull();
     // (The credential a push goes out under was not asked for by either.)
@@ -247,6 +248,12 @@ describe("git over the proxy", () => {
     expect(forwarded).toHaveLength(1);
     expect(forwarded[0].body).toBe(new TextDecoder().decode(body));
     expect(forwarded[0].headers.get("authorization")).toContain("Basic ");
+  });
+
+  it("sends an approved push under the credential asked for once it was approved, not the one it had at the door", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "allow", reason: "ok" }], tokenLater: { after: 1, token: "issued-since" } });
+    expect((await push(send)).status).toBe(200);
+    expect(forwarded.map((each) => each.headers.get("authorization"))).toEqual([`Basic ${btoa("x-access-token:issued-since")}`]);
   });
 
   it("gives two identical pushes two separate questions", async () => {

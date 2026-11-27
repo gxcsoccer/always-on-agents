@@ -23,8 +23,8 @@ const REMOTE_KEYS = new Set(["image_url", "file_url", "server_url", "url", "file
 /** Input items a coding agent produces by itself: its messages, its reasoning, calls to its own tools. */
 const LOCAL_ITEM_TYPES = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"]);
 
-/** The headers of a request to git's smart-HTTP endpoints that are passed on: those the exchange itself uses, and no others. */
-const GIT_HEADERS = ["accept", "accept-encoding", "accept-language", "content-type", "content-encoding", "content-length", "git-protocol", "user-agent", "pragma", "cache-control"];
+/** The headers of a request to git's smart-HTTP endpoints that are passed on: those the exchange itself uses, and no others. (How long the body is, is said by the runtime as it sends what is really sent.) */
+const GIT_HEADERS = ["accept", "accept-encoding", "accept-language", "content-type", "content-encoding", "git-protocol", "user-agent", "pragma", "cache-control"];
 
 /** One ref a push would move. `old` or `new` being all zeros means create or delete. */
 import type { RefUpdate } from "../questions";
