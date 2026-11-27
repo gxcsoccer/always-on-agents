@@ -1045,6 +1045,8 @@ export class Runner {
     const calls = new Set(items.filter((each) => each.item.type === "function_call" && each.item.name === "read_history").map((each) => String(each.item.call_id)));
     for (const each of items) {
       if (each.item.type !== "function_call_output" || !calls.has(String(each.item.call_id))) continue;
+      // (A call of it that was refused, in a run that also read: what it was told holds nothing of the record.)
+      if (typeof each.item.output === "string" && each.item.output.startsWith('{"error":')) continue;
       this.#s.sql.exec("UPDATE items SET item = ? WHERE session_id = ? AND seq = ?", JSON.stringify({ ...each.item, output: JSON.stringify(HISTORY_NOT_KEPT) }), run.session_id, each.seq);
     }
   }

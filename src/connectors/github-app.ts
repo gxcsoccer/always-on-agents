@@ -85,13 +85,15 @@ export async function fromTheirs(source: string, installation: string | undefine
  * Looked up each time it is asked, so removing a chat's link stops the lending at once.
  * (Who asked changes nothing yet: it is what a person's own authorisation will be lent by.)
  */
-/** (`repo`: "owner/name" in lower case, as a task names its repository.) */
 export async function lendsTo(env: Env, task: { scope: string; by?: string }, repo: string, to: "write" | "read" | "public"): Promise<boolean> {
+  // (However its name is written: a caller need not have made it lower case. None for no name.)
+  const wanted = repo.toLowerCase();
+  if (wanted === "") return false;
   if (to === "public") return true;
   const [tenant, kind, ...rest] = task.scope.split(":");
   const id = rest.join(":");
-  if (kind === "repo") return id.toLowerCase() === repo;
-  return kind === "chat" && (await registry(env).chatRepo(tenant, id)) === repo;
+  if (kind === "repo") return id.toLowerCase() === wanted;
+  return kind === "chat" && (await registry(env).chatRepo(tenant, id)) === wanted;
 }
 
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */

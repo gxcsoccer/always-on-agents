@@ -227,6 +227,18 @@ describe("the tool that reads further back", () => {
     expect(JSON.parse(output)).toEqual({ note: "What this gave is not kept after the run it was read in. Read again if it is needed." });
   });
 
+  it("keeps what a call that read nothing was told, since there is nothing of the record in it", async () => {
+    const { stub } = brain();
+    model.replies([call("read_history", { query: null, from: null, before: "last week", limit: null }, "look")], [say("")]);
+    await stub.ingest(message("what did we say last week?", { session_key: PRIVATE }));
+    await wake(stub);
+    model.replies([say("")]);
+    await stub.ingest(message("thanks", { session_key: PRIVATE }));
+    await wake(stub);
+    const later = JSON.parse(modelCalls.at(-1).input.find((each: any) => each.type === "function_call_output" && each.call_id === "look").output);
+    expect(later.error).toContain("before is a time");
+  });
+
   it("is not there for a conversation named as a private one in a place several people share", async () => {
     const { stub } = brain("chat");
     model.replies([call("read_history", { query: null, from: null, before: null, limit: null }, "look")], [say("")]);
