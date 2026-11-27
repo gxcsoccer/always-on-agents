@@ -367,8 +367,8 @@ export class BrainAgent extends DurableObject<Env> {
     this.#store.transaction(() => {
       // Old events lose their content but keep their identity for a year: the (source, source_id)
       // pair is what makes a replayed webhook a duplicate, and a signed webhook never expires.
-      this.#store.sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead') AND received_at < ? AND text IS NOT NULL", old);
-      this.#store.sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead') AND received_at < ?", now - RETAIN_AUDIT_MS);
+      this.#store.sql.exec("UPDATE inbox SET text = NULL, data = NULL, reply_to = NULL WHERE status IN ('done', 'dead', 'dropped') AND received_at < ? AND text IS NOT NULL", old);
+      this.#store.sql.exec("DELETE FROM inbox WHERE status IN ('done', 'dead', 'dropped') AND received_at < ?", now - RETAIN_AUDIT_MS);
       this.#store.sql.exec("DELETE FROM outbox WHERE status IN ('sent', 'dead', 'withdrawn', 'reconciling', 'void', 'unverified') AND created_at < ?", old);
       // Before what the index of work points at is cleared: a row still open for something that has
       // ended (ended while a version without the index ran, say) is given its end, with the time
@@ -546,13 +546,29 @@ export class BrainAgent extends DurableObject<Env> {
     );
   }
 
+  /**
+   * An operator lets go of what waits here and will never be worth doing: the events that wait
+   * in the conversations named, and the timers named. Only what waits: an event a run has taken
+   * up is that run's, and a task's own watch is the task's. The events are kept as dropped (they
+   * still make a repeat of the same delivery a duplicate), and it is put on record how many,
+   * never what any of them said.
+   */
+  async drop(sessions: string[], timers: string[]): Promise<{ events: number; timers: number }> {
+    return this.#store.transaction(() => {
+      const events = this.#store.rows("UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND session_key IN (SELECT value FROM json_each(?)) RETURNING id", JSON.stringify(sessions)).length;
+      const cancelled = this.#store.rows("UPDATE timers SET status = 'cancelled' WHERE status = 'active' AND id IN (SELECT value FROM json_each(?)) AND (data IS NULL OR json_extract(data, '$.task_id') IS NULL) RETURNING id", JSON.stringify(timers)).length;
+      this.#store.audit("(operator)", "admin.dropped", { sessions, timers, events, cancelled });
+      return { events, timers: cancelled };
+    });
+  }
+
   async inspect(): Promise<Record<string, unknown>> {
     const count = (table: string, where = "1") => this.#store.rows<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`)[0].n;
     return {
       scope: this.#store.meta("scope"),
       alarm_at: await this.ctx.storage.getAlarm(),
       active_run: this.#runner.activeRun() ?? null,
-      inbox: { pending: count("inbox", "status = 'pending'"), claimed: count("inbox", "status = 'claimed'"), done: count("inbox", "status = 'done'"), dead: count("inbox", "status = 'dead'") },
+      inbox: { pending: count("inbox", "status = 'pending'"), claimed: count("inbox", "status = 'claimed'"), done: count("inbox", "status = 'done'"), dead: count("inbox", "status = 'dead'"), dropped: count("inbox", "status = 'dropped'") },
       recent_events: this.#store.rows("SELECT id, source, kind, session_key, status, substr(text, 1, 160) AS text FROM inbox ORDER BY id DESC LIMIT 15"),
       // What each recent message carries besides its words, by name only; and, where it was written as a reply, how much of what it replies to was found.
       recent_shapes: this.#store.rows(

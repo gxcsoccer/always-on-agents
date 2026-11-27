@@ -86,6 +86,13 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     const brain = env.BRAIN.getByName(decodeURIComponent(path[1]));
     if (path.length === 2 && method === "GET") return json(await brain.inspect());
     if (path[2] === "memory" && method === "GET") return json({ content: await brain.readMemory(url.searchParams.get("path") ?? "") });
+    // What waits there and will never be worth doing, let go of by name: see BrainAgent.drop.
+    if (path[2] === "drop" && path.length === 3 && method === "POST") {
+      const { sessions = [], timers = [] } = await body();
+      const names = (value: unknown): value is string[] => Array.isArray(value) && value.length <= 500 && value.every((each) => typeof each === "string" && each !== "" && each.length <= 300);
+      if (!names(sessions) || !names(timers) || sessions.length + timers.length === 0) return json({ error: "give the conversations whose waiting events are dropped (sessions) and the timers to cancel (timers), each a list of names" }, 400);
+      return json(await brain.drop(sessions, timers));
+    }
   }
 
   if (path[0] === "tasks" && /^[0-9a-f-]{36}$/.test(path[1] ?? "")) {
