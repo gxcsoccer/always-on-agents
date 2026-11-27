@@ -121,11 +121,17 @@ export class Registry extends DurableObject<Env> {
     this.ctx.storage.sql.exec("INSERT INTO scopes (name, tenant, kind, first_at, noted_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET noted_at = excluded.noted_at", name, tenant, kind, now, now);
   }
 
-  /** The scopes that have said they are there, the latest told of first: all of them, or those of a tenant or a kind. */
-  async scopes(of: { tenant?: string; kind?: string } = {}): Promise<{ name: string; tenant: string; kind: string; first_at: number; noted_at: number }[]> {
-    return this.ctx.storage.sql
-      .exec<{ name: string; tenant: string; kind: string; first_at: number; noted_at: number }>("SELECT name, tenant, kind, first_at, noted_at FROM scopes WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR kind = ?2) ORDER BY noted_at DESC, name LIMIT 1000", of.tenant ?? null, of.kind ?? null)
+  /**
+   * The scopes that have said they are there, by name, a page at a time: all of them, or those of
+   * a tenant or a kind. `next` is where to go on from, where there are more. (By name, which does
+   * not change, so that every one of them is reached however many are told of meanwhile.)
+   */
+  async scopes(of: { tenant?: string; kind?: string; after?: string; limit?: number } = {}): Promise<{ scopes: { name: string; tenant: string; kind: string; first_at: number; noted_at: number }[]; next: string | null }> {
+    const limit = Math.max(1, Math.min(500, of.limit ?? 500));
+    const found = this.ctx.storage.sql
+      .exec<{ name: string; tenant: string; kind: string; first_at: number; noted_at: number }>("SELECT name, tenant, kind, first_at, noted_at FROM scopes WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR kind = ?2) AND name > ?3 ORDER BY name LIMIT ?4", of.tenant ?? null, of.kind ?? null, of.after ?? "", limit + 1)
       .toArray();
+    return { scopes: found.slice(0, limit), next: found.length > limit ? found[limit - 1].name : null };
   }
 
   async createTenant(id: string, name: string): Promise<{ tenant: Tenant; api_key: string }> {

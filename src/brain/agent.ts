@@ -44,6 +44,8 @@ const BATCH_WINDOW_MS = 2_000;
 const RETAIN_RECORDS_MS = 30 * 86_400_000;
 /** How often, at most, a scope says to the registry that it is there. */
 const LISTED_EVERY_MS = 3_600_000;
+/** How soon, at the earliest, it is tried again where the registry could not be told. */
+const LISTED_RETRY_MS = 60_000;
 const RETAIN_AUDIT_MS = 365 * 86_400_000;
 /** A conversation keeps at least this many recent transcript items, however old. */
 const RETAIN_ITEMS_PER_SESSION = 200;
@@ -219,17 +221,21 @@ export class BrainAgent extends DurableObject<Env> {
    */
   /**
    * Says to the registry that this scope is there, so that an operator can ask which scopes there
-   * are: when something comes to it, and no more than once an hour. Beside whatever else is done,
-   * and never in its way: if the registry cannot be told now, it is told the next time.
+   * are. Each time it wakes (which it does for anything that has come to it, and for a timer of
+   * its own), once an hour at most. That it has been told is written down only once the registry
+   * has said so: one that is interrupted in between is told again at the next waking. Where the
+   * registry cannot be told, it is tried again no sooner than a minute later. Beside whatever else
+   * is done, and never in its way.
    */
   #listed(): void {
     const now = Date.now();
-    if (now - Number(this.#store.meta("listed_at") ?? 0) < LISTED_EVERY_MS) return;
-    this.#store.setMeta("listed_at", String(now));
+    if (now - Number(this.#store.meta("listed_at") ?? 0) < LISTED_EVERY_MS || now - Number(this.#store.meta("listed_tried") ?? 0) < LISTED_RETRY_MS) return;
+    this.#store.setMeta("listed_tried", String(now));
     this.ctx.waitUntil(
       registry(this.env)
         .noteScope(this.#store.scopeName())
-        .catch(() => this.#store.sql.exec("DELETE FROM meta WHERE key = 'listed_at'")),
+        .then(() => this.#store.setMeta("listed_at", String(now)))
+        .catch(() => undefined),
     );
   }
 
@@ -238,7 +244,6 @@ export class BrainAgent extends DurableObject<Env> {
     // Larger than the longest comment any connector passes on, so a reply is stored whole: what it
     // says about an open question is read from the stored text, and a cut-off refusal would be lost.
     if ((event.text?.length ?? 0) > 300_000) throw new Error("event text is too long");
-    this.#listed();
     // Which optional tools of plugged-in connectors are for whoever caused this: said by those
     // connectors now, and by nobody else. Whatever the event's own connector wrote there is dropped.
     if (event.data && "offered" in event.data) event = { ...event, data: Object.fromEntries(Object.entries(event.data).filter(([key]) => key !== "offered")) };
@@ -309,6 +314,7 @@ export class BrainAgent extends DurableObject<Env> {
   // ------------------------------------------------------------------ the wake cycle
 
   async alarm(): Promise<void> {
+    this.#listed();
     try {
       this.#timers.fire(Date.now());
       this.#requests.deadlines(Date.now());

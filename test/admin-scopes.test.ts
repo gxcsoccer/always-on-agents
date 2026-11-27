@@ -1,49 +1,91 @@
 /**
- * An operator can ask which scopes there are: each says so of itself when something comes to it.
+ * An operator can ask which scopes there are: each says so of itself when it wakes.
  */
 import { runInDurableObject } from "cloudflare:test";
-import { exports } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { env, exports } from "cloudflare:workers";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { brain, installFakeModel, message } from "./helpers";
+import { brain, installFakeModel, message, model, say, wake } from "./helpers";
 
 beforeEach(() => installFakeModel());
 
+type Listed = { name: string; tenant: string; kind: string; first_at: number; noted_at: number };
 const admin = (path: string, authorised = true) => (exports as any).default.fetch(new Request(`https://agent.test/v1/admin/${path}`, { headers: authorised ? { authorization: "Bearer test-admin" } : {} })) as Promise<Response>;
-const listed = async (query = "") => ((await (await admin(`scopes${query}`)).json()) as { scopes: { name: string; tenant: string; kind: string; first_at: number; noted_at: number }[] }).scopes;
+/** Every scope listed, read a page at a time by where each page says to go on from. */
+async function listed(query = "", limit = 500): Promise<Listed[]> {
+  const all: Listed[] = [];
+  for (let after: string | null = ""; after !== null; ) {
+    const page = (await (await admin(`scopes?limit=${limit}${after ? `&after=${encodeURIComponent(after)}` : ""}${query}`)).json()) as { scopes: Listed[]; next: string | null };
+    all.push(...page.scopes);
+    after = page.next;
+  }
+  return all;
+}
+const of = async (name: string) => (await listed()).filter((each) => each.name === name);
+const registry = () => (env as any).REGISTRY.getByName("global");
+/** Something comes to a scope and it wakes for it; what it tells the registry beside that has been told by the time this is over. */
+async function comes(stub: any, text: string) {
+  model.replies([say("")]);
+  await stub.ingest(message(text, { session_key: "chat" }));
+  await wake(stub);
+  await vi.waitFor(async () => expect(await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT value FROM meta WHERE key = 'listed_at'").toArray().length)).toBe(1));
+}
 
 describe("which scopes there are", () => {
-  it("lists a scope once something has come to it, by its name, and only to an operator", async () => {
+  it("lists a scope once it has woken for something, by its name, and only to an operator", async () => {
     const chat = brain("chat");
-    const person = brain("user");
     const quiet = brain("chat");
-    await chat.stub.ingest(message("hello", { session_key: "chat" }));
-    await person.stub.ingest(message("hello"));
-    // Told once, however much comes within the hour.
-    await chat.stub.ingest(message("again", { session_key: "chat" }));
-
-    const all = await listed();
-    const mine = (name: string) => all.filter((each) => each.name === name);
-    expect(mine(chat.name)).toEqual([{ name: chat.name, tenant: chat.name.split(":")[0], kind: "chat", first_at: expect.any(Number), noted_at: expect.any(Number) }]);
-    expect(mine(person.name)).toHaveLength(1);
+    await comes(chat.stub, "hello");
+    expect(await of(chat.name)).toEqual([{ name: chat.name, tenant: chat.name.split(":")[0], kind: "chat", first_at: expect.any(Number), noted_at: expect.any(Number) }]);
     // One nothing has come to is not there.
-    expect(mine(quiet.name)).toEqual([]);
-    // By kind, and by tenant.
-    expect((await listed("?kind=chat")).every((each) => each.kind === "chat")).toBe(true);
-    expect((await listed("?kind=chat")).some((each) => each.name === chat.name)).toBe(true);
-    expect(await listed(`?tenant=${chat.name.split(":")[0]}`)).toEqual(mine(chat.name));
+    expect(await of(quiet.name)).toEqual([]);
+    // By kind, and by tenant; a page at a time, every one reached.
+    expect((await listed("&kind=chat")).some((each) => each.name === chat.name)).toBe(true);
+    expect((await listed("&kind=repo")).some((each) => each.name === chat.name)).toBe(false);
+    expect(await listed(`&tenant=${chat.name.split(":")[0]}`)).toEqual(await of(chat.name));
+    await comes(brain("chat").stub, "hello");
+    await comes(brain("chat").stub, "hello");
+    expect((await listed("", 1)).map((each) => each.name)).toEqual((await listed()).map((each) => each.name));
+    expect((await listed("", 1)).length).toBeGreaterThanOrEqual(3);
+    // Not to anyone else; not kept by anything in between; and a name given as nothing is a mistake, not everything.
     expect((await admin("scopes", false)).status).toBe(401);
+    expect((await admin("scopes")).headers.get("cache-control")).toBe("no-store");
+    expect((await admin("scopes?tenant=")).status).toBe(400);
   });
 
-  it("says when it was last told of a scope, told again no more than once an hour", async () => {
+  it("is told of a scope once an hour at most, and again after that", async () => {
     const { name, stub } = brain("chat");
-    await stub.ingest(message("hello", { session_key: "chat" }));
-    const [first] = (await listed()).filter((each) => each.name === name);
-    // An hour and more later, something comes again.
-    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'listed_at'", String(first.noted_at - 2 * 3_600_000)));
+    await comes(stub, "hello");
+    // Told long ago, as far as the registry knows.
+    await runInDurableObject(registry(), (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE scopes SET noted_at = 5, first_at = 5 WHERE name = ?", name));
+    // Within the hour: not told again, however often it wakes.
+    model.replies([say("")]);
+    await stub.ingest(message("again", { session_key: "chat" }));
+    await wake(stub);
+    expect((await of(name))[0].noted_at).toBe(5);
+    // An hour and more since it was last told: told again, and when it was first told stays.
+    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE meta SET value = '1' WHERE key IN ('listed_at', 'listed_tried')"));
+    model.replies([say("")]);
     await stub.ingest(message("later", { session_key: "chat" }));
-    const [again] = (await listed()).filter((each) => each.name === name);
-    expect(again.first_at).toBe(first.first_at);
-    expect(again.noted_at).toBeGreaterThanOrEqual(first.noted_at);
+    await wake(stub);
+    await vi.waitFor(async () => expect((await of(name))[0].noted_at).toBeGreaterThan(5));
+    expect((await of(name))[0].first_at).toBe(5);
+  });
+
+  it("is told at the next waking where telling was cut short, and no sooner than a minute after one that failed", async () => {
+    const { name, stub } = brain("chat");
+    // It tried, and nothing says the registry was told: as after an interruption between the two.
+    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('listed_tried', ?)", String(Date.now()));
+    });
+    model.replies([say("")]);
+    await stub.ingest(message("hello", { session_key: "chat" }));
+    await wake(stub);
+    // Within the minute it is not tried again.
+    expect(await of(name)).toEqual([]);
+    // After it, the next waking tells.
+    await runInDurableObject(stub, (_i: unknown, state: DurableObjectState) => void state.storage.sql.exec("UPDATE meta SET value = '1' WHERE key = 'listed_tried'"));
+    await comes(stub, "again");
+    expect(await of(name)).toHaveLength(1);
   });
 });
