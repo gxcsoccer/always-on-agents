@@ -30,11 +30,12 @@ export interface RemindersHost {
  * named; whether a name means one person is told here, over all of them.
  */
 export type Named = { id: string; name: string };
+// (One with no id is someone the message named who cannot be reminded: kept so that a name they share with another is taken for neither.)
 
 /** What is kept of where and by whom a thing was asked, with a task or a timer, to go by when it comes back. */
 export type Asked = { by: string; named: Named[]; place: string };
 
-const named = (noted: unknown): Named[] => (Array.isArray(noted) ? noted.filter((each): each is Named => typeof each?.id === "string" && each.id !== "" && typeof each?.name === "string") : []);
+const named = (noted: unknown): Named[] => (Array.isArray(noted) ? noted.filter((each): each is Named => typeof each?.id === "string" && typeof each?.name === "string") : []);
 
 /**
  * The place a message is written in or sent to, as the connector addresses it, without what is
@@ -149,7 +150,7 @@ export class Reminders {
     if (!about || about.sessionKey !== here || about.place !== placeOf(target)) return undefined;
     const { by, sessionKey } = about;
     // Named by them: by who they are, always; by the name only where it means one person.
-    const ids = new Set(about.named.map((each) => each.id));
+    const ids = new Set(about.named.flatMap((each) => (each.id === "" ? [] : [each.id])));
     const names = new Map<string, Set<string>>();
     // (Over everyone named in all the messages the request was made in: a name two of them bear, in one message or in two, means neither.)
     for (const each of about.named) if (each.name !== "") names.set(each.name.toLowerCase(), new Set([...(names.get(each.name.toLowerCase()) ?? []), each.id]));
@@ -159,7 +160,7 @@ export class Reminders {
       if (ref === "" || ref.toLowerCase() === "all") return undefined;
       if (ref.toLowerCase() === by.toLowerCase()) return by;
       const meant = names.get(ref.toLowerCase());
-      if (meant?.size === 1) return [...meant][0];
+      if (meant?.size === 1 && !meant.has("")) return [...meant][0];
       const exact = [...ids].find((id) => id.toLowerCase() === ref.toLowerCase());
       if (exact) return exact;
       // (A name is not who someone is: only those the one who asked named are found by a name.)
@@ -179,10 +180,10 @@ export class Reminders {
       // Last, and only where it is nobody by who they are: the name the one who asked wrote for
       // someone, given without the chat's mark before it. The same name, where it means one person.
       const bare = names.get(`@${ref.toLowerCase()}`);
-      return bare?.size === 1 ? [...bare][0] : undefined;
+      return bare?.size === 1 && !bare.has("") ? [...bare][0] : undefined;
     };
     // The name the one who asked wrote for a person, where it means that one person: what the words of a message may name them by.
-    const name = (id: string): string | undefined => about.named.find((each) => each.id === id && each.name !== "" && names.get(each.name.toLowerCase())?.size === 1)?.name;
+    const name = (id: string): string | undefined => (id === "" ? undefined : about.named.find((each) => each.id === id && each.name !== "" && names.get(each.name.toLowerCase())?.size === 1)?.name);
     return { event: about.event, who, name, ...(about.timer ? { timer: about.timer } : {}) };
   }
 

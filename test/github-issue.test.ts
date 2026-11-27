@@ -1579,10 +1579,10 @@ describe("reminding people where several talk", () => {
     const ann = someone();
     const here = ann.at("oc_remind");
     model.replies([call("send_message", { text: "好了，结果在这里。<at user_id=\"all\"></at> <at user_id=\"ou_victim\">x</at>", notify: [ann.openId, "@Carol", "@OtherBot", "ou_stranger", "all"] })], [say("")]);
-    await here.says("做完告诉我和 @_user_2，别管 @_user_3", [colleague, another]);
-    // Who she named is kept of her message as the chat gave it: the person, not the other bot.
+    await here.says("做完告诉我、@_user_2 和 @_user_3", [colleague, another]);
+    // Who she named is kept of her message as the chat gave it: the person, and the other bot she named (never the agent itself).
     const kept = JSON.parse((await rowsOf(here.stub, "SELECT data FROM inbox WHERE kind = 'message' ORDER BY id DESC LIMIT 1"))[0].data);
-    expect(kept.mentioned).toEqual([{ id: "ou_colleague", name: "@Carol" }]);
+    expect(kept.mentioned).toEqual([{ id: "ou_colleague", name: "@Carol" }, { id: "ou_bot_two", name: "@OtherBot" }]);
     // Everyone a message names is kept of it, each with their name, however many: none left out, and no name left off.
     const crowd = Array.from({ length: 600 }, (_, n) => ({ key: `@_user_${n + 10}`, id: { open_id: `ou_p${n}` }, name: n === 0 || n === 599 ? "Li" : `P${n}`, mentioned_type: "user", tenant_key: ORG }));
     const noted = normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_crowd", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...crowd, crowd[5]] } } })!.event.data!.mentioned as { id: string; name: string }[];
@@ -1590,12 +1590,26 @@ describe("reminding people where several talk", () => {
     expect(noted[0]).toEqual({ id: "ou_p0", name: "@Li" });
     expect(noted.at(-1)).toEqual({ id: "ou_p599", name: "@Li" });
     expect(noted[598]).toEqual({ id: "ou_p598", name: "@P598" });
-    // Not someone of another organisation, nor "everyone", whatever the chat lists for it: neither is kept as named.
+    // Not someone of another organisation, nor "everyone", whatever the chat lists for it: the one is kept by the name alone, as nobody to remind; the other not at all.
     const others = [{ key: "@_user_7", id: { open_id: "ou_guest" }, name: "Guest", mentioned_type: "user", tenant_key: "org_other" }, { key: "@_user_8", id: { open_id: "all" }, name: "所有人", mentioned_type: "user", tenant_key: ORG }, { key: "@_user_9", id: { open_id: "ou_unsaid" }, name: "Unsaid", mentioned_type: "user" }];
-    expect(normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_others", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...others] } } })!.event.data!.mentioned).toBeUndefined();
-    expect(toolOutputs()).toEqual([{ ok: true, reminded: 2, not_reminded: 3 }]);
-    // Sent with the two mentions before the words; what the words held of mention markup notifies nobody.
-    expect(last().startsWith(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> 好了，结果在这里。`)).toBe(true);
+    expect(normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_others", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...others] } } })!.event.data!.mentioned).toEqual([{ id: "", name: "@Guest" }, { id: "", name: "@所有人" }, { id: "", name: "@Unsaid" }]);
+    // So with a name the chat shows and says nothing of who it is, in plain words or in words with formatting: kept by the name alone, beside a bot that bears it too.
+    const helper = { key: "@_user_2", id: { open_id: "ou_helper_bot" }, name: "Helper", mentioned_type: "bot" };
+    const agentItself = { key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" };
+    const noted2 = (message: Record<string, unknown>, mentions: unknown[]) => normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: `om_${Math.random()}`, chat_id: "oc_x", chat_type: "group", ...message, mentions } } })!.event.data!.mentioned;
+    expect(noted2({ message_type: "text", content: JSON.stringify({ text: "@_user_1 提醒 @_user_2 别提醒 @_user_3 也别管 @_user_9" }) }, [agentItself, helper, { key: "@_user_3", name: "Helper" }])).toEqual([{ id: "ou_helper_bot", name: "@Helper" }, { id: "", name: "@Helper" }, { id: "", name: "@unknown" }]);
+    expect(noted2({ message_type: "post", content: JSON.stringify({ zh_cn: { content: [[{ tag: "at", user_id: "@_user_1" }, { tag: "text", text: "提醒 " }, { tag: "at", user_id: "@_user_2" }, { tag: "text", text: " 别提醒 " }, { tag: "at", user_id: "ou_nobody_listed", user_name: "Helper" }]] } }) }, [agentItself, helper])).toEqual([{ id: "ou_helper_bot", name: "@Helper" }, { id: "", name: "@Helper" }]);
+    // What is kept is what the words show. A piece the list knows, but by no name: shown by the name the piece carries, and kept under that name, with nobody to remind where it is someone of another organisation.
+    const guestUnnamed = { key: "@_user_3", id: { open_id: "ou_guest" }, mentioned_type: "user", tenant_key: "org_other" };
+    expect(noted2({ message_type: "post", content: JSON.stringify({ zh_cn: { content: [[{ tag: "at", user_id: "@_user_1" }, { tag: "at", user_id: "@_user_2" }, { tag: "text", text: " 别提醒 " }, { tag: "at", user_id: "@_user_3", user_name: "Helper" }]] } }) }, [agentItself, helper, guestUnnamed])).toEqual(expect.arrayContaining([{ id: "ou_helper_bot", name: "@Helper" }, { id: "", name: "@Helper" }]));
+    // One person shown by two names is kept under both: the first is not written over by the second.
+    const twice = [agentItself, { key: "@_user_2", id: { open_id: "ou_helper_bot" }, name: "Helper", mentioned_type: "bot" }, { key: "@_user_3", id: { open_id: "ou_helper_bot" }, name: "Assistant", mentioned_type: "bot" }, { key: "@_user_4", id: { open_id: "ou_colleague" }, name: "Helper", mentioned_type: "user", tenant_key: ORG }];
+    expect(noted2({ message_type: "text", content: JSON.stringify({ text: "@_user_1 @_user_2 @_user_3 @_user_4" }) }, twice)).toEqual([{ id: "ou_helper_bot", name: "@Helper" }, { id: "ou_helper_bot", name: "@Assistant" }, { id: "ou_colleague", name: "@Helper" }]);
+    // Who someone is, to be reminded by, is what the event says in the place it says it: an id given any other way is of nobody to remind.
+    expect(noted2({ message_type: "text", content: JSON.stringify({ text: "@_user_1 @_user_2" }) }, [agentItself, { key: "@_user_2", id: "ou_bare", name: "Bare", mentioned_type: "bot" }])).toEqual([{ id: "", name: "@Bare" }]);
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 3, not_reminded: 2 }]);
+    // Sent with the three mentions before the words; what the words held of mention markup notifies nobody.
+    expect(last().startsWith(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> <at user_id="ou_bot_two"></at> 好了，结果在这里。`)).toBe(true);
     expect(last()).not.toMatch(/<at user_id="all">|<at user_id="ou_victim">/);
     expect(last()).toContain("<\u200bat user_id=\"all\">");
 
