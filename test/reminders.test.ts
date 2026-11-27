@@ -96,6 +96,23 @@ describe("who a message may remind", () => {
     });
   });
 
+  it("takes a name for nobody where someone the message named who cannot be reminded bears it too", async () => {
+    await within(({ message, run, reminders }) => {
+      // Two named by one name: a bot of the chat, and a person of another organisation, who is kept by the name alone.
+      message(ANN, "remind @Helper, not @Helper", { run: "r1", data: { group: true, mentioned: [{ id: "ou_helper_bot", name: "@Helper" }, { id: "", name: "@Helper" }, { id: "", name: "@Guest" }] } });
+      const asked = run("r1");
+      const may = reminders.of(asked, HERE)!;
+      expect(may.who("@Helper")).toBeUndefined();
+      expect(may.who("helper")).toBeUndefined();
+      expect(may.who("@Guest")).toBeUndefined();
+      expect(may.who("guest")).toBeUndefined();
+      expect(may.who("")).toBeUndefined();
+      // By who it is, it is still the one it is; but the words name it by no name of its own.
+      expect(may.who("ou_helper_bot")).toBe("ou_helper_bot");
+      expect(reminders.claimed(asked, ["@Helper", "ou_helper_bot", "@Guest"], HERE)).toEqual({ ids: ["ou_helper_bot"], names: {} });
+    });
+  });
+
   it("finds someone who wrote here long ago, however much has been written since", async () => {
     await within(({ message, run, reminders }) => {
       message(BOB, "an early question of his");

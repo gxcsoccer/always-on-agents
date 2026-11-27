@@ -85,7 +85,7 @@ export const TOOLS: ToolDefinition[] = [
         type: ["array", "null"],
         items: { type: "string" },
         description:
-          "People this message is to remind (they get a notification where the place has such a thing), or null. Each as you see them in this conversation: a person's id, or a name the person who asked wrote with a mention (@name). Only the one who asked for the thing, people they named that way, and people who have written to you here can be reminded; anyone else is left out, and you are told how many were. Writing @name or an id in `text` reminds nobody: it is only text. Remind someone when they asked to be told, or the one who asked wanted them told; not otherwise.",
+          "People this message is to remind (they get a notification where the place has such a thing), or null. Each as you see them in this conversation: a person's id, or a name the person who asked wrote with a mention (@name), which may be another bot of the chat. Only the one who asked for the thing, people they named that way, and people who have written to you here can be reminded; anyone else is left out, and you are told how many were. Writing @name or an id in `text` reminds nobody: it is only text. Remind someone when they asked to be told, or the one who asked wanted them told; not otherwise.",
       },
     },
   ),

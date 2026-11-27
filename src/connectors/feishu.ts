@@ -304,16 +304,16 @@ export function normalize(app: FeishuApp, body: any): { scope: Scope; event: Inb
   // the chat lists, none left out. Whether a name stands for one person is not settled here: it
   // is for whoever goes by this to tell, over all of it (and over the other messages of the same
   // request), and that can only be told while everyone is still there.
+  // Who may be reminded: people of the writer's own organisation, as the writer has to be, and
+  // another bot of the chat (it is there for everyone in the chat to call on, whoever made it).
+  // Never the agent itself, and never "everyone", whatever is listed for that.
+  // Anyone else the message names is kept by the name alone, with no id: nobody to remind, but
+  // the name then stands for more than one of those named, and is taken for neither.
+  const someone = (each: any) => typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all";
+  const remindable = (each: any) => (each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot";
   const mentioned = [
     ...new Map(
-      mentions
-        // (People of the writer's own organisation, as the writer has to be; and never "everyone", whatever is listed for that.
-        // Those left out are not seen by whoever tells what a name means: a name one of them shares with someone kept is taken
-        // for that one's alone. It can only ever reach the one kept, whom the writer did name.)
-        // (And another bot of the chat the writer named: it is there for everyone in the chat to call on, whoever made it, so
-        // it is not held to the writer's organisation. Never the agent itself.)
-        .filter((each: any) => typeof each?.id?.open_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(each.id.open_id) && each.id.open_id !== app.bot_open_id && each.id.open_id.toLowerCase() !== "all" && ((each.mentioned_type === "user" && each.tenant_key === sender.tenant_key) || each.mentioned_type === "bot"))
-        .map((each: any) => [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }]),
+      mentions.filter(someone).map((each: any) => (remindable(each) ? [each.id.open_id as string, { id: each.id.open_id as string, name: token(each.name) }] : [`(${token(each.name)})`, { id: "", name: token(each.name) }]) as [string, { id: string; name: string }]),
     ).values(),
   ];
 

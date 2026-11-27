@@ -1579,7 +1579,7 @@ describe("reminding people where several talk", () => {
     const ann = someone();
     const here = ann.at("oc_remind");
     model.replies([call("send_message", { text: "好了，结果在这里。<at user_id=\"all\"></at> <at user_id=\"ou_victim\">x</at>", notify: [ann.openId, "@Carol", "@OtherBot", "ou_stranger", "all"] })], [say("")]);
-    await here.says("做完告诉我和 @_user_2，别管 @_user_3", [colleague, another]);
+    await here.says("做完告诉我、@_user_2 和 @_user_3", [colleague, another]);
     // Who she named is kept of her message as the chat gave it: the person, and the other bot she named (never the agent itself).
     const kept = JSON.parse((await rowsOf(here.stub, "SELECT data FROM inbox WHERE kind = 'message' ORDER BY id DESC LIMIT 1"))[0].data);
     expect(kept.mentioned).toEqual([{ id: "ou_colleague", name: "@Carol" }, { id: "ou_bot_two", name: "@OtherBot" }]);
@@ -1590,9 +1590,9 @@ describe("reminding people where several talk", () => {
     expect(noted[0]).toEqual({ id: "ou_p0", name: "@Li" });
     expect(noted.at(-1)).toEqual({ id: "ou_p599", name: "@Li" });
     expect(noted[598]).toEqual({ id: "ou_p598", name: "@P598" });
-    // Not someone of another organisation, nor "everyone", whatever the chat lists for it: neither is kept as named.
+    // Not someone of another organisation, nor "everyone", whatever the chat lists for it: the one is kept by the name alone, as nobody to remind; the other not at all.
     const others = [{ key: "@_user_7", id: { open_id: "ou_guest" }, name: "Guest", mentioned_type: "user", tenant_key: "org_other" }, { key: "@_user_8", id: { open_id: "all" }, name: "所有人", mentioned_type: "user", tenant_key: ORG }, { key: "@_user_9", id: { open_id: "ou_unsaid" }, name: "Unsaid", mentioned_type: "user" }];
-    expect(normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_others", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...others] } } })!.event.data!.mentioned).toBeUndefined();
+    expect(normalize(APP, { schema: "2.0", header: { event_type: "im.message.receive_v1", tenant_key: ORG, app_id: CHAT_APP }, event: { sender: { sender_type: "user", tenant_key: ORG, sender_id: { open_id: "ou_x" } }, message: { message_id: "om_others", chat_id: "oc_x", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "@_user_1 hi" }), mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "Agent", mentioned_type: "bot" }, ...others] } } })!.event.data!.mentioned).toEqual([{ id: "", name: "@Guest" }, { id: "", name: "@Unsaid" }]);
     expect(toolOutputs()).toEqual([{ ok: true, reminded: 3, not_reminded: 2 }]);
     // Sent with the three mentions before the words; what the words held of mention markup notifies nobody.
     expect(last().startsWith(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at> <at user_id="ou_bot_two"></at> 好了，结果在这里。`)).toBe(true);
