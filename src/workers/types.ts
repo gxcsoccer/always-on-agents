@@ -13,11 +13,18 @@ import type { Env } from "../env";
 import type { Scope } from "../events";
 import type { QuestionFate } from "./result";
 
-/** What a host knows of the one person a run acts for, for a worker that looks at work before it is written. */
+/**
+ * What a host knows of the one person a run acts for, for a worker that looks at work before it is
+ * written. A run acts for one person in their own conversation and also where several people talk:
+ * that there is an actor says nothing of where. Where it is, is told by the scope, the conversation
+ * and `shared`.
+ */
 export interface Actor {
   person: string;
   connector: string;
   origin: Record<string, string>;
+  /** Set where they asked in a conversation several people share. */
+  shared?: true;
   /** What they wrote in the messages this was asked in, and shortly before: each with the message it is of. */
   said: { ref: number; text: string }[];
   recent: { ref: number; text: string }[];

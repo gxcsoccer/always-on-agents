@@ -720,9 +720,16 @@ describe("tasks, by themselves", () => {
         const make = (call: string, brief = "b", where = "acme/app") => tasks.dispatch(RUN, SESSION_KEY, call, "careful", "t", brief, { where }) as Promise<{ task_id: string }>;
 
         // What is not something that can be kept is not a binding: said, and nothing is written. Never taken for work as ever.
-        for (const record of [undefined, null, "leave", 3, ["a"]]) {
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        for (const record of [undefined, null, "leave", 3, ["a"], circular, { n: 1n }, { toJSON: () => "words" }, { toJSON: () => undefined }]) {
           answer = { kind: "bound", record };
-          await expect(make(`call_bad_${String(record)}`)).rejects.toThrow("the worker could not say what this work is allowed; nothing was started");
+          await expect(make(`call_bad_${Math.random()}`)).rejects.toThrow("the worker could not say what this work is allowed; nothing was started");
+        }
+        // Nor is anything but one of the three answers an answer: never taken for work as ever.
+        for (const said of [undefined, null, {}, { kind: "fine" }, { kind: "refused" }, { kind: "refused", reason: "" }]) {
+          answer = said;
+          await expect(make(`call_odd_${Math.random()}`)).rejects.toThrow("the worker could not say what this work is allowed; nothing was started");
         }
         expect(store.rows("SELECT 1 FROM tasks")).toEqual([]);
         expect(slots.acquired).toEqual([]);
@@ -740,9 +747,15 @@ describe("tasks, by themselves", () => {
 
         // Bound, and its start not heard of: the call made again, with other words and another place, is the work as it was bound.
         const first = await make("call_fixed");
+        // (As where the word that it had started never came back: still to be started.)
+        store.sql.exec("UPDATE tasks SET status = 'dispatching' WHERE id = ?", first.task_id);
         const again = await tasks.dispatch(RUN, SESSION_KEY, "call_fixed", "careful", "t", "another brief", { where: "acme/other" });
         expect((again as { task_id: string }).task_id).toBe(first.task_id);
-        expect(started.filter((each) => each.id === first.task_id).every((each) => each.brief === "b" && each.options.where === "acme/app" && each.by === "alice")).toBe(true);
+        // Started a second time, and each time as the very same work.
+        const starts = started.filter((each) => each.id === first.task_id);
+        expect(starts).toHaveLength(2);
+        expect(starts[1]).toEqual(starts[0]);
+        expect(starts[0]).toEqual({ id: first.task_id, lend: { v: 1 }, by: "alice", brief: "b", options: { where: "acme/app" } });
         // Made again for someone else, it is not their call, however far it has got: they are not told how it stands, and nothing further is started.
         expect(store.rows<{ status: string }>("SELECT status FROM tasks WHERE id = ?", first.task_id)[0].status).toBe("running");
         settings.deciders = [{ kind: "human", id: "bob", explicit: true }];
@@ -753,6 +766,25 @@ describe("tasks, by themselves", () => {
         expect(started).toHaveLength(before);
         store.sql.exec("UPDATE tasks SET status = 'running' WHERE id = ?", first.task_id);
         settings.deciders = [{ kind: "human", id: "alice", explicit: true }];
+
+        // One put behind another that has not ended is started later, by itself, when its turn comes: as the work it was bound as.
+        careful.goes_on = true;
+        answer = { kind: "bound", record: { v: 1, leave: "ahead" } };
+        const ahead = await make("call_ahead");
+        answer = { kind: "bound", record: { v: 1, leave: "behind" } };
+        const behind = (await tasks.dispatch(RUN, SESSION_KEY, "call_behind", "careful", "t", "then this", { where: "acme/app" }, ahead.task_id)) as { task_id: string; status: string };
+        expect(started.some((each) => each.id === behind.task_id)).toBe(false);
+        await tasks.event(ahead.task_id, 1, "result", { text: "done" });
+        await tasks.settle();
+        expect(started.filter((each) => each.id === behind.task_id)).toEqual([{ id: behind.task_id, lend: { v: 1, leave: "behind" }, by: "alice", brief: "then this", options: { where: "acme/app" } }]);
+        // What it goes on from has to be the asker's own before the worker is asked anything of it: said at once, and the worker is not asked.
+        let asked = 0;
+        const counting = careful.prepareStart!;
+        careful.prepareStart = async (...args) => (asked++, counting(...args));
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_stray", "careful", "t", "b", { where: "acme/app" }, "no-such-work")).rejects.toThrow("there is no piece of work");
+        expect(asked).toBe(0);
+        careful.prepareStart = counting;
+        answer = { kind: "bound", record: { v: 1 } };
 
         // The look of one making fails after another making of the same call has been written: it is that task, not a failure.
         let fail!: () => void;

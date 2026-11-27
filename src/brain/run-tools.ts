@@ -528,13 +528,14 @@ export class RunTools {
         // wrote, each with the message it is of. Never whoever a task's end or a timer stands for,
         // nor anything the model said: only the run's own acting, decided from what is stored.
         // (Put together only for a worker that looks: no other is told any of it.)
-        const looks = this.#b.workers().find((each) => each.name === name)?.prepareStart !== undefined;
+        const looks = acting !== undefined && worker.prepareStart !== undefined;
         const basis = looks ? this.#b.requests.basis(run.id) : [];
         const actor = acting && looks
           ? {
               person: acting.person,
               connector: acting.connector,
               origin: acting.origin,
+              ...(acting.shared ? { shared: true as const } : {}),
               said: acting.said.flatMap((each, at) => (basis[at] ? [{ ref: basis[at].id, text: each.text }] : [])),
               recent: acting.recent.flatMap((each, at) => (acting.recentIds[at] !== undefined ? [{ ref: acting.recentIds[at], text: each.text }] : [])),
             }
