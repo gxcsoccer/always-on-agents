@@ -21,7 +21,7 @@ import {
 import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../../env";
-import { fromTheirs, githubTokenFor } from "../../connectors/github-app";
+import { fromTheirs, githubTokenFor, lendsTo } from "../../connectors/github-app";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
 import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
@@ -108,6 +108,8 @@ export interface TaskState {
   /** Counts approval requests, so each gets its own id. */
   asks: number;
   brain?: string;
+  /** The one person established to have asked for this task, where there is one: what a connector decides lending by, and nothing else. */
+  requested_by?: string;
   model_calls: number;
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
@@ -184,6 +186,8 @@ export interface TaskState {
 export interface StartInput {
   /** Scope name of the Brain to report to. Without it the task runs but reports to nobody. */
   brain?: string;
+  /** The one person the Brain established asked for this, where there is one. */
+  requested_by?: string;
   id: string;
   prompt?: string;
   repository?: string;
@@ -417,6 +421,7 @@ export class TaskSandbox extends DurableObject<Env> {
       grants: {},
       asks: 0,
       brain: input.brain,
+      ...(input.requested_by ? { requested_by: input.requested_by } : {}),
       model_calls: 0,
       starting_since: t0,
       out: [],
@@ -828,11 +833,10 @@ export class TaskSandbox extends DurableObject<Env> {
     if (!ACTIVE.has(state.phase) && state.phase !== "starting") return undefined;
     // A task with no Brain is a development probe; it gets the development token or nothing.
     if (!state.brain) return this.env.GITHUB_APP_ID || this.env.GITHUB_APP_PRIVATE_KEY || to !== "write" ? undefined : this.env.GITHUB_TOKEN || undefined;
-    const [tenant, kind, ...rest] = state.brain.split(":");
-    // Lent in the repository's own conversation, or in a group chat an operator has linked to this
-    // very repository. Looked up each time, so removing the link stops the lending at once.
-    // (One that is allowed nothing is lent to any task of the tenant's, for its repository.)
-    const entitled = async () => to === "public" || (kind === "repo" && rest.join(":").toLowerCase() === repo) || (kind === "chat" && (await registry(this.env).chatRepo(tenant, rest.join(":"))) === repo);
+    const [tenant] = state.brain.split(":");
+    // Whether it is lent one is the connector's to say, each time it is asked.
+    const task = { scope: state.brain, ...(state.requested_by ? { by: state.requested_by } : {}) };
+    const entitled = () => lendsTo(this.env, task, repo, to);
     if (!(await entitled())) return undefined;
     // Looking the link up took a moment; the task may have ended meanwhile.
     const still = this.#state();

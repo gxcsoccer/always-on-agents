@@ -71,6 +71,29 @@ export async function fromTheirs(source: string, installation: string | undefine
   return (await tenantOf(installation)) === tenant;
 }
 
+/**
+ * Whether a task is lent a credential of the tenant's for a repository: decided here, by the
+ * connector that issues it, from where the task was started (the scope name of its Brain) and,
+ * where one person is established to have asked for it, who.
+ *
+ * Lent in the repository's own conversation (which exists only because GitHub delivered a signed
+ * event for it under this tenant's installation), or in a group chat an operator has linked to
+ * this very repository. A task started anywhere else can name any repository, so it is lent none
+ * and reads only what is public: being in a tenant is not having access to all of its code. One
+ * that is allowed nothing ("public") is lent to any task of the tenant's.
+ *
+ * Looked up each time it is asked, so removing a chat's link stops the lending at once.
+ * (Who asked changes nothing yet: it is what a person's own authorisation will be lent by.)
+ */
+/** (`repo`: "owner/name" in lower case, as a task names its repository.) */
+export async function lendsTo(env: Env, task: { scope: string; by?: string }, repo: string, to: "write" | "read" | "public"): Promise<boolean> {
+  if (to === "public") return true;
+  const [tenant, kind, ...rest] = task.scope.split(":");
+  const id = rest.join(":");
+  if (kind === "repo") return id.toLowerCase() === repo;
+  return kind === "chat" && (await registry(env).chatRepo(tenant, id)) === repo;
+}
+
 /** The App's own identity: a JWT signed with its private key, valid for a few minutes. */
 export async function appJwt(appId: string, privateKeyPem: string, now = Date.now()): Promise<string> {
   const key = await crypto.subtle.importKey("pkcs8", pemToPkcs8(privateKeyPem).buffer as ArrayBuffer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
