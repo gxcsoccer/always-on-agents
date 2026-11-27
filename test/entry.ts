@@ -88,9 +88,6 @@ export class FakeTask extends DurableObject {
     this.ctx.storage.kv.put("token_asks", asked);
     const limit = (this.#policy() as { tokenWithdrawnAfter?: number }).tokenWithdrawnAfter;
     if (limit !== undefined && asked > limit) return undefined;
-    // (Or have another one issued after it has been asked for a number of times: what goes out is the one asked for last.)
-    const later = (this.#policy() as { tokenLater?: { after: number; token: string } }).tokenLater;
-    if (later && asked > later.after) return later.token;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
   }
   async tokenAsks() {

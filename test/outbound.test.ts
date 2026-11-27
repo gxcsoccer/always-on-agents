@@ -220,7 +220,7 @@ describe("git over the proxy", () => {
 
   it("does not send an approved push if the task's access to the repository was withdrawn while it waited", async () => {
     // The credential is there when the push arrives, and gone by the time someone approves it.
-    const { send } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "pending", reason: "" }, { state: "allow", reason: "ok" }], tokenWithdrawnAfter: 1 });
+    const { send } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "pending", reason: "" }, { state: "allow", reason: "ok" }], tokenWithdrawnAfter: 0 });
     const response = await push(send, "acme/demo", pushBody(`${A} ${B} refs/heads/main`));
     expect(response.status).toBe(403);
     expect(await response.text()).toMatch(/no longer allowed a credential/);
@@ -228,7 +228,7 @@ describe("git over the proxy", () => {
   });
 
   it("does not send even a push that moves nothing once the task's access was withdrawn", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", tokenWithdrawnAfter: 1 });
+    const { send } = await proxyFor({ repository: "acme/demo", tokenWithdrawnAfter: 0 });
     const response = await push(send, "acme/demo", new TextEncoder().encode("0000"));
     expect(response.status).toBe(403);
     expect(forwarded).toHaveLength(0);
@@ -250,10 +250,23 @@ describe("git over the proxy", () => {
     expect(forwarded[0].headers.get("authorization")).toContain("Basic ");
   });
 
-  it("sends an approved push under the credential asked for once it was approved, not the one it had at the door", async () => {
-    const { send } = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "allow", reason: "ok" }], tokenLater: { after: 1, token: "issued-since" } });
-    expect((await push(send)).status).toBe(200);
-    expect(forwarded.map((each) => each.headers.get("authorization"))).toEqual([`Basic ${btoa("x-access-token:issued-since")}`]);
+  it("asks for the credential a push goes out under only once the push is about to be sent: never for one that is refused, cannot be read, or is too large", async () => {
+    const approved = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "allow", reason: "ok" }] });
+    expect((await push(approved.send)).status).toBe(200);
+    expect(await approved.pushAsks()).toBe(1);
+    const denied = await proxyFor({ repository: "acme/demo", verdicts: [{ state: "deny", reason: "no" }] });
+    expect((await push(denied.send)).status).toBe(403);
+    expect(await denied.pushAsks()).toBe(0);
+    const unread = await proxyFor({ repository: "acme/demo" });
+    expect((await push(unread.send, "acme/demo", "not a push")).status).toBe(403);
+    expect(await unread.pushAsks()).toBe(0);
+  });
+
+  it("sends nothing for a task that ended while a credential was asked for, when git reads or asks what the remote has", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", ended: true });
+    expect((await send(advert)).status).toBe(403);
+    expect((await send("https://github.com/acme/demo.git/info/refs?service=git-receive-pack")).status).toBe(403);
+    expect(forwarded).toHaveLength(0);
   });
 
   it("gives two identical pushes two separate questions", async () => {
