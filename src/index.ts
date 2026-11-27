@@ -82,6 +82,12 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     return json({ ok: true });
   }
 
+  // Which scopes there are: each says so of itself when something comes to it (see Registry.noteScope).
+  if (path[0] === "scopes" && path.length === 1 && method === "GET") {
+    const tenant = url.searchParams.get("tenant") ?? undefined;
+    const kind = url.searchParams.get("kind") ?? undefined;
+    return json({ scopes: await registry(env).scopes({ ...(tenant ? { tenant } : {}), ...(kind ? { kind } : {}) }) });
+  }
   if (path[0] === "scopes" && path[1]) {
     const brain = env.BRAIN.getByName(decodeURIComponent(path[1]));
     if (path.length === 2 && method === "GET") return json(await brain.inspect());
