@@ -424,6 +424,8 @@ export class RunTools {
       readHistory: (ask) => {
         // Decided where it is carried out, as for any tool a run may not have: not by what was offered.
         if (!readsHistory(this.#s.scope(), String(session?.session_key ?? ""))) throw new Error('there is no tool "read_history" in this run');
+        // (Noted, so that what it gave is found again and let go: see Runner.)
+        this.#s.setMeta(`history:${run.id}`, "1");
         return this.#b.history.read(run, ask);
       },
       memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),

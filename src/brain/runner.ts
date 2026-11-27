@@ -475,6 +475,10 @@ export class Runner {
   async execute(runId: string): Promise<void> {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
+    // Taken up again after an interruption: what it had read of the conversation's record is not
+    // given to the model a second time as it stood then. It reads again, and is given what stands now.
+    // (Whatever it read, it read in an earlier entry: nothing of this one has happened yet.)
+    this.#forgetRead(entered);
     // A tool ended the matter itself: that is how the run ends, however often it was entered.
     if (entered.closed === "settled") {
       const run = this.#stillActive(runId);
@@ -810,7 +814,7 @@ export class Runner {
         // With whom it was to remind: a draft that is dropped reminds nobody.
         this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
       }
-      this.#forgetRead(run);
+      this.#forgetRead(run, true);
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
@@ -1033,8 +1037,11 @@ export class Runner {
    * a fixed note stands in its place. A message taken back afterwards is then not shown again
    * from an old answer; a later run that needs it reads again, and is given what stands then.
    */
-  #forgetRead(run: RunRow): void {
-    const items = this.#s.rows<{ seq: number; item: string }>("SELECT seq, item FROM items WHERE run_id = ? AND is_user = 0 AND (item LIKE '%read_history%' OR item LIKE '%function_call_output%')", run.id).map((each) => ({ seq: each.seq, item: JSON.parse(each.item) as Item }));
+  #forgetRead(run: RunRow, ended = false): void {
+    // Only a run that read it has anything to look for.
+    if (this.#s.meta(`history:${run.id}`) === undefined) return;
+    if (ended) this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `history:${run.id}`);
+    const items = this.#s.rows<{ seq: number; item: string }>("SELECT seq, item FROM items WHERE session_id = ? AND run_id = ? AND is_user = 0 AND (item LIKE '%read_history%' OR item LIKE '%function_call_output%')", run.session_id, run.id).map((each) => ({ seq: each.seq, item: JSON.parse(each.item) as Item }));
     const calls = new Set(items.filter((each) => each.item.type === "function_call" && each.item.name === "read_history").map((each) => String(each.item.call_id)));
     for (const each of items) {
       if (each.item.type !== "function_call_output" || !calls.has(String(each.item.call_id))) continue;

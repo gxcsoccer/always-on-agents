@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { HISTORY_KEPT_MS, History, MAX_HISTORY, MAX_HISTORY_TEXT } from "../src/brain/history";
 import { BrainStore, type RunRow } from "../src/brain/store";
 import { privateSessionKey } from "../src/events";
+import { DEFAULT_LIMITS } from "../src/limits";
 import { brain, call, installFakeModel, message, model, modelCalls, say, wake } from "./helpers";
 
 let scopes = 0;
@@ -95,10 +96,14 @@ describe("reading further back in a conversation", () => {
   });
 
   it("gives of the agent's words only those known to have gone to this very conversation", async () => {
-    await within(({ answered, read }) => {
+    await within(({ answered, read, store }) => {
       answered("went here", DAY);
       answered("went to the scope's last known place instead", DAY, "private:ann", AT("oc_elsewhere", "om_1"));
       answered("the row it was sent by is no longer kept", DAY, "private:ann", null);
+      // One known here to have been taken back since, by what its channel calls it.
+      const back = answered("taken back since", DAY);
+      store.sql.exec("UPDATE said SET receipt_subject = 'feishu:message:om_back' WHERE outbox_id = ?", back);
+      store.sql.exec("INSERT INTO revisions (subject, revision, deleted, holder) VALUES ('feishu:message:om_back', 1, 1, '')");
       expect(read().messages.map((each) => each.text)).toEqual(["went here"]);
     });
   });
@@ -189,6 +194,37 @@ describe("the tool that reads further back", () => {
     const later = modelCalls.at(-1).input.find((each: any) => each.type === "function_call_output" && each.call_id === "look").output;
     expect(later).not.toContain("The launch is on Friday.");
     expect(JSON.parse(later)).toEqual({ note: "What this gave is not kept after the run it was read in. Read again if it is needed." });
+  });
+
+  it("does not give a run that is taken up again, after an interruption, what it had read before: it reads again", async () => {
+    const { stub } = brain();
+    model.replies([say("")]);
+    await stub.ingest(message("the code is 4711", { session_key: PRIVATE }));
+    await wake(stub);
+    modelCalls.length = 0;
+    // The model's answer after the reading never comes: the run is interrupted there, and entered again.
+    // It reads, and is then held up before the model is asked again: the day's allowance runs out with that first call.
+    model.replies([call("read_history", { query: "code", from: null, before: null, limit: null }, "look")]);
+    await stub.ingest(message("what was the code?", { session_key: PRIVATE }));
+    const day = `tokens:${new Date().toISOString().slice(0, 10)}`;
+    await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => void state.storage.sql.exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", day, String(DEFAULT_LIMITS.scope_daily_tokens - 10)));
+    await wake(stub);
+    expect(modelCalls).toHaveLength(1);
+    expect((await stub.inspect()).active_run.retry_at).toBeGreaterThan(Date.now());
+    const kept = await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
+      const items = [...state.storage.sql.exec("SELECT item FROM items WHERE item LIKE '%function_call_output%'")].map((each) => String(each.item));
+      // Entered again, once there is allowance again.
+      state.storage.sql.exec("UPDATE meta SET value = '0' WHERE key = ?", day);
+      state.storage.sql.exec("UPDATE runs SET retry_at = NULL");
+      return items;
+    });
+    // (Until then it was kept as it was given: the run was at work with it.)
+    expect(kept.join()).toContain("the code is 4711");
+    model.replies([say("")]);
+    await wake(stub);
+    expect(modelCalls).toHaveLength(2);
+    const output = modelCalls[1].input.find((each: any) => each.type === "function_call_output" && each.call_id === "look").output;
+    expect(JSON.parse(output)).toEqual({ note: "What this gave is not kept after the run it was read in. Read again if it is needed." });
   });
 
   it("is not there for a conversation named as a private one in a place several people share", async () => {
