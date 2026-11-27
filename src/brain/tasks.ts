@@ -276,8 +276,11 @@ export class Tasks implements Wakes {
         this.#s.sql.exec("INSERT OR IGNORE INTO task_bounds (task_id, bounds) VALUES (?, ?)", id, JSON.stringify({ lifetime_ms: this.#limits().task_minutes * 60_000, model_calls: this.#limits().task_model_calls }));
         workIs(this.#s, { id, worker: WORKER, sessionKey, person: requestedBy }, "open");
         // Who asked for it, whom they named in asking, and where: they may be reminded there when it has ended.
-        const asked = requestedBy !== null ? this.#b.askedIn(run.id) : undefined;
-        if (asked && asked.by === requestedBy) this.#s.sql.exec("INSERT OR IGNORE INTO task_asked (task_id, asked) VALUES (?, ?)", id, JSON.stringify(asked));
+        // (Kept apart from who the task is credited to. Handed over in a run a person's words started, it is that
+        // person's or nobody's. Handed over in a run that a timer's firing or a task's end started, nobody wrote and it is
+        // credited to nobody, as before; who is told at its end is still whoever asked for the thing it is a step of.)
+        const asked = askers.length <= 1 ? this.#b.askedIn(run.id) : undefined;
+        if (asked && (askers.length === 0 || asked.by === requestedBy)) this.#s.sql.exec("INSERT OR IGNORE INTO task_asked (task_id, asked) VALUES (?, ?)", id, JSON.stringify(asked));
         // What the person's request said was to be done for them after it, and the messages it
         // was made in: kept with the task from the start, under the run that hands it over.
         // What it works on: what it was given, or, going on from another, what that one worked on.

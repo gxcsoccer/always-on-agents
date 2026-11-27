@@ -1683,6 +1683,67 @@ describe("reminding people where several talk", () => {
     expect(await rowsOf(here.stub, "SELECT status FROM timers")).toEqual([{ status: "done" }]);
   });
 
+  it("reminds the one who asked at the end of something done in several steps, each a timer set when the one before it fired", async () => {
+    const ann = someone();
+    const here = ann.at("oc_steps");
+    const step = (text: string, more: boolean, notify: string[] | null = null) => [call("send_message", { text, notify }), ...(more ? [call("set_timer", { delay_seconds: 60, note: "下一个数", repeat_every_seconds: null, stop_after_reminding: null })] : [])];
+    const fire = async () => {
+      await rowsOf(here.stub, "UPDATE timers SET due_at = ? WHERE status = 'active'", Date.now() - 1);
+      await rest(here.stub);
+    };
+    model.replies(step("1", true), [say("")]);
+    await here.says("从 1 数到 4，数完提醒我");
+    for (const n of [2, 3]) {
+      model.replies(step(String(n), true), [say("")]);
+      await fire();
+      expect(last()).toBe(String(n));
+    }
+    model.replies(step("4，数完啦。", false, [ann.openId]), [say("")]);
+    await fire();
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 4，数完啦。`);
+  });
+
+  it("reminds the one who asked at the end of work handed over along the way: when a timer of theirs fired, and when work of theirs ended", async () => {
+    const ann = someone();
+    const here = ann.at("oc_steps_work");
+    const handOver = (title: string) => call("hand_over", { worker: "sandbox", title, brief: "看看构建。", continue_from: null, repository: `https://github.com/${PUBLIC}`, then: null });
+    const keptWith = async (id: string) => (await rowsOf(here.stub, "SELECT t.requested_by, a.asked FROM tasks t LEFT JOIN task_asked a ON a.task_id = t.id WHERE t.id = ?", id))[0];
+
+    // She asks; a timer is set; when it fires, the work is handed over; when that ends, she is told.
+    model.replies([call("set_timer", { delay_seconds: 60, note: "到点去查", repeat_every_seconds: null, stop_after_reminding: null })], [say("")]);
+    await here.says("一分钟后查一下构建，查完提醒我");
+    model.replies([handOver("到点查")], [say("")]);
+    await rowsOf(here.stub, "UPDATE timers SET due_at = ? WHERE status = 'active'", Date.now() - 1);
+    await rest(here.stub);
+    const later = toolOutputs()[0].work_id as string;
+    // Nobody wrote in the run that handed it over: it is credited to nobody, as before, and who is told at its end is kept all the same.
+    expect(await keptWith(later)).toMatchObject({ requested_by: null });
+    expect(JSON.parse((await keptWith(later)).asked)).toMatchObject({ by: ann.openId });
+    model.replies([call("send_message", { text: "到点查完了。", notify: [ann.openId] })], [say("")]);
+    await here.stub.taskEvent(later, 1, "result", { text: "构建通过。" });
+    await rest(here.stub);
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 到点查完了。`);
+
+    // She asks for work; when it ends, more work is handed over; when that ends, she is told.
+    model.replies([handOver("第一步")], [say("")]);
+    await here.says("先查构建，再查测试，都完了提醒我");
+    const first = toolOutputs()[0].work_id as string;
+    model.replies([handOver("第二步")], [say("")]);
+    await here.stub.taskEvent(first, 1, "result", { text: "构建通过。" });
+    await rest(here.stub);
+    const second = toolOutputs()[0].work_id as string;
+    expect(second).not.toBe(first);
+    expect(await keptWith(second)).toMatchObject({ requested_by: null });
+    expect(JSON.parse((await keptWith(second)).asked)).toMatchObject({ by: ann.openId });
+    model.replies([call("send_message", { text: "两步都完了。", notify: [ann.openId] })], [say("")]);
+    await here.stub.taskEvent(second, 1, "result", { text: "测试通过。" });
+    await rest(here.stub);
+    expect(toolOutputs()).toEqual([{ ok: true, reminded: 1, not_reminded: 0 }]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> 两步都完了。`);
+  });
+
   it("reminds the one who set a timer long ago when it fires at last, however late, and nobody once it was called off", async () => {
     const ann = someone();
     const here = ann.at("oc_timer_old");
