@@ -12,7 +12,8 @@ import type { ConnectorTool, Quoted } from "../connectors";
 import type { Picture, PictureRef } from "../connectors/types";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
-import { type ChainLevel, type Principal, type Target, chainLevels, isPrivateSession, privateSessionKey } from "../events";
+import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
+import { HISTORY_NOT_KEPT, readsHistory } from "./history";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
@@ -809,6 +810,7 @@ export class Runner {
         // With whom it was to remind: a draft that is dropped reminds nobody.
         this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
       }
+      this.#forgetRead(run);
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
@@ -1024,6 +1026,20 @@ export class Runner {
     for (const each of rows) if (each.user && (each.item as { _carried?: boolean })._carried === true) this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND seq = ?", run.id, each.seq);
     // Cleared as a run that read outside text is: marked, and left to that.
     this.#s.sql.exec("UPDATE items SET outside = 1 WHERE run_id = ? AND is_user = 0 AND outside = 0", run.id);
+  }
+
+  /**
+   * What a reading of the conversation's record gave a run is the run's alone: once it has ended,
+   * a fixed note stands in its place. A message taken back afterwards is then not shown again
+   * from an old answer; a later run that needs it reads again, and is given what stands then.
+   */
+  #forgetRead(run: RunRow): void {
+    const items = this.#s.rows<{ seq: number; item: string }>("SELECT seq, item FROM items WHERE run_id = ? AND is_user = 0 AND (item LIKE '%read_history%' OR item LIKE '%function_call_output%')", run.id).map((each) => ({ seq: each.seq, item: JSON.parse(each.item) as Item }));
+    const calls = new Set(items.filter((each) => each.item.type === "function_call" && each.item.name === "read_history").map((each) => String(each.item.call_id)));
+    for (const each of items) {
+      if (each.item.type !== "function_call_output" || !calls.has(String(each.item.call_id))) continue;
+      this.#s.sql.exec("UPDATE items SET item = ? WHERE session_id = ? AND seq = ?", JSON.stringify({ ...each.item, output: JSON.stringify(HISTORY_NOT_KEPT) }), run.session_id, each.seq);
+    }
   }
 
   #forgetOutside(run: RunRow, read: { args: string }[] = []): void {
@@ -1311,7 +1327,7 @@ export class Runner {
     const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined, follows ? thenable(acting, this.#b.toolsOf) : [], means);
     // In a person's own conversation, what stands further back in it can be read: everything there is theirs.
     // (Where several people talk, what one person had read for them is in what was said there: see docs/design/history-on-demand.zh-CN.md.)
-    const own = [...TOOLS, ...(isPrivateSession(this.#sessionKeyOf(runId)) ? [READ_HISTORY] : []), ...handing];
+    const own = [...TOOLS, ...(readsHistory(this.#s.scope(), this.#sessionKeyOf(runId)) ? [READ_HISTORY] : []), ...handing];
     // (What a hand-over may name as to follow it: what the run may do in the person's name itself.)
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     // The run a task's result starts acts for nobody. Where the person's request said, when it

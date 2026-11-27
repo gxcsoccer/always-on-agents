@@ -15,12 +15,14 @@ let scopes = 0;
 const ANN = "ou_ann";
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 10, 27, 12);
+/** Where a conversation is answered, as a connector addresses it: the chat, and the message answered. */
+const AT = (chat: string, message: string) => JSON.stringify({ connector: "feishu", address: { chat_id: chat, message_id: message } });
 
 function bench(state: DurableObjectState) {
   const store = new BrainStore(state);
   let made = 0;
   const session = (key: string) => {
-    store.sql.exec("INSERT OR IGNORE INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, '{}', 1, 1)", `s:${key}`, key);
+    store.sql.exec("INSERT OR IGNORE INTO sessions (id, session_key, target, created_at, updated_at) VALUES (?, ?, ?, 1, 1)", `s:${key}`, key, AT(key, "om_latest"));
     return `s:${key}`;
   };
   /** A person's message, taken up and done with, some time ago. */
@@ -37,9 +39,11 @@ function bench(state: DurableObjectState) {
       NOW - ago,
     )[0].id;
   /** Words of the agent's own that reached the conversation, some time ago. */
-  const answered = (text: string, ago: number, key = "private:ann"): number => {
+  const answered = (text: string, ago: number, key = "private:ann", to: string | null = AT(key, `om_${made}`)): number => {
     const id = ++made + 1_000;
     store.sql.exec("INSERT INTO said (outbox_id, run_id, session_id, text, sent_at, reads) VALUES (?, 'earlier', ?, ?, ?, '[]')", id, session(key), text, NOW - ago);
+    // The row it was sent by, with where it really went; none where that is no longer kept.
+    if (to !== null) store.sql.exec("INSERT INTO outbox (id, idem, run_id, target, text, status, next_at, created_at) VALUES (?, ?, 'earlier', ?, '', 'sent', 1, 1)", id, `msg:${id}`, to);
     return id;
   };
   const run = (key = "private:ann"): RunRow => {
@@ -87,6 +91,15 @@ describe("reading further back in a conversation", () => {
       gone.add(wrote("edited or taken back since", DAY));
       wrote("the one thing there is", DAY);
       expect(read().messages.map((each) => each.text)).toEqual(["the one thing there is"]);
+    });
+  });
+
+  it("gives of the agent's words only those known to have gone to this very conversation", async () => {
+    await within(({ answered, read }) => {
+      answered("went here", DAY);
+      answered("went to the scope's last known place instead", DAY, "private:ann", AT("oc_elsewhere", "om_1"));
+      answered("the row it was sent by is no longer kept", DAY, "private:ann", null);
+      expect(read().messages.map((each) => each.text)).toEqual(["went here"]);
     });
   });
 
@@ -168,6 +181,23 @@ describe("the tool that reads further back", () => {
       ["you", "The launch is on Friday."],
     ]);
     expect(given.earlier).toBeNull();
+    // What it gave is the run's alone: once the run has ended it is not kept, so that a message
+    // taken back afterwards is not shown again from an old answer. A later run reads again.
+    model.replies([say("")]);
+    await stub.ingest(message("thanks", { session_key: PRIVATE }));
+    await wake(stub);
+    const later = modelCalls.at(-1).input.find((each: any) => each.type === "function_call_output" && each.call_id === "look").output;
+    expect(later).not.toContain("The launch is on Friday.");
+    expect(JSON.parse(later)).toEqual({ note: "What this gave is not kept after the run it was read in. Read again if it is needed." });
+  });
+
+  it("is not there for a conversation named as a private one in a place several people share", async () => {
+    const { stub } = brain("chat");
+    model.replies([call("read_history", { query: null, from: null, before: null, limit: null }, "look")], [say("")]);
+    await stub.ingest(message("what did we say?", { session_key: PRIVATE }));
+    await wake(stub);
+    expect(offered(0)).not.toContain("read_history");
+    expect(JSON.parse(modelCalls[1].input.find((each: any) => each.type === "function_call_output" && each.call_id === "look").output).error).toBeDefined();
   });
 
   it("is not there where several people talk, and a call of it does nothing", async () => {

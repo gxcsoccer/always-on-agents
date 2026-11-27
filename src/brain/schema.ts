@@ -362,6 +362,9 @@ export const MIGRATIONS: string[] = [
   `CREATE TABLE IF NOT EXISTS outbox_reminds (idem TEXT PRIMARY KEY, mention TEXT, notify TEXT);
    CREATE TABLE IF NOT EXISTS task_asked (task_id TEXT PRIMARY KEY, asked TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS reminded (event TEXT NOT NULL, person TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (event, person));`,
+  // 40: a conversation's record read back by time (see History): what people wrote there, and what the agent said there.
+  `CREATE INDEX IF NOT EXISTS inbox_session ON inbox (session_key, received_at);
+   CREATE INDEX IF NOT EXISTS said_session ON said (session_id, sent_at);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

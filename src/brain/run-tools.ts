@@ -9,8 +9,8 @@ import { type WorkEnd, workIs } from "./work";
 import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
-import { chainLevels, isPrivateSession, type Target } from "../events";
-import type { History } from "./history";
+import { chainLevels, type Target } from "../events";
+import { type History, readsHistory } from "./history";
 import type { Outbox } from "./outbox";
 import type { Reminders } from "./reminders";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
@@ -423,7 +423,7 @@ export class RunTools {
 
       readHistory: (ask) => {
         // Decided where it is carried out, as for any tool a run may not have: not by what was offered.
-        if (!isPrivateSession(String(session?.session_key ?? ""))) throw new Error('there is no tool "read_history" in this run');
+        if (!readsHistory(this.#s.scope(), String(session?.session_key ?? ""))) throw new Error('there is no tool "read_history" in this run');
         return this.#b.history.read(run, ask);
       },
       memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
