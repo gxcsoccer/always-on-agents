@@ -13,6 +13,7 @@ import type { Picture, PictureRef } from "../connectors/types";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
 import { type ChainLevel, type Principal, type Target, chainLevels, privateSessionKey } from "../events";
+import { HISTORY_NOT_KEPT, readsHistory } from "./history";
 import { type Item, ModelError, type ModelRequest, type ModelResponse, type ToolDefinition } from "../model/openai";
 import type { registry } from "../registry";
 import { MODEL_CALL_RESERVE, limitsFrom } from "../limits";
@@ -23,7 +24,7 @@ import { HANDLING_LIMIT_MS, type Requests } from "./requests";
 import { READ_OUTSIDE, type RunTools, eligibleSource, standingOf, thenable, toolsIn, unheard, workersIn } from "./run-tools";
 import type { BrainStore, InboxRow, Row, RunRow } from "./store";
 import { workIs } from "./work";
-import { TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
+import { READ_HISTORY, TOOLS, type ToolCall, describeTool, executeTool, workTools } from "./tools";
 
 // (How many times a run may ask the model is the tenant's limit: see ../limits.)
 /** How often a run may be (re)entered before it is abandoned: crashes, deploys, model failures. */
@@ -474,6 +475,10 @@ export class Runner {
   async execute(runId: string): Promise<void> {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
+    // Taken up again after an interruption: what it had read of the conversation's record is not
+    // given to the model a second time as it stood then. It reads again, and is given what stands now.
+    // (Whatever it read, it read in an earlier entry: nothing of this one has happened yet.)
+    this.#forgetRead(entered);
     // A tool ended the matter itself: that is how the run ends, however often it was entered.
     if (entered.closed === "settled") {
       const run = this.#stillActive(runId);
@@ -809,6 +814,7 @@ export class Runner {
         // With whom it was to remind: a draft that is dropped reminds nobody.
         this.#s.sql.exec("DELETE FROM outbox_reminds WHERE idem = ? AND mention IS NULL", `answer:${carried.id}`);
       }
+      this.#forgetRead(run, true);
       this.#forgetPersonal(run);
       this.#forgetOutside(run, read);
       if (this.#s.meta("active_run") === runId) this.#s.sql.exec("DELETE FROM meta WHERE key = 'active_run'");
@@ -1024,6 +1030,23 @@ export class Runner {
     for (const each of rows) if (each.user && (each.item as { _carried?: boolean })._carried === true) this.#s.sql.exec("DELETE FROM items WHERE run_id = ? AND seq = ?", run.id, each.seq);
     // Cleared as a run that read outside text is: marked, and left to that.
     this.#s.sql.exec("UPDATE items SET outside = 1 WHERE run_id = ? AND is_user = 0 AND outside = 0", run.id);
+  }
+
+  /**
+   * What a reading of the conversation's record gave a run is the run's alone: once it has ended,
+   * a fixed note stands in its place. A message taken back afterwards is then not shown again
+   * from an old answer; a later run that needs it reads again, and is given what stands then.
+   */
+  #forgetRead(run: RunRow, ended = false): void {
+    // Only a run that read it has anything to look for.
+    if (this.#s.meta(`history:${run.id}`) === undefined) return;
+    if (ended) this.#s.sql.exec("DELETE FROM meta WHERE key = ?", `history:${run.id}`);
+    const items = this.#s.rows<{ seq: number; item: string }>("SELECT seq, item FROM items WHERE session_id = ? AND run_id = ? AND is_user = 0 AND (item LIKE '%read_history%' OR item LIKE '%function_call_output%')", run.session_id, run.id).map((each) => ({ seq: each.seq, item: JSON.parse(each.item) as Item }));
+    const calls = new Set(items.filter((each) => each.item.type === "function_call" && each.item.name === "read_history").map((each) => String(each.item.call_id)));
+    for (const each of items) {
+      if (each.item.type !== "function_call_output" || !calls.has(String(each.item.call_id))) continue;
+      this.#s.sql.exec("UPDATE items SET item = ? WHERE session_id = ? AND seq = ?", JSON.stringify({ ...each.item, output: JSON.stringify(HISTORY_NOT_KEPT) }), run.session_id, each.seq);
+    }
   }
 
   #forgetOutside(run: RunRow, read: { args: string }[] = []): void {
@@ -1293,6 +1316,10 @@ export class Runner {
     this.#s.sql.exec("DELETE FROM meta WHERE key LIKE 'shape:%' AND key NOT IN (SELECT 'shape:' || id FROM runs ORDER BY started_at DESC LIMIT 5)");
   }
 
+  #sessionKeyOf(runId: string): string {
+    return this.#s.rows<{ session_key: string }>("SELECT s.session_key FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?", runId)[0]?.session_key ?? "";
+  }
+
   #toolsFor(runId: string): ToolDefinition[] {
     // A run that carries a request on answers it, and does nothing else.
     if (this.#b.requests.continuationOf(runId)) return TOOLS.filter((each) => each.name === "send_message");
@@ -1305,7 +1332,9 @@ export class Runner {
     const follows = acting && workers.some((each) => each.start !== undefined);
     const means = follows ? toolsIn(acting, this.#b.toolsOf).flatMap((each) => (each.follows ? Object.entries(each.conditions ?? {}).map(([condition, meaning]) => `- ${each.name}:${condition}: ${meaning}`) : [])).join("\n") : "";
     const handing = workTools(workers.map((each) => ({ name: each.name, description: each.description, acts_as: each.acts_as, options: each.options, continues: each.tool !== undefined || each.goes_on === true, tells: each.tell !== undefined })), carrying.size > 0 ? REPLACES : undefined, follows ? thenable(acting, this.#b.toolsOf) : [], means);
-    const own = [...TOOLS, ...handing];
+    // In a person's own conversation, what stands further back in it can be read: everything there is theirs.
+    // (Where several people talk, what one person had read for them is in what was said there: see docs/design/history-on-demand.zh-CN.md.)
+    const own = [...TOOLS, ...(readsHistory(this.#s.scope(), this.#sessionKeyOf(runId)) ? [READ_HISTORY] : []), ...handing];
     // (What a hand-over may name as to follow it: what the run may do in the person's name itself.)
     const all = acting ? [...own, ...toolsIn(acting, this.#b.toolsOf).filter((each) => each.hands_to === undefined).map((each) => describeTool(each.name, each.description, { ...each.parameters, replaces: REPLACES }))] : own;
     // The run a task's result starts acts for nobody. Where the person's request said, when it

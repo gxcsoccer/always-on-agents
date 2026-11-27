@@ -10,6 +10,7 @@ import { type ConnectorTool, isSettled, isWaiting } from "../connectors";
 import type { Env } from "../env";
 import type { Worker } from "../workers";
 import { chainLevels, type Target } from "../events";
+import { type History, readsHistory } from "./history";
 import type { Outbox } from "./outbox";
 import type { Reminders } from "./reminders";
 import { MAX_LOADED_INDEX, MAX_LOADED_INSTRUCTIONS } from "./prompt";
@@ -49,6 +50,7 @@ export interface RunToolsHost {
   workStands(work: { id: string; state: string; condition: string | null; generation: number | null }): Promise<boolean>;
   readonly requests: Pick<Requests, "continuationOf" | "mayCancel" | "cancel" | "basis" | "endRequest" | "noteSource" | "wait" | "draft" | "record" | "indexed" | "promised" | "putOff">;
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
+  readonly history: Pick<History, "read">;
   /** Who a message may remind: see Reminders. */
   readonly reminders: Pick<Reminders, "claim" | "asked">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
@@ -419,6 +421,13 @@ export class RunTools {
         return this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, said, undefined, { summary, ...(commit ? { commit } : {}), comments }, { authored: true });
       },
 
+      readHistory: (ask) => {
+        // Decided where it is carried out, as for any tool a run may not have: not by what was offered.
+        if (!readsHistory(this.#s.scope(), String(session?.session_key ?? ""))) throw new Error('there is no tool "read_history" in this run');
+        // (Noted, so that what it gave is found again and let go: see Runner.)
+        this.#s.setMeta(`history:${run.id}`, "1");
+        return this.#b.history.read(run, ask);
+      },
       memoryList: () => ({ files: this.#s.rows("SELECT path, LENGTH(content) AS size, updated_at FROM memory ORDER BY path") }),
       memoryRead: (path) => {
         const row = this.#s.rows<Row>("SELECT content FROM memory WHERE path = ?", path)[0];

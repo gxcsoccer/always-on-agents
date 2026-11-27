@@ -35,6 +35,8 @@ export interface ToolHost {
   answerTask(callId: string, taskId: string, decision: "allow" | "deny", reason: string): Promise<unknown>;
   cancelTask(taskId: string): Promise<unknown>;
   cancelRequest(callId: string, requestId: string, ask: string): unknown;
+  /** What stands further back in this conversation than the run is shown: see History. */
+  readHistory(ask: { query?: string; from?: string; before?: string; limit?: number }): unknown;
 }
 
 /** The longest message the Brain can send. */
@@ -52,6 +54,21 @@ function tool(name: string, description: string, properties: Record<string, unkn
     parameters: { type: "object", properties, required: Object.keys(properties), additionalProperties: false },
   };
 }
+
+/**
+ * Reading further back in this conversation. Offered where the conversation is one person's own
+ * (see Runner): not one of the tools every run has.
+ */
+export const READ_HISTORY: ToolDefinition = tool(
+  "read_history",
+  "Read further back in this conversation than you are shown: what the person wrote to you here and what your own messages said, over the last thirty days. Use it when what is asked rests on something said earlier that you do not see above. It gives the latest that fit, oldest first, and `earlier` to go on from where there is more. What tools returned, and messages edited or taken back since, are not in it.",
+  {
+    query: { ...nullable("string"), description: "Words the message contains, as written (no other kind of search), or null for everything." },
+    from: { ...nullable("string"), description: 'Only what one writer wrote: a person\'s id, or "you" for your own messages. Null for everyone.' },
+    before: { ...nullable("string"), description: "Only what stands before this: a time (2026-11-27T12:00:00Z), or what an earlier call gave as `earlier`. Null for the latest." },
+    limit: { ...nullable("integer"), description: "How many at most, up to 30. Null for 30." },
+  },
+);
 
 /** A connector's tool, as the model is told about it. */
 export function describeTool(name: string, description: string, properties: Record<string, unknown>): ToolDefinition {
@@ -255,6 +272,13 @@ function route(host: ToolHost, call: ToolCall, a: Record<string, any>): unknown 
       return host.answerTask(call.call_id, text(a.task_id, "task_id", 64), a.decision, text(a.reason, "reason", 1_000, true));
     case "cancel_task":
       return host.cancelTask(text(a.task_id, "task_id", 64));
+    case "read_history":
+      return host.readHistory({
+        ...(a.query == null || a.query === "" ? {} : { query: text(a.query, "query", 200) }),
+        ...(a.from == null || a.from === "" ? {} : { from: text(a.from, "from", 200) }),
+        ...(a.before == null || a.before === "" ? {} : { before: text(a.before, "before", 60) }),
+        ...(a.limit == null ? {} : { limit: integer(a.limit, "limit") }),
+      });
     case "cancel_request":
       return host.cancelRequest(call.call_id, text(a.request_id, "request_id", 200), typeof a.ask === "string" ? a.ask.slice(0, 300) : "");
     default:
