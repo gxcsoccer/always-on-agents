@@ -61,7 +61,11 @@ function bench(state: DurableObjectState) {
     mayUse: () => settings.mayUse,
     following: () => settings.following,
     reminders: {
-      claim: (_run: unknown, asked: string[], target: unknown) => (calls.push(["claim", asked, target]), asked.filter((each) => settings.remindable.includes(each))),
+      claimed: (_run: unknown, asked: string[], target: unknown) => {
+        calls.push(["claim", asked, target]);
+        const ids = asked.filter((each) => settings.remindable.includes(each));
+        return { ids, names: Object.fromEntries(ids.filter((each) => each.startsWith("@")).map((each) => [each, each])) };
+      },
       asked: () => settings.asked,
     } as RunToolsHost["reminders"],
     instructionEditors: () => {
@@ -83,8 +87,11 @@ function bench(state: DurableObjectState) {
     outbox: {
       // (As the real one: whom a message reminds is asked for once where it goes is known.)
       enqueue: (...args: unknown[]) => {
-        const bound = args[6] as { mention?: (target: string) => string[] } | undefined;
-        calls.push(["enqueue", ...args.slice(0, 6), bound ? { ...bound, ...(bound.mention ? { mention: bound.mention("the target") } : {}) } : bound]);
+        const bound = args[6] as { mention?: (target: string) => string[]; names?: () => Record<string, string> } | undefined;
+        // (Whom it reminds first, then the names of those: in that order, as the outbox asks.)
+        const mention = bound?.mention?.("the target");
+        const { names, ...rest } = bound ?? {};
+        calls.push(["enqueue", ...args.slice(0, 6), bound ? { ...rest, ...(mention ? { mention } : {}), ...(names && Object.keys(names()).length > 0 ? { names: names() } : {}) } : bound]);
         return { ok: true as const };
       },
       notify: note("notify"),
@@ -299,7 +306,7 @@ describe("a run's tools", () => {
         expect(tools().sendMessage("c1", "done", ["ou_1", "ou_stranger", "@Carol"])).toEqual({ ok: true, reminded: 2, not_reminded: 1 });
         // Decided against where the message really goes.
         expect(of("claim")).toEqual([[["ou_1", "ou_stranger", "@Carol"], "the target"]]);
-        expect(of("enqueue")[0][6]).toEqual({ authored: true, mention: ["ou_1", "@Carol"] });
+        expect(of("enqueue")[0][6]).toEqual({ authored: true, mention: ["ou_1", "@Carol"], names: { "@Carol": "@Carol" } });
         // The same call again (the run was replayed) is the message already kept: nothing is settled a second time.
         store.sql.exec("INSERT INTO outbox (idem, run_id, target, text, next_at, created_at) VALUES ('msg:c1', 'r1', '{}', 'done', 1, 1)");
         store.sql.exec("INSERT INTO outbox_reminds (idem, mention) VALUES ('msg:c1', ?)", JSON.stringify(["ou_1", "ou_carol"]));

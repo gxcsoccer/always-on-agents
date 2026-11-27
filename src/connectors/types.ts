@@ -526,9 +526,10 @@ export interface OutboundMessage {
   /**
    * Which encoding to send it with, fixed at its first attempt so that every retry sends the very
    * same thing under the same `idem`: 0 for the encoding before connectors could choose one (a
-   * message whose sending began then), 1 for the first a connector chose by, 2 for the current
-   * one, under which a connector may put the words right as it writes them out. A connector sends
-   * a message of an earlier encoding as it would have then.
+   * message whose sending began then), 1 for the first a connector chose by, 2 for the one under
+   * which a connector may put the words right as it writes them out, 3 for the current one, under
+   * which it may also put its mention of someone where the words name them. A connector sends a
+   * message of an earlier encoding as it would have then.
    */
   encoding?: number;
   /** When the message was written, in ms. */
@@ -539,6 +540,12 @@ export interface OutboundMessage {
    * so in its own way; whatever in `text` looks like a mention is only text.
    */
   mention?: string[];
+  /**
+   * For some of them, the name the one who asked wrote for the person (as the connector gave it
+   * when the message came). A channel may put its mention where the words name the person by it,
+   * and not a second time before them.
+   */
+  mention_names?: Record<string, string>;
   /**
    * Set when the message is an approval question. `text` says the same in words; a connector that
    * can show something better than text (buttons, say) builds it from this.

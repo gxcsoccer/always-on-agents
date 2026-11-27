@@ -52,7 +52,7 @@ export interface RunToolsHost {
   readonly outbox: Pick<Outbox, "enqueue" | "notify" | "notice" | "isNotice">;
   readonly history: Pick<History, "read">;
   /** Who a message may remind: see Reminders. */
-  readonly reminders: Pick<Reminders, "claim" | "asked">;
+  readonly reminders: Pick<Reminders, "claimed" | "asked">;
   readonly tasks: Pick<Tasks, "dispatch" | "status" | "answer" | "cancel" | "tell" | "withdrawThen">;
 }
 
@@ -389,17 +389,20 @@ export class RunTools {
           if (this.#s.rows("SELECT 1 FROM outbox WHERE idem = ?", `msg:${callId}`).length > 0) return told((JSON.parse(this.#s.rows<{ mention: string | null }>("SELECT mention FROM outbox_reminds WHERE idem = ?", `msg:${callId}`)[0]?.mention ?? "[]") as string[]).length);
           // Who it reminds is settled, and taken for this thing, in the step that keeps the message.
           return this.#s.transaction(() => {
-            let reminded = 0;
+            let count = 0;
+            let names: Record<string, string> = {};
             // (Decided against where the message really goes, which is worked out as it is kept.)
             this.#b.outbox.enqueue(`msg:${callId}`, run.session_id, run.id, text, undefined, undefined, {
               authored: true,
               mention: (target) => {
-                const ids = this.#b.reminders.claim(run, notify, target);
-                reminded = ids.length;
-                return ids;
+                const taken = this.#b.reminders.claimed(run, notify, target);
+                count = taken.ids.length;
+                names = taken.names;
+                return taken.ids;
               },
+              names: () => names,
             });
-            return told(reminded);
+            return told(count);
           });
         }
         // Everything such a run says belongs to the request it carries on. That request has one

@@ -702,15 +702,36 @@ export async function deliverFeishu(env: Env, scope: Scope, target: Target, mess
   // which stay as inert as ever. (The same markup is a mention in a post and in plain text.)
   // (The last line of defence, whatever was kept: only in a place of several people, as itself
   // and for everyone there to see; each a person by their id, and never everyone at once.)
-  const reminds =
-    scope.kind === "chat" && chatId && !only && !card && current
-      ? (message.mention ?? [])
-          .filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all")
-          .map((id) => `<at user_id="${id}"></at>`)
-          .join(" ")
-      : "";
+  // (Each person once, whatever was kept.)
+  const toRemind = scope.kind === "chat" && chatId && !only && !card && current ? [...new Set(message.mention ?? [])].filter((id) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && id.toLowerCase() !== "all") : [];
+  const at = (id: string) => `<at user_id="${id}"></at>`;
   // (From the second encoding on, emphasis that full-width punctuation would have kept from holding is made to hold.)
-  const words = current && message.authored ? quiet((message.encoding ?? 0) >= 2 ? emphasised(message.text) : message.text) : message.text;
+  let words = current && message.authored ? quiet((message.encoding ?? 0) >= 2 ? emphasised(message.text) : message.text) : message.text;
+  // From the third encoding on: where the words name someone it reminds by the very name the one
+  // who asked wrote for them, the mention stands there, once, and not before the words as well.
+  // Not where anything in the words is shown as code: a mention inside that is shown as it is
+  // written and reminds nobody, so there every mention stays in front.
+  const inPlace = new Set<string>();
+  if ((message.encoding ?? 0) >= 3 && message.authored && plainWords(words)) {
+    // Each looked for in the words as they are now, before any mention is put into them, and
+    // each place taken once (two who go by one name: the first has the first place, the next the
+    // next, if there is one). Put in from the last backwards, so that no place moves.
+    const taken = new Set<number>();
+    const places = toRemind.flatMap((id) => {
+      const name = message.mention_names?.[id];
+      if (!name || !/^@[\p{L}\p{N}_-]+$/u.test(name)) return [];
+      let where = spoken(words, name);
+      while (where >= 0 && taken.has(where)) where = spoken(words, name, where + 1);
+      if (where < 0) return [];
+      taken.add(where);
+      return [{ id, where, length: name.length }];
+    });
+    for (const each of places.sort((a, b) => b.where - a.where)) {
+      words = `${words.slice(0, each.where)}${at(each.id)}${words.slice(each.where + each.length)}`;
+      inPlace.add(each.id);
+    }
+  }
+  const reminds = toRemind.filter((id) => !inPlace.has(id)).map(at).join(" ");
   // On a line of their own where the words begin as a heading, a list, a quotation, a table, a
   // rule or a block of code would: put on the same line, the words would no longer begin that way, and
   // would be shown with their marks.
@@ -780,6 +801,43 @@ function plainCard(invitation: Invitation): unknown {
 
 /** Feishu's limit for a post, in bytes of the request, with a margin. */
 const MAX_POST_BYTES = 29_000;
+
+/**
+ * Whether words shown as Markdown hold nothing but plain text and the marks that leave a word a
+ * word (emphasis, headings, simple lists, quotations): nothing struck through and no code (two
+ * tildes in a row, a backtick, a tab, or four spaces in a row anywhere: a line is code by its indentation, at its beginning
+ * or after a list's or a quotation's mark), no link, address or markup (a bracket, an angle
+ * bracket, "://", "www."), no table. Said of the whole of them, not of a line: a link's address
+ * may stand lines away from its text, and what a line is can depend on the lines around it.
+ * Where this is not so, nothing is put into the words. (A tilde by itself is only a tilde.)
+ */
+function plainWords(words: string): boolean {
+  return !/[`\[\]<>|\t]|~~| {4}|:\/\/|www\./i.test(words);
+}
+
+/**
+ * Where, in such words, a name stands as a word of its own, at or after `from`: the first such
+ * place, or -1. Whatever its case, as a name is found by whatever its case when people are named.
+ * Not the beginning of a longer name, and not after a letter or figure of ASCII or any mark a
+ * mail address may be written with before its "@" (a tilde among them: so also not a word struck
+ * through, which is where a name is taken back). Looked for by the name as it is, never as a pattern.
+ */
+function spoken(words: string, name: string, from = 0): number {
+  const wanted = name.toLowerCase();
+  for (let at = words.indexOf("@", from); at >= 0; at = words.indexOf("@", at + 1)) {
+    // (As many units as the name has: where case changes how many, it is not found, and the mention stays in front.)
+    if (words.slice(at, at + name.length).toLowerCase() !== wanted) continue;
+    // What stands before it, past any marks of emphasis right before it (they are part of an address only where an address goes on before them).
+    let back = at;
+    while (back > 0 && (words[back - 1] === "*" || words[back - 1] === "_")) back--;
+    const before = back === 0 ? "" : words[back - 1];
+    const after = words.slice(at + name.length, at + name.length + 3);
+    // (Nor where it goes on as an address does, with a dot and more: whatever stands before the "@" there, it is an address.)
+    if (/^[\p{L}\p{N}_-]/u.test(after) || /^\.[\p{L}\p{N}]/u.test(after) || /[A-Za-z0-9.!#$%&'+\/=?^{}~:\\-]/.test(before)) continue;
+    return at;
+  }
+  return -1;
+}
 
 /**
  * The agent's words as Feishu shows them, minus their one way of acting: Feishu's mention markup

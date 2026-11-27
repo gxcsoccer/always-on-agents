@@ -139,7 +139,7 @@ export class Reminders {
    * is, or where it was asked; it came up in another conversation, or another place, than the
    * one this message goes out in.
    */
-  of(run: RunRow, target: string | null | undefined): { event: string; who(asked: string): string | undefined; timer?: string } | undefined {
+  of(run: RunRow, target: string | null | undefined): { event: string; who(asked: string): string | undefined; name(id: string): string | undefined; timer?: string } | undefined {
     if (this.#s.scope().kind !== "chat") return undefined;
     const here = this.#s.rows<{ session_key: string }>("SELECT session_key FROM sessions WHERE id = ?", run.session_id)[0]?.session_key;
     const about = here === undefined ? undefined : this.#about(run.id);
@@ -162,22 +162,28 @@ export class Reminders {
       if (meant?.size === 1) return [...meant][0];
       const exact = [...ids].find((id) => id.toLowerCase() === ref.toLowerCase());
       if (exact) return exact;
+      // (A name is not who someone is: only those the one who asked named are found by a name.)
+      if (ref.startsWith("@")) return undefined;
       // Someone who has written to the agent in this conversation themselves: looked for by who
       // they are, however long ago and whatever else of theirs is kept here since (answers of
       // theirs brought in from elsewhere, say), through all that is still kept of it.
-      // (A name is not who someone is: only those the one who asked named are found by a name.)
-      if (ref.startsWith("@")) return undefined;
       for (let before = Number.MAX_SAFE_INTEGER; ; ) {
         const page = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND kind = 'message' AND text IS NOT NULL AND data IS NOT NULL AND reply_to IS NOT NULL AND lower(json_extract(principal, '$.id')) = ? AND id < ? ORDER BY id DESC LIMIT 100", sessionKey, ref.toLowerCase(), before);
         for (const each of page) {
           const writer = this.#writer(each);
           if (writer !== undefined && placeOf(each.reply_to as string | null) === about!.place) return writer;
         }
-        if (page.length < 100) return undefined;
+        if (page.length < 100) break;
         before = page.at(-1)!.id;
       }
+      // Last, and only where it is nobody by who they are: the name the one who asked wrote for
+      // someone, given without the chat's mark before it. The same name, where it means one person.
+      const bare = names.get(`@${ref.toLowerCase()}`);
+      return bare?.size === 1 ? [...bare][0] : undefined;
     };
-    return { event: about.event, who, ...(about.timer ? { timer: about.timer } : {}) };
+    // The name the one who asked wrote for a person, where it means that one person: what the words of a message may name them by.
+    const name = (id: string): string | undefined => about.named.find((each) => each.id === id && each.name !== "" && names.get(each.name.toLowerCase())?.size === 1)?.name;
+    return { event: about.event, who, name, ...(about.timer ? { timer: about.timer } : {}) };
   }
 
   /**
@@ -188,8 +194,18 @@ export class Reminders {
    * written on it, so that a firing of it already waiting reminds nobody.
    */
   claim(run: RunRow, asked: string[], target: string | null | undefined): string[] {
+    return this.claimed(run, asked, target).ids;
+  }
+
+  /**
+   * The same, with the name the one who asked wrote for each of them, where they wrote one: what
+   * the words of the message may name the person by. Told in the same step as they are taken,
+   * from what stood before taking them (a timer that stops once it has reminded says nothing of
+   * whose it was afterwards).
+   */
+  claimed(run: RunRow, asked: string[], target: string | null | undefined): { ids: string[]; names: Record<string, string> } {
     const may = asked.length > 0 ? this.of(run, target) : undefined;
-    if (!may) return [];
+    if (!may) return { ids: [], names: {} };
     const reminded: string[] = [];
     // (Of one thing, not of one message: a run made to send message after message reminds no more people by it.)
     const left = MAX_REMINDED - this.#s.rows<{ n: number }>("SELECT COUNT(*) AS n FROM reminded WHERE event = ?", may.event)[0].n;
@@ -199,11 +215,12 @@ export class Reminders {
       if (id === undefined || reminded.includes(id) || this.#s.rows("SELECT 1 FROM reminded WHERE event = ? AND person = ?", may.event, id).length > 0) continue;
       reminded.push(id);
     }
+    const names = Object.fromEntries(reminded.flatMap((id) => (may.name(id) ? [[id, may.name(id)!]] : [])));
     for (const id of reminded) this.#s.sql.exec("INSERT INTO reminded (event, person, at) VALUES (?, ?, ?)", may.event, id, Date.now());
     if (reminded.length > 0 && may.timer) {
       const kept = JSON.parse(this.#s.rows<{ data: string | null }>("SELECT data FROM timers WHERE id = ?", may.timer)[0]?.data ?? "{}") as Record<string, unknown>;
       this.#s.sql.exec("UPDATE timers SET status = CASE WHEN status = 'active' THEN 'done' ELSE status END, data = ? WHERE id = ?", JSON.stringify({ ...kept, reminded: may.event }), may.timer);
     }
-    return reminded;
+    return { ids: reminded, names };
   }
 }

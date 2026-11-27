@@ -403,6 +403,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("DELETE FROM task_on WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_asked WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM outbox_reminds WHERE idem NOT IN (SELECT idem FROM outbox)");
+      this.#store.sql.exec("DELETE FROM outbox_names WHERE idem NOT IN (SELECT idem FROM outbox)");
       this.#store.sql.exec("DELETE FROM reminded WHERE at < ?", old);
       this.#store.sql.exec("DELETE FROM request_acts WHERE request NOT IN (SELECT request FROM task_then) AND ('then:' || request) NOT IN (SELECT id FROM continuations WHERE status IN ('waiting', 'resuming'))");
       // The index of work is kept as long as what it points at: work that has ended, for the same time.

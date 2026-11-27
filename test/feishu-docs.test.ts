@@ -3961,6 +3961,23 @@ describe("how the bot's words are sent", () => {
     expect(sentAs()).toMatchObject({ msg_type: "post", reply_in_thread: true });
   });
 
+  it("puts each mention in one place of its own, whatever was kept beside the message, and only under the encoding that says so", async () => {
+    const room = { tenant: TENANT, kind: "chat" as const, id: "oc_room" };
+    const there = { connector: "feishu", address: { app_id: APP_ID, chat_id: "oc_room" } };
+    const sent = async (text: string, more: Record<string, unknown>) => {
+      await deliverFeishu(env as any, room, there, { id: ++n, idem: `msg:place_${n}`, text, authored: true, encoding: 3, ...more });
+      return JSON.parse(sentAs().content).zh_cn.content[0][0].text as string;
+    };
+    // Two people kept under one name: each has a place of their own where there are two, and the second stays in front where there is one.
+    const two = { mention: ["ou_1", "ou_2"], mention_names: { ou_1: "@Carol", ou_2: "@Carol" } };
+    expect(await sent("@Carol 和 @Carol 请看。", two)).toBe('<at user_id="ou_1"></at> 和 <at user_id="ou_2"></at> 请看。');
+    expect(await sent("@Carol 请看。", two)).toBe('<at user_id="ou_2"></at> <at user_id="ou_1"></at> 请看。');
+    // One person kept twice is one person.
+    expect(await sent("@Carol 请看。", { mention: ["ou_1", "ou_1"], mention_names: { ou_1: "@Carol" } })).toBe('<at user_id="ou_1"></at> 请看。');
+    // A message whose sending began under the encoding before goes out as it would have then, names or no names.
+    expect(await sent("@Carol 请看。", { encoding: 2, mention: ["ou_1"], mention_names: { ou_1: "@Carol" } })).toBe('<at user_id="ou_1"></at> @Carol 请看。');
+  });
+
   it("makes emphasis hold that full-width punctuation would have kept from holding, for a message first sent under the encoding that says so", async () => {
     const text = "**结论：**可以合入。\n\n`**代码：**不动`";
     await deliverFeishu(env as any, scope, dm, { id: 901, idem: "msg:mended", text, authored: true, encoding: 2 });

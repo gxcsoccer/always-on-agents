@@ -1609,6 +1609,51 @@ describe("reminding people where several talk", () => {
     model.replies([call("send_message", { text: "只有字 @Carol ou_colleague。", notify: null })], [say("")]);
     await here.says("那就这样");
     expect(last()).toBe("只有字 @Carol ou_colleague。");
+    // Where the words themselves name someone it reminds, by the name the one who asked wrote, the mention stands there and not a second time before the words.
+    // (A name given without its @ is the same name; a longer word that begins like it is another word; the one who asked has no such name and stays in front.)
+    model.replies([call("send_message", { text: "@Carol，该你了；@Caroline 不用。", notify: ["Carol", ann.openId] })], [say("")]);
+    await here.says("叫一下 @_user_2", [colleague]);
+    expect(last()).toBe(`<at user_id="${ann.openId}"></at> <at user_id="ou_colleague"></at>，该你了；@Caroline 不用。`);
+    expect(toolOutputs().at(-1)).toEqual({ ok: true, reminded: 2, not_reminded: 0 });
+    // Not inside what is shown as code, where it would be shown as it is written and remind nobody: there the mention stays in front.
+    model.replies([call("send_message", { text: "运行 `ping @Carol` 就行。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫一下 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> 运行 `ping @Carol` 就行。');
+    // Two on one line, each where it is named. A name with a hyphen in it is a name like any other, in the words or not.
+    const hyphen = { key: "@_user_3", id: { open_id: "ou_hyphen" }, name: "Mary-Ann", mentioned_type: "user", tenant_key: ORG };
+    model.replies([call("send_message", { text: "@Carol、@Mary-Ann：请看。", notify: ["@Carol", "@Mary-Ann"] })], [call("send_message", { text: "请看。", notify: ["@Mary-Ann"] })], [say("")]);
+    await here.says("叫 @_user_2 和 @_user_3", [colleague, hyphen]);
+    expect(world.sent.filter((each) => each.type === "text").slice(-2).map((each) => String(each.content.text))).toEqual(['<at user_id="ou_colleague"></at>、<at user_id="ou_hyphen"></at>：请看。', "请看。"]);
+    // Not in an address, a link or a table, where what is shown is not what is written: there the mention stays in front, and the words stay as they are.
+    for (const text of ["见 [说明](https://x.test/@Carol) 。", "写信给 team@Carol 。", "| 谁 |\n| --- |\n| @Carol |", "见 https://x.test/u 和 @Carol"]) {
+      model.replies([call("send_message", { text, notify: ["@Carol"] })], [say("")]);
+      await here.says("再叫 @_user_2", [colleague]);
+      expect(last(), text).toBe(`<at user_id="ou_colleague"></at>${text.startsWith("|") ? "\n\n" : " "}${text}`);
+    }
+    // Said of the whole of the words: a link's address may stand lines away from its text, and a line may be code by the lines around it.
+    // Where anything of the kind is in them, every word stays as it is written and the mention stays in front.
+    for (const text of ["见 https://x.test/@Carol\n\n@Carol 请看。", "[文档][r]\n\n[r]:\n  @Carol/guide\n\n请 @Carol。", "步骤：\n\n  \t@Carol run\n\n请 @Carol。", "-     @Carol\n\n请 @Carol。", "1.     @Carol\n\n请 @Carol。", "~~~\n@Carol\n~~~\n\n请 @Carol。"]) {
+      model.replies([call("send_message", { text, notify: ["@Carol"] })], [say("")]);
+      await here.says("再叫 @_user_2", [colleague]);
+      // (On a line of its own before words that begin as a list or as code would, as ever.)
+      expect(last(), text).toBe(`<at user_id="ou_colleague"></at>${/^(?:-|1\.|~~~)/.test(text) ? "\n\n" : " "}${text}`);
+    }
+    // A tilde by itself is only a tilde; and the name is found whatever its case, as it is when people are named.
+    model.replies([call("send_message", { text: "@carol 大约 3~5 分钟，好呀~", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> 大约 3~5 分钟，好呀~');
+    // Not inside a mail address, whatever marks it is written with, nor a word struck through: the next place that is a word is taken.
+    model.replies([call("send_message", { text: "请写到 build~@carol.invalid、a*@carol.invalid、*@carol.invalid 或 _@carol.invalid，另请 **@Carol**：确认。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('请写到 build~@carol.invalid、a*@carol.invalid、*@carol.invalid 或 _@carol.invalid，另请 **<at user_id="ou_colleague"></at>**：确认。');
+    // Where anything in the words is struck through, nothing is put into them: a name may be taken back there.
+    model.replies([call("send_message", { text: "~~此前请 @Carol 确认~~，现请 @Carol。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> ~~此前请 @Carol 确认~~，现请 @Carol。');
+    // With headings, lists and emphasis around it, a word is still a word.
+    model.replies([call("send_message", { text: "## 提醒\n\n- **@Carol**：请看。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('## 提醒\n\n- **<at user_id="ou_colleague"></at>**：请看。');
     // The model was told what its messages come to in this chat, in the Brain's own words.
     expect(modelCalls.at(-1).instructions).toContain("Your messages here are shown as Markdown. A message here can remind people: name them in notify.");
     // Words that begin as a heading, a list, a table or a block of code keep their first line to themselves: the mention goes on a line before them.
