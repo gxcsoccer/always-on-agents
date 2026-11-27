@@ -582,6 +582,20 @@ export class BrainAgent extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Timers by name, whatever has become of them: where each is, what it was set to do (its note,
+   * which the agent wrote), and whether a person is on record as having asked for it. Not a
+   * task's own watch.
+   */
+  async timersNamed(ids: string[]): Promise<Record<string, unknown>[]> {
+    return this.#store
+      .rows<{ id: string; status: string; session_key: string; note: string; every_s: number | null; due_at: number; created_at: number; data: string | null }>(
+        "SELECT id, status, session_key, note, every_s, due_at, created_at, data FROM timers WHERE id IN (SELECT value FROM json_each(?)) AND (data IS NULL OR json_extract(data, '$.task_id') IS NULL) ORDER BY id",
+        JSON.stringify(ids),
+      )
+      .map(({ data, ...each }) => ({ ...each, asked: typeof (JSON.parse(data ?? "{}") as { by?: unknown }).by === "string" }));
+  }
+
   async inspect(): Promise<Record<string, unknown>> {
     const count = (table: string, where = "1") => this.#store.rows<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`)[0].n;
     return {

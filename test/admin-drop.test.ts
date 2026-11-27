@@ -92,6 +92,15 @@ describe("letting go of what waits in a scope", () => {
     // Which timers have something in line is said by the scope, by their names: what they are then named by here.
     const named = (await stub.inspect()).waiting.filter((each: any) => each.source === "timer").map((each: any) => each.timer).sort();
     expect(named).toEqual(["tmr_cancelled", "tmr_once"]);
+    // What each of them is for, asked by name before anything is let go of: one that has long ended is told too.
+    const told = await (await admin("GET", `scopes/${encodeURIComponent(name)}/timers?ids=${named.join(",")},tmr_unknown`)).json();
+    expect(told).toEqual({
+      timers: [
+        { id: "tmr_cancelled", status: "cancelled", session_key: "pr:1", note: "look again", every_s: null, due_at: 1, created_at: 1, asked: false },
+        { id: "tmr_once", status: "done", session_key: "pr:1", note: "look again", every_s: null, due_at: 1, created_at: 1, asked: false },
+      ],
+    });
+    expect((await admin("GET", `scopes/${encodeURIComponent(name)}/timers`)).status).toBe(400);
     expect(await drop({ timers: named })).toEqual({ events: 0, timers: 0, timer_events: 2 });
     expect(await drop({ timers: ["tmr_once", "tmr_cancelled"] })).toEqual({ events: 0, timers: 0, timer_events: 0 });
     await wake(stub);
