@@ -88,10 +88,15 @@ async function admin(request: Request, env: Env, path: string[], url: URL): Prom
     if (path[2] === "memory" && method === "GET") return json({ content: await brain.readMemory(url.searchParams.get("path") ?? "") });
     // What waits there and will never be worth doing, let go of by name: see BrainAgent.drop.
     if (path[2] === "drop" && path.length === 3 && method === "POST") {
-      const { sessions = [], timers = [] } = await body();
+      const { sessions = [], timers = [], source, kind, up_to } = await body();
       const names = (value: unknown): value is string[] => Array.isArray(value) && value.length <= 500 && value.every((each) => typeof each === "string" && each !== "" && each.length <= 300);
-      if (!names(sessions) || !names(timers) || sessions.length + timers.length === 0) return json({ error: "give the conversations whose waiting events are dropped (sessions) and the timers to cancel (timers), each a list of names" }, 400);
-      return json(await brain.drop(sessions, timers));
+      if (!names(sessions) || !names(timers) || sessions.length + timers.length === 0) return json({ error: "give the conversations whose waiting notifications are dropped (sessions) and the timers to cancel (timers), each a list of names" }, 400);
+      // Which notifications, said exactly: of one source and kind, and no later than where stock was taken.
+      const which = sessions.length === 0 ? undefined : { source, kind, up_to };
+      if (which && (typeof source !== "string" || typeof kind !== "string" || !Number.isInteger(up_to) || kind === "message" || ["timer", "request", "worker"].includes(source))) {
+        return json({ error: "with sessions, say which notifications: their source and kind (a connector's own, never people's messages or what the system tells itself) and up_to, the last event counted when stock was taken (see `waiting` in the scope's state)" }, 400);
+      }
+      return json(await brain.drop(sessions, timers, which as { source: string; kind: string; up_to: number } | undefined));
     }
   }
 
