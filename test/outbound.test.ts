@@ -27,7 +27,9 @@ async function proxyFor(policy: Parameters<any>[0] = {}) {
   const proxy = (exports as any).Outbound({ props: { taskId } });
   const send = (url: string, init?: RequestInit) => proxy.fetch(new Request(url, init)) as Promise<Response>;
   const recorded = async (method: string) => (await task(taskId).calls()).filter((c: any) => c.method === method).map((c: any) => c.args);
-  return { send, recorded };
+  /** How often the credential a push goes out under was asked for. */
+  const pushAsks = () => task(taskId).tokenAsks() as Promise<number>;
+  return { send, recorded, pushAsks };
 }
 
 const pkt = (line: string) => (line.length + 4).toString(16).padStart(4, "0") + line;
@@ -182,6 +184,23 @@ describe("git over the proxy", () => {
     await send("https://github.com/acme/secret.git/info/refs?service=git-upload-pack", { headers: { authorization: "Basic guessed" } });
     expect(forwarded[0].headers.get("authorization")).toBe(`Basic ${btoa("x-access-token:test-github-token")}`);
     expect(forwarded[1].headers.get("authorization")).toBeNull();
+  });
+
+  it("asks for what git reads with apart from what a push goes out under, and passes on only the headers git's own exchange needs", async () => {
+    // Lent for reading and not for pushing: reading goes out with it, and nothing is asked for of the other kind.
+    const { send, pushAsks } = await proxyFor({ repository: "acme/demo", fetchToken: "test-fetch-token", tokenWithdrawnAfter: 0 });
+    await send(advert, { headers: { "git-protocol": "version=2", "user-agent": "git/2.50", accept: "*/*", cookie: "a=b", "x-forwarded-for": "1.2.3.4", "x-github-otp": "000000", authorization: "Basic guessed" } });
+    await send("https://github.com/acme/demo.git/git-upload-pack", { method: "POST", body: "0000", headers: { "content-type": "application/x-git-upload-pack-request", "x-anything": "else" } });
+    expect(forwarded.map((each) => each.headers.get("authorization"))).toEqual([`Basic ${btoa("x-access-token:test-fetch-token")}`, `Basic ${btoa("x-access-token:test-fetch-token")}`]);
+    expect([...forwarded[0].headers.keys()].sort()).toEqual(["accept", "authorization", "git-protocol", "user-agent"]);
+    expect(forwarded[1].headers.get("content-type")).toBe("application/x-git-upload-pack-request");
+    expect(forwarded[1].headers.get("x-anything")).toBeNull();
+    // (The credential a push goes out under was not asked for by either.)
+    expect(await pushAsks()).toBe(0);
+    // Asking what the remote has, for a push, is of the push's kind: not what reading is lent.
+    await send("https://github.com/acme/demo.git/info/refs?service=git-receive-pack");
+    expect(forwarded[2].headers.get("authorization")).toBeNull();
+    expect(await pushAsks()).toBe(1);
   });
 
   it("offers nothing on github.com except git", async () => {

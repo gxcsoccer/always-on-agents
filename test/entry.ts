@@ -90,6 +90,14 @@ export class FakeTask extends DurableObject {
     if (limit !== undefined && asked > limit) return undefined;
     return (this.#policy().repository ?? "") ? "test-github-token" : undefined;
   }
+  async tokenAsks() {
+    return (this.ctx.storage.kv.get("token_asks") as number | undefined) ?? 0;
+  }
+  /** As the real task: what git reads the task's own repository with (cloning, fetching): asked for apart from what a push goes out under. The same by default; a test can say another, to tell the two apart. */
+  async githubFetchToken() {
+    const policy = this.#policy() as { repository?: string; fetchToken?: string };
+    return (policy.repository ?? "") ? (policy.fetchToken ?? "test-github-token") : undefined;
+  }
   /** As the real task: a credential that can only read, lent where the other is; none where the test says the task is not lent one. A test can have the lending fail, or the task end while it is asked. */
   async githubReadToken() {
     const policy = this.#policy() as { repository?: string; unlent?: boolean; lendingFails?: boolean; endsWhileLending?: boolean };
