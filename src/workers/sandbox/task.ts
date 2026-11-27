@@ -521,7 +521,9 @@ export class TaskSandbox extends DurableObject<Env> {
   async status(): Promise<TaskState | { error: string }> {
     const state = this.#state();
     if (!state) return { error: "no such task" };
-    return { ...state, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined, github_read_token: state.github_read_token ? { ...state.github_read_token, token: "(hidden)" } : undefined, github_public_token: state.github_public_token ? { ...state.github_public_token, token: "(hidden)" } : undefined };
+    // (Who asked for it is for deciding what it is lent, and is not part of how it stands.)
+    const { requested_by: _, ...shown } = state;
+    return { ...shown, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined, github_read_token: state.github_read_token ? { ...state.github_read_token, token: "(hidden)" } : undefined, github_public_token: state.github_public_token ? { ...state.github_public_token, token: "(hidden)" } : undefined };
   }
 
   /**
