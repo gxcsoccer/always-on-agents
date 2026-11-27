@@ -1632,11 +1632,16 @@ describe("reminding people where several talk", () => {
     }
     // Said of the whole of the words: a link's address may stand lines away from its text, and a line may be code by the lines around it.
     // Where anything of the kind is in them, every word stays as it is written and the mention stays in front.
-    for (const text of ["见 https://x.test/@Carol\n\n@Carol 请看。", "[文档][r]\n\n[r]:\n  @Carol/guide\n\n请 @Carol。", "步骤：\n\n  \t@Carol run\n\n请 @Carol。"]) {
+    for (const text of ["见 https://x.test/@Carol\n\n@Carol 请看。", "[文档][r]\n\n[r]:\n  @Carol/guide\n\n请 @Carol。", "步骤：\n\n  \t@Carol run\n\n请 @Carol。", "-     @Carol\n\n请 @Carol。", "1.     @Carol\n\n请 @Carol。", "~~~\n@Carol\n~~~\n\n请 @Carol。"]) {
       model.replies([call("send_message", { text, notify: ["@Carol"] })], [say("")]);
       await here.says("再叫 @_user_2", [colleague]);
-      expect(last(), text).toBe(`<at user_id="ou_colleague"></at> ${text}`);
+      // (On a line of its own before words that begin as a list or as code would, as ever.)
+      expect(last(), text).toBe(`<at user_id="ou_colleague"></at>${/^(?:-|1\.|~~~)/.test(text) ? "\n\n" : " "}${text}`);
     }
+    // A tilde by itself is only a tilde; and the name is found whatever its case, as it is when people are named.
+    model.replies([call("send_message", { text: "@carol 大约 3~5 分钟，好呀~", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> 大约 3~5 分钟，好呀~');
     // With headings, lists and emphasis around it, a word is still a word.
     model.replies([call("send_message", { text: "## 提醒\n\n- **@Carol**：请看。", notify: ["@Carol"] })], [say("")]);
     await here.says("再叫 @_user_2", [colleague]);

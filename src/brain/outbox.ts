@@ -75,7 +75,8 @@ export interface OutboxHost {
 /**
  * The encoding a message is first sent with now. One whose sending began under an earlier one keeps
  * that (see `OutboundMessage.encoding`): 1 was the first a connector could choose by; 2 is where a
- * connector may put the words right as it writes them out (emphasis that would not have held).
+ * connector may put the words right as it writes them out (emphasis that would not have held); 3
+ * is where it may put its mention of someone where the words name them (see `mention_names`).
  */
 const WIRE = 3;
 
@@ -154,7 +155,7 @@ export class Outbox implements Wakes {
   /** Keeps, beside a message, the names some of those it reminds were named by: one way for a message kept now and for an answer let go later. */
   names(idem: string, ids: string[], names: Record<string, string>): void {
     const kept = Object.fromEntries(Object.entries(names).filter(([id]) => ids.includes(id)));
-    if (Object.keys(kept).length > 0) this.#s.sql.exec("INSERT OR REPLACE INTO outbox_names (idem, names) VALUES (?, ?)", idem, JSON.stringify(kept));
+    if (Object.keys(kept).length > 0) this.#s.sql.exec("INSERT OR IGNORE INTO outbox_names (idem, names) VALUES (?, ?)", idem, JSON.stringify(kept));
   }
 
   /** One of the system's fixed notices, in the language the person last wrote in in this conversation. */
