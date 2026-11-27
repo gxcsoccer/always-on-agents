@@ -1643,9 +1643,13 @@ describe("reminding people where several talk", () => {
     await here.says("再叫 @_user_2", [colleague]);
     expect(last()).toBe('<at user_id="ou_colleague"></at> 大约 3~5 分钟，好呀~');
     // Not inside a mail address, whatever marks it is written with, nor a word struck through: the next place that is a word is taken.
-    model.replies([call("send_message", { text: "请写到 build~@carol.invalid 或 a*@carol.invalid，~~@Carol~~ 不对，再请 @Carol 确认。", notify: ["@Carol"] })], [say("")]);
+    model.replies([call("send_message", { text: "请写到 build~@carol.invalid、a*@carol.invalid、*@carol.invalid 或 _@carol.invalid，另请 **@Carol**：确认。", notify: ["@Carol"] })], [say("")]);
     await here.says("再叫 @_user_2", [colleague]);
-    expect(last()).toBe('请写到 build~@carol.invalid 或 a*@carol.invalid，~~@Carol~~ 不对，再请 <at user_id="ou_colleague"></at> 确认。');
+    expect(last()).toBe('请写到 build~@carol.invalid、a*@carol.invalid、*@carol.invalid 或 _@carol.invalid，另请 **<at user_id="ou_colleague"></at>**：确认。');
+    // Where anything in the words is struck through, nothing is put into them: a name may be taken back there.
+    model.replies([call("send_message", { text: "~~此前请 @Carol 确认~~，现请 @Carol。", notify: ["@Carol"] })], [say("")]);
+    await here.says("再叫 @_user_2", [colleague]);
+    expect(last()).toBe('<at user_id="ou_colleague"></at> ~~此前请 @Carol 确认~~，现请 @Carol。');
     // With headings, lists and emphasis around it, a word is still a word.
     model.replies([call("send_message", { text: "## 提醒\n\n- **@Carol**：请看。", notify: ["@Carol"] })], [say("")]);
     await here.says("再叫 @_user_2", [colleague]);

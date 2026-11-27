@@ -804,15 +804,15 @@ const MAX_POST_BYTES = 29_000;
 
 /**
  * Whether words shown as Markdown hold nothing but plain text and the marks that leave a word a
- * word (emphasis, headings, simple lists, quotations): no code (a backtick, three tildes in a row,
- * a tab, or four spaces in a row anywhere: a line is code by its indentation, at its beginning
+ * word (emphasis, headings, simple lists, quotations): nothing struck through and no code (two
+ * tildes in a row, a backtick, a tab, or four spaces in a row anywhere: a line is code by its indentation, at its beginning
  * or after a list's or a quotation's mark), no link, address or markup (a bracket, an angle
  * bracket, "://", "www."), no table. Said of the whole of them, not of a line: a link's address
  * may stand lines away from its text, and what a line is can depend on the lines around it.
  * Where this is not so, nothing is put into the words. (A tilde by itself is only a tilde.)
  */
 function plainWords(words: string): boolean {
-  return !/[`\[\]<>|\t]|~~~| {4}|:\/\/|www\./i.test(words);
+  return !/[`\[\]<>|\t]|~~| {4}|:\/\/|www\./i.test(words);
 }
 
 /**
@@ -831,7 +831,9 @@ function spoken(words: string, name: string, from = 0): number {
     let back = at;
     while (back > 0 && (words[back - 1] === "*" || words[back - 1] === "_")) back--;
     const before = back === 0 ? "" : words[back - 1];
-    if (/^[\p{L}\p{N}_-]/u.test(words.slice(at + name.length, at + name.length + 2)) || /[A-Za-z0-9.!#$%&'+\/=?^{}~:\\-]/.test(before)) continue;
+    const after = words.slice(at + name.length, at + name.length + 3);
+    // (Nor where it goes on as an address does, with a dot and more: whatever stands before the "@" there, it is an address.)
+    if (/^[\p{L}\p{N}_-]/u.test(after) || /^\.[\p{L}\p{N}]/u.test(after) || /[A-Za-z0-9.!#$%&'+\/=?^{}~:\\-]/.test(before)) continue;
     return at;
   }
   return -1;
