@@ -38,6 +38,7 @@ Plain variables are in `wrangler.jsonc`; secrets are set with `wrangler secret p
 | `ADMIN_KEY` | secret, required | Guards the admin API. |
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | secret | The GitHub App the agent acts as. With these, tokens are issued per installation and repository. |
 | `GITHUB_WEBHOOK_SECRET` | secret | The App's webhook secret. |
+| `GITHUB_AUTO_REVIEW` | var | `on`: a pull request that is opened or pushed to is reviewed by itself (each review is a piece of sandbox work, and counts against the scope's daily allowance). Unset or anything else: only when someone asks the agent in the pull request. |
 | `GITHUB_BOT_HANDLE` | secret | The agent's account name on GitHub (an App's slug). How people address it. |
 | `GITHUB_BOT_EMAIL` | secret | The address sandbox commits are made under. |
 | `GITHUB_TOKEN` | secret | One token for every repository, used only when no App is configured. Local development only. |

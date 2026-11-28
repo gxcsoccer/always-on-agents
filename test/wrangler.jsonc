@@ -15,6 +15,7 @@
     "ADMIN_KEY": "test-admin",
     "GITHUB_WEBHOOK_SECRET": "test-webhook-secret",
     "GITHUB_TOKEN": "test-github-token",
+    "GITHUB_AUTO_REVIEW": "on",
     "GITHUB_CLIENT_ID": "test-client-id",
     "GITHUB_CLIENT_SECRET": "test-client-secret",
     "PUBLIC_ORIGIN": "https://agent.test",

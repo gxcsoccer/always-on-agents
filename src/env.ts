@@ -35,6 +35,8 @@ export interface Env {
   GITHUB_CLIENT_SECRET?: string;
   /** The agent's account name on GitHub (an App's bot is `<app-slug>`), used to recognise mentions. */
   GITHUB_BOT_HANDLE?: string;
+  /** "on": a pull request that is opened or pushed to is brought before the agent by itself. Anything else: only when someone asks it there. */
+  GITHUB_AUTO_REVIEW?: string;
   /** The address commits are made under; for an App, `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. */
   GITHUB_BOT_EMAIL?: string;
   /** Optional: a regular expression for shell commands inside the sandbox that a person must approve. Default: none. */

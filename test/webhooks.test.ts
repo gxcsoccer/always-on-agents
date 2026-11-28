@@ -75,6 +75,36 @@ describe("the GitHub webhook endpoint", () => {
     expect(shown).not.toContain("Pull request #7");
   });
 
+  it("takes up no word of a pull request by itself where the deployment has not said to, and still answers someone who asks there", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const word = (action: string, sha: string, updated_at?: string) => deliver(webhook_secret, "pull_request", { action, repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 907, number: 7, title: "Add retry", html_url: `https://github.com/${repo}/pull/7`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, ...(updated_at ? { updated_at } : {}) } });
+    const statuses = () => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT kind, status FROM inbox ORDER BY id").toArray().map((row) => `${row.kind} ${row.status}`));
+    // One that waits from when it was still looked at by itself.
+    await word("opened", "a1", "2026-11-28T01:00:00Z");
+    expect(await statuses()).toEqual(["github.pull_request pending"]);
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      expect((await word("synchronize", "a2", "2026-11-28T02:00:00Z")).status).toBe(202);
+      // Neither waits now; the same one again is the one held.
+      expect(await statuses()).toEqual(["github.pull_request dropped", "github.pull_request dropped"]);
+      expect(await (await word("synchronize", "a2", "2026-11-28T02:00:00Z")).json()).toMatchObject({ duplicate: true });
+      expect(await (await word("synchronize", "a3")).json()).toMatchObject({ ignored: expect.any(String) });
+      await wake(brain);
+      expect(modelCalls).toHaveLength(0);
+      // Someone asks in the pull request: that is taken up as ever.
+      model.replies([say("")]);
+      expect((await deliver(webhook_secret, "issue_comment", { ...comment(repo, 31, "@always-on-agent please review this"), issue: { number: 7, pull_request: {} } })).status).toBe(202);
+      await wake(brain);
+      expect(modelCalls).toHaveLength(1);
+      expect(JSON.stringify(modelCalls[0].input)).toContain("please review this");
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+  });
+
   it("gives the same refusal for a wrong secret, another repository's secret and an unregistered repository", async () => {
     const a = await tenant();
     const b = await tenant();

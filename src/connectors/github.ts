@@ -404,6 +404,13 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   if (normalized.onlyIfQuotes !== undefined && !(await brain.quotesOpenQuestion(normalized.onlyIfQuotes, event.session_key))) {
     return dropped("the comment does not address the agent");
   }
+  // Word that a pull request was opened or pushed to is something to look at by itself only where
+  // the deployment says so. Elsewhere it is taken in as one that ends what waits and is not taken
+  // up (see InboundEvent.supersedes): someone who asks there is still answered.
+  if (event.kind === "github.pull_request" && env.GITHUB_AUTO_REVIEW !== "on") {
+    if (!event.supersedes) return json({ ignored: "pull requests are looked at only when someone asks" }, 202);
+    event.supersedes = { ...event.supersedes, void: true };
+  }
   const result = await brain.ingest(event);
   return json({ ...result, scope: scopeName(scope), kind: event.kind }, 202);
 }
