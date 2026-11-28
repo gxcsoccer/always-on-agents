@@ -2494,14 +2494,74 @@ describe("tasks, by themselves", () => {
           expect(kept("t1")).toMatchObject({ status: "needs_input", answering: null });
         });
       }
-      // Something is said here while it is being asked: looked at again from the start.
-      await pushing(async ({ asks, reply, answer, worker, settings }) => {
-        let open!: { code: string };
-        settings.writes = () => (reply("wait", { person: "carol", status: "pending" }), "yes");
-        open = await asks("t1", 1, push);
+      // While GitHub is asked, someone refuses, or the one who approved says something more: judged again from what is there then, and not taken.
+      for (const meanwhile of [{ text: (code: string) => `deny ${code}`, person: "carol", like: /a reply refuses this/ }, { text: () => "wait", person: "alice", like: /said something after approving/ }]) {
+        await pushing(async ({ asks, reply, answer, worker, settings, kept }) => {
+          let open!: { code: string };
+          settings.writes = () => (reply(meanwhile.text(open.code), { person: meanwhile.person, status: "pending" }), "yes");
+          open = await asks("t1", 1, push);
+          reply(`approve ${open.code}`);
+          await expect(answer("t1", "allow")).rejects.toThrow(meanwhile.like);
+          expect(worker.answered).toEqual([]);
+          expect(kept("t1").answering).toBeNull();
+        });
+      }
+      // Something else said by someone else meanwhile changes nothing, as ever.
+      await pushing(async ({ asks, reply, answer, settings }) => {
+        settings.writes = () => (reply("unrelated", { person: "carol", status: "pending" }), "yes");
+        const open = await asks("t1", 1, push);
         reply(`approve ${open.code}`);
-        await expect(answer("t1", "allow")).rejects.toThrow(/changed while GitHub was being asked/);
-        expect(worker.answered).toEqual([]);
+        expect(await answer("t1", "allow")).toMatchObject({ decision: "allow", decided_by: "alice" });
+      });
+      // An approval on record whose word never came back from the worker is not sent again on the strength of what was found out then.
+      await pushing(async ({ asks, reply, answer, worker, settings, kept }) => {
+        let may: "yes" | "no" | "unknown" = "yes";
+        settings.writes = () => may;
+        const sent = worker.answer;
+        worker.answer = async () => {
+          throw new Error("connection lost");
+        };
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow(/connection lost/);
+        expect(JSON.parse(kept("t1").answering)).toMatchObject({ decision: "allow", decided_by: "alice" });
+        worker.answer = sent;
+        // It cannot be asked just now: nothing more is sent, and what is on record stays.
+        may = "unknown";
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/could not be asked just now.*nothing more was sent/);
+        expect(worker.answered).toHaveLength(1);
+        expect(JSON.parse(kept("t1").answering)).toMatchObject({ decision: "allow" });
+        // They may no longer write there: not sent again; it takes someone who may, saying so.
+        may = "no";
+        await expect(answer("t1", "allow", "call_3")).rejects.toThrow(/was not taken/);
+        expect(worker.answered).toHaveLength(1);
+        settings.writes = (person) => (person === "bob" ? "yes" : "no");
+        reply(`approve ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "allow", "call_4")).toMatchObject({ decision: "allow", decided_by: "bob" });
+        expect(worker.answered).toHaveLength(2);
+      });
+      // And where they still may, it is sent again as it was.
+      await pushing(async ({ asks, reply, answer, worker, settings }) => {
+        settings.writes = () => "yes";
+        const sent = worker.answer;
+        worker.answer = async () => {
+          throw new Error("connection lost");
+        };
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow(/connection lost/);
+        worker.answer = sent;
+        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decision: "allow", decided_by: "alice" });
+        expect(settings.writesAsked).toHaveLength(2);
+      });
+      // One on record from before every push was asked about, said to be for the rest of the task: sent again, it reaches no further than this push.
+      await pushing(async ({ asks, reply, answer, worker, settings, store }) => {
+        settings.writes = () => "yes";
+        const open = await asks("t1", 1, push);
+        const said = reply(`approve all ${open.code}`);
+        store.sql.exec("UPDATE tasks SET answering = ? WHERE id = 't1'", JSON.stringify({ call_id: "call_old", pending_id: "q1", decision: "allow", reason: "r", decided_by: "alice", deciding_event: said, ask: open.ask, standing: true }));
+        await answer("t1", "allow", "call_old");
+        expect(worker.answered[0][3]).toBe(false);
       });
       // A refusal is anyone's, and nobody is asked about.
       await pushing(async ({ asks, reply, answer, settings }) => {
@@ -2521,13 +2581,49 @@ describe("tasks, by themselves", () => {
         expect(await answer("t1", "allow", "call_2")).toMatchObject({ decided_by: "alice" });
         expect(settings.writesAsked).toEqual([]);
       });
-      // Where no connector can say who may write: the one person's who asked, as ever.
-      await pushing(async ({ asks, reply, answer }) => {
+      // Where nothing can say who may write, or it is not on record that the push is to the task's repository: nobody's, not the asker's either. It can still be refused.
+      await pushing(async ({ asks, reply, answer, worker, kept }) => {
         const open = await asks("t1", 1, push);
-        reply(`approve ${open.code}`, { person: "bob" });
-        await expect(answer("t1", "allow")).rejects.toThrow(/only alice, who requested this task, can approve it/);
         reply(`approve ${open.code}`);
-        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decided_by: "alice" });
+        await expect(answer("t1", "allow")).rejects.toThrow(/cannot be found out.*can only be refused/);
+        expect(worker.answered).toEqual([]);
+        expect(kept("t1").answering).toBeNull();
+        reply(`deny ${open.code}`);
+        expect(await answer("t1", "deny", "call_2")).toMatchObject({ decision: "deny" });
+      });
+      for (const elsewhere of [true, false]) {
+        await within(async ({ task, store, asks, reply, answer, worker, settings }) => {
+          task("t1");
+          if (elsewhere) store.sql.exec("INSERT INTO task_on (task_id, repository) VALUES ('t1', 'https://github.com/acme/other')");
+          settings.writes = () => "yes";
+          const open = await asks("t1", 1, push);
+          reply(`approve ${open.code}`);
+          await expect(answer("t1", "allow")).rejects.toThrow(/not on record that this push is to the repository this task works on.*can only be refused/);
+          expect(worker.answered).toEqual([]);
+          expect(settings.writesAsked).toEqual([]);
+        });
+      }
+      // What was said to approve and was not taken is not taken later by itself: they say it again once they may.
+      await pushing(async ({ asks, reply, answer, worker, settings }) => {
+        let may: "unconnected" | "no" | "yes" = "unconnected";
+        settings.writes = () => may;
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow(/not known here which GitHub account/);
+        may = "yes";
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/was not taken.*again/);
+        expect(worker.answered).toEqual([]);
+        reply(`approve ${open.code}`);
+        expect(await answer("t1", "allow", "call_3")).toMatchObject({ decision: "allow", decided_by: "alice" });
+      });
+      // The reply that approved is taken back (its comment deleted), or its author says more where they typed it, while GitHub is asked: not taken.
+      await pushing(async ({ asks, reply, answer, worker, settings, store }) => {
+        let id = 0;
+        settings.writes = () => (store.sql.exec("UPDATE inbox SET text = 'never mind' WHERE id = ?", id), "yes");
+        const open = await asks("t1", 1, push);
+        id = reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow();
+        expect(worker.answered).toEqual([]);
       });
       // One person alone with the agent: theirs, with nobody asked about.
       await within(async ({ task, store, asks, reply, answer, settings }) => {
@@ -2555,8 +2651,10 @@ describe("tasks, by themselves", () => {
         expect(audited("task.approved")[0].standing).toBe(true);
       }, "user:alice");
       // Said where several people talk: it approves this push, and the next is asked about again.
-      await within(async ({ task, asks, reply, answer, worker, kept }) => {
+      await within(async ({ task, store, settings, asks, reply, answer, worker, kept }) => {
         task("t1");
+        store.sql.exec("INSERT INTO task_on (task_id, repository) VALUES ('t1', 'https://github.com/acme/app')");
+        settings.writes = () => "yes";
         const open = await asks("t1", 1, push);
         reply(`approve all ${open.code}`);
         expect(await answer("t1", "allow")).toEqual({ ok: true, task_id: "t1", decision: "allow", decided_by: "alice" });
@@ -2570,7 +2668,7 @@ describe("tasks, by themselves", () => {
         reply(`approve ${open.code}`);
         await answer("t1", "allow");
         expect(worker.answered[0][3]).toBe(false);
-      });
+      }, "user:alice");
       // Said, but of a command, or of a push that deletes: not carried.
       for (const body of [{ id: "q1", command: "x" }, { ...push, refs: [{ ref: "refs/heads/old", old: "a".repeat(40), new: ZERO }] }]) {
         await within(async ({ task, asks, reply, answer, worker }) => {
@@ -2579,7 +2677,7 @@ describe("tasks, by themselves", () => {
           reply(`approve all ${open.code}`);
           await answer("t1", "allow");
           expect(worker.answered[0][3]).toBe(false);
-        });
+        }, "user:alice");
       }
     });
 

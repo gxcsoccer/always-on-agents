@@ -1117,10 +1117,11 @@ describe("tasks and approvals", () => {
     expect(await reply(once.stub, once.id, "bob", `approve ${once.code}`)).not.toHaveProperty("standing");
     expect((await answersSent(once.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
 
-    // Where several people talk, every push is asked about: the words approve this one, once.
+    // Where several people talk, a push is approved only by someone who can be shown to be allowed to write to the
+    // repository; here nothing can say who is, so it can only be refused.
     const shared = await waitingOnPush("chat");
-    expect(await reply(shared.stub, shared.id, "bob", `approve all ${shared.code}`)).not.toHaveProperty("standing");
-    expect((await answersSent(shared.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
+    expect((await reply(shared.stub, shared.id, "bob", `approve all ${shared.code}`)).error).toMatch(/can only be refused/);
+    expect(await answersSent(shared.id)).toEqual([]);
 
     const always = await waitingOnPush();
     expect(await reply(always.stub, always.id, "bob", `approve all ${always.code}`)).toHaveProperty("standing");
@@ -1141,7 +1142,7 @@ describe("tasks and approvals", () => {
     expect((await answersSent(command.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
 
     // Nor does a push that includes a tag: it is approved, once.
-    const scope = brain("chat");
+    const scope = brain("user");
     model.replies([call("dispatch_task", { title: "release", brief: "tag it", repository: null })], [say("")]);
     await scope.stub.ingest(message("@agent release", { user: "bob", session_key: "chat" }));
     await wake(scope.stub);
@@ -1759,7 +1760,7 @@ describe("records and limits", () => {
   });
 
   it("keeps a record of who asked for work, what exactly was approved, and by which message", async () => {
-    const { stub } = brain("chat");
+    const { stub } = brain("user");
     model.replies([call("dispatch_task", { title: "cleanup", brief: "b", repository: null })], [say("")]);
     await stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
     await wake(stub);

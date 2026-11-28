@@ -51,6 +51,8 @@ const world = {
   /** GitHub gives no answer to a renewal. */
   renewalsDown: false,
   duringWrite: undefined as undefined | (() => unknown),
+  /** Something that happens while GitHub is asked about a repository. */
+  duringRepo: undefined as undefined | (() => unknown),
   renewals: 0,
   /** How long an access token lasts, in seconds. */
   lasts: 28_800,
@@ -80,6 +82,7 @@ function installWorld() {
   world.appDown = false;
   world.renewalsDown = false;
   world.duringWrite = undefined;
+  world.duringRepo = undefined;
   world.renewals = 0;
   world.lasts = 28_800;
   world.external.clear();
@@ -179,6 +182,7 @@ function installWorld() {
     if (!at || !repo || (!tenant && repo.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
     if (!at[2] && world.reposDown) return Response.json({ message: "unavailable" }, { status: 503 });
     // (What the one asking may do there: to push, they have to be one of those the repository lets write.)
+    if (!at[2]) await world.duringRepo?.();
     if (!at[2]) return Response.json({ id: repo.id, private: repo.private, full_name: repo.full_name, permissions: { pull: true, push: tenant || repo.members.includes(user!.account), admin: false } });
     if ((init?.method ?? "GET") === "GET") {
       if (world.listingDown) return Response.json({ message: "down" }, { status: 502 });
@@ -776,6 +780,18 @@ describe("whether someone may write to a repository, asked before their approval
     expect(await (await ann.grant()).canPush(PUBLIC, ann.account + 1_000)).toBe("unconnected");
     // Somebody's in another tenant only: not known here.
     expect(await grantWrites(env as any, "github", { ...REPO, tenant: "elsewhere" }, { person: "x", data: { account: ann.account } }, PUBLIC)).toBe("unconnected");
+
+    // Their authorisation is given up while GitHub is asked: what GitHub said is of one that is no longer held.
+    const dee = someone();
+    await authorised(dee);
+    world.repos.get(PUBLIC)!.members.push(dee.account);
+    expect(await inChat(dee)).toBe("yes");
+    world.duringRepo = async () => {
+      world.duringRepo = undefined;
+      await (await dee.grant()).drop();
+    };
+    expect(await inChat(dee)).toBe("unknown");
+    expect(await inChat(dee)).toBe("unconnected");
 
     // GitHub no longer takes their token: not connected any more.
     for (const [token, each] of world.tokens) if (each.account === ann.account) world.tokens.set(token, { ...each, good: false });

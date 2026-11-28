@@ -292,6 +292,8 @@ export class GithubGrant extends DurableObject<Env> {
     if (seen.status === 404 || seen.status === 403 || (seen.status >= 300 && seen.status < 400)) return "no";
     const found = seen.ok ? ((await seen.json().catch(() => null)) as { permissions?: { push?: unknown } } | null) : null;
     if (!found) return "unknown";
+    // As it stands now: taken away, or replaced, while GitHub was asked, what it said is of an authorisation that is no longer the one held.
+    if ((await this.#load())?.grant?.version !== held.version) return "unknown";
     return found.permissions?.push === true ? "yes" : "no";
   }
 
