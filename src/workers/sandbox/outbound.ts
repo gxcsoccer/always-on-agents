@@ -142,7 +142,7 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(reading, new Request(request, { headers, redirect: "manual" })));
     if (!own) return this.#refuse(request, url, "this task may only push to the repository it was started on");
     // Asking what the remote has is harmless; the push itself is the request that carries commits.
-    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
+    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(`https://github.com/${git.repo}.git/info/refs?service=git-receive-pack`, new Request(request, { headers, redirect: "manual" })));
 
     // A push is decided here, by what the request is, not by what the command looked like. The body
     // says exactly which refs would move to which commits, and that is what a person approves.

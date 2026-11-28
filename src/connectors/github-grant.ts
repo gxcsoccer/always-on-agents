@@ -199,26 +199,27 @@ export class GithubGrant extends DurableObject<Env> {
     const account = String(first.held.account);
     const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name);
     if (!claimed) return "another";
-    // As things are now: the grant may have been taken away while that was asked.
-    const stored = await this.#load();
-    const through = held(stored);
-    if (!stored || !through?.held || stored.generation !== before.generation) {
-      if (claimed === "new") await registry(this.env).releaseGithubPerson(name, account);
-      return undefined;
-    }
-    const { confirm: _spent, until: _over, ...grant } = through.held;
     const now = Date.now();
-    delete through.held;
-    through.state = "done";
-    through.at = now;
+    // As things are now: the grant may have been taken away while that was asked.
     // A new giving of the authorisation. Whatever was lent under one before it is not lent under
     // this one: it is stopped, in the same step as this is written.
-    await this.#withdraw(() => {
+    const written = await this.#withdraw((stored) => {
+      const through = held(stored);
+      if (!stored || !through?.held || stored.generation !== before.generation) return false;
+      const { confirm: _spent, until: _over, ...grant } = through.held;
+      delete through.held;
+      through.state = "done";
+      through.at = now;
       stored.grant = { ...grant, since: now, mark: random(16) };
       stored.bound = grant.account;
       stored.owed = this.#owed(stored, grant.version);
       void this.ctx.storage.put("grant", stored);
+      return true;
     });
+    if (!written) {
+      if (claimed === "new") await registry(this.env).releaseGithubPerson(name, account);
+      return undefined;
+    }
     void this.ctx.storage.setAlarm(now);
     return "done";
   }
@@ -258,14 +259,19 @@ export class GithubGrant extends DurableObject<Env> {
   /** Forgets the tokens and closes every open invitation, and the account is no longer this person's here. Only here: GitHub's own record of the authorisation is the person's to remove. */
   /** `only`: where the reason is about one GitHub account (it was revoked there), and the person may hold another by now. */
   async drop(only?: number): Promise<void> {
-    const stored = await this.#load();
-    if (!stored || (only !== undefined && stored.bound !== only)) return;
-    const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
-    await this.#withdraw(() => void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed }));
+    let was: { who: Who; bound?: number } | undefined;
+    await this.#withdraw((stored) => {
+      if (!stored || (only !== undefined && stored.bound !== only)) return false;
+      was = { who: stored.who, bound: stored.bound };
+      const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
+      void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
+      return true;
+    });
+    if (!was) return;
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
     // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
-    if (only === undefined || stored.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(stored.who), only === undefined ? undefined : String(stored.bound));
+    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), only === undefined ? undefined : String(was.bound));
   }
 
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
@@ -471,7 +477,7 @@ export class GithubGrant extends DurableObject<Env> {
       return undefined;
     }
     // Run out, with nothing left to renew it by: it will not come back, and what was lent it is stopped.
-    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return await this.#withdraw(), undefined;
+    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return await this.#withdraw((now) => now?.grant?.version === grant.version), undefined;
     this.#renewing ??= this.#renew(grant.version).finally(() => (this.#renewing = undefined));
     return this.#renewing;
   }
@@ -493,15 +499,18 @@ export class GithubGrant extends DurableObject<Env> {
     // as it stands then: a grant taken away, or replaced, meanwhile is not written over.
     const next = random(16);
     const sealed = renewed ? { access: await seal(key, renewed.access_token, next), refresh: renewed.refresh_token ? await seal(key, renewed.refresh_token, next) : undefined } : undefined;
-    const after = await this.#load();
-    if (!after?.grant || after.grant.version !== version || after.generation !== stored.generation) return undefined;
+    const still = (now: Stored | undefined): now is Stored & { grant: NonNullable<Stored["grant"]> } => now?.grant !== undefined && now.grant.version === version && now.generation === stored.generation;
     if (!renewed || !sealed) {
-      await this.#withdraw(() => {
-        delete after.grant;
-        void this.ctx.storage.put("grant", after);
+      await this.#withdraw((now) => {
+        if (!still(now)) return false;
+        delete (now as Stored).grant;
+        void this.ctx.storage.put("grant", now);
+        return true;
       });
       return undefined;
     }
+    const after = await this.#load();
+    if (!still(after)) return undefined;
     after.grant = { ...after.grant, ...sealed, version: next, ...tokensOf(renewed, Date.now()) };
     void this.ctx.storage.put("grant", after);
     return { token: renewed.access_token, version: next, account: after.grant.account, login: after.grant.login };
@@ -509,11 +518,11 @@ export class GithubGrant extends DurableObject<Env> {
 
   /** Forgets a token GitHub turned away, if it is still the one held. */
   async #refused(version: string): Promise<void> {
-    const stored = await this.#load();
-    if (!stored || stored.grant?.version !== version) return;
-    await this.#withdraw(() => {
+    await this.#withdraw((stored) => {
+      if (!stored || stored.grant?.version !== version) return false;
       delete stored.grant;
       void this.ctx.storage.put("grant", stored);
+      return true;
     });
   }
 
@@ -598,7 +607,7 @@ export class GithubGrant extends DurableObject<Env> {
   async #standsNow(of: { generation: number; mark: string; account: number }): Promise<boolean> {
     const stored = await this.#load();
     if (this.#stands(stored, of)) return true;
-    if (this.#same(stored, of)) await this.#withdraw();
+    if (this.#same(stored, of)) await this.#withdraw((now) => this.#same(now, of) && !this.#usable(now!.grant!));
     return false;
   }
 
@@ -614,17 +623,20 @@ export class GithubGrant extends DurableObject<Env> {
 
   /**
    * The authorisation is gone: every piece of work that was lent it is to be stopped, and is until
-   * it has been. `write`: what records that it is gone. That, and the list of what is to be
-   * stopped, are written with nothing waited for between them: both are kept, or neither.
+   * it has been. `write` is handed the record as it stands, read together with the list of what
+   * was lent: it says whether it is (still) so, and writes what records that it is gone. From that
+   * reading on nothing is waited for: the record is never written from an earlier reading of it,
+   * and it and the list of what is to be stopped are kept together or not at all.
    */
-  async #withdraw(write?: () => void): Promise<void> {
-    const lent = await this.ctx.storage.list<number>({ prefix: "lent:" });
-    write?.();
+  async #withdraw(write: (stored: Stored | undefined) => boolean): Promise<boolean> {
+    const [stored, lent] = await Promise.all([this.#load(), this.ctx.storage.list<number>({ prefix: "lent:" })]);
+    if (!write(stored)) return false;
     for (const [key, at] of lent) {
       void this.ctx.storage.put(`stop:${key.slice("lent:".length)}`, at);
       void this.ctx.storage.delete(key);
     }
     if (lent.size > 0) void this.ctx.storage.setAlarm(Date.now());
+    return true;
   }
 
   /** Stops each piece of work that is to be stopped. Says whether any could not be told. */
