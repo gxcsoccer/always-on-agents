@@ -90,6 +90,14 @@ export interface TasksHost {
   isDecider(principal: Principal, source: string): boolean;
   /** Whether this source can say what one of its messages says now. */
   canRevisit(source: string): boolean;
+  /**
+   * Whether whoever wrote a message may write to a repository, as the service that keeps it says
+   * now (see Connector.writes). Nothing where no connector has such a word to say of messages
+   * from that source.
+   */
+  writes(event: InboxRow, principal: Principal, repo: string): Promise<"yes" | "no" | "unconnected" | "unknown"> | undefined;
+  /** Whether that can be asked at all of messages from a source. */
+  saysWhoWrites(source: string): boolean;
   /** What a revisable message says at its source now. Throws if the source cannot be asked. */
   standingOf(source: string, subject: string): Promise<Standing | undefined>;
   /** Keeps a message to deliver: see Outbox.enqueue. */
@@ -960,6 +968,11 @@ export class Tasks implements Wakes {
       const replies = received.events
         .map((event) => ({ event, principal: JSON.parse(event.principal) as Principal }))
         .filter(({ event, principal }) => this.#b.isDecider(principal, event.source));
+      // The approval of a push, where several people talk, is taken from anyone whose word counts
+      // there and who may write to the repository: asked of the service that keeps it, below.
+      const shared = this.#s.scope().kind !== "user";
+      const on = (this.#s.rows<{ repository: string }>("SELECT repository FROM task_on WHERE task_id = ?", taskId)[0]?.repository ?? "").replace(/^https:\/\/github\.com\//i, "").replace(/(\.git|\/)+$/i, "").toLowerCase();
+      const checks = decision === "allow" && shared && (pending as { source?: string }).source === "proxy" && on !== "";
       const deciding = decidingReply(decision, pending, {
         replies,
         unresolved: received.unresolved,
@@ -972,8 +985,9 @@ export class Tasks implements Wakes {
         // One message approves one question.
         used: () => new Set(this.#s.rows<{ event: number | null }>("SELECT json_extract(answering, '$.deciding_event') AS event FROM tasks WHERE answering IS NOT NULL").map((r) => r.event)),
         setAside,
-        shared: this.#s.scope().kind !== "user",
+        shared,
         requestedBy: task.requested_by,
+        ...(checks ? { writers: (reply) => this.#b.saysWhoWrites(reply.event.source) } : {}),
         // Anything of theirs that arrived after this run started and is still in the inbox. And,
         // for an approval that was typed elsewhere in the chat and brought here, anything they
         // have said since in the place they typed it.
@@ -987,8 +1001,22 @@ export class Tasks implements Wakes {
       // "For the rest of this task" is the approver's to say, in their own message; it is offered
       // only for pushes.
       // only for pushes that update branches, which is also the only kind it is offered for.
+      // Not where several people talk: there each push is asked about, and whoever approves it is asked about each time.
       const asksAbout = pending as { source?: string; refs?: RefUpdate[] };
-      const standing = decision === "allow" && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
+      const asked_ = checks && this.#b.saysWhoWrites(deciding.event.source) ? this.#b.writes(deciding.event, deciding.principal, on) : undefined;
+      if (asked_ !== undefined) {
+        const who = deciding.principal.display ?? deciding.principal.id;
+        const latest = () => this.#s.rows<{ id: number | null }>("SELECT MAX(id) AS id FROM inbox WHERE session_key = ?", sessionKey)[0]?.id ?? 0;
+        const before_ = latest();
+        const may = await asked_.catch(() => "unknown" as const);
+        if (may === "no") throw new Error(`${who} cannot write to ${on} on GitHub, so their approval of this push does not count; nothing was pushed and the question is still open. Someone here who can write to that repository can approve it, with the same words; anyone can still refuse it`);
+        if (may === "unconnected") throw new Error(`it is not known here which GitHub account is ${who}'s, so it cannot be told whether they may approve a push to ${on}; nothing was pushed and the question is still open. They have to connect GitHub with you first (in their own conversation with you), and then approve again with the same words: their earlier approval is not taken up by itself`);
+        if (may !== "yes") throw new Error(`GitHub could not be asked just now whether ${who} may write to ${on}; nothing was pushed and the question is still open. Call this tool again in a little while`);
+        // Asking took time. Only if nothing here has changed meanwhile: the question, what was on record of it, and what was said.
+        const now = this.#s.rows<Row>("SELECT status, pending, answering FROM tasks WHERE id = ?", taskId)[0];
+        if (!now || now.status !== task.status || now.pending !== task.pending || now.answering !== task.answering || latest() !== before_) throw new Error("something here changed while GitHub was being asked; call this tool again");
+      }
+      const standing = decision === "allow" && !shared && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
       intent = { call_id: callId, pending_id: pending.id, decision, reason, decided_by: deciding.principal.id, deciding_event: deciding.event.id, ...(pending.ask ? { ask: pending.ask } : {}), ...(standing ? { standing } : {}), ...(before ? { before } : {}) };
       this.#s.sql.exec("UPDATE tasks SET answering = ? WHERE id = ?", JSON.stringify(intent), taskId);
       // Recorded with the question as it was put and the message that answered it.
@@ -1244,7 +1272,7 @@ export class Tasks implements Wakes {
             detail: body.source === "proxy" ? String(body.summary ?? `${body.action} on ${body.resource}`) : String(body.command ?? ""),
             can_approve: !truncated,
             ...(body.source === "proxy"
-              ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated && standingEligible(Array.isArray(body.refs) ? (body.refs as RefUpdate[]) : []) }
+              ? { resource: String(body.resource ?? ""), refs: Array.isArray(body.refs) ? (body.refs as ApprovalQuestion["refs"]) : [], standing_offered: !truncated && this.#s.scope().kind === "user" && standingEligible(Array.isArray(body.refs) ? (body.refs as RefUpdate[]) : []) }
               : {}),
           };
           this.#b.enqueue(ask, session.id, null, `Task "${task.title}" is paused and needs approval to ${what}\n\n${how}`, question);

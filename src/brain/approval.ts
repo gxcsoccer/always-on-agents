@@ -36,6 +36,13 @@ export interface Facts {
   shared: boolean;
   /** The one person who asked for the task, if there was exactly one. */
   requestedBy: string | null;
+  /**
+   * For a question about a push: whether it can be asked, of the service that keeps the
+   * repository, if the author of this reply may write to it. Where it can, the approval of a push
+   * is anyone's whose word counts here (and is then taken only if they may write there, which
+   * whoever calls this finds out); where it cannot, it is the one person's who asked, as ever.
+   */
+  writers?(reply: Reply): boolean;
   /** Whether the author of this reply has said anything since that is not among `replies`. */
   saidMore(deciding: Reply): boolean;
   /** Whether a message still says what it said when it was read. */
@@ -92,9 +99,8 @@ export function decidingReply(decision: "allow" | "deny", asked: Asked, facts: F
     }
     approvals = unused;
     if (facts.shared) {
-      if (!facts.requestedBy) throw new Error("this task was not started by a person, so nobody can approve this; it can only be refused");
-      approvals = approvals.filter(({ principal }) => principal.id === facts.requestedBy);
-      if (approvals.length === 0) throw new Error(`only ${facts.requestedBy}, who requested this task, can approve it`);
+      approvals = approvals.filter((reply) => facts.writers?.(reply) === true || reply.principal.id === facts.requestedBy);
+      if (approvals.length === 0) throw new Error(facts.requestedBy ? `only ${facts.requestedBy}, who requested this task, can approve it` : "this task was not started by a person, so nobody can approve this; it can only be refused");
     }
     // "Last" is by when a thing was said, where the source tells us: deliveries can arrive out
     // of order, and a "wait" sent after the approval may get here before it.

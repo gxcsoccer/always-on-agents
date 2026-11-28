@@ -33,6 +33,9 @@ function bench(state: DurableObjectState) {
   const settings = {
     deciders: [{ kind: "human", id: "alice", explicit: true }] as Principal[],
     revisable: new Set<string>(),
+    /** What the service that keeps a repository says of whether someone may write to it; nothing where no connector has such a word to say. */
+    writes: undefined as undefined | ((person: string, repo: string) => "yes" | "no" | "unconnected" | "unknown" | Promise<"yes" | "no" | "unconnected" | "unknown">),
+    writesAsked: [] as [string, string][],
     /** What a source says one of its messages is now, by subject. */
     now: {} as Record<string, Standing>,
     /** The workers this deployment lists, by name. */
@@ -122,6 +125,8 @@ function bench(state: DurableObjectState) {
     isDecider,
     canRevisit: mayRevisit,
     standingOf,
+    saysWhoWrites: () => settings.writes !== undefined,
+    writes: (_event, principal, repo) => (settings.writes ? (settings.writesAsked.push([principal.id, repo]), Promise.resolve().then(() => settings.writes!(principal.id, repo))) : undefined),
     // As the outbox's own does, as far as the row goes.
     enqueue: (idem, sessionId, runId, text, ask) => {
       const target = store.rows<{ target: string | null }>("SELECT target FROM sessions WHERE id = ?", sessionId)[0]?.target;
@@ -1935,7 +1940,13 @@ describe("tasks, by themselves", () => {
       });
     });
 
-    it("describe a push by what it does to which branches, and offer approval for the rest of the task only for branch updates", async () => {
+    it("describe a push by what it does to which branches, and offer approval for the rest of the task only for branch updates, and only to one person alone", async () => {
+      // Where several people talk, every push is asked about.
+      await within(async ({ tasks, task, question }) => {
+        task("t1");
+        await tasks.event("t1", 1, "needs_input", { id: "q1", source: "proxy", summary: "push to acme/app: move branch main", resource: "acme/app", action: "push", refs: BRANCH });
+        expect(JSON.parse(question("ask:t1:1").ask)).toMatchObject({ kind: "push", standing_offered: false, can_approve: true });
+      });
       await within(async ({ tasks, task, question }) => {
         task("t1");
         await tasks.event("t1", 1, "needs_input", { id: "q1", source: "proxy", summary: "push to acme/app: move branch main", resource: "acme/app", action: "push", refs: BRANCH });
@@ -1943,7 +1954,7 @@ describe("tasks, by themselves", () => {
         expect(question("ask:t1:1").text).toContain("needs approval to push to acme/app: move branch main.\n\n");
         await tasks.event("t1", 2, "needs_input", { id: "q2", source: "proxy", action: "push", resource: "acme/app", refs: [{ ref: "refs/heads/old", old: "a".repeat(40), new: ZERO }] });
         expect(JSON.parse(question("ask:t1:2").ask)).toMatchObject({ detail: "push on acme/app", standing_offered: false });
-      });
+      }, "user:alice");
     });
 
     it("show a question too long to show in full as one that can only be refused", async () => {
@@ -2437,6 +2448,99 @@ describe("tasks, by themselves", () => {
       });
     });
 
+    it("takes the approval of a push, where several people talk, from anyone there who may write to the repository, and from nobody who may not", async () => {
+      const push = { id: "q1", source: "proxy", summary: "push", resource: "acme/app", action: "push", refs: BRANCH };
+      const pushing = (use: Parameters<typeof within>[0]) =>
+        within(async (bench) => {
+          bench.task("t1");
+          bench.store.sql.exec("INSERT INTO task_on (task_id, repository) VALUES ('t1', 'https://github.com/Acme/App.git')");
+          return use(bench);
+        });
+      // Someone other than the one who asked, who may write there: theirs is taken, and it is on record as theirs.
+      await pushing(async ({ asks, reply, answer, worker, settings, audited, kept }) => {
+        settings.writes = (person) => (person === "bob" ? "yes" : "no");
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "allow")).toMatchObject({ ok: true, decision: "allow", decided_by: "bob" });
+        expect(settings.writesAsked).toEqual([["bob", "acme/app"]]);
+        expect(worker.answered).toHaveLength(1);
+        expect(audited("task.approved")[0]).toMatchObject({ actor: "bob" });
+        expect(kept("t1").status).toBe("running");
+      });
+      // The one who asked, who may not write there: not taken; the question stays open, and nothing is on record or sent.
+      await pushing(async ({ asks, reply, answer, worker, settings, kept, audited }) => {
+        settings.writes = (person) => (person === "bob" ? "yes" : "no");
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow(/alice cannot write to acme\/app on GitHub.*question is still open/);
+        expect(worker.answered).toEqual([]);
+        expect(kept("t1")).toMatchObject({ status: "needs_input", answering: null });
+        expect(audited("task.approved")).toEqual([]);
+        // Then someone who may: taken.
+        reply(`approve ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decision: "allow", decided_by: "bob" });
+      });
+      // It is not known which account is theirs; or it cannot be asked just now: not taken, and said which.
+      for (const [verdict, like] of [["unconnected", /not known here which GitHub account.*approve again/], ["unknown", /could not be asked just now.*again in a little while/], [new Error("down"), /could not be asked just now/]] as const) {
+        await pushing(async ({ asks, reply, answer, worker, settings, kept }) => {
+          settings.writes = () => {
+            if (verdict instanceof Error) throw verdict;
+            return verdict;
+          };
+          const open = await asks("t1", 1, push);
+          reply(`approve ${open.code}`);
+          await expect(answer("t1", "allow")).rejects.toThrow(like);
+          expect(worker.answered).toEqual([]);
+          expect(kept("t1")).toMatchObject({ status: "needs_input", answering: null });
+        });
+      }
+      // Something is said here while it is being asked: looked at again from the start.
+      await pushing(async ({ asks, reply, answer, worker, settings }) => {
+        let open!: { code: string };
+        settings.writes = () => (reply("wait", { person: "carol", status: "pending" }), "yes");
+        open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        await expect(answer("t1", "allow")).rejects.toThrow(/changed while GitHub was being asked/);
+        expect(worker.answered).toEqual([]);
+      });
+      // A refusal is anyone's, and nobody is asked about.
+      await pushing(async ({ asks, reply, answer, settings }) => {
+        settings.writes = () => "no";
+        const open = await asks("t1", 1, push);
+        reply(`deny ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "deny")).toMatchObject({ decision: "deny", decided_by: "bob" });
+        expect(settings.writesAsked).toEqual([]);
+      });
+      // A question that is not about a push is the one person's who asked, as ever, and nobody is asked about.
+      await pushing(async ({ asks, reply, answer, settings }) => {
+        settings.writes = () => "yes";
+        const open = await asks("t1", 1);
+        reply(`approve ${open.code}`, { person: "bob" });
+        await expect(answer("t1", "allow")).rejects.toThrow(/only alice, who requested this task, can approve it/);
+        reply(`approve ${open.code}`);
+        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decided_by: "alice" });
+        expect(settings.writesAsked).toEqual([]);
+      });
+      // Where no connector can say who may write: the one person's who asked, as ever.
+      await pushing(async ({ asks, reply, answer }) => {
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`, { person: "bob" });
+        await expect(answer("t1", "allow")).rejects.toThrow(/only alice, who requested this task, can approve it/);
+        reply(`approve ${open.code}`);
+        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decided_by: "alice" });
+      });
+      // One person alone with the agent: theirs, with nobody asked about.
+      await within(async ({ task, store, asks, reply, answer, settings }) => {
+        task("t1");
+        store.sql.exec("INSERT INTO task_on (task_id, repository) VALUES ('t1', 'https://github.com/acme/app')");
+        settings.writes = () => "no";
+        const open = await asks("t1", 1, push);
+        reply(`approve ${open.code}`);
+        expect(await answer("t1", "allow")).toMatchObject({ decided_by: "alice" });
+        expect(settings.writesAsked).toEqual([]);
+      }, "user:alice");
+    });
+
     it("carries 'for the rest of this task' only when the approver said so, for a push that only updates branches", async () => {
       const push = { id: "q1", source: "proxy", summary: "push", resource: "acme/app", action: "push", refs: BRANCH };
       await within(async ({ task, asks, reply, answer, worker, kept, closed, audited }) => {
@@ -2449,6 +2553,15 @@ describe("tasks, by themselves", () => {
         expect(JSON.parse(kept("t1").answering).standing).toBe(true);
         expect(closed(open.ask)).toEqual({ state: "approved", standing: true });
         expect(audited("task.approved")[0].standing).toBe(true);
+      }, "user:alice");
+      // Said where several people talk: it approves this push, and the next is asked about again.
+      await within(async ({ task, asks, reply, answer, worker, kept }) => {
+        task("t1");
+        const open = await asks("t1", 1, push);
+        reply(`approve all ${open.code}`);
+        expect(await answer("t1", "allow")).toEqual({ ok: true, task_id: "t1", decision: "allow", decided_by: "alice" });
+        expect(worker.answered[0][3]).toBe(false);
+        expect(JSON.parse(kept("t1").answering).standing).toBeUndefined();
       });
       // Not said: not carried.
       await within(async ({ task, asks, reply, answer, worker }) => {
