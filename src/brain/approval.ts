@@ -36,6 +36,15 @@ export interface Facts {
   shared: boolean;
   /** The one person who asked for the task, if there was exactly one. */
   requestedBy: string | null;
+  /**
+   * For a question about a push: whether it can be asked, of the service that keeps the
+   * repository, if the author of this reply may write to it. Where it can, the approval of a push
+   * is anyone's whose word counts here (and is then taken only if they may write there, which
+   * whoever calls this finds out); where it cannot, it is the one person's who asked, as ever.
+   */
+  writers?(reply: Reply): boolean;
+  /** Messages that were not taken as an approval of this task's push when they were looked at (their author could not be shown to be allowed to write there): they are not taken later either. */
+  voided?(): Set<number>;
   /** Whether the author of this reply has said anything since that is not among `replies`. */
   saidMore(deciding: Reply): boolean;
   /** Whether a message still says what it said when it was read. */
@@ -81,20 +90,25 @@ export function decidingReply(decision: "allow" | "deny", asked: Asked, facts: F
     if (facts.unresolved) throw new Error("a reply here was edited and its new text has not arrived yet; call this tool again when it has");
     let approvals = read.filter(({ says }) => says === "allow");
     if (approvals.length === 0) throw new Error(`no reply so far is an approval. An approval is a message whose only words are "approve ${asked.code}" (mentioning you in front of it is fine; anything after it, or any other wording, is not). Tell them that, and call this tool again whenever a new reply arrives`);
+    // What said "approve" and was not taken, because its author could not be shown to be allowed to write there, is not taken later either.
+    const voided = facts.voided?.() ?? new Set<number>();
+    const notTaken = `the approval given so far was not taken, because whoever gave it could not be shown to be allowed to write to that repository; it is not taken up again by itself. Whoever approves has to send "approve ${asked.code}" again (they, once they may; or someone else here who may)`;
     // One message approves one question.
     const used = facts.used();
     const unused = approvals.filter(({ event }) => !used.has(event.id));
     if (unused.length === 0) {
       // The message is the one this question's own approval rested on, until it was set aside.
       const own = approvals.find(({ event }) => event.id === facts.setAside);
+      if (own && voided.has(own.event.id)) throw new Error(notTaken);
       if (own) throw new Error(`${own.principal.id}'s earlier approval of this was set aside because of what was said since; ask them to confirm by sending just "approve ${asked.code}" again`);
       throw new Error("that reply was already used to approve another question");
     }
     approvals = unused;
+    if (approvals.length > 0 && approvals.every(({ event }) => voided.has(event.id))) throw new Error(notTaken);
+    approvals = approvals.filter(({ event }) => !voided.has(event.id));
     if (facts.shared) {
-      if (!facts.requestedBy) throw new Error("this task was not started by a person, so nobody can approve this; it can only be refused");
-      approvals = approvals.filter(({ principal }) => principal.id === facts.requestedBy);
-      if (approvals.length === 0) throw new Error(`only ${facts.requestedBy}, who requested this task, can approve it`);
+      approvals = approvals.filter((reply) => facts.writers?.(reply) === true || reply.principal.id === facts.requestedBy);
+      if (approvals.length === 0) throw new Error(facts.requestedBy ? `only ${facts.requestedBy}, who requested this task, can approve it` : "this task was not started by a person, so nobody can approve this; it can only be refused");
     }
     // "Last" is by when a thing was said, where the source tells us: deliveries can arrive out
     // of order, and a "wait" sent after the approval may get here before it.

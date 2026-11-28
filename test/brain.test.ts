@@ -1101,8 +1101,8 @@ describe("tasks and approvals", () => {
 
   it("passes on an approval for the rest of the task only when the approver said so, and only for a push", async () => {
     const pushAsk = { source: "proxy", id: "q-1", action: "push", resource: "acme/demo", refs: [{ ref: "refs/heads/feature", old: "a".repeat(40), new: "b".repeat(40) }], summary: "push to acme/demo: move branch feature" };
-    const waitingOnPush = async () => {
-      const scope = brain("chat");
+    const waitingOnPush = async (where: "chat" | "user" = "user") => {
+      const scope = brain(where);
       model.replies([call("dispatch_task", { title: "ship", brief: "push the fix", repository: null })], [say("")]);
       await scope.stub.ingest(message("@agent ship it", { user: "bob", session_key: "chat" }));
       await wake(scope.stub);
@@ -1116,6 +1116,12 @@ describe("tasks and approvals", () => {
     const once = await waitingOnPush();
     expect(await reply(once.stub, once.id, "bob", `approve ${once.code}`)).not.toHaveProperty("standing");
     expect((await answersSent(once.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
+
+    // Where several people talk, a push is approved only by someone who can be shown to be allowed to write to the
+    // repository; here nothing can say who is, so it can only be refused.
+    const shared = await waitingOnPush("chat");
+    expect((await reply(shared.stub, shared.id, "bob", `approve all ${shared.code}`)).error).toMatch(/can only be refused/);
+    expect(await answersSent(shared.id)).toEqual([]);
 
     const always = await waitingOnPush();
     expect(await reply(always.stub, always.id, "bob", `approve all ${always.code}`)).toHaveProperty("standing");
@@ -1136,7 +1142,7 @@ describe("tasks and approvals", () => {
     expect((await answersSent(command.id)).at(-1)).toMatchObject({ decision: "allow", standing: false });
 
     // Nor does a push that includes a tag: it is approved, once.
-    const scope = brain("chat");
+    const scope = brain("user");
     model.replies([call("dispatch_task", { title: "release", brief: "tag it", repository: null })], [say("")]);
     await scope.stub.ingest(message("@agent release", { user: "bob", session_key: "chat" }));
     await wake(scope.stub);
@@ -1754,7 +1760,7 @@ describe("records and limits", () => {
   });
 
   it("keeps a record of who asked for work, what exactly was approved, and by which message", async () => {
-    const { stub } = brain("chat");
+    const { stub } = brain("user");
     model.replies([call("dispatch_task", { title: "cleanup", brief: "b", repository: null })], [say("")]);
     await stub.ingest(message("@agent clean up", { user: "bob", session_key: "chat" }));
     await wake(stub);

@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantWrites } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 /** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
@@ -28,6 +28,7 @@ export const githubConnector: Connector = {
   serves: ["feishu"],
   tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
+  writes: grantWrites,
   offers: grantOffers,
   invitation: grantInvitation,
   async http(request, env, path) {
@@ -415,10 +416,12 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // renamed and then claimed by someone else.
   if (event.principal.kind === "human") {
     const accountId = event.principal.id.replace(/^github:/, "");
-    const user = (await registry(env).resolveIdentity(tenant, "github", accountId)) ?? (await personAs(env, tenant, accountId));
+    // (One an operator linked is who the operator said, before anything else.)
+    const linked = await registry(env).resolveIdentity(tenant, "github", accountId);
+    const user = linked ?? (await personAs(env, tenant, accountId));
     // A user id of the form "github:…", which can no longer be given, was never counted as a
     // member in a repository. It still is not.
-    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined };
+    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined, ...(linked === null ? { self_connected: true as const } : {}) };
   }
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.
@@ -536,6 +539,8 @@ export function normalize(
         data: {
           number,
           comment_id: payload.comment.id,
+          // Which account wrote it, by GitHub's number: what it is asked of whether they may write here.
+          ...(Number.isInteger(sender.id) ? { account: sender.id } : {}),
           is_pull_request: Boolean(payload.issue.pull_request),
           // Shown to the model next to the comment, which on its own does not say where it was made.
           where: `${payload.issue.pull_request ? "pull request" : "issue"} #${number} of ${repo}`,

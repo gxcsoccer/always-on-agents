@@ -271,7 +271,9 @@ export class GithubGrant extends DurableObject<Env> {
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
     // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
-    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), only === undefined ? undefined : String(was.bound));
+    // (By that account where there was one, so that a note made anew meanwhile, of their authorising again, is not taken away with the old one.
+    // Where none was bound, whatever is noted as theirs goes: what a binding interrupted half-way left behind.)
+    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), was.bound === undefined ? undefined : String(was.bound));
   }
 
   /**
@@ -281,6 +283,29 @@ export class GithubGrant extends DurableObject<Env> {
   async personOf(account: number): Promise<string | null> {
     const stored = await this.#load();
     return stored && stored.bound === account ? stored.who.open_id : null;
+  }
+
+  /**
+   * Whether this person can push to a repository, as GitHub says now of their own token. `as`:
+   * the account they have to be (where what is asked about was written as that account).
+   */
+  async canPush(repo: string, as?: number): Promise<"yes" | "no" | "unconnected" | "unknown"> {
+    const held = await this.#token();
+    if (held === "later") return "unknown";
+    if (!held || (as !== undefined && held.account !== as)) return "unconnected";
+    let seen: Response;
+    try {
+      seen = await github(held.token, `/repos/${repo}`);
+    } catch {
+      return "unknown";
+    }
+    if (seen.status === 401) return await this.#refused(held.version), "unconnected";
+    if (seen.status === 404 || seen.status === 403 || (seen.status >= 300 && seen.status < 400)) return "no";
+    const found = seen.ok ? ((await seen.json().catch(() => null)) as { permissions?: { push?: unknown } } | null) : null;
+    if (!found) return "unknown";
+    // As it stands now: taken away, or replaced, while GitHub was asked, what it said is of an authorisation that is no longer the one held.
+    if ((await this.#load())?.grant?.version !== held.version) return "unknown";
+    return found.permissions?.push === true ? "yes" : "no";
   }
 
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
@@ -778,6 +803,31 @@ const why = (kind: Kind, reason: string): string | undefined =>
     no_comment: "GitHub did not let the person comment there (the conversation may be locked, or they may not be allowed to); nothing was posted",
   })[reason];
 
+/**
+ * Whether whoever wrote a message may push to a repository (see Connector.writes): asked of
+ * GitHub with their own authorisation, given here. In a chat, they are the person the chat says;
+ * in a repository's own conversation, the account that wrote the comment, where someone of the
+ * tenant has authorised as it.
+ */
+export async function grantWrites(env: Env, source: string, scope: Scope, by: { person: string; data: Record<string, unknown> }, repo: string): Promise<"yes" | "no" | "unconnected" | "unknown"> {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return "unknown";
+  try {
+    if (source === "github") {
+      const account = by.data.account;
+      if (typeof account !== "number" || !Number.isSafeInteger(account)) return "unconnected";
+      const grant = await registry(env).githubPersonGrant(scope.tenant, String(account));
+      return grant ? await env.GITHUB_GRANTS.getByName(grant).canPush(repo.toLowerCase(), account) : "unconnected";
+    }
+    const origin = (by.data.origin ?? {}) as Record<string, unknown>;
+    const app = typeof origin.app_id === "string" ? await registry(env).feishuApp(origin.app_id) : null;
+    if (!app || app.tenant !== scope.tenant || typeof origin.tenant_key !== "string" || !origin.tenant_key) return "unconnected";
+    const name = await grantName({ tenant: scope.tenant, chat_app_id: app.app_id, tenant_key: origin.tenant_key, open_id: by.person });
+    return await env.GITHUB_GRANTS.getByName(name).canPush(repo.toLowerCase());
+  } catch {
+    return "unknown";
+  }
+}
+
 export const githubCreateIssue: ConnectorTool = {
   name: "github_create_issue",
   description:
@@ -1143,7 +1193,7 @@ export async function grantCallback(request: Request, env: Env): Promise<Respons
     // and asked. What they send back carries a word only this page was given.
     const confirm = await grant.hold(state[2], invitation.generation, issued as Issued, { id: account.id, login: account.login });
     if (!confirm) return await refused("superseded");
-    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
+    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作；@${account.login} 在这个组织接入的仓库里向我提出的请求，也会被当作那个人提出的。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
   } catch {
     return await refused("interrupted");
   }
