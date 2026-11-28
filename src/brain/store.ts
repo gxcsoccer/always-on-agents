@@ -111,8 +111,8 @@ export class BrainStore {
       event = { ...event, data: latest ? { ...rest, supersedes: { key: latest.key, at: latest.at } } : rest };
     }
     this.sql.exec(
-      `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.source,
       event.source_id,
       event.kind,
@@ -122,8 +122,9 @@ export class BrainStore {
       event.data ? JSON.stringify(event.data) : null,
       event.reply_to ? JSON.stringify(event.reply_to) : null,
       Date.now(),
+      // (Written as it stands from the first: one that came late, or only ends the others, never waits.)
+      latest && (late || latest.void) ? "dropped" : "pending",
     );
-    if (latest && (late || latest.void)) this.sql.exec("UPDATE inbox SET status = 'dropped' WHERE source = ? AND source_id = ?", event.source, event.source_id);
     return true;
   }
 }

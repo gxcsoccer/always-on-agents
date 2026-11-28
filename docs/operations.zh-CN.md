@@ -38,6 +38,7 @@ Worker 的地址是 `https://always-on-agent.<你的子域>.workers.dev`。如�
 | `ADMIN_KEY` | 密钥，必填 | 保护管理接口 |
 | `GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY` | 密钥 | agent 所使用的 GitHub App。配置后，令牌按安装和仓库签发 |
 | `GITHUB_WEBHOOK_SECRET` | 密钥 | App 的 webhook secret |
+| `GITHUB_AUTO_REVIEW` | 变量 | 设为 `on`：PR 新开或有新推送时自动评审（每次评审是一个沙箱任务，计入该 scope 的每日额度）。不设或其他值：只有人在 PR 里 @ agent 时才评审。**默认行为变了：以前总是自动评审，想恢复就设为 `on`。** 关掉后，已经在排队的 PR 通知会在下次要被处理时作废。 |
 | `GITHUB_BOT_HANDLE` | 密钥 | agent 在 GitHub 上的账号名（App 的 slug），人们用它来 @ agent |
 | `GITHUB_BOT_EMAIL` | 密钥 | 沙箱里提交代码时使用的邮箱 |
 | `GITHUB_TOKEN` | 密钥 | 一个用于所有仓库的令牌，只在没有配置 App 时使用。仅限本地开发 |

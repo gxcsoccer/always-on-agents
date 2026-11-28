@@ -314,7 +314,8 @@ export class BrainAgent extends DurableObject<Env> {
       for (const waiting of this.#store.rows<Continuation>("SELECT c.* FROM continuations c JOIN sessions s ON s.id = c.session_id WHERE c.status = 'waiting' AND s.session_key = ? AND (c.person = ? OR (? = 1 AND c.person IS NULL))", event.session_key, event.principal.id, isPrivateSession(event.session_key) ? 1 : 0)) this.#requests.hint(waiting, `said:${event.source}:${event.source_id}`);
     }
     // Also on a duplicate: the first delivery may have been stored without its wake-up being scheduled.
-    await this.#wakeBy(Date.now() + BATCH_WINDOW_MS);
+    // Not for one that was dropped as it was taken in (see InboundEvent.supersedes): there is nothing of it to wake up for.
+    if (this.#store.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ? AND status = 'dropped' LIMIT 1", event.source, event.source_id).length === 0) await this.#wakeBy(Date.now() + BATCH_WINDOW_MS);
     return { accepted: true, duplicate: !inserted };
   }
 

@@ -100,6 +100,13 @@ describe("the GitHub webhook endpoint", () => {
       await wake(brain);
       expect(modelCalls).toHaveLength(1);
       expect(JSON.stringify(modelCalls[0].input)).toContain("please review this");
+      // Where nothing of it waits, the Brain is not woken for it at all: not when it arrives, nor when it is delivered again.
+      const quiet = await tenant();
+      const { webhook_secret: other } = await registry().linkGithubRepo(`acme/${quiet}`, quiet);
+      const pushed = () => deliver(other, "pull_request", { action: "opened", repository: { full_name: `acme/${quiet}` }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 1, number: 1, title: "t", html_url: "https://github.com/x/y/pull/1", head: { ref: "r", sha: "s" }, base: { ref: "main" }, user: { login: "dana" }, updated_at: "2026-11-28T01:00:00Z" } });
+      await pushed();
+      await pushed();
+      expect(await runInDurableObject(brainFor(`${quiet}:repo:acme/${quiet}`), (_i: unknown, state: DurableObjectState) => state.storage.getAlarm())).toBeNull();
     } finally {
       (env as any).GITHUB_AUTO_REVIEW = "on";
     }
