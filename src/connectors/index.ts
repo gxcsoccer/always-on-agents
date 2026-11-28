@@ -62,6 +62,12 @@ export function writes(env: Env, source: string, scope: Scope, by: { person: str
   return saying?.writes?.(env, source, scope, by, repo);
 }
 
+/** Whether whoever wrote a message is still the person they were known as (see Connector.stillIs): yes where no connector has such a word to say. */
+export async function stillIs(env: Env, source: string, scope: Scope, by: { person: string; data: Record<string, unknown> }): Promise<boolean | "unknown"> {
+  const saying = [byName.get(source), ...serving(source)].find((each) => each?.stillIs);
+  return saying?.stillIs ? saying.stillIs(env, source, scope, by) : true;
+}
+
 /** Whether it can be asked, of messages that come through a connector, if their authors may write to a repository. */
 export function saysWhoWrites(source: string): boolean {
   return [byName.get(source), ...serving(source)].some((each) => each?.writes !== undefined);

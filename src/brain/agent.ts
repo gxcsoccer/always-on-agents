@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, saysWhoWrites, toolsOf, trusts, unreceived, wanted, writes } from "../connectors";
+import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, saysWhoWrites, stillIs, toolsOf, trusts, unreceived, wanted, writes } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -111,6 +111,7 @@ export class BrainAgent extends DurableObject<Env> {
       isDecider: (principal, source) => this.#isDecider(principal, source),
       canRevisit,
       saysWhoWrites,
+      stillIs: (event, principal) => stillIs(this.env, event.source, this.#store.scope(), { person: principal.id, data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} }),
       writes: (event, principal, repo) => writes(this.env, event.source, this.#store.scope(), { person: principal.id, data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} }, repo),
       standingOf: (source, subject) => standingOf(this.env, source, this.#store.scope(), subject),
       enqueue: (...args) => this.#outbox.enqueue(...args),

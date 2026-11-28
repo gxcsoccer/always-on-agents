@@ -36,6 +36,8 @@ function bench(state: DurableObjectState) {
     /** What the service that keeps a repository says of whether someone may write to it; nothing where no connector has such a word to say. */
     writes: undefined as undefined | ((person: string, repo: string) => "yes" | "no" | "unconnected" | "unknown" | Promise<"yes" | "no" | "unconnected" | "unknown">),
     writesAsked: [] as [string, string][],
+    /** Whether someone known only by an account they connected themselves is still that person. */
+    stillIs: undefined as undefined | ((person: string) => boolean | "unknown"),
     /** What a source says one of its messages is now, by subject. */
     now: {} as Record<string, Standing>,
     /** The workers this deployment lists, by name. */
@@ -126,6 +128,7 @@ function bench(state: DurableObjectState) {
     canRevisit: mayRevisit,
     standingOf,
     saysWhoWrites: () => settings.writes !== undefined,
+    stillIs: async (_event, principal) => settings.stillIs?.(principal.id) ?? true,
     writes: (_event, principal, repo) => (settings.writes ? (settings.writesAsked.push([principal.id, repo]), Promise.resolve().then(() => settings.writes!(principal.id, repo))) : undefined),
     // As the outbox's own does, as far as the row goes.
     enqueue: (idem, sessionId, runId, text, ask) => {
@@ -2754,6 +2757,51 @@ describe("tasks, by themselves", () => {
         expect(await answer("t1", "allow")).toMatchObject({ decided_by: "alice" });
         expect(settings.writesAsked).toEqual([]);
       }, "user:alice");
+    });
+
+    it("takes no approval from someone known only by an account they connected themselves once they are no longer that person by the same binding", async () => {
+      const approves = (bench: Awaited<Parameters<Parameters<typeof within>[0]>[0]>, code: string) =>
+        bench.store.rows<{ id: number }>(
+          "INSERT INTO inbox (source, source_id, kind, session_key, principal, text, data, status, received_at) VALUES ('github', ?, 'message', ?, ?, ?, '{}', 'done', ?) RETURNING id",
+          `c_${Math.random()}`,
+          SESSION_KEY,
+          JSON.stringify({ kind: "human", id: "connected:ou_a", explicit: true, self_connected: true, display: "ann" }),
+          `approve ${code}`,
+          20_000,
+        )[0].id;
+      // Still them: taken, as anyone's.
+      await within(async (bench) => {
+        bench.task("t1", { requested_by: "connected:ou_a" });
+        bench.settings.stillIs = () => true;
+        const open = await bench.asks("t1", 1);
+        approves(bench, open.code);
+        expect(await bench.answer("t1", "allow")).toMatchObject({ decision: "allow", decided_by: "connected:ou_a" });
+      });
+      // No longer: not taken, the question stays open, and what they said then is not taken later by itself.
+      await within(async (bench) => {
+        bench.task("t1", { requested_by: "connected:ou_a" });
+        let still: boolean | "unknown" = "unknown";
+        bench.settings.stillIs = () => still;
+        const open = await bench.asks("t1", 1);
+        approves(bench, open.code);
+        await expect(bench.answer("t1", "allow")).rejects.toThrow(/could not be found out just now.*still open/);
+        expect(bench.kept("t1").answering).toBeNull();
+        still = false;
+        await expect(bench.answer("t1", "allow", "call_2")).rejects.toThrow(/ann is no longer connected here as the account they approved as/);
+        expect(bench.worker.answered).toEqual([]);
+        still = true;
+        await expect(bench.answer("t1", "allow", "call_3")).rejects.toThrow(/was not taken/);
+        approves(bench, open.code);
+        expect(await bench.answer("t1", "allow", "call_4")).toMatchObject({ decision: "allow" });
+      });
+      // Someone an operator named is not asked about.
+      await within(async (bench) => {
+        bench.task("t1");
+        bench.settings.stillIs = () => false;
+        const open = await bench.asks("t1", 1);
+        bench.reply(`approve ${open.code}`);
+        expect(await bench.answer("t1", "allow")).toMatchObject({ decided_by: "alice" });
+      });
     });
 
     it("carries 'for the rest of this task' only when the approver said so, for a push that only updates branches", async () => {

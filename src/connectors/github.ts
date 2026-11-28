@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantWrites } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantStillIs, grantWrites, memberKey } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 /** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
@@ -29,6 +29,7 @@ export const githubConnector: Connector = {
   tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
   writes: grantWrites,
+  stillIs: grantStillIs,
   offers: grantOffers,
   invitation: grantInvitation,
   async http(request, env, path) {
@@ -339,11 +340,13 @@ export async function commentStanding(env: Env, scope: Scope, subject: string): 
  * hand. While the account is theirs there: given up, it is nobody's again. None where that
  * cannot be asked just now (they are then taken as not known, which lets nothing through).
  */
-async function personAs(env: Env, tenant: string, account: string): Promise<string | null> {
+async function personAs(env: Env, tenant: string, account: string): Promise<{ person: string; binding: string } | null> {
   if (!/^\d+$/.test(account)) return null;
   try {
-    const grant = await registry(env).githubPersonGrant(tenant, account);
-    return grant ? await env.GITHUB_GRANTS.getByName(grant).personOf(Number(account)) : null;
+    const noted = await registry(env).githubPersonGrant(tenant, account);
+    const now = noted ? await env.GITHUB_GRANTS.getByName(noted.grant).personOf(Number(account)) : null;
+    // (The note and the grant have to say the same binding: one of them left over from another is not it.)
+    return noted && now && now.binding === noted.binding ? now : null;
   } catch {
     return null;
   }
@@ -418,10 +421,15 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
     const accountId = event.principal.id.replace(/^github:/, "");
     // (One an operator linked is who the operator said, before anything else.)
     const linked = await registry(env).resolveIdentity(tenant, "github", accountId);
-    const user = linked ?? (await personAs(env, tenant, accountId));
+    const connected = linked === null ? await personAs(env, tenant, accountId) : null;
+    // (Named apart from every name an operator can give, so that the two are never taken for one
+    // another where a task is somebody's; and kept with the binding it was known by, which is
+    // asked about again before their word decides anything.)
+    const user = linked ?? (connected ? memberKey(connected.person) : null);
     // A user id of the form "github:…", which can no longer be given, was never counted as a
     // member in a repository. It still is not.
-    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined, ...(linked === null ? { self_connected: true as const } : {}) };
+    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined, ...(connected ? { self_connected: true as const } : {}) };
+    if (connected) event.data = { ...event.data, binding: connected.binding };
   }
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.
