@@ -154,9 +154,28 @@ describe("the GitHub webhook endpoint", () => {
       expect(modelCalls).toHaveLength(before);
       expect((await sql("SELECT status FROM runs WHERE id = 'r-held'"))[0].status).toBe("done");
       expect((await sql("SELECT status FROM inbox WHERE id = ?", event.id))[0].status).toBe("dropped");
+      // What that run had written of it into the conversation's record is gone with it: someone who asks there next is not shown it.
+      expect(await sql("SELECT 1 FROM items WHERE run_id = 'r-held'")).toEqual([]);
     } finally {
       (env as any).GITHUB_AUTO_REVIEW = "on";
     }
+
+    // Looked at by themselves, still: a run that took up word of a pull request and was put off, and the pull request
+    // is closed meanwhile. What it took up is known to be superseded: it ends with nothing spent.
+    await word(10, "d1", "2026-11-28T03:00:00Z");
+    const [late] = await sql("SELECT id, session_key FROM inbox WHERE status = 'pending'");
+    await sql("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s-late', ?, 1, 1)", late.session_key);
+    await sql("INSERT INTO runs (id, session_id, status, started_at, retry_at) VALUES ('r-late', 's-late', 'running', 1, 1)");
+    await sql("INSERT INTO items (session_id, seq, run_id, item) VALUES ('s-late', 1, 'r-late', ?)", JSON.stringify({ role: "user", content: "Pull request #10 was opened" }));
+    await sql("UPDATE inbox SET status = 'claimed', run_id = 'r-late' WHERE id = ?", late.id);
+    await sql("INSERT INTO meta (key, value) VALUES ('active_run', 'r-late') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    await deliver(webhook_secret, "pull_request", { action: "closed", repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 910, number: 10, title: "Add retry", html_url: `https://github.com/${repo}/pull/10`, head: { ref: "retry", sha: "d1" }, base: { ref: "main" }, user: { login: "dana" }, updated_at: "2026-11-28T03:01:00Z" } });
+    const calls = modelCalls.length;
+    for (let i = 0; i < 3; i++) await wake(brain);
+    expect(modelCalls).toHaveLength(calls);
+    expect((await sql("SELECT status FROM runs WHERE id = 'r-late'"))[0].status).toBe("done");
+    expect((await sql("SELECT status FROM inbox WHERE id = ?", late.id))[0].status).toBe("dropped");
+    expect(await sql("SELECT 1 FROM items WHERE run_id = 'r-late'")).toEqual([]);
   });
 
   it("gives the same refusal for a wrong secret, another repository's secret and an unregistered repository", async () => {

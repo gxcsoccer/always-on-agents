@@ -87,6 +87,23 @@ export class BrainStore {
   }
 
   /** Stores an event unless the same (source, source_id) is already held. Says whether it was stored. */
+  /**
+   * Whether an event that was taken in says how something stood at a moment that a later word
+   * under its key has since superseded (see InboundEvent.supersedes): known from what is kept of
+   * the latest state, with nothing asked of anyone.
+   */
+  superseded(source: string, data: string | null): boolean {
+    let under: { key?: unknown; at?: unknown } | undefined;
+    try {
+      under = (JSON.parse(data ?? "{}") as { supersedes?: { key?: unknown; at?: unknown } }).supersedes;
+    } catch {
+      return false;
+    }
+    if (typeof under?.key !== "string" || typeof under.at !== "number") return false;
+    const latest = this.rows<{ at: number; void: number }>("SELECT at, void FROM latest_states WHERE source = ? AND key = ?", source, under.key)[0];
+    return latest !== undefined && (latest.at > under.at || (latest.at === under.at && latest.void === 1));
+  }
+
   insertEvent(event: InboundEvent): boolean {
     // Checked explicitly: rowsWritten also counts index writes, so it cannot tell an insert from an ignore.
     if (this.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ?", event.source, event.source_id).length > 0) return false;
