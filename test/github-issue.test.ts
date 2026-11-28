@@ -1981,8 +1981,16 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     world.reposDown = true;
     expect(await said(ann)).toMatch(/again in a little while/);
     world.reposDown = false;
+    // Git cannot be asked as a stranger would: the same words for all three kinds of name, for someone who cannot read
+    // the tenant's own; and someone who can read it is not held up by that.
     world.gitDown = true;
-    expect(await said(ann, SECRET)).toMatch(/again in a little while/);
+    world.strangers.add(ann.account);
+    const down = [await said(ann), await said(ann, SECRET), await said(ann, "acme/no-such-thing")];
+    expect(new Set(down).size).toBe(1);
+    expect(down[0]).toMatch(/again in a little while/);
+    world.strangers.delete(ann.account);
+    expect((await lendForStart(env as any, about(ann))).kind).toBe("bound");
+    expect(await lendForStart(env as any, about(ann, PUBLIC))).toEqual({ kind: "ordinary" });
     world.gitDown = false;
     // How their authorisation stands cannot be found out just now (their token has run out and cannot be renewed at the
     // moment; or the object that holds it cannot be asked): to be asked again, and that in the same words whichever

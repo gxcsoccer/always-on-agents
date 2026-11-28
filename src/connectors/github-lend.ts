@@ -105,10 +105,10 @@ export async function lendForStart(env: Env, about: { scope: Scope; sessionKey: 
   // same whatever the tenant's own credential saw (one of the tenant's that is not public, one
   // that is not connected here, no repository at all), and under the same trouble too: so that
   // nothing of that is told to someone who has not been shown to be able to read it.
-  // First, what a stranger could find out. (Of one seen to be not public, that is known already.)
-  const open = connected ? false : await anyoneReads(repo);
-  if (open === "unknown") return refused(LATER);
-  if (open) return ORDINARY;
+  // First, what a stranger could find out: asked of every such name alike, also of one already
+  // seen to be not public, so that trouble in asking shows the same for all of them.
+  const open = await anyoneReads(repo);
+  if (open === true) return ORDINARY;
   // Then how the person's own authorisation stands, which has nothing to do with which repository
   // it is: where that cannot be found out just now, it is to be asked again, whichever was named.
   const name = await grantName({ tenant: scope.tenant, chat_app_id: app.app_id, tenant_key: actor.origin.tenant_key, open_id: actor.person });
@@ -129,7 +129,8 @@ export async function lendForStart(env: Env, about: { scope: Scope; sessionKey: 
       return { kind: "bound", record: record as unknown as Record<string, unknown> };
     }
   }
-  return refused(UNREADABLE);
+  // Not shown to be theirs to read. Where even a stranger's look could not be made, that is all that is said.
+  return refused(open === "unknown" ? LATER : UNREADABLE);
 }
 
 /** A record of this kind, as it was kept; nothing for anything else. */
