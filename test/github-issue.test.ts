@@ -783,9 +783,10 @@ describe("who a GitHub account is, in a repository's own conversation", () => {
     // Giving it up takes away the note of that account only: one made of another meanwhile stays.
     const eve = someone();
     await authorised(eve);
-    await registry().claimGithubPerson(TENANT, "424242", await grantName(eve.who));
+    await rowsOf(registry(), "INSERT INTO github_people (tenant, account, grant_name) VALUES (?, '424242', ?)", TENANT, await grantName(eve.who));
     await (await eve.grant()).drop();
     expect(await registry().githubPersonGrant(TENANT, String(eve.account))).toBeNull();
+    expect(await registry().githubPersonGrant(TENANT, "424242")).toBe(await grantName(eve.who));
     // And where the note that an account is someone's outlives its being theirs (left behind half-way), the grant itself says it is not.
     const cal = someone();
     await authorised(cal);
