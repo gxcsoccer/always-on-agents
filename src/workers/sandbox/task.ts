@@ -753,6 +753,15 @@ export class TaskSandbox extends DurableObject<Env> {
     return this.#lend("write");
   }
 
+  /**
+   * The same, for what git reads this task's repository with (cloning, fetching): asked for apart
+   * from what a push goes out under, so that one can be lent where the other is not. Lent by the
+   * same rule today.
+   */
+  async githubFetchToken(): Promise<string | undefined> {
+    return this.#lend("write");
+  }
+
   /** The same, for reading GitHub's API: lent by the same rule, and it can only read. None without an App: there is no token of the deployment's that only reads. */
   /**
    * Beside it, for a read of what anyone may read of a public repository (its issues, pull requests,

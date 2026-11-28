@@ -23,6 +23,9 @@ const REMOTE_KEYS = new Set(["image_url", "file_url", "server_url", "url", "file
 /** Input items a coding agent produces by itself: its messages, its reasoning, calls to its own tools. */
 const LOCAL_ITEM_TYPES = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"]);
 
+/** The headers of a request to git's smart-HTTP endpoints that are passed on: those the exchange itself uses, and no others. (How long the body is, is said by the runtime as it sends what is really sent.) */
+const GIT_HEADERS = ["accept", "accept-encoding", "accept-language", "content-type", "content-encoding", "git-protocol", "user-agent", "pragma", "cache-control"];
+
 /** One ref a push would move. `old` or `new` being all zeros means create or delete. */
 import type { RefUpdate } from "../questions";
 
@@ -116,15 +119,25 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // A token is lent only for the repository this task was started on, and it is one issued for
     // this task's tenant and that repository alone. Anything else is reached anonymously, so a task
     // cannot read private code it was not given.
-    const token = own ? await this.#task.githubToken() : undefined;
-    const headers = new Headers(request.headers);
-    if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
-    else headers.delete("authorization");
+    // Only what git's own exchange needs is passed on, made here: nothing else the guest sent goes
+    // out beside a credential.
+    const headers = new Headers();
+    for (const name of GIT_HEADERS) if (request.headers.has(name)) headers.set(name, request.headers.get(name)!);
+    // A credential is asked for by what it is for (what git reads with, or what a push goes out
+    // under: the two are lent apart), and only where the request it is for is about to be sent.
+    // Asking takes a moment, and no credential is also what a task that has ended is given: such a
+    // one sends nothing, with a credential or without.
+    const credited = async (lent: () => Promise<string | undefined>): Promise<Response | undefined> => {
+      const token = own ? await lent() : undefined;
+      if (own && !(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+      if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
+      return undefined;
+    };
 
-    if (!git.push) return fetch(new Request(request, { headers, redirect: "manual" }));
+    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
     if (!own) return this.#refuse(request, url, "this task may only push to the repository it was started on");
     // Asking what the remote has is harmless; the push itself is the request that carries commits.
-    if (git.endpoint === "info/refs") return fetch(new Request(request, { headers, redirect: "manual" }));
+    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
 
     // A push is decided here, by what the request is, not by what the command looked like. The body
     // says exactly which refs would move to which commits, and that is what a person approves.
@@ -139,6 +152,8 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     const send = async (): Promise<Response> => {
       const current = await this.#task.githubToken();
       if (!current) return new Response(`this task is no longer allowed a credential for ${git.repo}\n`, { status: 403 });
+      // (Asking took a moment, and a credential held from before may be handed to a task that has ended since: such a one sends nothing, approved or not.)
+      if (!(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
       headers.set("authorization", `Basic ${btoa(`x-access-token:${current}`)}`);
       return fetch(url, { method: "POST", headers, body, redirect: "manual" });
     };
