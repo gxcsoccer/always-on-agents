@@ -2589,6 +2589,39 @@ describe("tasks, by themselves", () => {
         expect(kept("t1")).toMatchObject({ status: "running", pending: null, answering: null });
         expect(closed(open.ask)).toEqual({ state: "withdrawn" });
       });
+      // The same when what is said next is a refusal. Over: closed, and nothing more is sent.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, kept, closed, reply } = bench;
+        settings.writes = () => "yes";
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "undecided" };
+        reply(`deny ${open.code}`, { person: "bob" });
+        await expect(answer("t1", "deny", "call_2")).rejects.toThrow(/that question is over/);
+        expect(worker.answered).toHaveLength(1);
+        expect(kept("t1")).toMatchObject({ status: "running", pending: null, answering: null });
+        expect(closed(open.ask)).toEqual({ state: "withdrawn" });
+      });
+      // Still waited on: the refusal takes effect at once, and nobody is asked about.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, reply } = bench;
+        settings.writes = () => "yes";
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "pending" };
+        settings.writesAsked.length = 0;
+        reply(`deny ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "deny", "call_2")).toMatchObject({ decision: "deny", decided_by: "bob" });
+        expect(settings.writesAsked).toEqual([]);
+        expect(worker.answered.at(-1)![0]).toBe("deny");
+      });
+      // Taken already: it stands as it was given, and that is what is told.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, reply } = bench;
+        settings.writes = () => "yes";
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "decided", decision: "allow" };
+        reply(`deny ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "deny", "call_2")).toMatchObject({ decision: "allow", decided_by: "alice" });
+      });
       // The work did take it; since then the question as posted was edited, or whoever approved said more: what happened is told as it happened, not that it can only be refused.
       for (const since of ["edited", "took back"]) {
         await pushing(async (bench) => {

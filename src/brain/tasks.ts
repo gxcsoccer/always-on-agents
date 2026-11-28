@@ -903,7 +903,8 @@ export class Tasks implements Wakes {
     let waiting = false;
     {
       const openAt = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { id: string; source?: string; ask?: string }) : undefined;
-      if (decision === "allow" && intent?.decision === "allow" && openAt && intent.pending_id === openAt.id && this.#s.scope().kind !== "user" && openAt.source === "proxy") {
+      // (Whatever is proposed now, an approval or a refusal: what became of the one on record is found out first.)
+      if (intent?.decision === "allow" && openAt && intent.pending_id === openAt.id && this.#s.scope().kind !== "user" && openAt.source === "proxy") {
         // (A worker that keeps no record of its questions cannot say.)
         const fate: QuestionFate = asking.decisionOn ? await asking.decisionOn(this.#b.env, taskId, intent.pending_id).catch(() => ({ state: "unknown" as const })) : { state: "unknown" };
         if (fate.state === "unknown") throw new Error("it could not be found out just now whether the approval given earlier reached the work; nothing more was sent. Call this tool again in a little while");
