@@ -2514,52 +2514,106 @@ describe("tasks, by themselves", () => {
         expect(await answer("t1", "allow")).toMatchObject({ decision: "allow", decided_by: "alice" });
       });
       // An approval on record whose word never came back from the worker is not sent again on the strength of what was found out then.
-      await pushing(async ({ asks, reply, answer, worker, settings, kept }) => {
-        let may: "yes" | "no" | "unknown" = "yes";
-        settings.writes = () => may;
-        const sent = worker.answer;
-        worker.answer = async () => {
+      const unheard = async (bench: Awaited<Parameters<Parameters<typeof within>[0]>[0]>, more: Record<string, unknown> = {}) => {
+        const sent = bench.worker.answer;
+        bench.worker.answer = async () => {
           throw new Error("connection lost");
         };
-        const open = await asks("t1", 1, push);
-        reply(`approve ${open.code}`);
-        await expect(answer("t1", "allow")).rejects.toThrow(/connection lost/);
-        expect(JSON.parse(kept("t1").answering)).toMatchObject({ decision: "allow", decided_by: "alice" });
-        worker.answer = sent;
-        // It cannot be asked just now: nothing more is sent, and what is on record stays.
+        const open = await bench.asks("t1", 1, push, more.receipt);
+        const said = bench.reply(`approve ${open.code}`);
+        await expect(bench.answer("t1", "allow")).rejects.toThrow(/connection lost/);
+        expect(JSON.parse(bench.kept("t1").answering)).toMatchObject({ decision: "allow", decided_by: "alice" });
+        bench.worker.answer = sent;
+        return { open, said };
+      };
+      await pushing(async (bench) => {
+        const { answer, worker, settings, kept, reply } = bench;
+        let may: "yes" | "no" | "unknown" = "yes";
+        settings.writes = () => may;
+        const { open } = await unheard(bench);
+        // Whether the work has it cannot be found out: nothing more is sent, nobody is asked about, and what is on record stays.
+        settings.writesAsked.length = 0;
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/whether the approval given earlier reached the work/);
+        expect(settings.writesAsked).toEqual([]);
+        // The work has not had it. GitHub cannot be asked just now: nothing more is sent, and what is on record stays.
+        worker.fate.q1 = { state: "pending" };
         may = "unknown";
         await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/could not be asked just now.*nothing more was sent/);
         expect(worker.answered).toHaveLength(1);
         expect(JSON.parse(kept("t1").answering)).toMatchObject({ decision: "allow" });
-        // They may no longer write there: not sent again; it takes someone who may, saying so.
+        // They may no longer write there: not sent again, and no longer on record.
         may = "no";
         await expect(answer("t1", "allow", "call_3")).rejects.toThrow(/was not taken/);
         expect(worker.answered).toHaveLength(1);
-        settings.writes = (person) => (person === "bob" ? "yes" : "no");
+        expect(kept("t1").answering).toBeNull();
+        // They may again: what was set aside does not come back by itself.
+        may = "yes";
+        await expect(answer("t1", "allow", "call_4")).rejects.toThrow(/was not taken/);
+        expect(worker.answered).toHaveLength(1);
+        // It takes someone who may, saying so.
         reply(`approve ${open.code}`, { person: "bob" });
-        expect(await answer("t1", "allow", "call_4")).toMatchObject({ decision: "allow", decided_by: "bob" });
+        expect(await answer("t1", "allow", "call_5")).toMatchObject({ decision: "allow", decided_by: "bob" });
         expect(worker.answered).toHaveLength(2);
       });
-      // And where they still may, it is sent again as it was.
-      await pushing(async ({ asks, reply, answer, worker, settings }) => {
+      // The work did take it, and only the word of that was lost: it stands as it was given and by whom, whatever has changed since.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, reply } = bench;
         settings.writes = () => "yes";
-        const sent = worker.answer;
-        worker.answer = async () => {
-          throw new Error("connection lost");
-        };
-        const open = await asks("t1", 1, push);
-        reply(`approve ${open.code}`);
-        await expect(answer("t1", "allow")).rejects.toThrow(/connection lost/);
-        worker.answer = sent;
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "decided", decision: "allow" };
+        settings.writes = (person) => (person === "bob" ? "yes" : "no");
+        settings.writesAsked.length = 0;
+        reply(`approve ${open.code}`, { person: "bob" });
+        expect(await answer("t1", "allow", "call_2")).toMatchObject({ decision: "allow", decided_by: "alice" });
+        expect(settings.writesAsked).toEqual([]);
+      });
+      // Not had by the work, and they still may: sent again as it was.
+      await pushing(async (bench) => {
+        const { answer, worker, settings } = bench;
+        settings.writes = () => "yes";
+        await unheard(bench);
+        worker.fate.q1 = { state: "undecided" };
         expect(await answer("t1", "allow", "call_2")).toMatchObject({ decision: "allow", decided_by: "alice" });
         expect(settings.writesAsked).toHaveLength(2);
       });
+      // While GitHub is asked about them again, someone refuses: set aside, as anything said against it sets it aside.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, reply } = bench;
+        settings.writes = () => "yes";
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "pending" };
+        settings.writes = () => (reply(`deny ${open.code}`, { person: "carol" }), "yes");
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow();
+        expect(worker.answered).toHaveLength(1);
+      });
+      // The question itself is edited while GitHub is asked, on the first asking and on a sending again: nobody has approved what is there now.
+      for (const again of [false, true]) {
+        await pushing(async (bench) => {
+          const { answer, worker, settings, store, asks, reply } = bench;
+          const RECEIPT = { subject: "q:posted", holder: "as written" };
+          settings.revisable.add("feishu");
+          settings.now[RECEIPT.subject] = { revision: 1, holder: "as written", deleted: false, edited: false };
+          settings.writes = () => "yes";
+          if (again) {
+            await unheard(bench, { receipt: RECEIPT });
+            worker.fate.q1 = { state: "pending" };
+          } else {
+            const open = await asks("t1", 1, push, RECEIPT);
+            reply(`approve ${open.code}`);
+          }
+          const before = worker.answered.length;
+          settings.writes = () => (store.sql.exec("INSERT INTO revisions (subject, revision, deleted, holder) VALUES ('q:posted', 2, 0, 'reworded')"), "yes");
+          await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/has since been changed or removed/);
+          expect(worker.answered).toHaveLength(before);
+        });
+      }
       // One on record from before every push was asked about, said to be for the rest of the task: sent again, it reaches no further than this push.
       await pushing(async ({ asks, reply, answer, worker, settings, store }) => {
         settings.writes = () => "yes";
         const open = await asks("t1", 1, push);
         const said = reply(`approve all ${open.code}`);
         store.sql.exec("UPDATE tasks SET answering = ? WHERE id = 't1'", JSON.stringify({ call_id: "call_old", pending_id: "q1", decision: "allow", reason: "r", decided_by: "alice", deciding_event: said, ask: open.ask, standing: true }));
+        worker.fate.q1 = { state: "pending" };
         await answer("t1", "allow", "call_old");
         expect(worker.answered[0][3]).toBe(false);
       });

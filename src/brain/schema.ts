@@ -373,13 +373,13 @@ export const MIGRATIONS: string[] = [
   // task is started, with the options it was asked with then (one that is bound is started with
   // those, however its call is made again). Beside the task, by its id, as the other things added to tasks are.
   `CREATE TABLE IF NOT EXISTS task_lends (task_id TEXT PRIMARY KEY, record TEXT NOT NULL, options TEXT NOT NULL);`,
-  // Messages that said "approve" to a push and were not taken, because whoever wrote them could
-  // not be shown to be allowed to write to the repository: they are not taken later either.
-  `CREATE TABLE IF NOT EXISTS approvals_void (event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, at INTEGER NOT NULL);`,
   // Of the things of which only the latest state means anything (see InboundEvent.supersedes):
   // which state was the latest heard of under each key, and when by its source's clock. One row a
   // key, kept apart from the events themselves, whose words are not kept as long.
   `CREATE TABLE IF NOT EXISTS latest_states (source TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL, void INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (source, key));`,
+  // Messages that said "approve" to a push and were not taken, because whoever wrote them could
+  // not be shown to be allowed to write to the repository: they are not taken later either.
+  `CREATE TABLE IF NOT EXISTS approvals_void (event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, at INTEGER NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -935,44 +935,76 @@ export class Tasks implements Wakes {
     // An approval on record but not yet confirmed by the worker does not outrank a change of mind:
     // a refusal proposed now is judged afresh, and an approval is only re-sent if nothing that has
     // arrived since speaks against it.
-    if (intent?.decision === "allow" && intent.pending_id === open) {
-      const approver = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
+    // Whether the question, as it was posted somewhere it can be changed, has been edited or
+    // deleted by what is known here now: looked at again after anything that took time.
+    const QUESTION_CHANGED = "the question as it was posted has since been changed or removed, so nobody can be taken to have approved this action; it can only be refused";
+    const CHANGED = "something here changed while GitHub was being asked; call this tool again";
+    const questionTouched = () => {
+      const ask = task.pending ? (JSON.parse(task.pending) as { ask?: string }).ask : undefined;
+      const receipt = ask ? this.#s.rows<{ receipt: string | null }>("SELECT receipt FROM outbox WHERE idem = ?", ask)[0]?.receipt : undefined;
+      return Boolean(receipt) && this.#s.rows("SELECT 1 FROM revisions WHERE subject = ?", (JSON.parse(receipt!) as { subject: string }).subject).length > 0;
+    };
+    const unchanged = () => {
+      const now = this.#s.rows<Row>("SELECT status, pending, answering FROM tasks WHERE id = ?", taskId)[0];
+      return now !== undefined && now.status === task.status && now.pending === task.pending && now.answering === task.answering;
+    };
+    // Whether an approval on record no longer holds, by what is stored now: a refusal is proposed,
+    // something speaks against it, or the message it rests on is gone or no longer says so.
+    const stale = (held: Intent) => {
+      const approver = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", held.deciding_event)[0];
       const onRecord = JSON.parse(task.pending) as { code: string; ask?: string };
       // Everything else members have said in this conversation since the task began, whenever it
       // arrived: a later word from the approver, or anything about this question that is not an approval.
       const later = this.#r.reconcile(
-        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, intent.deciding_event).filter((event) => this.#b.isDecider(JSON.parse(event.principal) as Principal, event.source)),
+        this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ? AND id != ?", sessionKey, task.created_at ?? 0, held.deciding_event).filter((event) => this.#b.isDecider(JSON.parse(event.principal) as Principal, event.source)),
       );
       const against =
-        speaksAgainst(later, onRecord, approver, intent.decided_by) ||
+        speaksAgainst(later, onRecord, approver, held.decided_by) ||
         // And anything the approver has said since in the place the approval was typed, if it was moved here.
         (approver !== undefined && this.#r.saidSinceWhereTyped(approver, task.created_at ?? 0));
-      if (decision === "deny" || against || !approver || !this.#r.stillStands(approver)) {
-        before = { decision: intent.decision, decided_by: intent.decided_by };
-        setAside = intent.deciding_event;
-        intent = undefined;
-      }
-    }
-    // An approval of a push on record, where several people talk, is not sent again on the strength
-    // of what was found out when it was given: whoever gave it is asked about again. Who may no
-    // longer write there has not approved; that approval is set aside.
-    if (intent?.decision === "allow" && intent.pending_id === open && this.#s.scope().kind !== "user" && (JSON.parse(task.pending) as { source?: string }).source === "proxy") {
-      const approver = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", intent.deciding_event)[0];
-      const on = this.#repositoryOf(taskId);
-      const may = approver && on !== "" && this.#b.saysWhoWrites(approver.source) ? await (this.#b.writes(approver, JSON.parse(approver.principal) as Principal, on) ?? Promise.resolve("unknown" as const)).catch(() => "unknown" as const) : "no";
-      if (may === "unknown") throw new Error("GitHub could not be asked just now whether whoever approved this push may still write to that repository; nothing more was sent. Call this tool again in a little while");
-      const now = this.#s.rows<Row>("SELECT status, pending, answering FROM tasks WHERE id = ?", taskId)[0];
-      if (!now || now.status !== task.status || now.pending !== task.pending || now.answering !== task.answering) throw new Error("something here changed while GitHub was being asked; call this tool again");
-      if (may !== "yes") {
-        this.#s.sql.exec("INSERT OR IGNORE INTO approvals_void (event_id, task_id, at) VALUES (?, ?, ?)", intent.deciding_event, taskId, Date.now());
-        before = { decision: intent.decision, decided_by: intent.decided_by };
-        setAside = intent.deciding_event;
-        intent = undefined;
-      }
-    }
+      return decision === "deny" || against || !approver || !this.#r.stillStands(approver);
+    };
     // Known before anything is written: an answer nobody can be given is not recorded as given.
     const asking = this.#b.workerOf(String(task.worker));
     if (!asking.answer) throw new Error("the worker of this task takes no answers");
+    if (intent?.decision === "allow" && intent.pending_id === open && stale(intent)) {
+      before = { decision: intent.decision, decided_by: intent.decided_by };
+      setAside = intent.deciding_event;
+      intent = undefined;
+    }
+    // An approval of a push on record, where several people talk, is not sent again on the strength
+    // of what was found out when it was given. First the worker is asked whether it has it: one
+    // it took stands as it was given, by whom it was given, whatever has changed since. One it
+    // has not is looked at as a new one would be: whoever gave it is asked about again, and who may
+    // no longer write there has not approved (that approval is void, and is on record no more).
+    if (intent?.decision === "allow" && intent.pending_id === open && this.#s.scope().kind !== "user" && (JSON.parse(task.pending) as { source?: string }).source === "proxy") {
+      const held = intent;
+      const fate = asking.decisionOn ? await asking.decisionOn(this.#b.env, taskId, held.pending_id).catch(() => ({ state: "unknown" as const })) : { state: "pending" as const };
+      if (fate.state === "unknown") throw new Error("it could not be found out just now whether the approval given earlier reached the work; nothing more was sent. Call this tool again in a little while");
+      if (fate.state !== "decided") {
+        const approver = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", held.deciding_event)[0];
+        const on = this.#repositoryOf(taskId);
+        const resource = (JSON.parse(task.pending) as { resource?: unknown }).resource;
+        const told = typeof resource === "string" && resource.toLowerCase() === on;
+        const may = approver && on !== "" && told && this.#b.saysWhoWrites(approver.source) ? await (this.#b.writes(approver, JSON.parse(approver.principal) as Principal, on) ?? Promise.resolve("unknown" as const)).catch(() => "unknown" as const) : "no";
+        if (may === "unknown") throw new Error("GitHub could not be asked just now whether whoever approved this push may still write to that repository; nothing more was sent. Call this tool again in a little while");
+        // Asking took time: looked at again as things are stored now.
+        if (!unchanged()) throw new Error(CHANGED);
+        if (questionTouched()) throw new Error(QUESTION_CHANGED);
+        if (stale(held)) {
+          before = { decision: held.decision, decided_by: held.decided_by };
+          setAside = held.deciding_event;
+          intent = undefined;
+        } else if (may !== "yes") {
+          this.#s.transaction(() => {
+            this.#s.sql.exec("INSERT OR IGNORE INTO approvals_void (event_id, task_id, at) VALUES (?, ?, ?)", held.deciding_event, taskId, Date.now());
+            this.#s.sql.exec("UPDATE tasks SET answering = NULL WHERE id = ?", taskId);
+          });
+          task = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+          intent = undefined;
+        }
+      }
+    }
     if (!intent) {
       if (task.status !== "needs_input" || !task.pending) throw new Error(`task ${taskId} is ${task.status}; it is not waiting for an answer`);
       const pending = JSON.parse(task.pending) as { id: string; code: string; asked_at: number; ask?: string; truncated?: boolean };
@@ -1033,7 +1065,7 @@ export class Tasks implements Wakes {
       if (checks) {
         const who = deciding.principal.display ?? deciding.principal.id;
         const STILL = "nothing was pushed and the question is still open";
-        if (on === "" || (typeof asksAbout.resource === "string" && /^[\w.-]+\/[\w.-]+$/.test(asksAbout.resource) && asksAbout.resource.toLowerCase() !== on)) throw new Error("it is not on record that this push is to the repository this task works on, so nobody can be asked about who may approve it; it can only be refused");
+        if (on === "" || typeof asksAbout.resource !== "string" || asksAbout.resource.toLowerCase() !== on) throw new Error("it is not on record that this push is to the repository this task works on, so nobody can be asked about who may approve it; it can only be refused");
         if (!this.#b.saysWhoWrites(deciding.event.source)) throw new Error("it cannot be found out, of what is said here, who may write to that repository, so nobody can approve this push from here; it can only be refused");
         const may = await (this.#b.writes(deciding.event, deciding.principal, on) ?? Promise.resolve("unknown" as const)).catch(() => "unknown" as const);
         if (may === "no" || may === "unconnected") {
@@ -1046,11 +1078,8 @@ export class Tasks implements Wakes {
         // Asking took time. Judged again from what is stored now: the same question, with nothing
         // on record of it meanwhile, and the same message deciding it (not taken back, not spoken
         // against, not edited or deleted, here or where it was typed).
-        const now = this.#s.rows<Row>("SELECT status, pending, answering FROM tasks WHERE id = ?", taskId)[0];
-        const CHANGED = "something here changed while GitHub was being asked; call this tool again";
-        if (!now || now.status !== task.status || now.pending !== task.pending || now.answering !== task.answering) throw new Error(CHANGED);
-        const shownNow = pending.ask ? this.#s.rows<Row>("SELECT status, sent_at, receipt FROM outbox WHERE idem = ?", pending.ask)[0] : undefined;
-        if (shownNow?.status !== asked.status || shownNow?.receipt !== asked.receipt) throw new Error(CHANGED);
+        if (!unchanged()) throw new Error(CHANGED);
+        if (questionTouched()) throw new Error(QUESTION_CHANGED);
         if (judge().event.id !== deciding.event.id) throw new Error(CHANGED);
       }
       const standing = decision === "allow" && !shared && asksAbout.source === "proxy" && standingEligible(Array.isArray(asksAbout.refs) ? asksAbout.refs : []) && wantsStanding(deciding.event.text ?? "");
