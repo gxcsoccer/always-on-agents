@@ -110,6 +110,13 @@ export interface Worker {
    */
   prepareStart?(env: Env, about: { scope: Scope; sessionKey: string; by: string | null; options: Record<string, unknown>; continueFrom: string | null; actor?: Actor }): Promise<Prepared>;
   /**
+   * For a worker that binds work (see `prepareStart`): whether what a piece of work was bound to
+   * still stands, by the record kept with it. Asked before the good end of such work is taken in:
+   * where it is "gone", the work is taken as failed, and nothing that was to follow it is done.
+   * Throwing means it could not be asked: the report is not taken yet, and comes again.
+   */
+  holds?(env: Env, record: unknown): Promise<"holds" | "gone">;
+  /**
    * For a worker the Brain starts: it can go on from an earlier piece of its own work that ended
    * well (see `Work.continue_from`), for as long as it keeps what that left. Said to the model
    * with the hand-over tool; a worker that does not say so is never asked to.

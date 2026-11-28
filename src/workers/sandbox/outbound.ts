@@ -127,17 +127,22 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // under: the two are lent apart), and only where the request it is for is about to be sent.
     // Asking takes a moment, and no credential is also what a task that has ended is given: such a
     // one sends nothing, with a credential or without.
-    const credited = async (lent: () => Promise<string | undefined>): Promise<Response | undefined> => {
+    const credited = async (lent: () => Promise<string | false | undefined>): Promise<Response | undefined> => {
       const token = own ? await lent() : undefined;
       if (own && !(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+      // Lent something that is no longer to be had: not sent as a stranger's request instead.
+      if (token === false) return new Response("what this task read this repository with is no longer lent to it\n", { status: 403 });
       if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
       return undefined;
     };
 
-    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
+    // What git reads with goes to the address made here from what the request was taken to be
+    // (which repository, which of git's endpoints, for reading), not to the address as the guest wrote it.
+    const reading = `https://github.com/${git.repo}.git/${git.endpoint}${git.endpoint === "info/refs" ? "?service=git-upload-pack" : ""}`;
+    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(reading, new Request(request, { headers, redirect: "manual" })));
     if (!own) return this.#refuse(request, url, "this task may only push to the repository it was started on");
     // Asking what the remote has is harmless; the push itself is the request that carries commits.
-    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
+    if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(`https://github.com/${git.repo}.git/info/refs?service=git-receive-pack`, new Request(request, { headers, redirect: "manual" })));
 
     // A push is decided here, by what the request is, not by what the command looked like. The body
     // says exactly which refs would move to which commits, and that is what a person approves.

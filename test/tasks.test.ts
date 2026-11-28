@@ -693,6 +693,56 @@ describe("tasks, by themselves", () => {
         expect(started.slice(count).filter((each: any) => each.id === one.task_id).length).toBeGreaterThanOrEqual(1);
         // (A start may be asked for more than once; each asking is for the very same work.)
         expect(new Set(started.slice(count).map((each) => JSON.stringify(each)))).toEqual(new Set([JSON.stringify({ id: one.task_id, lend: { v: 1, leave: "once" }, by: "alice", brief: "b", options: { where: "acme/app" } })]));
+
+        // The good end of bound work is taken in only while its worker says, asked then with the record as kept, that what it was bound to stands.
+        const statusOf = (id: string) => store.rows<{ status: string; result: string | null }>("SELECT status, result FROM tasks WHERE id = ?", id)[0];
+        const checked: unknown[] = [];
+        let stands: "holds" | "gone" | Error = new Error("cannot be asked just now");
+        careful.holds = async (_env, record) => {
+          checked.push(record);
+          if (stands instanceof Error) throw stands;
+          return stands;
+        };
+        // It cannot be asked: the report is not taken, and comes again.
+        await expect(tasks.event(bound.task_id, 1, "result", { text: "found it" })).rejects.toThrow("cannot be asked just now");
+        expect(statusOf(bound.task_id).status).not.toBe("succeeded");
+        expect(store.rows("SELECT 1 FROM task_events WHERE task_id = ?", bound.task_id)).toEqual([]);
+        // Gone: taken as failed, with nothing of what it came to.
+        stands = "gone";
+        await tasks.event(bound.task_id, 1, "result", { text: "found it", usage: { total_tokens: 3 } });
+        expect(statusOf(bound.task_id).status).toBe("failed");
+        expect(statusOf(bound.task_id).result).not.toContain("found it");
+        expect(checked).toEqual([1, 2].map(() => ({ v: 1, leave: "to read acme/app" })));
+        // Of work that has ended here already nobody is asked, whatever is reported of it after.
+        stands = new Error("cannot be asked just now");
+        await tasks.event(bound.task_id, 2, "result", { text: "found it after all", usage: { total_tokens: 4 } });
+        expect(statusOf(bound.task_id).status).toBe("failed");
+        expect(checked).toHaveLength(2);
+        // Nor is anything of what it says kept: neither of the end that was not taken in, nor of the late one. What was spent is.
+        const keptOf = JSON.stringify(store.rows("SELECT seq, kind, body FROM task_events WHERE task_id = ?", bound.task_id));
+        expect(keptOf).not.toContain("found it");
+        expect(store.rows<{ body: string }>("SELECT body FROM task_events WHERE task_id = ? AND seq = 2", bound.task_id).map((each) => JSON.parse(each.body))).toEqual([{ usage: { total_tokens: 4 } }]);
+        // Work that was bound to nothing is not asked about.
+        await tasks.event(plain.task_id, 1, "result", { text: "plain" });
+        expect(statusOf(plain.task_id)).toMatchObject({ status: "succeeded", result: expect.stringContaining("plain") });
+        expect(checked).toHaveLength(2);
+        // Stands: taken in as ever.
+        stands = "holds";
+        await tasks.event(one.task_id, 1, "result", { text: "found once" });
+        expect(statusOf(one.task_id)).toMatchObject({ status: "succeeded", result: expect.stringContaining("found once") });
+        // Its worker is no longer known here at all: nobody can say that it stands, and it is not taken as having ended well.
+        answer = { kind: "bound", record: { v: 1, leave: "orphan" } };
+        const orphan = (await tasks.dispatch(RUN, SESSION_KEY, "call_orphan", "careful", "t", "b", { where: "acme/app" }, null, undefined, actor)) as { task_id: string };
+        settings.others = [];
+        await tasks.event(orphan.task_id, 1, "result", { text: "found late" });
+        expect(statusOf(orphan.task_id).status).toBe("failed");
+        expect(statusOf(orphan.task_id).result).not.toContain("found late");
+        // And nothing may be named to follow work that is bound: nothing is written or started.
+        settings.others = [careful];
+        const startedBefore = started.length;
+        await expect(tasks.dispatch(RUN, SESSION_KEY, "call_then", "careful", "t", "b", { where: "acme/app" }, null, { tools: ["some_tool"], events: { said: [], recent: [] } }, actor)).rejects.toThrow("nothing can be named to follow such work");
+        expect(store.rows("SELECT 1 FROM tasks WHERE op_id = 'call_then'")).toEqual([]);
+        expect(started).toHaveLength(startedBefore);
       });
     });
 

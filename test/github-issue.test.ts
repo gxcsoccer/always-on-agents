@@ -9,7 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { challengeOf } from "../src/connectors/feishu-grant";
 import { normalize } from "../src/connectors/feishu";
 import { grantName } from "../src/connectors/github-grant";
-import { scopeName } from "../src/events";
+import { lendForStart, lentToken, type PersonLend } from "../src/connectors/github-lend";
+import { privateSessionKey, scopeName } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 import { call, installFakeModel, model, modelCalls, say, wake } from "./helpers";
 
@@ -27,7 +28,10 @@ const world = {
   /** Tokens GitHub has issued: whose, and whether each is still good. */
   tokens: new Map<string, { account: number; good: boolean }>(),
   refreshes: new Map<string, number>(),
-  repos: new Map<string, { id: number; private: boolean; full_name: string; members: number[] }>(),
+  repos: new Map<string, { id: number; private: boolean; full_name: string; members: number[]; installation?: string }>(),
+  /** GitHub gives no answer to git asked as a stranger, or to the App asking for a token. */
+  gitDown: false,
+  appDown: false,
   issues: [] as { repo: string; number: number; html_url: string; title: string; body: string; user: { id: number } }[],
   comments: [] as { repo: string; number: number; id: number; html_url: string; body: string; user: { id: number } }[],
   /** Every comment asked of GitHub. */
@@ -72,6 +76,8 @@ function installWorld() {
   world.dropAnswers = 0;
   world.listingDown = false;
   world.reposDown = false;
+  world.gitDown = false;
+  world.appDown = false;
   world.renewalsDown = false;
   world.duringWrite = undefined;
   world.renewals = 0;
@@ -125,9 +131,21 @@ function installWorld() {
       if (!consent || consent.redirect !== form.get("redirect_uri") || (await challengeOf(String(form.get("code_verifier")))) !== consent.challenge) return Response.json({ error: "bad_verification_code" });
       return Response.json(grant(consent.account));
     }
+    // Git, asked as a stranger would: only what anyone may read is there.
+    const git = url.host === "github.com" ? /^\/([^/]+\/[^/]+?)\.git\/info\/refs$/.exec(url.pathname) : null;
+    if (git) return world.gitDown ? new Response("", { status: 503 }) : world.repos.get(git[1].toLowerCase())?.private === false ? new Response("refs") : new Response("", { status: 401 });
     if (url.host !== "api.github.com") throw new Error(`unexpected fetch to ${url.href}`);
+    // The App asks for a token of one installation, for one repository: only where that installation covers it.
+    const installation = /^\/app\/installations\/([^/]+)\/access_tokens$/.exec(url.pathname);
+    if (installation) {
+      if (world.appDown) return Response.json({ message: "unavailable" }, { status: 503 });
+      const wanted = JSON.parse(String(init?.body)).repositories[0];
+      const covered = [...world.repos.values()].filter((each) => each.installation === installation[1] && each.full_name.split("/")[1].toLowerCase() === wanted.toLowerCase());
+      if (covered.length !== 1) return Response.json({ message: "not there" }, { status: 422 });
+      return Response.json({ token: `ghs_${installation[1]}`, expires_at: new Date(Date.now() + 3_600_000).toISOString(), repositories: covered.map((each) => ({ id: each.id, full_name: each.full_name, private: each.private })) }, { status: 201 });
+    }
     // The tenant's own credential for its repositories, or a person's token.
-    const tenant = bearer === "test-github-token";
+    const tenant = bearer === "test-github-token" || bearer.startsWith("ghs_");
     const user = world.tokens.get(bearer);
     if (!tenant && !user?.good) return Response.json({ message: "Bad credentials" }, { status: 401 });
     if (url.pathname === "/user") return Response.json({ id: user!.account, login: loginOf(user!.account) });
@@ -1827,5 +1845,433 @@ describe("reminding people where several talk", () => {
     await rest(here.stub);
     expect(await rowsOf(here.stub, "SELECT status FROM timers WHERE id = ?", id)).toEqual([{ status: "cancelled" }]);
     expect(world.sent.filter((each) => each.type === "text").map((each) => String(each.content.text)).filter((text) => text.includes(`<at user_id="${ann.openId}"></at> 喝水`))).toEqual([]);
+  });
+});
+
+describe("lending a person's own GitHub authorisation to sandbox work they asked for", () => {
+  const SESSION = privateSessionKey("feishu", { app_id: CHAT_APP, tenant_key: ORG });
+  const INSTALLED = "77";
+  const SECRET = "elsewhere/secret";
+  let key: string;
+  // With the App set up, and one installation of the tenant's that covers its two repositories.
+  beforeEach(async () => {
+    key ??= await (async () => {
+      const pair = (await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
+      const der = new Uint8Array((await crypto.subtle.exportKey("pkcs8", pair.privateKey)) as ArrayBuffer);
+      return `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...der)).replace(/(.{64})/g, "$1\n")}\n-----END PRIVATE KEY-----\n`;
+    })();
+    Object.assign(env as any, { GITHUB_APP_ID: "4242", GITHUB_APP_PRIVATE_KEY: key });
+    await registry().linkGithubInstallation(INSTALLED, TENANT);
+    for (const repo of [PUBLIC, PRIVATE]) world.repos.get(repo)!.installation = INSTALLED;
+    // One that is not public and not this tenant's here; `other/thing` is public and not this tenant's either.
+    world.repos.set(SECRET, { id: 301, private: true, full_name: SECRET, members: [], installation: "88" });
+  });
+  afterEach(() => {
+    delete (env as any).GITHUB_APP_ID;
+    delete (env as any).GITHUB_APP_PRIVATE_KEY;
+  });
+  /** A piece of sandbox work as it is looked at before it is written: asked by this person, alone with the agent, on a repository they named. */
+  const about = (person: ReturnType<typeof someone>, repo = PRIVATE, over: Record<string, unknown> = {}, actor: Record<string, unknown> = {}) =>
+    ({
+      scope: { tenant: TENANT, kind: "user" as const, id: person.openId },
+      sessionKey: SESSION,
+      by: person.openId,
+      options: { repository: `https://github.com/${repo}` },
+      continueFrom: null,
+      actor: { person: person.openId, connector: "feishu", origin: { app_id: CHAT_APP, tenant_key: ORG }, said: [{ ref: 7, text: `看下 ${repo} 的测试为什么挂了` }], recent: [], ...actor },
+      ...over,
+    }) as Parameters<typeof lendForStart>[1];
+  const lent = async (person: ReturnType<typeof someone>) => {
+    const prepared = await lendForStart(env as any, about(person));
+    expect(prepared.kind).toBe("bound");
+    return (prepared as { record: unknown }).record as PersonLend;
+  };
+  const task = (person: ReturnType<typeof someone>, id = `task-${Math.random().toString(36).slice(2)}`) => ({ id, brain: scopeName({ tenant: TENANT, kind: "user", id: person.openId }), repo: PRIVATE });
+  const revokedAt = async (id: string) => ((await (env as any).TASKS.getByName(id).calls()) as { method: string }[]).filter((each) => each.method === "revoked").length;
+  /** They authorise again (asked to, for an issue), as the same account. */
+  const again = async (person: ReturnType<typeof someone>, alone: Awaited<ReturnType<typeof authorised>>) => {
+    model.replies([opens(PUBLIC)], [say("")]);
+    await alone.says(`在 ${PUBLIC} 再提个 issue：重连后消息重复`);
+    model.replies(...done("建好了"));
+    expect((await consent(linkOn(alone.cards().at(-1)), person.account)).status).toBe(200);
+    await alone.settle();
+  };
+
+  it("binds the work to their authorisation where they named a repository of the tenant's that is not public and can read it, and says on the strength of what", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mark = (await ann.stored()).grant.mark;
+    expect(mark).toEqual(expect.stringMatching(/\S{8,}/));
+    expect(record).toEqual({ v: 1, kind: "github-person", grant: await grantName(ann.who), tenant: TENANT, person: ann.openId, connector: "feishu", origin: { app_id: CHAT_APP, tenant_key: ORG }, session: SESSION, ref: 7, repo: PRIVATE, repo_id: 102, installation: INSTALLED, account: ann.account, generation: 1, mark });
+    // Nothing of a token is in it.
+    expect(JSON.stringify(record)).not.toMatch(/gh[usr]_/);
+    // Named a little before, and given as its address: the same.
+    expect((await lendForStart(env as any, about(ann, PRIVATE, {}, { said: [{ ref: 9, text: "看下测试" }], recent: [{ ref: 4, text: `仓库是 https://github.com/${PRIVATE}` }] })) as any).record.ref).toBe(4);
+    // An authorisation given before each giving had a mark gets one the first time it is lent on, and keeps it.
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      delete stored.grant.mark;
+      await state.storage.put("grant", stored);
+    });
+    const late = await lent(ann);
+    expect(late.mark).not.toBe(mark);
+    expect((await lent(ann)).mark).toBe(late.mark);
+  });
+
+  it("leaves the work as ever where it is not one person alone with the agent who named that repository, or anyone may read it", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const ordinary = async (over: Record<string, unknown>, actor: Record<string, unknown> = {}, repo = PRIVATE) => expect(await lendForStart(env as any, about(ann, repo, over, actor)), JSON.stringify([over, actor, repo])).toEqual({ kind: "ordinary" });
+    // Where several people talk, however it is told.
+    await ordinary({ scope: { tenant: TENANT, kind: "chat", id: "oc_team" } });
+    await ordinary({}, { shared: true });
+    await ordinary({ sessionKey: "chat:oc_team" });
+    // A private conversation, but not the one of the origin they were verified through.
+    await ordinary({ sessionKey: "private:own" });
+    await ordinary({ sessionKey: privateSessionKey("feishu", { app_id: CHAT_APP, tenant_key: "org_other" }) });
+    // In the repository's own conversation.
+    await ordinary({ scope: { tenant: TENANT, kind: "repo", id: PRIVATE } });
+    // Nobody established to have asked, or someone else, or another person's conversation.
+    await ordinary({ by: null });
+    await ordinary({ by: "ou_other" });
+    await ordinary({ scope: { tenant: TENANT, kind: "user", id: "ou_other" } });
+    await ordinary({ actor: undefined });
+    // A repository the model named and they did not; or one named as part of something else.
+    await ordinary({}, { said: [{ ref: 7, text: "看下核心仓库的测试" }] });
+    await ordinary({}, { said: [{ ref: 7, text: `看下 https://example.com/${PRIVATE}/x` }] });
+    // Going on from earlier work; no repository.
+    await ordinary({ continueFrom: "earlier" });
+    await ordinary({ options: { repository: null } });
+    // Verified through another connector, whose origin happens to carry the same names: other people.
+    await ordinary({ sessionKey: privateSessionKey("other", { app_id: CHAT_APP, tenant_key: ORG }) }, { connector: "other" });
+    // Through a chat app that is not this tenant's.
+    await ordinary({}, { origin: { app_id: "cli_unknown", tenant_key: ORG } });
+    // One anyone may read: the tenant's own, and somebody else's.
+    await ordinary({}, {}, PUBLIC);
+    await ordinary({}, {}, "other/thing");
+  });
+
+  it("does not start work that could read nothing, and says the same of every repository that cannot be read here, whatever the reason", async () => {
+    const ann = someone();
+    const said = async (person: ReturnType<typeof someone>, repo = PRIVATE) => {
+      const prepared = await lendForStart(env as any, about(person, repo));
+      expect(prepared.kind).toBe("refused");
+      expect((prepared as { reason: string }).reason).toContain("nothing was started");
+      return (prepared as { reason: string }).reason;
+    };
+    // Never authorised: nothing of what the tenant's own credential saw of the repository is said.
+    const unreadable = await said(ann);
+    expect(unreadable).not.toMatch(/again in a little while/);
+    // The same words for one that is not there at all, and for one that is not this tenant's here.
+    expect(await said(ann, "acme/no-such-thing")).toBe(unreadable);
+    expect(await said(ann, SECRET)).toBe(unreadable);
+    await authorised(ann);
+    expect(await said(ann, SECRET)).toBe(unreadable);
+    // Their account cannot see it; or the name has come to mean another repository between the two looks.
+    world.strangers.add(ann.account);
+    expect(await said(ann)).toBe(unreadable);
+    world.strangers.delete(ann.account);
+    expect(await (await ann.grant()).sees(PRIVATE, 999)).toBe("no_access");
+    // The tenant has no installation that covers it.
+    world.repos.get(PRIVATE)!.installation = undefined;
+    expect(await said(ann)).toBe(unreadable);
+    world.repos.get(PRIVATE)!.installation = INSTALLED;
+    // GitHub cannot be asked just now, about the repository or as a stranger: to be asked again, and that is all that is said.
+    world.reposDown = true;
+    expect(await said(ann)).toMatch(/again in a little while/);
+    world.reposDown = false;
+    // Git cannot be asked as a stranger would: the same words for all three kinds of name, for someone who cannot read
+    // the tenant's own; and someone who can read it is not held up by that.
+    world.gitDown = true;
+    world.strangers.add(ann.account);
+    const down = [await said(ann), await said(ann, SECRET), await said(ann, "acme/no-such-thing")];
+    expect(new Set(down).size).toBe(1);
+    expect(down[0]).toMatch(/again in a little while/);
+    world.strangers.delete(ann.account);
+    expect((await lendForStart(env as any, about(ann))).kind).toBe("bound");
+    expect(await lendForStart(env as any, about(ann, PUBLIC))).toEqual({ kind: "ordinary" });
+    world.gitDown = false;
+    // How their authorisation stands cannot be found out just now (their token has run out and cannot be renewed at the
+    // moment; or the object that holds it cannot be asked): to be asked again, and that in the same words whichever
+    // repository was named, the tenant's own, somebody else's, or none at all.
+    const everywhere = async () => {
+      const each = [await said(ann), await said(ann, SECRET), await said(ann, "acme/no-such-thing")];
+      expect(new Set(each).size).toBe(1);
+      expect(each[0]).toMatch(/again in a little while/);
+    };
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    world.renewalsDown = true;
+    await everywhere();
+    // (A repository anyone may read is not held up by that.)
+    expect(await lendForStart(env as any, about(ann, PUBLIC))).toEqual({ kind: "ordinary" });
+    expect(await lendForStart(env as any, about(ann, "other/thing"))).toEqual({ kind: "ordinary" });
+    world.renewalsDown = false;
+    const real = (env as any).GITHUB_GRANTS;
+    (env as any).GITHUB_GRANTS = { getByName: () => ({ standing: async () => Promise.reject(new Error("unreachable")) }) };
+    await everywhere();
+    // Their authorisation stands, and it is only the look at this repository that fails: said as of any that cannot be read.
+    (env as any).GITHUB_GRANTS = { getByName: () => ({ standing: async () => ({ generation: 1, authorised: true }), sees: async () => Promise.reject(new Error("unreachable")) }) };
+    expect(await said(ann)).toBe(unreadable);
+    (env as any).GITHUB_GRANTS = real;
+    expect((await lendForStart(env as any, about(ann))).kind).toBe("bound");
+    // GitHub no longer takes their token.
+    for (const [token, each] of world.tokens) world.tokens.set(token, { ...each, good: false });
+    expect(await said(ann)).toBe(unreadable);
+    expect((await ann.stored()).grant).toBeUndefined();
+  });
+
+  it("hands their token out one request at a time, to that work on that repository while it is still the one meant and still the tenant's", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    const token = await lentToken(env as any, record, mine);
+    expect(world.tokens.get(token!)).toMatchObject({ account: ann.account, good: true });
+    // Run out and renewed meanwhile: still that authorisation, and it is the new token that is handed out.
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    const renewed = await lentToken(env as any, record, mine);
+    expect(renewed).not.toBe(token);
+    expect(world.tokens.get(renewed!)).toMatchObject({ account: ann.account, good: true });
+    const none = async (lend: PersonLend, work = mine) => expect(await lentToken(env as any, lend, work)).toBeUndefined();
+    // Not for another conversation's work, nor for another repository.
+    await none(record, { ...mine, brain: scopeName({ tenant: TENANT, kind: "chat", id: "oc_team" }) });
+    await none(record, { ...mine, brain: scopeName({ tenant: "other", kind: "user", id: ann.openId }) });
+    await none(record, { ...mine, repo: PUBLIC });
+    // Nor under a record that says another account, or another giving of the authorisation.
+    await none({ ...record, account: record.account + 1 });
+    await none({ ...record, mark: `${record.mark}x` });
+    await none({ ...record, generation: record.generation + 1 });
+    // The name comes to mean another repository; the repository is taken out of the installation; GitHub cannot be asked.
+    const repo = world.repos.get(PRIVATE)!;
+    repo.id = 999;
+    await none(record);
+    repo.id = 102;
+    repo.installation = "88";
+    await none(record);
+    repo.installation = INSTALLED;
+    world.appDown = true;
+    await none(record);
+    world.appDown = false;
+    // The installation is given to another tenant: from then on, nothing.
+    await registry().createTenant("other", "other");
+    await registry().linkGithubInstallation(INSTALLED, "other");
+    await none(record);
+    await registry().linkGithubInstallation(INSTALLED, TENANT);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+  });
+
+  it("stops the work that was lent it when they give the authorisation up, and lends that work nothing after, also once they have authorised anew", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const record = await lent(ann);
+    const [one, two, never] = [task(ann), task(ann), task(ann)];
+    expect(await lentToken(env as any, record, one)).toBeDefined();
+    expect(await lentToken(env as any, record, two)).toBeDefined();
+    expect(await (await ann.grant()).holds(record)).toBe(true);
+    // One of them cannot be told at first: it is told again until it has been, however long that takes.
+    await (env as any).TASKS.getByName(two.id).configure({ revokedUnheard: true });
+    await (await ann.grant()).drop();
+    expect(await (await ann.grant()).holds(record)).toBe(false);
+    await runDurableObjectAlarm(await ann.grant());
+    expect([await revokedAt(one.id), await revokedAt(two.id)]).toEqual([1, 1]);
+    await (env as any).TASKS.getByName(two.id).configure({});
+    await runDurableObjectAlarm(await ann.grant());
+    expect([await revokedAt(one.id), await revokedAt(two.id)]).toEqual([1, 2]);
+    expect(await runDurableObjectAlarm(await ann.grant())).toBe(false);
+    // Work that never asked for it was never lent it: there is nothing of it to stop.
+    expect(await revokedAt(never.id)).toBe(0);
+    for (const each of [one, two, never]) expect(await lentToken(env as any, record, each)).toBeUndefined();
+    // They authorise again, as the same account: work bound before is still lent nothing; work bound now is.
+    await again(ann, alone);
+    expect(await lentToken(env as any, record, one)).toBeUndefined();
+    expect(await lentToken(env as any, await lent(ann), task(ann))).toBeDefined();
+  });
+
+  it("stops the work when GitHub no longer takes their token, and an authorisation given after that is not the one the work was lent", async () => {
+    const ann = someone();
+    const alone = await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+    // Revoked on GitHub: found out the next time it is used there.
+    for (const [token, each] of world.tokens) world.tokens.set(token, { ...each, good: false });
+    expect(await (await ann.grant()).sees(PRIVATE, 102)).toBe("unauthorised");
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(mine.id)).toBe(1);
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+    // Nothing was given up here, so it is the same generation: and still not the same giving.
+    await again(ann, alone);
+    expect((await ann.stored()).generation).toBe(record.generation);
+    expect((await ann.stored()).grant.account).toBe(record.account);
+    expect(await (await ann.grant()).holds(record)).toBe(false);
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+  });
+
+  it("stops what was lent under an earlier giving of the authorisation when it is given anew over that one", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+    // Someone comes back through an invitation and confirms, while the earlier giving is still held.
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      const { since: _since, mark: _mark, ...held } = stored.grant;
+      stored.pending.push({ nonce: "n-again", verifier: "v", redirect: "https://agent.test/v1/github/oauth/callback", expires_at: Date.now() + 600_000, state: "taken", held: { ...held, confirm: "word", until: Date.now() + 60_000 } });
+      await state.storage.put("grant", stored);
+    });
+    expect(await (await ann.grant()).install("n-again", "word")).toBe("done");
+    expect((await ann.stored()).grant.mark).not.toBe(record.mark);
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(mine.id)).toBe(1);
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+    expect(await lentToken(env as any, await lent(ann), task(ann))).toBeDefined();
+  });
+
+  it("keeps work that is still under way on the list of what it was lent to, however many more ask", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const works = Array.from({ length: 50 }, () => task(ann));
+    for (const each of works) expect(await lentToken(env as any, record, each)).toBeDefined();
+    // Full, and all of them at work: one more is lent nothing, and none of those is forgotten.
+    const more = task(ann);
+    expect(await lentToken(env as any, record, more)).toBeUndefined();
+    // One of them is over: once it has answered that what it read is discarded, its place is the newcomer's.
+    await (env as any).TASKS.getByName(works[3].id).configure({ ended: true, revokedUnheard: true });
+    expect(await lentToken(env as any, record, more)).toBeUndefined();
+    await (env as any).TASKS.getByName(works[3].id).configure({ ended: true });
+    expect(await lentToken(env as any, record, more)).toBeDefined();
+    expect(await revokedAt(works[3].id)).toBe(2);
+    await (await ann.grant()).drop();
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(works[0].id)).toBe(1);
+    expect(await revokedAt(works[49].id)).toBe(1);
+    expect(await revokedAt(more.id)).toBe(1);
+    expect(await revokedAt(works[3].id)).toBe(2);
+  });
+
+  it("no longer stands once it has run out with nothing to renew it by: what was lent it is stopped, and nothing is taken for standing", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      stored.grant.refresh_expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    // Something asked under another giving of it changes nothing for what is lent under this one.
+    expect(await (await ann.grant()).holds({ ...record, mark: `${record.mark}x` })).toBe(false);
+    expect(await runDurableObjectAlarm(await ann.grant())).toBe(false);
+    // Seen by the work's own next asking (nobody else has to ask anything): it is told to stop.
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(mine.id)).toBe(1);
+
+    // And seen where the good end of the work is about to be taken in: the same.
+    const bea = someone();
+    await authorised(bea);
+    const hers = await lent(bea);
+    const work = task(bea);
+    expect(await lentToken(env as any, hers, work)).toBeDefined();
+    await runInDurableObject(await bea.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      stored.grant.refresh_expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    expect(await (await bea.grant()).holds(hers)).toBe(false);
+    await runDurableObjectAlarm(await bea.grant());
+    expect(await revokedAt(work.id)).toBe(1);
+  });
+
+  describe("from their own conversation", () => {
+    const handed = () => call("hand_over", { worker: "sandbox", title: "看测试", brief: "看看测试为什么挂了。", continue_from: null, repository: `https://github.com/${PRIVATE}`, then: null });
+    const startsOf = async (id: string) => ((await (env as any).TASKS.getByName(id).calls()) as { method: string; args: any }[]).filter((each) => each.method === "start");
+
+    it("is what the sandbox is started with, and nothing is started without it", async () => {
+      const ann = someone();
+      const alone = await authorised(ann);
+      model.replies([handed()], [say("")]);
+      await alone.says(`看下 ${PRIVATE} 的测试为什么挂了`);
+      const id = toolOutputs()[0].work_id as string;
+      expect(id).toEqual(expect.any(String));
+      const started = await startsOf(id);
+      expect(started).toHaveLength(1);
+      expect(started[0].args.lend).toMatchObject({ kind: "github-person", person: ann.openId, repo: PRIVATE, repo_id: 102, account: ann.account, installation: INSTALLED });
+      model.replies([say("")]);
+      await alone.stub.taskEvent(id, 99, "failed", { error: "the test is over" });
+      await rest(alone.stub);
+
+      // Someone who has given no authorisation: nothing is written, nothing started, and the model is told why.
+      const bob = someone();
+      const his = bob.at();
+      model.replies([handed()], [say("")]);
+      await his.says(`看下 ${PRIVATE} 的测试为什么挂了`);
+      expect(JSON.stringify(toolOutputs())).toContain("nothing was started");
+      expect(await rowsOf(his.stub, "SELECT id FROM tasks")).toEqual([]);
+    });
+
+    it("starts nothing where something is named to follow work that would be lent it", async () => {
+      const ann = someone();
+      const alone = await authorised(ann);
+      model.replies([call("hand_over", { worker: "sandbox", title: "看测试", brief: "看看测试为什么挂了。", continue_from: null, repository: `https://github.com/${PRIVATE}`, then: ["github_create_issue"] })], [say("")]);
+      await alone.says(`看下 ${PRIVATE} 的测试为什么挂了，有问题就提个 issue`);
+      expect(JSON.stringify(toolOutputs())).toContain("nothing can be named to follow such work");
+      expect(await rowsOf(alone.stub, "SELECT id FROM tasks WHERE worker = 'sandbox' AND title = '看测试'")).toEqual([]);
+    });
+
+    it("does not take in what the work came to once the authorisation it was lent is gone, though the work was not yet told to stop", async () => {
+      const ann = someone();
+      const alone = await authorised(ann);
+      model.replies([handed()], [say("")]);
+      await alone.says(`看下 ${PRIVATE} 的测试为什么挂了`);
+      const id = toolOutputs()[0].work_id as string;
+      // While it cannot be asked whether the authorisation stands, the report is not taken: it comes again.
+      const real = (env as any).GITHUB_GRANTS;
+      (env as any).GITHUB_GRANTS = { getByName: () => { throw new Error("unreachable"); } };
+      expect(await alone.stub.taskEvent(id, 1, "result", { text: "测试挂在时区上。" }).then(() => "taken", () => "not taken")).toBe("not taken");
+      (env as any).GITHUB_GRANTS = real;
+      expect((await rowsOf(alone.stub, "SELECT status FROM tasks WHERE id = ?", id))[0].status).toBe("running");
+      // Given up; the word to stop has not reached the work, and its good end arrives.
+      await (await ann.grant()).drop();
+      model.replies([say("")], [say("")]);
+      await alone.stub.taskEvent(id, 1, "result", { text: "测试挂在时区上。", usage: { total_tokens: 10 } });
+      await rest(alone.stub);
+      const kept = (await rowsOf(alone.stub, "SELECT status, result FROM tasks WHERE id = ?", id))[0];
+      expect(kept.status).toBe("failed");
+      expect(kept.result).not.toContain("时区");
+      expect(JSON.stringify(await rowsOf(alone.stub, "SELECT text FROM inbox WHERE source = 'worker'"))).not.toContain("时区");
+    });
+
+    it("takes in what the work came to while the authorisation stands", async () => {
+      const ann = someone();
+      const alone = await authorised(ann);
+      model.replies([handed()], [say("")]);
+      await alone.says(`看下 ${PRIVATE} 的测试为什么挂了`);
+      const id = toolOutputs()[0].work_id as string;
+      model.replies([say("")]);
+      await alone.stub.taskEvent(id, 1, "result", { text: "测试挂在时区上。" });
+      await rest(alone.stub);
+      expect((await rowsOf(alone.stub, "SELECT status, result FROM tasks WHERE id = ?", id))[0]).toMatchObject({ status: "succeeded", result: expect.stringContaining("时区") });
+      // Nothing goes on from it: asked to, the sandbox says why, and starts nothing.
+      model.replies([call("hand_over", { worker: "sandbox", title: "接着修", brief: "接着把它修好。", continue_from: id, repository: null, then: null })], [say("")]);
+      await alone.says("接着把它修好");
+      const after = await rowsOf(alone.stub, "SELECT id, status, result FROM tasks WHERE id != ?", id);
+      expect(JSON.stringify([toolOutputs(), after])).toContain("nothing is kept of such work to go on from");
+      for (const each of after) expect(await startsOf(each.id)).toEqual([]);
+    });
   });
 });

@@ -42,6 +42,8 @@ const MAX_TITLE = 256;
 const MAX_BODY = 30_000;
 /** How many pages of an issue's comments are gone through to find one again. */
 const FIND_PAGES = 10;
+/** How many pieces of work may be lent it at a time. */
+const MAX_LENT = 50;
 
 /** A person as the chat connector verified them, in one tenant. */
 interface Who {
@@ -87,7 +89,8 @@ interface Stored {
   generation: number;
   pending: { nonce: string; verifier: string; redirect: string; expires_at: number; state?: "taken" | "done" | "refused"; at?: number; brain?: string; call?: string; what?: { text: string; where: "private" | "chat"; action?: string }; held?: Held }[];
   /** `refresh`: absent where the App's tokens do not run out. `account`: whose it is on GitHub, by number. */
-  grant?: { access: string; refresh?: string; version: string; expires_at: number; refresh_expires_at?: number; since: number; account: number; login: string };
+  /** `mark`: which giving of the authorisation this is. Made as it is given, kept through every renewal, and never the same for one given anew. */
+  grant?: { access: string; refresh?: string; version: string; expires_at: number; refresh_expires_at?: number; since: number; account: number; login: string; mark?: string };
   /** The GitHub account that is this person's in the tenant, by number: from when they first authorised as it until they give it up, whatever becomes of the tokens meanwhile. */
   bound?: number;
   /** Word owed of a change, to each conversation that waits on this person's authorisation, until each has heard. */
@@ -196,22 +199,27 @@ export class GithubGrant extends DurableObject<Env> {
     const account = String(first.held.account);
     const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name);
     if (!claimed) return "another";
+    const now = Date.now();
     // As things are now: the grant may have been taken away while that was asked.
-    const stored = await this.#load();
-    const through = held(stored);
-    if (!stored || !through?.held || stored.generation !== before.generation) {
+    // A new giving of the authorisation. Whatever was lent under one before it is not lent under
+    // this one: it is stopped, in the same step as this is written.
+    const written = await this.#withdraw((stored) => {
+      const through = held(stored);
+      if (!stored || !through?.held || stored.generation !== before.generation) return false;
+      const { confirm: _spent, until: _over, ...grant } = through.held;
+      delete through.held;
+      through.state = "done";
+      through.at = now;
+      stored.grant = { ...grant, since: now, mark: random(16) };
+      stored.bound = grant.account;
+      stored.owed = this.#owed(stored, grant.version);
+      void this.ctx.storage.put("grant", stored);
+      return true;
+    });
+    if (!written) {
       if (claimed === "new") await registry(this.env).releaseGithubPerson(name, account);
       return undefined;
     }
-    const { confirm: _spent, until: _over, ...grant } = through.held;
-    const now = Date.now();
-    delete through.held;
-    through.state = "done";
-    through.at = now;
-    stored.grant = { ...grant, since: now };
-    stored.bound = grant.account;
-    stored.owed = this.#owed(stored, grant.version);
-    void this.ctx.storage.put("grant", stored);
     void this.ctx.storage.setAlarm(now);
     return "done";
   }
@@ -251,14 +259,19 @@ export class GithubGrant extends DurableObject<Env> {
   /** Forgets the tokens and closes every open invitation, and the account is no longer this person's here. Only here: GitHub's own record of the authorisation is the person's to remove. */
   /** `only`: where the reason is about one GitHub account (it was revoked there), and the person may hold another by now. */
   async drop(only?: number): Promise<void> {
-    const stored = await this.#load();
-    if (!stored || (only !== undefined && stored.bound !== only)) return;
-    const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
-    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
+    let was: { who: Who; bound?: number } | undefined;
+    await this.#withdraw((stored) => {
+      if (!stored || (only !== undefined && stored.bound !== only)) return false;
+      was = { who: stored.who, bound: stored.bound };
+      const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
+      void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
+      return true;
+    });
+    if (!was) return;
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
     // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
-    if (only === undefined || stored.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(stored.who), only === undefined ? undefined : String(stored.bound));
+    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), only === undefined ? undefined : String(was.bound));
   }
 
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
@@ -463,7 +476,8 @@ export class GithubGrant extends DurableObject<Env> {
     } catch {
       return undefined;
     }
-    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return undefined;
+    // Run out, with nothing left to renew it by: it will not come back, and what was lent it is stopped.
+    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return await this.#withdraw((now) => now?.grant?.version === grant.version), undefined;
     this.#renewing ??= this.#renew(grant.version).finally(() => (this.#renewing = undefined));
     return this.#renewing;
   }
@@ -485,13 +499,18 @@ export class GithubGrant extends DurableObject<Env> {
     // as it stands then: a grant taken away, or replaced, meanwhile is not written over.
     const next = random(16);
     const sealed = renewed ? { access: await seal(key, renewed.access_token, next), refresh: renewed.refresh_token ? await seal(key, renewed.refresh_token, next) : undefined } : undefined;
-    const after = await this.#load();
-    if (!after?.grant || after.grant.version !== version || after.generation !== stored.generation) return undefined;
+    const still = (now: Stored | undefined): now is Stored & { grant: NonNullable<Stored["grant"]> } => now?.grant !== undefined && now.grant.version === version && now.generation === stored.generation;
     if (!renewed || !sealed) {
-      delete after.grant;
-      void this.ctx.storage.put("grant", after);
+      await this.#withdraw((now) => {
+        if (!still(now)) return false;
+        delete (now as Stored).grant;
+        void this.ctx.storage.put("grant", now);
+        return true;
+      });
       return undefined;
     }
+    const after = await this.#load();
+    if (!still(after)) return undefined;
     after.grant = { ...after.grant, ...sealed, version: next, ...tokensOf(renewed, Date.now()) };
     void this.ctx.storage.put("grant", after);
     return { token: renewed.access_token, version: next, account: after.grant.account, login: after.grant.login };
@@ -499,10 +518,140 @@ export class GithubGrant extends DurableObject<Env> {
 
   /** Forgets a token GitHub turned away, if it is still the one held. */
   async #refused(version: string): Promise<void> {
+    await this.#withdraw((stored) => {
+      if (!stored || stored.grant?.version !== version) return false;
+      delete stored.grant;
+      void this.ctx.storage.put("grant", stored);
+      return true;
+    });
+  }
+
+  /**
+   * Whether this person, with their own token, can see a repository now, and that it is the one
+   * meant (by GitHub's number for it). Where they can: under which authorisation, for a record of
+   * something lent on the strength of it. The token stays here.
+   */
+  async sees(repo: string, repoId: number): Promise<{ account: number; generation: number; mark: string } | "unauthorised" | "later" | "no_access" | "unreachable"> {
+    const held = await this.#token();
+    if (!held || held === "later") return held ?? "unauthorised";
+    let seen: Response;
+    try {
+      seen = await github(held.token, `/repos/${repo}`);
+    } catch {
+      return "unreachable";
+    }
+    if (seen.status === 401) return await this.#refused(held.version), "unauthorised";
+    const found = seen.ok ? ((await seen.json().catch(() => null)) as { id?: unknown } | null) : null;
+    if (!found) return seen.status === 404 || seen.status === 403 || (seen.status >= 300 && seen.status < 400) ? "no_access" : "unreachable";
+    if (found.id !== repoId) return "no_access";
+    // As it stands now: taken away, or replaced, while GitHub was asked, it is not this one any more.
     const stored = await this.#load();
-    if (!stored || stored.grant?.version !== version) return;
-    delete stored.grant;
-    await this.ctx.storage.put("grant", stored);
+    if (!stored?.grant || stored.grant.version !== held.version) return "later";
+    // (One given before each giving had a mark gets its own now, once.)
+    if (!stored.grant.mark) {
+      stored.grant.mark = random(16);
+      await this.ctx.storage.put("grant", stored);
+    }
+    return { account: stored.grant.account, generation: stored.generation, mark: stored.grant.mark };
+  }
+
+  /**
+   * The person's token, for one request of a piece of work it was lent to: only while the
+   * authorisation it was lent under is the one that stands (the same giving of it, by the same
+   * account; a token renewed meanwhile is still that one, one authorised anew is not). Which work
+   * was lent it is noted before it is handed out, so that the work can be stopped when the
+   * authorisation goes. Never kept by whoever asks: asked for again each time.
+   */
+  async lendToken(of: { generation: number; mark: string; account: number; task: string }): Promise<string | undefined> {
+    if (!of.task || !(await this.#standsNow(of))) return undefined;
+    const key = `lent:${of.task}`;
+    if ((await this.ctx.storage.get(key)) === undefined) {
+      const kept = [...(await this.ctx.storage.list<number>({ prefix: "lent:" })).keys()];
+      // Full: room is made only of work that says itself that it is over, and that has answered
+      // that what it read is discarded (see `revoked`: of work that has ended, only that is done).
+      // Work still under way is never dropped from the list.
+      if (kept.length >= MAX_LENT) {
+        const done = async (id: string) => {
+          const work = this.env.TASKS.getByName(id);
+          if (await work.isActive()) return false;
+          await work.revoked();
+          return true;
+        };
+        const over = await Promise.all(kept.map((each) => done(each.slice("lent:".length)).catch(() => false)));
+        const gone = kept.filter((_each, at) => over[at]);
+        if (gone.length === 0) return undefined;
+        for (const each of gone) void this.ctx.storage.delete(each);
+        // (Asking took time: only under the authorisation as it stands now.)
+      }
+      // (Noted only under the authorisation as it stands at this very step.)
+      if (!this.#stands(await this.#load(), of)) return undefined;
+      await this.ctx.storage.put(key, Date.now());
+    }
+    const held = await this.#token();
+    if (!held || held === "later") return undefined;
+    // Renewing takes time: taken away meanwhile, nothing is handed out. And the work is still noted as lent it.
+    return this.#stands(await this.#load(), of) && (await this.ctx.storage.get(key)) !== undefined ? held.token : undefined;
+  }
+
+  /** Whether the authorisation something was lent under is the one that stands now. */
+  async holds(of: { generation: number; mark: string; account: number }): Promise<boolean> {
+    return this.#standsNow(of);
+  }
+
+  /**
+   * The same, for whoever asks on behalf of something lent: where it is seen here that this very
+   * giving of the authorisation has run out with nothing to renew it by, what was lent it is
+   * stopped (once: there is nothing left on the list after). An asker under another giving is
+   * only turned away: what is lent under the one that stands now is not touched.
+   */
+  async #standsNow(of: { generation: number; mark: string; account: number }): Promise<boolean> {
+    const stored = await this.#load();
+    if (this.#stands(stored, of)) return true;
+    if (this.#same(stored, of)) await this.#withdraw((now) => this.#same(now, of) && !this.#usable(now!.grant!));
+    return false;
+  }
+
+  /** Whether what is held is the giving of the authorisation that something was lent under, whether or not it is still good. */
+  #same(stored: Stored | undefined, of: { generation: number; mark: string; account: number }): boolean {
+    return stored !== undefined && stored.generation === of.generation && stored.grant !== undefined && stored.grant.mark === of.mark && of.mark !== "" && stored.grant.account === of.account;
+  }
+
+  #stands(stored: Stored | undefined, of: { generation: number; mark: string; account: number }): boolean {
+    // (One that has run out with nothing to renew it by does not stand either.)
+    return this.#same(stored, of) && this.#usable(stored!.grant!);
+  }
+
+  /**
+   * The authorisation is gone: every piece of work that was lent it is to be stopped, and is until
+   * it has been. `write` is handed the record as it stands, read together with the list of what
+   * was lent: it says whether it is (still) so, and writes what records that it is gone. From that
+   * reading on nothing is waited for: the record is never written from an earlier reading of it,
+   * and it and the list of what is to be stopped are kept together or not at all.
+   */
+  async #withdraw(write: (stored: Stored | undefined) => boolean): Promise<boolean> {
+    const [stored, lent] = await Promise.all([this.#load(), this.ctx.storage.list<number>({ prefix: "lent:" })]);
+    if (!write(stored)) return false;
+    for (const [key, at] of lent) {
+      void this.ctx.storage.put(`stop:${key.slice("lent:".length)}`, at);
+      void this.ctx.storage.delete(key);
+    }
+    if (lent.size > 0) void this.ctx.storage.setAlarm(Date.now());
+    return true;
+  }
+
+  /** Stops each piece of work that is to be stopped. Says whether any could not be told. */
+  async #halt(): Promise<boolean> {
+    let left = false;
+    for (const key of (await this.ctx.storage.list<number>({ prefix: "stop:" })).keys()) {
+      try {
+        // Kept until the work itself has answered: work whose record is gone answers too, that there is nothing to stop.
+        await this.env.TASKS.getByName(key.slice("stop:".length)).revoked();
+        await this.ctx.storage.delete(key);
+      } catch {
+        left = true;
+      }
+    }
+    return left;
   }
 
   /** Whether there is something to act with: a token still good, or one that can be renewed. */
@@ -516,20 +665,28 @@ export class GithubGrant extends DurableObject<Env> {
     return { event, attempts: 0, to: [...new Set(stored.pending.filter((each) => each.expires_at + INVITATION_KEPT_MS > now).map((each) => each.brain).filter((each): each is string => typeof each === "string"))] };
   }
 
-  /** Tells each conversation that is owed word, until each has heard. */
+  /** What is due: work lent a token that is gone is stopped, and each conversation that is owed word is told, until each has been. */
   async alarm(): Promise<void> {
+    const left = await this.#halt();
+    const next = await this.#tell();
+    const waits = [...(left ? [15_000] : []), ...(next === undefined ? [] : [next])];
+    if (waits.length > 0) void this.ctx.storage.setAlarm(Date.now() + Math.min(...waits));
+  }
+
+  /** Tells each conversation that is owed word. Says how long until it is to be tried again, where some have not heard. */
+  async #tell(): Promise<number | undefined> {
     const stored = await this.#load();
-    if (!stored?.owed) return;
+    if (!stored?.owed) return undefined;
     const { event, attempts } = stored.owed;
     const name = await grantName(stored.who);
     const heard = await Promise.all(stored.owed.to.map((each) => this.env.BRAIN.getByName(each).conditionReported("feishu", name, event).then((answer) => answer.ok, () => false)));
     const left = stored.owed.to.filter((_each, index) => !heard[index]);
     const after = await this.#load();
-    if (after?.owed?.event !== event) return;
+    if (after?.owed?.event !== event) return undefined;
     if (left.length === 0) delete after.owed;
     else after.owed = { event, attempts: attempts + 1, to: left };
     void this.ctx.storage.put("grant", after);
-    if (after.owed) void this.ctx.storage.setAlarm(Date.now() + Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)));
+    return after.owed ? Math.min(600_000, 15_000 * 2 ** Math.min(attempts, 10)) : undefined;
   }
 
   #load(): Promise<Stored | undefined> {
@@ -566,7 +723,7 @@ function redirectUri(env: Env): string | undefined {
   return origin && /^https:\/\/[A-Za-z0-9.-]+(:\d+)?$/.test(origin) ? `${origin}/v1/github/oauth/callback` : undefined;
 }
 
-const setUp = (env: Env) => Boolean(redirectUri(env) && grantsKey(env) && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
+export const setUp = (env: Env) => Boolean(redirectUri(env) && grantsKey(env) && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
 
 /**
  * The repository as GitHub has it now, if it is one this tenant has connected: covered by an
@@ -574,18 +731,18 @@ const setUp = (env: Env) => Boolean(redirectUri(env) && grantsKey(env) && env.GI
  * the tenant by the operator. Asked with the tenant's own credential for it, never the person's:
  * that the person can reach a repository does not make it this tenant's.
  */
-async function repositoryOf(env: Env, tenant: string, repo: string): Promise<{ id: number; private: boolean; name: string } | "not_connected" | "unknown"> {
+export async function repositoryOf(env: Env, tenant: string, repo: string, to: "write" | "read" = "write"): Promise<{ id: number; private: boolean; name: string; installation?: string } | "not_connected" | "unknown"> {
   const linked = await registry(env).githubRepo(repo);
   if (linked && linked.tenant !== tenant) return "not_connected";
   const app = Boolean(env.GITHUB_APP_ID || env.GITHUB_APP_PRIVATE_KEY);
   if (!app && !linked) return "not_connected";
   try {
-    const credential = await githubTokenFor(env, tenant, repo);
+    const credential = await githubTokenFor(env, tenant, repo, to);
     if (!credential) return "not_connected";
     const seen = await github(credential.token, `/repos/${repo}`);
     if (seen.status === 404 || (seen.status >= 300 && seen.status < 400)) return "not_connected";
     const found = seen.ok ? ((await seen.json().catch(() => null)) as { id?: unknown; private?: unknown; full_name?: unknown } | null) : null;
-    return found && typeof found.id === "number" && typeof found.private === "boolean" && typeof found.full_name === "string" && found.full_name.toLowerCase() === repo.toLowerCase() ? { id: found.id, private: found.private, name: found.full_name } : "unknown";
+    return found && typeof found.id === "number" && typeof found.private === "boolean" && typeof found.full_name === "string" && found.full_name.toLowerCase() === repo.toLowerCase() ? { id: found.id, private: found.private, name: found.full_name, ...(credential.installation ? { installation: credential.installation } : {}) } : "unknown";
   } catch {
     return "unknown";
   }
@@ -703,7 +860,7 @@ function unsearched(reads: unknown): string | undefined {
 }
 
 /** Every repository a text names whole: by its address on GitHub (the first two parts of the path), or as owner/name standing by itself, never part of some other address or path. In lower case. */
-function reposIn(text: string): string[] {
+export function reposIn(text: string): string[] {
   const addresses = [...text.matchAll(/https?:\/\/(?:www\.)?github\.com\/([\w.-]+\/[\w.-]+)/gi)].map((found) => found[1]);
   const bare = [...text.replace(/https?:\/\/\S+/gi, " ").matchAll(/(?<![\w.\/-])([\w.-]+\/[\w.-]+)(?![\w\/-])/g)].map((found) => found[1]);
   return [...addresses, ...bare].map((found) => found.replace(/(\.git|[.\/])+$/i, "").toLowerCase());
