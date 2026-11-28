@@ -715,9 +715,13 @@ describe("tasks, by themselves", () => {
         expect(checked).toEqual([1, 2].map(() => ({ v: 1, leave: "to read acme/app" })));
         // Of work that has ended here already nobody is asked, whatever is reported of it after.
         stands = new Error("cannot be asked just now");
-        await tasks.event(bound.task_id, 2, "result", { text: "found it after all" });
+        await tasks.event(bound.task_id, 2, "result", { text: "found it after all", usage: { total_tokens: 4 } });
         expect(statusOf(bound.task_id).status).toBe("failed");
         expect(checked).toHaveLength(2);
+        // Nor is anything of what it says kept: neither of the end that was not taken in, nor of the late one. What was spent is.
+        const keptOf = JSON.stringify(store.rows("SELECT seq, kind, body FROM task_events WHERE task_id = ?", bound.task_id));
+        expect(keptOf).not.toContain("found it");
+        expect(store.rows<{ body: string }>("SELECT body FROM task_events WHERE task_id = ? AND seq = 2", bound.task_id).map((each) => JSON.parse(each.body))).toEqual([{ usage: { total_tokens: 4 } }]);
         // Work that was bound to nothing is not asked about.
         await tasks.event(plain.task_id, 1, "result", { text: "plain" });
         expect(statusOf(plain.task_id)).toMatchObject({ status: "succeeded", result: expect.stringContaining("plain") });

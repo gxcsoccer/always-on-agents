@@ -100,26 +100,36 @@ export async function lendForStart(env: Env, about: { scope: Scope; sessionKey: 
   const repository = await repositoryOf(env, scope.tenant, repo, "read");
   if (repository === "unknown") return refused(LATER);
   if (repository !== "not_connected" && !repository.private) return ORDINARY;
-  if (repository !== "not_connected" && repository.installation) {
-    const grant = await grantName({ tenant: scope.tenant, chat_app_id: app.app_id, tenant_key: actor.origin.tenant_key, open_id: actor.person });
-    let sees: { account: number; generation: number; mark: string } | "unauthorised" | "later" | "no_access" | "unreachable";
-    try {
-      sees = await env.GITHUB_GRANTS.getByName(grant).sees(repo, repository.id);
-    } catch {
-      sees = "unreachable";
-    }
-    // Whether they can read it could not be found out just now: that, and not that they cannot.
-    if (sees === "later" || sees === "unreachable") return refused(LATER);
+  const connected = repository !== "not_connected" && repository.installation ? { id: repository.id, installation: repository.installation } : undefined;
+  // From here on the name is of nothing that is known to be public. What is said of it is the
+  // same whatever the tenant's own credential saw (one of the tenant's that is not public, one
+  // that is not connected here, no repository at all), and under the same trouble too: so that
+  // nothing of that is told to someone who has not been shown to be able to read it.
+  // First, what a stranger could find out. (Of one seen to be not public, that is known already.)
+  const open = connected ? false : await anyoneReads(repo);
+  if (open === "unknown") return refused(LATER);
+  if (open) return ORDINARY;
+  // Then how the person's own authorisation stands, which has nothing to do with which repository
+  // it is: where that cannot be found out just now, it is to be asked again, whichever was named.
+  const name = await grantName({ tenant: scope.tenant, chat_app_id: app.app_id, tenant_key: actor.origin.tenant_key, open_id: actor.person });
+  const grant = env.GITHUB_GRANTS.getByName(name);
+  let authorised: boolean | "later";
+  try {
+    authorised = (await grant.standing()).authorised;
+  } catch {
+    authorised = "later";
+  }
+  if (authorised === "later") return refused(LATER);
+  // Last, whether they can read this one: only where it is one of the tenant's. Anything short
+  // of "yes" is said as for every other name that cannot be read.
+  if (connected && authorised) {
+    const sees = await grant.sees(repo, connected.id).catch(() => "unreachable" as const);
     if (typeof sees === "object") {
-      const record: PersonLend = { v: 1, kind: "github-person", grant, tenant: scope.tenant, person: actor.person, connector: actor.connector, origin: { app_id: app.app_id, tenant_key: actor.origin.tenant_key }, session: about.sessionKey, ref: named.ref, repo, repo_id: repository.id, installation: repository.installation, account: sees.account, generation: sees.generation, mark: sees.mark };
+      const record: PersonLend = { v: 1, kind: "github-person", grant: name, tenant: scope.tenant, person: actor.person, connector: actor.connector, origin: { app_id: app.app_id, tenant_key: actor.origin.tenant_key }, session: about.sessionKey, ref: named.ref, repo, repo_id: connected.id, installation: connected.installation, account: sees.account, generation: sees.generation, mark: sees.mark };
       return { kind: "bound", record: record as unknown as Record<string, unknown> };
     }
   }
-  // Not theirs to read by anything shown here. What is said from here on is what a stranger could
-  // find out, and nothing of what the tenant's own credential saw.
-  const open = await anyoneReads(repo);
-  if (open === "unknown") return refused(LATER);
-  return open ? ORDINARY : refused(UNREADABLE);
+  return refused(UNREADABLE);
 }
 
 /** A record of this kind, as it was kept; nothing for anything else. */

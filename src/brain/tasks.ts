@@ -1146,11 +1146,11 @@ export class Tasks implements Wakes {
    */
   async event(taskId: string, seq: number, kind: WorkerEventKind, report: Record<string, unknown>): Promise<{ ok: boolean }> {
     let body = report;
+    const bound = this.#lendOf(taskId).lend;
     // The good end of work that was bound to something (see Worker.prepareStart) is taken in only
     // while that still stands, as its worker says now: asked before anything is written, and only
     // of a report not taken before. Gone, it is taken as failed, so that nothing follows it.
     if (kind === "result") {
-      const bound = this.#lendOf(taskId).lend;
       const task = bound === undefined ? undefined : this.#s.rows<{ worker: string; status: string }>("SELECT worker, status FROM tasks WHERE id = ?", taskId)[0];
       // (Of work that has ended here already nothing is taken in whatever is said: nobody is asked.)
       if (task && !TERMINAL_TASK.has(task.status) && this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length === 0) {
@@ -1180,6 +1180,10 @@ export class Tasks implements Wakes {
       // one ended here as lost, whose worker then repeats a mere progress report, has not been said to have ended.)
       const before = this.#s.rows<{ kind: string }>("SELECT kind FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq)[0];
       if (before) return { known: true, wake: true, terminal: TERMINAL_TASK.has(task.status) && ["result", "failed", "lost"].includes(before.kind) };
+      // What work that was bound came to, reported after the work has ended here: nobody was asked
+      // whether what it was bound to stands, and nothing of it is taken in. So nothing of what it
+      // says is kept either, only that it was reported and what was spent.
+      if (bound !== undefined && kind === "result" && TERMINAL_TASK.has(String(task.status))) body = { ...(body.usage !== undefined ? { usage: body.usage } : {}), ...(body.model_calls !== undefined ? { model_calls: body.model_calls } : {}) };
       this.#s.sql.exec("INSERT INTO task_events (task_id, seq, kind, body, at) VALUES (?, ?, ?, ?, ?)", taskId, seq, kind, JSON.stringify(body), Date.now());
 
       const text = typeof body.message === "string" ? body.message : typeof body.text === "string" ? body.text : "";

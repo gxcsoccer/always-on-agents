@@ -1984,19 +1984,31 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     world.gitDown = true;
     expect(await said(ann, SECRET)).toMatch(/again in a little while/);
     world.gitDown = false;
-    // Whether they can read it cannot be found out just now (their token has run out and cannot be renewed at the moment; or
-    // the object that holds it cannot be asked): to be asked again, and not that they cannot read it.
+    // How their authorisation stands cannot be found out just now (their token has run out and cannot be renewed at the
+    // moment; or the object that holds it cannot be asked): to be asked again, and that in the same words whichever
+    // repository was named, the tenant's own, somebody else's, or none at all.
+    const everywhere = async () => {
+      const each = [await said(ann), await said(ann, SECRET), await said(ann, "acme/no-such-thing")];
+      expect(new Set(each).size).toBe(1);
+      expect(each[0]).toMatch(/again in a little while/);
+    };
     await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
       const stored = (await state.storage.get<any>("grant"))!;
       stored.grant.expires_at = Date.now() - 1;
       await state.storage.put("grant", stored);
     });
     world.renewalsDown = true;
-    expect(await said(ann)).toMatch(/again in a little while/);
+    await everywhere();
+    // (A repository anyone may read is not held up by that.)
+    expect(await lendForStart(env as any, about(ann, PUBLIC))).toEqual({ kind: "ordinary" });
+    expect(await lendForStart(env as any, about(ann, "other/thing"))).toEqual({ kind: "ordinary" });
     world.renewalsDown = false;
     const real = (env as any).GITHUB_GRANTS;
-    (env as any).GITHUB_GRANTS = { getByName: () => ({ sees: async () => Promise.reject(new Error("unreachable")) }) };
-    expect(await said(ann)).toMatch(/again in a little while/);
+    (env as any).GITHUB_GRANTS = { getByName: () => ({ standing: async () => Promise.reject(new Error("unreachable")) }) };
+    await everywhere();
+    // Their authorisation stands, and it is only the look at this repository that fails: said as of any that cannot be read.
+    (env as any).GITHUB_GRANTS = { getByName: () => ({ standing: async () => ({ generation: 1, authorised: true }), sees: async () => Promise.reject(new Error("unreachable")) }) };
+    expect(await said(ann)).toBe(unreadable);
     (env as any).GITHUB_GRANTS = real;
     expect((await lendForStart(env as any, about(ann))).kind).toBe("bound");
     // GitHub no longer takes their token.
