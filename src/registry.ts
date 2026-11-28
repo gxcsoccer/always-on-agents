@@ -91,6 +91,8 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS tenant_usage (tenant TEXT NOT NULL, day TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (tenant, day));
     `);
     this.#addColumn("github_repos", "secret TEXT");
+    // Which binding of an account to a person a note is of: a later note of the same account and person is another one.
+    this.#addColumn("github_people", "binding TEXT");
     this.#addColumn("task_slots", "until INTEGER");
     this.#addColumn("task_slots", "lease TEXT");
     // Takings that were given back, by their lease: so that an asking for one of them that arrives late takes nothing.
@@ -329,24 +331,39 @@ export class Registry extends DurableObject<Env> {
    * names the user a comment on GitHub is taken to come from) is neither read nor written here:
    * its names are not the chat's names for people, so the two cannot be told apart or alike.
    */
-  async claimGithubPerson(tenant: string, account: string, grant: string): Promise<"new" | "same" | false> {
+  /**
+   * `binding`: a name for this binding, should it be made now. What comes back says which binding
+   * the note is of: the one made now, or the one that was there (kept: the account never stopped
+   * being theirs). Whatever is done later on the strength of a binding names it, so that a note
+   * made anew of the same account and person is not taken for the earlier one.
+   */
+  async claimGithubPerson(tenant: string, account: string, grant: string, binding = ""): Promise<{ how: "new" | "same"; binding: string } | false> {
     const sql = this.ctx.storage.sql;
-    const held = sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0];
-    if (held) return held.grant_name === grant ? "same" : false;
+    const held = sql.exec<{ grant_name: string; binding: string | null }>("SELECT grant_name, binding FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0];
+    if (held) {
+      if (held.grant_name !== grant) return false;
+      // (One noted before bindings had names gets this one's.)
+      if (held.binding === null) sql.exec("UPDATE github_people SET binding = ? WHERE tenant = ? AND account = ?", binding, tenant, account);
+      return { how: "same", binding: held.binding ?? binding };
+    }
     if (sql.exec("SELECT 1 FROM github_people WHERE grant_name = ?", grant).toArray().length > 0) return false;
-    sql.exec("INSERT INTO github_people (tenant, account, grant_name) VALUES (?, ?, ?)", tenant, account, grant);
-    return "new";
+    sql.exec("INSERT INTO github_people (tenant, account, grant_name, binding) VALUES (?, ?, ?, ?)", tenant, account, grant, binding);
+    return { how: "new", binding };
   }
 
   /** That account is no longer the person's whose grant this is: that one, and no other they hold since. With no account named: whatever is noted as theirs. */
-  async releaseGithubPerson(grant: string, account?: string): Promise<void> {
-    if (account === undefined) this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
-    else this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
+  /** `binding`: only the note of that binding. One made since, of the same account and person, is another and stays. */
+  async releaseGithubPerson(grant: string, account?: string, binding?: string): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    if (account === undefined) sql.exec("DELETE FROM github_people WHERE grant_name = ?", grant);
+    else if (binding === undefined) sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
+    else sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ? AND COALESCE(binding, '') = ?", grant, account, binding);
   }
 
   /** The grant under which a GitHub account is some person's in one tenant, by name; none where it is nobody's there. */
-  async githubPersonGrant(tenant: string, account: string): Promise<string | null> {
-    return this.ctx.storage.sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0]?.grant_name ?? null;
+  async githubPersonGrant(tenant: string, account: string): Promise<{ grant: string; binding: string } | null> {
+    const noted = this.ctx.storage.sql.exec<{ grant_name: string; binding: string | null }>("SELECT grant_name, binding FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0];
+    return noted ? { grant: noted.grant_name, binding: noted.binding ?? "" } : null;
   }
 
   /** Every grant given as one GitHub account, in whichever tenant. */

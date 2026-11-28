@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantWrites } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantStillIs, grantWrites, memberKey } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 /** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
@@ -29,6 +29,7 @@ export const githubConnector: Connector = {
   tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
   writes: grantWrites,
+  stillIs: grantStillIs,
   offers: grantOffers,
   invitation: grantInvitation,
   async http(request, env, path) {
@@ -333,6 +334,24 @@ export async function commentStanding(env: Env, scope: Scope, subject: string): 
   return { revision: Date.parse(comment.updated_at ?? comment.created_at ?? "") || 0, holder: fingerprint(comment.body ?? ""), deleted: false, edited: comment.updated_at !== comment.created_at };
 }
 
+/**
+ * The person of a tenant who authorised GitHub, in the chat, as this account: GitHub itself said
+ * then that the account is theirs, so on GitHub they are that person, with nothing set up by
+ * hand. While the account is theirs there: given up, it is nobody's again. None where that
+ * cannot be asked just now (they are then taken as not known, which lets nothing through).
+ */
+async function personAs(env: Env, tenant: string, account: string): Promise<{ person: string; binding: string } | null> {
+  if (!/^\d+$/.test(account)) return null;
+  try {
+    const noted = await registry(env).githubPersonGrant(tenant, account);
+    const now = noted ? await env.GITHUB_GRANTS.getByName(noted.grant).personOf(Number(account)) : null;
+    // (The note and the grant have to say the same binding: one of them left over from another is not it.)
+    return noted && now && now.binding === noted.binding ? now : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   // Until the signature has been checked the caller is unknown, so every refusal is the same 401,
   // whatever was wrong: a missing header, a body that is not JSON, an unknown source, a bad signature.
@@ -400,10 +419,17 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // renamed and then claimed by someone else.
   if (event.principal.kind === "human") {
     const accountId = event.principal.id.replace(/^github:/, "");
-    const user = await registry(env).resolveIdentity(tenant, "github", accountId);
+    // (One an operator linked is who the operator said, before anything else.)
+    const linked = await registry(env).resolveIdentity(tenant, "github", accountId);
+    const connected = linked === null ? await personAs(env, tenant, accountId) : null;
+    // (Named apart from every name an operator can give, so that the two are never taken for one
+    // another where a task is somebody's; and kept with the binding it was known by, which is
+    // asked about again before their word decides anything.)
+    const user = linked ?? (connected ? memberKey(connected.person) : null);
     // A user id of the form "github:…", which can no longer be given, was never counted as a
     // member in a repository. It still is not.
-    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined };
+    if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined, ...(connected ? { self_connected: true as const } : {}) };
+    if (connected) event.data = { ...event.data, binding: connected.binding };
   }
   // An unaddressed comment is only for the agent if it quotes the code of a question that is open
   // in that same pull request. The whole comment is checked, however long it is.

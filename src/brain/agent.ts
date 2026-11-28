@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, saysWhoWrites, toolsOf, trusts, unreceived, wanted, writes } from "../connectors";
+import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, saysWhoWrites, stillIs, toolsOf, trusts, unreceived, wanted, writes } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -111,6 +111,7 @@ export class BrainAgent extends DurableObject<Env> {
       isDecider: (principal, source) => this.#isDecider(principal, source),
       canRevisit,
       saysWhoWrites,
+      stillIs: (event, principal) => stillIs(this.env, event.source, this.#store.scope(), { person: principal.id, data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} }),
       writes: (event, principal, repo) => writes(this.env, event.source, this.#store.scope(), { person: principal.id, data: event.data ? (JSON.parse(event.data) as Record<string, unknown>) : {} }, repo),
       standingOf: (source, subject) => standingOf(this.env, source, this.#store.scope(), subject),
       enqueue: (...args) => this.#outbox.enqueue(...args),
@@ -536,6 +537,9 @@ export class BrainAgent extends DurableObject<Env> {
     if (principals.length === 0 || replyOnly || !speakers.every(({ principal, source }) => this.#isDecider(principal, source))) {
       throw new Error("instructions.md can only be changed in a run started solely by a person's request");
     }
+    // What everyone here is told from now on is not changed on the word of someone known only by
+    // an account they connected themselves: that says who they are, not what they may decide here.
+    if (principals.some((each) => each.self_connected === true)) throw new Error("instructions.md can only be changed here by someone an operator has linked to this organisation; whoever asked is known here only by the GitHub account they connected themselves. Nothing was changed");
     return [...new Set(principals.map((p) => p.id))];
   }
 

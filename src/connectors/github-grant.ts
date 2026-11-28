@@ -93,6 +93,8 @@ interface Stored {
   grant?: { access: string; refresh?: string; version: string; expires_at: number; refresh_expires_at?: number; since: number; account: number; login: string; mark?: string };
   /** The GitHub account that is this person's in the tenant, by number: from when they first authorised as it until they give it up, whatever becomes of the tokens meanwhile. */
   bound?: number;
+  /** Which binding of that account to this person it is, as the registry's note of it says (see Registry.claimGithubPerson). */
+  binding?: string;
   /** Word owed of a change, to each conversation that waits on this person's authorisation, until each has heard. */
   owed?: { event: string; attempts: number; to: string[] };
 }
@@ -197,7 +199,7 @@ export class GithubGrant extends DurableObject<Env> {
     if (!before || !first?.held) return undefined;
     const name = await grantName(before.who);
     const account = String(first.held.account);
-    const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name);
+    const claimed = await registry(this.env).claimGithubPerson(before.who.tenant, account, name, random(16));
     if (!claimed) return "another";
     const now = Date.now();
     // As things are now: the grant may have been taken away while that was asked.
@@ -212,12 +214,13 @@ export class GithubGrant extends DurableObject<Env> {
       through.at = now;
       stored.grant = { ...grant, since: now, mark: random(16) };
       stored.bound = grant.account;
+      stored.binding = claimed.binding;
       stored.owed = this.#owed(stored, grant.version);
       void this.ctx.storage.put("grant", stored);
       return true;
     });
     if (!written) {
-      if (claimed === "new") await registry(this.env).releaseGithubPerson(name, account);
+      if (claimed.how === "new") await registry(this.env).releaseGithubPerson(name, account, claimed.binding);
       return undefined;
     }
     void this.ctx.storage.setAlarm(now);
@@ -259,29 +262,43 @@ export class GithubGrant extends DurableObject<Env> {
   /** Forgets the tokens and closes every open invitation, and the account is no longer this person's here. Only here: GitHub's own record of the authorisation is the person's to remove. */
   /** `only`: where the reason is about one GitHub account (it was revoked there), and the person may hold another by now. */
   async drop(only?: number): Promise<void> {
-    let was: { who: Who; bound?: number } | undefined;
+    let was: { who: Who; bound?: number; binding?: string } | undefined;
     await this.#withdraw((stored) => {
       if (!stored || (only !== undefined && stored.bound !== only)) return false;
-      was = { who: stored.who, bound: stored.bound };
+      was = { who: stored.who, bound: stored.bound, binding: stored.binding };
       const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
-      void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
+      void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, binding: undefined, owed });
       return true;
     });
     if (!was) return;
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
     // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
-    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), only === undefined ? undefined : String(was.bound));
+    // (By that account where there was one, so that a note made anew meanwhile, of their authorising again, is not taken away with the old one.
+    // Where none was bound, whatever is noted as theirs goes: what a binding interrupted half-way left behind.)
+    // And by which binding it was: a note of the same account made since, of their binding it again, is another, and stays.
+    if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), was.bound === undefined ? undefined : String(was.bound), was.bound === undefined ? undefined : was.binding);
+  }
+
+  /**
+   * Who, in the chat, a GitHub account is: the person this grant is of, while that account is
+   * theirs here (from when they authorised as it until they give it up). None for any other account.
+   */
+  async personOf(account: number): Promise<{ person: string; binding: string } | null> {
+    const stored = await this.#load();
+    return stored && stored.bound === account ? { person: stored.who.open_id, binding: stored.binding ?? "" } : null;
   }
 
   /**
    * Whether this person can push to a repository, as GitHub says now of their own token. `as`:
    * the account they have to be (where what is asked about was written as that account).
    */
-  async canPush(repo: string, as?: number): Promise<"yes" | "no" | "unconnected" | "unknown"> {
+  async canPush(repo: string, as?: number, binding?: string): Promise<"yes" | "no" | "unconnected" | "unknown"> {
     const held = await this.#token();
     if (held === "later") return "unknown";
     if (!held || (as !== undefined && held.account !== as)) return "unconnected";
+    // (And, where what is asked about was written under one binding of the account to them, still under that one.)
+    if (binding !== undefined && ((await this.#load())?.binding ?? "") !== binding) return "unconnected";
     let seen: Response;
     try {
       seen = await github(held.token, `/repos/${repo}`);
@@ -804,8 +821,11 @@ export async function grantWrites(env: Env, source: string, scope: Scope, by: { 
     if (source === "github") {
       const account = by.data.account;
       if (typeof account !== "number" || !Number.isSafeInteger(account)) return "unconnected";
-      const grant = await registry(env).githubPersonGrant(scope.tenant, String(account));
-      return grant ? await env.GITHUB_GRANTS.getByName(grant).canPush(repo.toLowerCase(), account) : "unconnected";
+      const noted = await registry(env).githubPersonGrant(scope.tenant, String(account));
+      // Written under one binding of the account to a person: it has to be that binding still.
+      const under = typeof by.data.binding === "string" ? by.data.binding : undefined;
+      if (!noted || (under !== undefined && noted.binding !== under)) return "unconnected";
+      return await env.GITHUB_GRANTS.getByName(noted.grant).canPush(repo.toLowerCase(), account, under);
     }
     const origin = (by.data.origin ?? {}) as Record<string, unknown>;
     const app = typeof origin.app_id === "string" ? await registry(env).feishuApp(origin.app_id) : null;
@@ -816,6 +836,28 @@ export async function grantWrites(env: Env, source: string, scope: Scope, by: { 
     return "unknown";
   }
 }
+
+/**
+ * Whether whoever wrote a comment on GitHub, and was known as a person of the tenant only by an
+ * account they connected themselves, is still that person by that same binding: asked before
+ * their word decides anything. "unknown": it could not be asked just now.
+ */
+export async function grantStillIs(env: Env, source: string, scope: Scope, by: { person: string; data: Record<string, unknown> }): Promise<boolean | "unknown"> {
+  if (source !== "github") return true;
+  const { account, binding } = by.data;
+  if (typeof account !== "number" || typeof binding !== "string") return false;
+  try {
+    const noted = await registry(env).githubPersonGrant(scope.tenant, String(account));
+    if (!noted || noted.binding !== binding) return false;
+    const now = await env.GITHUB_GRANTS.getByName(noted.grant).personOf(account);
+    return now !== null && now.binding === binding && memberKey(now.person) === by.person;
+  } catch {
+    return "unknown";
+  }
+}
+
+/** How a person known only by an account they connected themselves is named where their word is kept: apart from every name an operator can give a member (those have no ":"). */
+export const memberKey = (person: string) => `connected:${person}`;
 
 export const githubCreateIssue: ConnectorTool = {
   name: "github_create_issue",
@@ -1182,7 +1224,7 @@ export async function grantCallback(request: Request, env: Env): Promise<Respons
     // and asked. What they send back carries a word only this page was given.
     const confirm = await grant.hold(state[2], invitation.generation, issued as Issued, { id: account.id, login: account.login });
     if (!confirm) return await refused("superseded");
-    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
+    return page("确认使用这个 GitHub 账号", `即将把 GitHub 账号 @${account.login} 交给聊天里向我发起这次请求的人使用：之后我会按那个人在聊天里的要求，以 @${account.login} 的名义在 GitHub 上操作；@${account.login} 在这个组织接入的仓库里向我提出的请求，也会被当作那个人提出的。如果这次请求不是你自己在聊天里发起的（比如链接是别人发给你的），请直接关闭这个页面。`, 200, `<form method="post" action="/v1/github/oauth/confirm"><input type="hidden" name="state" value="${state[1]}.${state[2]}"><input type="hidden" name="confirm" value="${confirm}"><button type="submit">是我发起的，确认</button></form>`);
   } catch {
     return await refused("interrupted");
   }

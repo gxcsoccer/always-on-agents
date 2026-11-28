@@ -46,6 +46,13 @@ export interface Principal {
    * to a user of the tenant. Such a person is known by name and is not a member of any scope.
    */
   unlinked?: boolean;
+  /**
+   * Set where the connector knows the account as this person only because they connected it
+   * themselves (authorised as it, in their own conversation), not because an operator linked it.
+   * Their word counts where they speak; what takes more than that (changing what the agent is
+   * told to do for everyone there from now on) is not theirs on that strength alone.
+   */
+  self_connected?: true;
 }
 
 /**

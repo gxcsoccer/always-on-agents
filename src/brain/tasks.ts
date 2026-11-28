@@ -98,6 +98,8 @@ export interface TasksHost {
   writes(event: InboxRow, principal: Principal, repo: string): Promise<"yes" | "no" | "unconnected" | "unknown"> | undefined;
   /** Whether that can be asked at all of messages from a source. */
   saysWhoWrites(source: string): boolean;
+  /** Whether whoever wrote a message, known as a person only by something they connected themselves, is still that person in the same way (see Connector.stillIs). */
+  stillIs(event: InboxRow, principal: Principal): Promise<boolean | "unknown">;
   /** What a revisable message says at its source now. Throws if the source cannot be asked. */
   standingOf(source: string, subject: string): Promise<Standing | undefined>;
   /** Keeps a message to deliver: see Outbox.enqueue. */
@@ -1087,6 +1089,20 @@ export class Tasks implements Wakes {
       // only for pushes that update branches, and only to one person alone: where several people
       // talk each push is asked about, and whoever approves it is asked about each time.
       const asksAbout = pending as { source?: string; refs?: RefUpdate[]; resource?: string };
+      // Whoever approved is known as a person only by an account they connected themselves: asked,
+      // before their word decides anything, whether they are that person still, by the same
+      // binding. One given up since, or bound anew, is not the one that was known then.
+      if (decision === "allow" && deciding.principal.self_connected === true) {
+        const still = await this.#b.stillIs(deciding.event, deciding.principal).catch(() => "unknown" as const);
+        if (still === "unknown") throw new Error("it could not be found out just now whether whoever approved is still connected here as they were; nothing was sent and the question is still open. Call this tool again in a little while");
+        if (still !== true) {
+          this.#s.sql.exec("INSERT OR IGNORE INTO approvals_void (event_id, task_id, at) VALUES (?, ?, ?)", deciding.event.id, taskId, Date.now());
+          throw new Error(`${deciding.principal.display ?? "whoever approved"} is no longer connected here as the account they approved as, so their approval does not count; nothing was sent and the question is still open. They can approve again once they have connected it again`);
+        }
+        if (!unchanged()) throw new Error(CHANGED);
+        if (questionTouched()) throw new Error(QUESTION_CHANGED);
+        if (judge().event.id !== deciding.event.id) throw new Error(CHANGED);
+      }
       if (checks) {
         const who = deciding.principal.display ?? deciding.principal.id;
         const STILL = "nothing was pushed and the question is still open";
