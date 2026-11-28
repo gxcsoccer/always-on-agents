@@ -50,6 +50,134 @@ describe("the GitHub webhook endpoint", () => {
     expect(await (await deliver(webhook_secret, "issue_comment", comment(`${t}/demo`, 1, "@always-on-agent hello"))).json()).toMatchObject({ duplicate: true });
   });
 
+  it("looks at a pull request as it stands: of several pushes that wait only the latest is taken up, and none once it is closed", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const word = (action: string, sha: string, updated_at: string, number = 7) => deliver(webhook_secret, "pull_request", { action, repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 900 + number, number, title: "Add retry", html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, updated_at } });
+    const waiting = () => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT source_id, status FROM inbox ORDER BY id").toArray().map((row) => `${String(row.source_id).split(":").slice(2, 4).join(":")} ${row.status}`));
+    // Nothing is taken up yet (the Brain is not woken between them here): three pushes to one pull request, one to another.
+    expect((await word("opened", "a1", "2026-11-28T01:00:00Z")).status).toBe(202);
+    await word("synchronize", "a2", "2026-11-28T02:00:00Z");
+    await word("synchronize", "a3", "2026-11-28T03:00:00Z");
+    await word("opened", "b1", "2026-11-28T02:30:00Z", 8);
+    expect(await waiting()).toEqual(["opened:a1 dropped", "synchronize:a2 dropped", "synchronize:a3 pending", "opened:b1 pending"]);
+    // The first is merged: nothing of it waits any more, and that it was closed is not something to take up either.
+    expect((await word("closed", "a3", "2026-11-28T04:00:00Z")).status).toBe(202);
+    expect(await waiting()).toEqual(["opened:a1 dropped", "synchronize:a2 dropped", "synchronize:a3 dropped", "opened:b1 pending", "closed:a3 dropped"]);
+    // Only the other pull request is brought before the model.
+    model.replies([say("")]);
+    await wake(brain);
+    expect(modelCalls).toHaveLength(1);
+    const shown = JSON.stringify(modelCalls[0].input);
+    expect(shown).toContain("Pull request #8");
+    expect(shown).not.toContain("Pull request #7");
+  });
+
+  it("takes up no word of a pull request by itself where the deployment has not said to, and still answers someone who asks there", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const word = (action: string, sha: string, updated_at?: string) => deliver(webhook_secret, "pull_request", { action, repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 907, number: 7, title: "Add retry", html_url: `https://github.com/${repo}/pull/7`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, ...(updated_at ? { updated_at } : {}) } });
+    const statuses = () => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT kind, status FROM inbox ORDER BY id").toArray().map((row) => `${row.kind} ${row.status}`));
+    // One that waits from when it was still looked at by itself.
+    await word("opened", "a1", "2026-11-28T01:00:00Z");
+    expect(await statuses()).toEqual(["github.pull_request pending"]);
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      expect((await word("synchronize", "a2", "2026-11-28T02:00:00Z")).status).toBe(202);
+      // Neither waits now; the same one again is the one held.
+      expect(await statuses()).toEqual(["github.pull_request dropped", "github.pull_request dropped"]);
+      expect(await (await word("synchronize", "a2", "2026-11-28T02:00:00Z")).json()).toMatchObject({ duplicate: true });
+      expect(await (await word("synchronize", "a3")).json()).toMatchObject({ ignored: expect.any(String) });
+      await wake(brain);
+      expect(modelCalls).toHaveLength(0);
+      // Someone asks in the pull request: that is taken up as ever.
+      model.replies([say("")]);
+      expect((await deliver(webhook_secret, "issue_comment", { ...comment(repo, 31, "@always-on-agent please review this"), issue: { number: 7, pull_request: {} } })).status).toBe(202);
+      await wake(brain);
+      expect(modelCalls).toHaveLength(1);
+      expect(JSON.stringify(modelCalls[0].input)).toContain("please review this");
+      // Where nothing of it waits, the Brain is not woken for it at all: not when it arrives, nor when it is delivered again.
+      const quiet = await tenant();
+      const { webhook_secret: other } = await registry().linkGithubRepo(`acme/${quiet}`, quiet);
+      const pushed = () => deliver(other, "pull_request", { action: "opened", repository: { full_name: `acme/${quiet}` }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 1, number: 1, title: "t", html_url: "https://github.com/x/y/pull/1", head: { ref: "r", sha: "s" }, base: { ref: "main" }, user: { login: "dana" }, updated_at: "2026-11-28T01:00:00Z" } });
+      await pushed();
+      await pushed();
+      expect(await runInDurableObject(brainFor(`${quiet}:repo:acme/${quiet}`), (_i: unknown, state: DurableObjectState) => state.storage.getAlarm())).toBeNull();
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+  });
+
+  it("spends nothing, once pull requests are no longer looked at by themselves, on word of them that already waits or was taken up and put off; with no further word arriving", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const sql = (query: string, ...args: unknown[]) => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
+    const word = (number: number, sha: string, updated_at: string) => deliver(webhook_secret, "pull_request", { action: "opened", repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 900 + number, number, title: "Add retry", html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, updated_at } });
+    // Taken in while they were looked at by themselves. One of them from before anything was kept of which it is the state of.
+    await word(7, "a1", "2026-11-28T01:00:00Z");
+    await word(8, "b1", "2026-11-28T01:00:00Z");
+    await sql("UPDATE inbox SET data = json_remove(data, '$.supersedes')");
+    await sql("DELETE FROM latest_states");
+    // And a person asks something in one of them.
+    await deliver(webhook_secret, "issue_comment", { ...comment(repo, 41, "@always-on-agent what does this change?"), issue: { number: 8, pull_request: {} } });
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      model.replies([say("")]);
+      for (let i = 0; i < 5; i++) await wake(brain);
+      // Only what the person asked was brought before the model.
+      expect(modelCalls).toHaveLength(1);
+      expect(JSON.stringify(modelCalls[0].input)).toContain("what does this change?");
+      expect(JSON.stringify(modelCalls[0].input)).not.toContain("was opened by");
+      expect((await sql("SELECT kind, status FROM inbox ORDER BY id")).map((row) => `${row.kind} ${row.status}`)).toEqual(["github.pull_request dropped", "github.pull_request dropped", "message done"]);
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+
+    // A run that took such word up and was put off before doing anything (the allowance was used up): ended with nothing spent.
+    await word(9, "c1", "2026-11-28T02:00:00Z");
+    const [event] = await sql("SELECT id, session_key FROM inbox WHERE status = 'pending'");
+    await sql("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s-held', ?, 1, 1) ON CONFLICT DO NOTHING", event.session_key);
+    const session = (await sql("SELECT id FROM sessions WHERE session_key = ?", event.session_key))[0].id;
+    await sql("INSERT INTO runs (id, session_id, status, started_at, retry_at) VALUES ('r-held', ?, 'running', 1, 1)", session);
+    await sql("UPDATE inbox SET status = 'claimed', run_id = 'r-held' WHERE id = ?", event.id);
+    await sql("INSERT INTO meta (key, value) VALUES ('active_run', 'r-held') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      const before = modelCalls.length;
+      for (let i = 0; i < 3; i++) await wake(brain);
+      expect(modelCalls).toHaveLength(before);
+      expect((await sql("SELECT status FROM runs WHERE id = 'r-held'"))[0].status).toBe("done");
+      expect((await sql("SELECT status FROM inbox WHERE id = ?", event.id))[0].status).toBe("dropped");
+      // What that run had written of it into the conversation's record is gone with it: someone who asks there next is not shown it.
+      expect(await sql("SELECT 1 FROM items WHERE run_id = 'r-held'")).toEqual([]);
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+
+    // Looked at by themselves, still: a run that took up word of a pull request and was put off, and the pull request
+    // is closed meanwhile. What it took up is known to be superseded: it ends with nothing spent.
+    await word(10, "d1", "2026-11-28T03:00:00Z");
+    const [late] = await sql("SELECT id, session_key FROM inbox WHERE status = 'pending'");
+    await sql("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s-late', ?, 1, 1)", late.session_key);
+    await sql("INSERT INTO runs (id, session_id, status, started_at, retry_at) VALUES ('r-late', 's-late', 'running', 1, 1)");
+    await sql("INSERT INTO items (session_id, seq, run_id, item) VALUES ('s-late', 1, 'r-late', ?)", JSON.stringify({ role: "user", content: "Pull request #10 was opened" }));
+    await sql("UPDATE inbox SET status = 'claimed', run_id = 'r-late' WHERE id = ?", late.id);
+    await sql("INSERT INTO meta (key, value) VALUES ('active_run', 'r-late') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    await deliver(webhook_secret, "pull_request", { action: "closed", repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 910, number: 10, title: "Add retry", html_url: `https://github.com/${repo}/pull/10`, head: { ref: "retry", sha: "d1" }, base: { ref: "main" }, user: { login: "dana" }, updated_at: "2026-11-28T03:01:00Z" } });
+    const calls = modelCalls.length;
+    for (let i = 0; i < 3; i++) await wake(brain);
+    expect(modelCalls).toHaveLength(calls);
+    expect((await sql("SELECT status FROM runs WHERE id = 'r-late'"))[0].status).toBe("done");
+    expect((await sql("SELECT status FROM inbox WHERE id = ?", late.id))[0].status).toBe("dropped");
+    expect(await sql("SELECT 1 FROM items WHERE run_id = 'r-late'")).toEqual([]);
+  });
+
   it("gives the same refusal for a wrong secret, another repository's secret and an unregistered repository", async () => {
     const a = await tenant();
     const b = await tenant();

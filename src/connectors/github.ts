@@ -17,8 +17,13 @@ import { githubTokenFor } from "./github-app";
 import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
+/** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
+const reviewsByItself = (env: Env) => env.GITHUB_AUTO_REVIEW === "on";
+
 export const githubConnector: Connector = {
   name: "github",
+  // Word of a pull request that was taken in while they were looked at by themselves, and still waits.
+  wanted: (env, event) => event.kind !== "github.pull_request" || reviewsByItself(env),
   // Also plugged into the chat connector: what a person there can have done on GitHub in their own name.
   serves: ["feishu"],
   tools: [githubCreateIssue, githubComment, githubDisconnect],
@@ -404,6 +409,13 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   if (normalized.onlyIfQuotes !== undefined && !(await brain.quotesOpenQuestion(normalized.onlyIfQuotes, event.session_key))) {
     return dropped("the comment does not address the agent");
   }
+  // Word that a pull request was opened or pushed to is something to look at by itself only where
+  // the deployment says so. Elsewhere it is taken in as one that ends what waits and is not taken
+  // up (see InboundEvent.supersedes): someone who asks there is still answered.
+  if (event.kind === "github.pull_request" && !reviewsByItself(env)) {
+    if (!event.supersedes) return json({ ignored: "pull requests are looked at only when someone asks" }, 202);
+    event.supersedes = { ...event.supersedes, void: true };
+  }
   const result = await brain.ingest(event);
   return json({ ...result, scope: scopeName(scope), kind: event.kind }, 202);
 }
@@ -434,13 +446,25 @@ export function normalize(
         { kind: "human", id: account, display: sender.login, explicit, unlinked: true };
   const replyTo = (number: number): Target => ({ connector: "github", address: { repo, number: String(number) } });
 
-  if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize"].includes(payload.action)) {
+  if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize", "closed"].includes(payload.action)) {
     const pr = payload.pull_request;
+    // Of a pull request only how it stands now is worth looking at: each of these says how it
+    // stood at one moment, by GitHub's own clock, and the latest takes the place of the others
+    // that still wait. One that says it was closed (or merged) only ends them.
+    const at = Date.parse(pr.updated_at ?? "") || 0;
+    const closed = payload.action === "closed";
+    // The same thing at the same commit, more than once (closed and opened again; pushed back to an
+    // earlier commit): each time is another event, told apart by when. One delivered again says the same time.
+    const again = at > 0 ? `:${at}` : "";
+    // (That it was closed is only for ending the others: where its place in the order cannot be told, it is nothing.)
+    if (closed && at === 0) return undefined;
     return {
       repo,
       event: {
         ...base,
-        source_id: `pr:${pr.id ?? pr.number}:${payload.action}:${pr.head?.sha ?? ""}`,
+        source_id: `pr:${pr.id ?? pr.number}:${payload.action}:${pr.head?.sha ?? ""}${again}`,
+        // (Where GitHub does not say when, nothing can be told of the order: such a one supersedes nothing.)
+        ...(at > 0 ? { supersedes: { key: `pr:${pr.id ?? pr.number}`, at, ...(closed ? { void: true as const } : {}) } } : {}),
         kind: "github.pull_request",
         session_key: `pr:${pr.number}`,
         principal: person(false),

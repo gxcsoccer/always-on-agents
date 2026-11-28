@@ -29,6 +29,12 @@ import type { InboundEvent, Principal, Scope, Target } from "../events";
 export interface Connector {
   /** Lowercase; also the first path segment of its routes and the `source` of its events. */
   name: string;
+  /**
+   * Whether an event of this connector's that waits is still to be taken up, asked just before
+   * anything is spent on it: of a kind of event the deployment may have stopped wanting since it
+   * arrived. One that is not is dropped, and nothing is done about it.
+   */
+  wanted?(env: Env, event: { kind: string }): boolean;
   /** Handles a request under /v1/<name>/. `path` is what follows the name. */
   http?(request: Request, env: Env, path: string[], ingress: Ingress): Promise<Response>;
   /** Handles an admin request it owns, already authenticated. Returns undefined for any other. */

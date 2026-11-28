@@ -69,6 +69,8 @@ export interface RunnerHost {
   isDecider(principal: Principal, source: string): boolean;
   /** A connector's tools. */
   toolsOf(connector: string): ConnectorTool[];
+  /** Whether an event that waits is still to be taken up, as its connector says now (see Connector.wanted). */
+  wanted(source: string, kind: string): boolean;
   /** Whether a message still says what it said when it came (see Revisions). */
   stillStands(event: InboxRow): boolean;
   /** Every worker this deployment lists. */
@@ -174,6 +176,11 @@ export class Runner {
       // an earlier message of the person's) counts too: each such thing once for the run.
       const counted = new Set<string>();
       for (const event of ids.length === 0 ? [] : this.#s.rows<InboxRow>(`SELECT * FROM inbox WHERE status = 'pending' AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids)) {
+        // One its connector no longer wants taken up waits no longer, and nothing is spent on it.
+        if (!this.#b.wanted(event.source, event.kind)) {
+          this.#s.sql.exec("UPDATE inbox SET status = 'dropped' WHERE id = ?", event.id);
+          continue;
+        }
         const shown = this.#shownWith(event).filter((each) => !counted.has(each.key));
         bytes += sizeOf(event) + shown.reduce((sum, each) => sum + each.size, 0);
         if (events.length > 0 && bytes > MAX_EVENT_BYTES_PER_RUN) break;
@@ -475,6 +482,25 @@ export class Runner {
   async execute(runId: string): Promise<void> {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
+    // Taken up and then put off before anything was done (the day's allowance was used up, say):
+    // what it took up is looked at again as things are now. Where its connector no longer wants
+    // any of it, or a later word about the same thing has superseded it meanwhile, all of it is
+    // dropped and the run ends here, with nothing spent; what it had written of them into the
+    // conversation's record (nothing else, so far) goes with it. Only where that is so of every
+    // event it took up: what it wrote into the record is one piece for all of them, and a run
+    // that still has something to do goes on with it as it is.
+    if (entered.steps === 0 && entered.status === "running") {
+      const held = this.#s.rows<{ id: number; source: string; kind: string; data: string | null }>("SELECT id, source, kind, data FROM inbox WHERE run_id = ? AND status = 'claimed'", runId);
+      const unwanted = held.filter((each) => !this.#b.wanted(each.source, each.kind) || this.#s.superseded(each.source, each.data));
+      if (held.length > 0 && unwanted.length === held.length) {
+        this.#s.transaction(() => {
+          for (const each of unwanted) this.#s.sql.exec("UPDATE inbox SET status = 'dropped', run_id = NULL WHERE id = ?", each.id);
+          this.#s.sql.exec("DELETE FROM items WHERE run_id = ?", runId);
+          this.#finish(runId, "done");
+        });
+        return;
+      }
+    }
     // Taken up again after an interruption: what it had read of the conversation's record is not
     // given to the model a second time as it stood then. It reads again, and is given what stands now.
     // (Whatever it read, it read in an earlier entry: nothing of this one has happened yet.)

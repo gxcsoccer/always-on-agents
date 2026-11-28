@@ -64,6 +64,69 @@ describe("the Brain's store", () => {
     });
   });
 
+  it("keeps waiting only the latest of the events that say how one thing stands, and nothing of one that only ends them", async () => {
+    await within((store) => {
+      const pushed = (id: string, key: string, at: number, more: Record<string, unknown> = {}) => store.insertEvent({ source: "github", source_id: id, kind: "github.pull_request", session_key: "pr:7", principal: { kind: "human", id: "github:1", explicit: false }, text: id, data: { number: 7 }, supersedes: { key, at }, ...more });
+      const how = () => Object.fromEntries(store.rows<{ source_id: string; status: string }>("SELECT source_id, status FROM inbox ORDER BY id").map((row) => [row.source_id, row.status]));
+      // What a person wrote there, and something else that happened, are never touched by any of it.
+      store.insertEvent({ source: "github", source_id: "comment:1", kind: "message", session_key: "pr:7", principal: { kind: "human", id: "github:1", explicit: true }, text: "please look" });
+      store.insertEvent({ source: "github", source_id: "ci:1", kind: "github.ci_failed", session_key: "pr:7", principal: { kind: "automation", id: "ci", explicit: false } });
+      expect(pushed("a", "pr:99", 100)).toBe(true);
+      expect(pushed("b", "pr:99", 200)).toBe(true);
+      // Another pull request's are its own.
+      expect(pushed("other", "pr:55", 150)).toBe(true);
+      expect(how()).toEqual({ "comment:1": "pending", "ci:1": "pending", a: "dropped", b: "pending", other: "pending" });
+      // What it was superseded under is kept with it.
+      expect(JSON.parse(store.rows<{ data: string }>("SELECT data FROM inbox WHERE source_id = 'b'")[0].data)).toEqual({ number: 7, supersedes: { key: "pr:99", at: 200 } });
+      // The same one again is the one held: it supersedes nothing a second time.
+      expect(pushed("a", "pr:99", 999)).toBe(false);
+      expect(how().b).toBe("pending");
+      // One that has been taken up is left alone, whatever comes after.
+      store.sql.exec("UPDATE inbox SET status = 'claimed' WHERE source_id = 'b'");
+      expect(pushed("c", "pr:99", 300)).toBe(true);
+      expect(how()).toMatchObject({ b: "claimed", c: "pending" });
+      // One that arrives after a later one was superseded before it came: kept, and not waiting.
+      expect(pushed("old", "pr:99", 250)).toBe(true);
+      expect(how()).toMatchObject({ old: "dropped", c: "pending" });
+      // At the very same moment, the one that arrives later stands.
+      expect(pushed("d", "pr:99", 300)).toBe(true);
+      expect(how()).toMatchObject({ c: "dropped", d: "pending" });
+      // One that only ends the others: they wait no longer, and neither does it. It is kept, so that it is not taken in twice.
+      expect(pushed("closed", "pr:99", 400, { supersedes: { key: "pr:99", at: 400, void: true } })).toBe(true);
+      expect(how()).toMatchObject({ d: "dropped", closed: "dropped", b: "claimed", other: "pending", "comment:1": "pending", "ci:1": "pending" });
+      expect(pushed("closed", "pr:99", 400, { supersedes: { key: "pr:99", at: 400, void: true } })).toBe(false);
+      // A push from before it was closed, arriving after: not waited on. Opened again later: that waits.
+      expect(pushed("stale", "pr:99", 350)).toBe(true);
+      expect(pushed("reopened", "pr:99", 500)).toBe(true);
+      expect(how()).toMatchObject({ stale: "dropped", reopened: "pending" });
+      // And an old word that it was closed, arriving after it was opened again, ends nothing.
+      expect(pushed("closed-late", "pr:99", 450, { supersedes: { key: "pr:99", at: 450, void: true } })).toBe(true);
+      expect(how()).toMatchObject({ "closed-late": "dropped", reopened: "pending" });
+      // At the very same moment as one that only ends the others, that one stands, whichever of the two arrives first.
+      expect(pushed("closed-2", "pr:99", 600, { supersedes: { key: "pr:99", at: 600, void: true } })).toBe(true);
+      expect(pushed("same-moment-after", "pr:99", 600)).toBe(true);
+      expect(how()).toMatchObject({ reopened: "dropped", "same-moment-after": "dropped" });
+      expect(pushed("first", "pr:77", 600)).toBe(true);
+      expect(pushed("then-closed", "pr:77", 600, { supersedes: { key: "pr:77", at: 600, void: true } })).toBe(true);
+      expect(how()).toMatchObject({ first: "dropped", "then-closed": "dropped" });
+      // Which state was the latest is kept apart from the events: it is still known when their words are gone.
+      store.sql.exec("UPDATE inbox SET text = NULL, data = NULL");
+      expect(pushed("long-after", "pr:99", 550)).toBe(true);
+      expect(how()["long-after"]).toBe("dropped");
+      expect(pushed("again-open", "pr:99", 700)).toBe(true);
+      expect(how()["again-open"]).toBe("pending");
+      expect(store.rows("SELECT key, at, void FROM latest_states WHERE source = 'github' ORDER BY key")).toEqual([{ key: "pr:55", at: 150, void: 0 }, { key: "pr:77", at: 600, void: 1 }, { key: "pr:99", at: 700, void: 0 }]);
+      // Nothing an event happens to carry in its own data puts it under a key: only what was said of it as it was handed over.
+      store.insertEvent({ source: "github", source_id: "comment:2", kind: "message", session_key: "pr:7", principal: { kind: "human", id: "github:1", explicit: true }, text: "look", data: { supersedes: { key: "pr:99", at: 1 }, number: 7 } });
+      expect(JSON.parse(store.rows<{ data: string }>("SELECT data FROM inbox WHERE source_id = 'comment:2'")[0].data)).toEqual({ number: 7 });
+      expect(pushed("closed-3", "pr:99", 800, { supersedes: { key: "pr:99", at: 800, void: true } })).toBe(true);
+      expect(how()).toMatchObject({ "comment:2": "pending", "again-open": "dropped" });
+      // The same key from another source is something else.
+      expect(store.insertEvent({ source: "elsewhere", source_id: "x", kind: "note", session_key: "pr:7", principal: { kind: "automation", id: "x", explicit: false }, supersedes: { key: "pr:99", at: 900 } })).toBe(true);
+      expect(how()).toMatchObject({ x: "pending" });
+    });
+  });
+
   it("stores what an event does not have as nothing, not as text", async () => {
     await within((store) => {
       store.insertEvent({ source: "timer", source_id: "t1", kind: "timer.fired", session_key: "dm", principal: { kind: "timer", id: "t1", explicit: false } });

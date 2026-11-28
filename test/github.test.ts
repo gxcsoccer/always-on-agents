@@ -43,6 +43,29 @@ describe("event normalisation", () => {
     expect(normalize("pull_request", pushedAgain)?.event.source_id).not.toBe(normalize("pull_request", payload)?.event.source_id);
   });
 
+  it("says of each word about a pull request which one it is the state of and when, so that only the latest is looked at; that it was closed only ends the others", () => {
+    const at = (action: string, updated_at?: string, more: Record<string, unknown> = {}) => normalize("pull_request", { action, repository, sender: { login: "dana", type: "User" }, pull_request: { ...pr, ...(updated_at ? { updated_at } : {}), ...more } })?.event;
+    const T1 = "2026-11-28T03:00:00Z";
+    const T2 = "2026-11-28T04:00:00Z";
+    for (const action of ["opened", "reopened", "ready_for_review", "synchronize"]) expect(at(action, T1)?.supersedes, action).toEqual({ key: "pr:99", at: Date.parse(T1) });
+    // The same key whatever the commit: it is the pull request that is looked at, as it stands.
+    expect(at("synchronize", T2, { head: { ref: "retry", sha: "def5678" } })?.supersedes).toEqual({ key: "pr:99", at: Date.parse(T2) });
+    // Closed (or merged): only ends the others.
+    expect(at("closed", T2)).toMatchObject({ kind: "github.pull_request", session_key: "pr:7", supersedes: { key: "pr:99", at: Date.parse(T2), void: true } });
+    // Closed and opened again at the same commit, more than once: each time is another event; a redelivery of one is the same one.
+    expect(at("closed", T1)?.source_id).not.toBe(at("closed", T2)?.source_id);
+    expect(at("reopened", T1)?.source_id).not.toBe(at("reopened", T2)?.source_id);
+    expect(at("closed", T1)?.source_id).toBe(at("closed", T1)?.source_id);
+    // Pushed back to a commit it was at before: another event, not the earlier one delivered again.
+    const A = { head: { ref: "retry", sha: "aaa" } };
+    expect(at("synchronize", T2, A)?.source_id).not.toBe(at("synchronize", T1, A)?.source_id);
+    expect(at("synchronize", T1, A)?.source_id).toBe(at("synchronize", T1, A)?.source_id);
+    // Where GitHub does not say when: nothing is superseded by it, and that it was closed is nothing at all.
+    expect(at("synchronize")?.supersedes).toBeUndefined();
+    expect(at("closed")).toBeUndefined();
+    expect(at("closed", "not a time")).toBeUndefined();
+  });
+
   const comment = (body: string, association: string, type = "User") => ({
     action: "created",
     repository,

@@ -86,13 +86,57 @@ export class BrainStore {
     console.log(JSON.stringify({ event, scope: this.#ctx.id.name, ...detail }));
   }
 
-  /** Stores an event unless the same (source, source_id) is already held. Says whether it was stored. */
+  /**
+   * Whether an event that was taken in says how something stood at a moment that a later word
+   * under its key has since superseded (see InboundEvent.supersedes): known from what is kept of
+   * the latest state, with nothing asked of anyone.
+   */
+  superseded(source: string, data: string | null): boolean {
+    let under: { key?: unknown; at?: unknown } | undefined;
+    try {
+      under = (JSON.parse(data ?? "{}") as { supersedes?: { key?: unknown; at?: unknown } }).supersedes;
+    } catch {
+      return false;
+    }
+    if (typeof under?.key !== "string" || typeof under.at !== "number") return false;
+    const latest = this.rows<{ at: number; void: number }>("SELECT at, void FROM latest_states WHERE source = ? AND key = ?", source, under.key)[0];
+    return latest !== undefined && (latest.at > under.at || (latest.at === under.at && latest.void === 1));
+  }
+
+  /**
+   * Stores an event unless the same (source, source_id) is already held. Says whether it was stored.
+   * What it supersedes, which state is the latest, and the event itself are written together or not at all.
+   */
   insertEvent(event: InboundEvent): boolean {
+    return this.transaction(() => this.#insert(event));
+  }
+
+  #insert(event: InboundEvent): boolean {
     // Checked explicitly: rowsWritten also counts index writes, so it cannot tell an insert from an ignore.
     if (this.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ?", event.source, event.source_id).length > 0) return false;
+    // Only the latest state under a key means anything (see InboundEvent.supersedes). Settled here,
+    // as the event is written and only for one that is new. Which state was the latest, and when,
+    // is kept by itself, for as long as the key is heard of: not with the events, whose words go.
+    // One from before the latest was superseded before it arrived; at the very same moment, one
+    // that only ends the others stands whichever arrived first, and of two others the later to arrive.
+    // What it supersedes is what still waits under its key (what has been taken up is left alone),
+    // and is kept, as dropped. Under the key is only what was said to be so here: nothing a
+    // connector happens to put in an event's own data counts.
+    const latest = event.supersedes;
+    const KEY = "json_extract(data, '$.supersedes.key')";
+    const before = latest ? this.rows<{ at: number; void: number }>("SELECT at, void FROM latest_states WHERE source = ? AND key = ?", event.source, latest.key)[0] : undefined;
+    const late = latest !== undefined && before !== undefined && (before.at > latest.at || (before.at === latest.at && before.void === 1 && !latest.void));
+    if (latest && !late) {
+      this.sql.exec(`UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = ? AND ${KEY} = ?`, event.source, latest.key);
+      this.sql.exec("INSERT INTO latest_states (source, key, at, void) VALUES (?, ?, ?, ?) ON CONFLICT(source, key) DO UPDATE SET at = excluded.at, void = excluded.void", event.source, latest.key, latest.at, latest.void ? 1 : 0);
+    }
+    if (latest || (event.data && "supersedes" in event.data)) {
+      const { supersedes: _not, ...rest } = event.data ?? {};
+      event = { ...event, data: latest ? { ...rest, supersedes: { key: latest.key, at: latest.at } } : rest };
+    }
     this.sql.exec(
-      `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.source,
       event.source_id,
       event.kind,
@@ -102,6 +146,8 @@ export class BrainStore {
       event.data ? JSON.stringify(event.data) : null,
       event.reply_to ? JSON.stringify(event.reply_to) : null,
       Date.now(),
+      // (Written as it stands from the first: one that came late, or only ends the others, never waits.)
+      latest && (late || latest.void) ? "dropped" : "pending",
     );
     return true;
   }
