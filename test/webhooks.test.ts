@@ -50,6 +50,31 @@ describe("the GitHub webhook endpoint", () => {
     expect(await (await deliver(webhook_secret, "issue_comment", comment(`${t}/demo`, 1, "@always-on-agent hello"))).json()).toMatchObject({ duplicate: true });
   });
 
+  it("looks at a pull request as it stands: of several pushes that wait only the latest is taken up, and none once it is closed", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const word = (action: string, sha: string, updated_at: string, number = 7) => deliver(webhook_secret, "pull_request", { action, repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 900 + number, number, title: "Add retry", html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, updated_at } });
+    const waiting = () => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec("SELECT source_id, status FROM inbox ORDER BY id").toArray().map((row) => `${String(row.source_id).split(":").slice(2, 4).join(":")} ${row.status}`));
+    // Nothing is taken up yet (the Brain is not woken between them here): three pushes to one pull request, one to another.
+    expect((await word("opened", "a1", "2026-11-28T01:00:00Z")).status).toBe(202);
+    await word("synchronize", "a2", "2026-11-28T02:00:00Z");
+    await word("synchronize", "a3", "2026-11-28T03:00:00Z");
+    await word("opened", "b1", "2026-11-28T02:30:00Z", 8);
+    expect(await waiting()).toEqual(["opened:a1 dropped", "synchronize:a2 dropped", "synchronize:a3 pending", "opened:b1 pending"]);
+    // The first is merged: nothing of it waits any more, and that it was closed is not something to take up either.
+    expect((await word("closed", "a3", "2026-11-28T04:00:00Z")).status).toBe(202);
+    expect(await waiting()).toEqual(["opened:a1 dropped", "synchronize:a2 dropped", "synchronize:a3 dropped", "opened:b1 pending", "closed:a3 dropped"]);
+    // Only the other pull request is brought before the model.
+    model.replies([say("")]);
+    await wake(brain);
+    expect(modelCalls).toHaveLength(1);
+    const shown = JSON.stringify(modelCalls[0].input);
+    expect(shown).toContain("Pull request #8");
+    expect(shown).not.toContain("Pull request #7");
+  });
+
   it("gives the same refusal for a wrong secret, another repository's secret and an unregistered repository", async () => {
     const a = await tenant();
     const b = await tenant();

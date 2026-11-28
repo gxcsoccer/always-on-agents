@@ -434,13 +434,24 @@ export function normalize(
         { kind: "human", id: account, display: sender.login, explicit, unlinked: true };
   const replyTo = (number: number): Target => ({ connector: "github", address: { repo, number: String(number) } });
 
-  if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize"].includes(payload.action)) {
+  if (type === "pull_request" && ["opened", "reopened", "ready_for_review", "synchronize", "closed"].includes(payload.action)) {
     const pr = payload.pull_request;
+    // Of a pull request only how it stands now is worth looking at: each of these says how it
+    // stood at one moment, by GitHub's own clock, and the latest takes the place of the others
+    // that still wait. One that says it was closed (or merged) only ends them.
+    const at = Date.parse(pr.updated_at ?? "") || 0;
+    const closed = payload.action === "closed";
+    // Closed and opened again at the same commit, more than once: each time is another event.
+    const again = closed || payload.action === "reopened" ? `:${at}` : "";
+    // (That it was closed is only for ending the others: where its place in the order cannot be told, it is nothing.)
+    if (closed && at === 0) return undefined;
     return {
       repo,
       event: {
         ...base,
-        source_id: `pr:${pr.id ?? pr.number}:${payload.action}:${pr.head?.sha ?? ""}`,
+        source_id: `pr:${pr.id ?? pr.number}:${payload.action}:${pr.head?.sha ?? ""}${again}`,
+        // (Where GitHub does not say when, nothing can be told of the order: such a one supersedes nothing.)
+        ...(at > 0 ? { supersedes: { key: `pr:${pr.id ?? pr.number}`, at, ...(closed ? { void: true as const } : {}) } } : {}),
         kind: "github.pull_request",
         session_key: `pr:${pr.number}`,
         principal: person(false),

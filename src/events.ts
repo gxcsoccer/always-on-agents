@@ -81,6 +81,16 @@ export interface InboundEvent {
    * pressed or a reply that was routed from elsewhere.
    */
   data?: Record<string, unknown>;
+  /**
+   * For a notification of which only the latest state means anything (a pull request was pushed
+   * to again, say): the connector names what it is the state of (`key`) and when that state was
+   * so (`at`, by the source's own clock). As such an event is taken in, earlier ones under the
+   * same key that nobody has taken up yet are dropped; one that arrives after a later one under
+   * its key is itself dropped. `void`: this one only ends the others (the pull request was
+   * closed): it is kept so that it is not taken in twice, and nothing is done about it. Only
+   * events that carry the same key are touched: never what a person wrote, nor anything else.
+   */
+  supersedes?: { key: string; at: number; void?: true };
   reply_to?: Target;
 }
 

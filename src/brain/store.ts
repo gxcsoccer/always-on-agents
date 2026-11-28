@@ -90,6 +90,16 @@ export class BrainStore {
   insertEvent(event: InboundEvent): boolean {
     // Checked explicitly: rowsWritten also counts index writes, so it cannot tell an insert from an ignore.
     if (this.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ?", event.source, event.source_id).length > 0) return false;
+    // Only the latest state under a key means anything (see InboundEvent.supersedes). Settled here,
+    // as the event is written and only for one that is new: what it supersedes is still waiting
+    // (what has been taken up is left alone), and is kept, as dropped. One that comes after a
+    // later one under its key was superseded before it arrived.
+    const latest = event.supersedes;
+    const KEY = "json_extract(data, '$.supersedes.key')";
+    const AT = "json_extract(data, '$.supersedes.at')";
+    const late = latest !== undefined && this.rows(`SELECT 1 FROM inbox WHERE source = ? AND ${KEY} = ? AND ${AT} > ?`, event.source, latest.key, latest.at).length > 0;
+    if (latest && !late) this.sql.exec(`UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = ? AND ${KEY} = ? AND ${AT} <= ?`, event.source, latest.key, latest.at);
+    if (latest) event = { ...event, data: { ...event.data, supersedes: { key: latest.key, at: latest.at } } };
     this.sql.exec(
       `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -103,6 +113,7 @@ export class BrainStore {
       event.reply_to ? JSON.stringify(event.reply_to) : null,
       Date.now(),
     );
+    if (latest && (late || latest.void)) this.sql.exec("UPDATE inbox SET status = 'dropped' WHERE source = ? AND source_id = ?", event.source, event.source_id);
     return true;
   }
 }
