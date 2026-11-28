@@ -52,6 +52,21 @@ export function wanted(env: Env, source: string, kind: string): boolean {
   return byName.get(source)?.wanted?.(env, { kind }) ?? true;
 }
 
+/**
+ * Whether whoever wrote a message that came through a connector may write to a repository (see
+ * Connector.writes): said by that connector, or by one plugged into it. Nothing where none of
+ * them has such a word to say.
+ */
+export function writes(env: Env, source: string, scope: Scope, by: { person: string; data: Record<string, unknown> }, repo: string): Promise<"yes" | "no" | "unconnected" | "unknown"> | undefined {
+  const saying = [byName.get(source), ...serving(source)].find((each) => each?.writes);
+  return saying?.writes?.(env, source, scope, by, repo);
+}
+
+/** Whether it can be asked, of messages that come through a connector, if their authors may write to a repository. */
+export function saysWhoWrites(source: string): boolean {
+  return [byName.get(source), ...serving(source)].some((each) => each?.writes !== undefined);
+}
+
 /** The tools a connector offers, if any. Whether they are offered in a given run is the Brain's decision. */
 export function toolsOf(name: string): ConnectorTool[] {
   return [...(byName.get(name)?.tools ?? []), ...serving(name).flatMap((each) => each.tools ?? [])];

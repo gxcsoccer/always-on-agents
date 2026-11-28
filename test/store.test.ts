@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { MIGRATIONS, migrate } from "../src/brain/schema";
 import { BrainStore } from "../src/brain/store";
 
 /**
@@ -15,6 +16,24 @@ function within<T>(use: (store: BrainStore, state: DurableObjectState) => T | Pr
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("the steps a Brain's database is brought up to date by", () => {
+  it("are only ever added at the end: a database that had the earlier ones gets the new one, and none again", async () => {
+    // Where each of the latest sits, by number: a step put in before one that databases already ran is never run for them.
+    const at = (table: string) => MIGRATIONS.findIndex((step) => step.includes(`CREATE TABLE IF NOT EXISTS ${table} `));
+    expect([at("task_lends"), at("latest_states"), at("approvals_void")]).toEqual([41, 42, 43]);
+    expect(MIGRATIONS).toHaveLength(44);
+    // A database as the version before this one left it: brought up to date, it has the new table.
+    await within((store, state) => {
+      store.sql.exec("DROP TABLE approvals_void");
+      store.setMeta("schema_version", "43");
+      migrate(state.storage);
+      expect(store.meta("schema_version")).toBe("44");
+      expect(store.rows("SELECT event_id FROM approvals_void")).toEqual([]);
+      expect(store.rows("SELECT key FROM latest_states")).toEqual([]);
+    });
+  });
+});
 
 describe("the Brain's store", () => {
   it("reads rows with bound values, and an empty list when nothing matches", async () => {

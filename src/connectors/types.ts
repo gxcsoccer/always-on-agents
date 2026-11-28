@@ -35,6 +35,15 @@ export interface Connector {
    * arrived. One that is not is dropped, and nothing is done about it.
    */
   wanted?(env: Env, event: { kind: string }): boolean;
+  /**
+   * Whether whoever wrote one of the messages that came in through a connector may write to a
+   * repository, as the service that keeps the repository says now: asked before their approval of
+   * a push there is taken. `source`: the connector the message came through (this one, or one
+   * this one plugs into). "unconnected": it is not known here which account there is theirs.
+   * "unknown": it could not be found out just now. A connector that has no such word to say leaves
+   * this out, and approvals of its people's are judged as they were before there was one.
+   */
+  writes?(env: Env, source: string, scope: Scope, by: { person: string; data: Record<string, unknown> }, repo: string): Promise<"yes" | "no" | "unconnected" | "unknown">;
   /** Handles a request under /v1/<name>/. `path` is what follows the name. */
   http?(request: Request, env: Env, path: string[], ingress: Ingress): Promise<Response>;
   /** Handles an admin request it owns, already authenticated. Returns undefined for any other. */

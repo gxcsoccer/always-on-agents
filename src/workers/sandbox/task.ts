@@ -975,7 +975,8 @@ export class TaskSandbox extends DurableObject<Env> {
       return ACTIVE.has(state.phase) ? { state: "pending", reason: "" } : { state: "deny", reason: `task is ${state.phase}` };
     }
     // The same test when it is used as when it was given: branches only, nothing deleted.
-    const covered = standingEligible(refs) && (state.standing ?? []).some((grant) => grant.resource === resource && refs.every((r) => grant.refs.includes(r.ref)));
+    // (Only for one person alone with the agent: where several people talk every push is asked about, also one approved for the rest of the task before that was so.)
+    const covered = (state.brain ?? "").split(":")[1] === "user" && standingEligible(refs) && (state.standing ?? []).some((grant) => grant.resource === resource && refs.every((r) => grant.refs.includes(r.ref)));
     if (covered) {
       // Said once for this task. Still on record, and the Brain is told each time.
       const message = `under the standing approval for this task: ${describePush(resource, refs)}`;

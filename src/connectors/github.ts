@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { type InboundEvent, NOT_FOR_THE_AGENT, type Principal, type Scope, type Target, scopeName } from "../events";
 import { registry } from "../registry";
 import { githubTokenFor } from "./github-app";
-import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
+import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers, grantWrites } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
 /** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
@@ -28,6 +28,7 @@ export const githubConnector: Connector = {
   serves: ["feishu"],
   tools: [githubCreateIssue, githubComment, githubDisconnect],
   holds: grantHolds,
+  writes: grantWrites,
   offers: grantOffers,
   invitation: grantInvitation,
   async http(request, env, path) {
@@ -520,6 +521,8 @@ export function normalize(
         data: {
           number,
           comment_id: payload.comment.id,
+          // Which account wrote it, by GitHub's number: what it is asked of whether they may write here.
+          ...(Number.isInteger(sender.id) ? { account: sender.id } : {}),
           is_pull_request: Boolean(payload.issue.pull_request),
           // Shown to the model next to the comment, which on its own does not say where it was made.
           where: `${payload.issue.pull_request ? "pull request" : "issue"} #${number} of ${repo}`,

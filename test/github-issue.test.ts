@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { challengeOf } from "../src/connectors/feishu-grant";
 import { normalize } from "../src/connectors/feishu";
-import { grantName } from "../src/connectors/github-grant";
+import { grantName, grantWrites } from "../src/connectors/github-grant";
 import { lendForStart, lentToken, type PersonLend } from "../src/connectors/github-lend";
 import { privateSessionKey, scopeName } from "../src/events";
 import type { FeishuApp } from "../src/registry";
@@ -51,6 +51,8 @@ const world = {
   /** GitHub gives no answer to a renewal. */
   renewalsDown: false,
   duringWrite: undefined as undefined | (() => unknown),
+  /** Something that happens while GitHub is asked about a repository. */
+  duringRepo: undefined as undefined | (() => unknown),
   renewals: 0,
   /** How long an access token lasts, in seconds. */
   lasts: 28_800,
@@ -80,6 +82,7 @@ function installWorld() {
   world.appDown = false;
   world.renewalsDown = false;
   world.duringWrite = undefined;
+  world.duringRepo = undefined;
   world.renewals = 0;
   world.lasts = 28_800;
   world.external.clear();
@@ -178,7 +181,9 @@ function installWorld() {
     const repo = at ? world.repos.get(at[1].toLowerCase()) : undefined;
     if (!at || !repo || (!tenant && repo.private && world.strangers.has(user!.account))) return Response.json({ message: "Not Found" }, { status: 404 });
     if (!at[2] && world.reposDown) return Response.json({ message: "unavailable" }, { status: 503 });
-    if (!at[2]) return Response.json({ id: repo.id, private: repo.private, full_name: repo.full_name });
+    // (What the one asking may do there: to push, they have to be one of those the repository lets write.)
+    if (!at[2]) await world.duringRepo?.();
+    if (!at[2]) return Response.json({ id: repo.id, private: repo.private, full_name: repo.full_name, permissions: { pull: true, push: tenant || repo.members.includes(user!.account), admin: false } });
     if ((init?.method ?? "GET") === "GET") {
       if (world.listingDown) return Response.json({ message: "down" }, { status: 502 });
       return Response.json(world.issues.filter((each) => each.repo === at[1].toLowerCase() && loginOf(each.user.id) === url.searchParams.get("creator")));
@@ -731,6 +736,77 @@ describe("whose GitHub account it is", () => {
     expect((await consent(linkOn(alone.cards().at(-1)), 9_101)).status).toBe(200);
     await alone.settle();
     expect(world.issues.at(-1)).toMatchObject({ title: "之后", user: { id: 9_101 } });
+  });
+});
+
+describe("whether someone may write to a repository, asked before their approval of a push there is taken", () => {
+  const CHAT = { tenant: TENANT, kind: "chat" as const, id: "oc_team" };
+  const REPO = { tenant: TENANT, kind: "repo" as const, id: PUBLIC };
+  const inChat = (person: ReturnType<typeof someone>, repo = PUBLIC) => grantWrites(env as any, "feishu", CHAT, { person: person.openId, data: { origin: { app_id: CHAT_APP, tenant_key: ORG } } }, repo);
+  const onGithub = (account: unknown, repo = PUBLIC) => grantWrites(env as any, "github", REPO, { person: "whoever", data: { account } }, repo);
+
+  it("is what GitHub says of their own account, where they have connected one here", async () => {
+    const [ann, bob, cal] = [someone(), someone(), someone()];
+    await authorised(ann);
+    await authorised(bob);
+    world.repos.get(PUBLIC)!.members = [ann.account];
+    // In a chat: the person the chat says they are.
+    expect(await inChat(ann)).toBe("yes");
+    expect(await inChat(ann, "Acme/Site")).toBe("yes");
+    // Connected, and not one of those the repository lets write; or it is one they cannot see at all.
+    expect(await inChat(bob)).toBe("no");
+    world.strangers.add(bob.account);
+    expect(await inChat(bob, PRIVATE)).toBe("no");
+    expect(await inChat(ann, "acme/no-such-thing")).toBe("no");
+    // Never connected: it is not known which account is theirs.
+    expect(await inChat(cal)).toBe("unconnected");
+    // Verified through a chat app that is not this tenant's, or with nothing to say who they are.
+    expect(await grantWrites(env as any, "feishu", CHAT, { person: ann.openId, data: { origin: { app_id: "cli_unknown", tenant_key: ORG } } }, PUBLIC)).toBe("unconnected");
+    expect(await grantWrites(env as any, "feishu", CHAT, { person: ann.openId, data: {} }, PUBLIC)).toBe("unconnected");
+    // GitHub cannot be asked just now.
+    world.reposDown = true;
+    expect(await inChat(ann)).toBe("unknown");
+    world.reposDown = false;
+    expect(await inChat(ann, "not a repository")).toBe("unknown");
+
+    // In the repository's own conversation: the account that wrote the comment, where someone of the tenant connected as it.
+    expect(await onGithub(ann.account)).toBe("yes");
+    expect(await onGithub(bob.account)).toBe("no");
+    expect(await onGithub(987_654)).toBe("unconnected");
+    expect(await onGithub(undefined)).toBe("unconnected");
+    expect(await onGithub(String(ann.account))).toBe("unconnected");
+    // The grant that is asked answers only for the account it is of.
+    expect(await (await ann.grant()).canPush(PUBLIC, ann.account)).toBe("yes");
+    expect(await (await ann.grant()).canPush(PUBLIC, ann.account + 1_000)).toBe("unconnected");
+    // Somebody's in another tenant only: not known here.
+    expect(await grantWrites(env as any, "github", { ...REPO, tenant: "elsewhere" }, { person: "x", data: { account: ann.account } }, PUBLIC)).toBe("unconnected");
+
+    // Their authorisation is given up while GitHub is asked: what GitHub said is of one that is no longer held.
+    const dee = someone();
+    await authorised(dee);
+    world.repos.get(PUBLIC)!.members.push(dee.account);
+    expect(await inChat(dee)).toBe("yes");
+    world.duringRepo = async () => {
+      world.duringRepo = undefined;
+      await (await dee.grant()).drop();
+    };
+    expect(await inChat(dee)).toBe("unknown");
+    expect(await inChat(dee)).toBe("unconnected");
+
+    // GitHub no longer takes their token: not connected any more.
+    for (const [token, each] of world.tokens) if (each.account === ann.account) world.tokens.set(token, { ...each, good: false });
+    expect(await inChat(ann)).toBe("unconnected");
+    // Given up.
+    await (await bob.grant()).drop();
+    expect(await inChat(bob)).toBe("unconnected");
+    expect(await onGithub(bob.account)).toBe("unconnected");
+  });
+
+  it("is written with a comment on GitHub as which account wrote it", async () => {
+    const { webhook_secret } = await registry().linkGithubRepo(PUBLIC, TENANT);
+    const brain = (env as any).BRAIN.getByName(scopeName(REPO)) as any;
+    await signed("issue_comment", { action: "created", repository: { full_name: PUBLIC }, sender: { id: 4_242, login: "dana", type: "User" }, issue: { number: 3, pull_request: {} }, comment: { id: 8_801, body: "@always-on-agent please look", user: { id: 4_242, login: "dana" }, author_association: "MEMBER", created_at: "2026-11-28T01:00:00Z", updated_at: "2026-11-28T01:00:00Z" } }, webhook_secret);
+    expect(JSON.parse((await rowsOf(brain, "SELECT data FROM inbox WHERE source_id = 'comment:8801'"))[0].data)).toMatchObject({ account: 4_242 });
   });
 });
 

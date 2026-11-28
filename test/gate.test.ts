@@ -5,10 +5,11 @@ import { describe, expect, it } from "vitest";
 import { fromTheirs } from "../src/connectors/github-app";
 
 /** A task that is running, as the real object would have stored it. */
-async function runningTask() {
+async function runningTask(brain?: string) {
   const stub = (env as any).GATE_TASKS.getByName(crypto.randomUUID()) as any;
   await runInDurableObject(stub, (_instance: unknown, state: DurableObjectState) => {
     state.storage.kv.put("state", {
+      ...(brain ? { brain } : {}),
       id: "t1", token: "pass", phase: "running", cwd: "/workspace/job", created_at: Date.now(), starting_since: Date.now(),
       timings: {}, runs: [], grants: {}, asks: 0, model_calls: 0, out: [], out_seq: 0, checkpoints_taken: 0, recoveries: 0,
       gate_questions: {}, decisions: {}, inbox: [], checks: [],
@@ -86,8 +87,20 @@ describe("pushes a task holds for approval", () => {
     expect((await stub.status()).pending.id).toBe("q-2");
   });
 
-  it("lets later pushes of the same branches through once approved for the task, and nothing else", async () => {
-    const { stub } = await runningTask();
+  it("asks about every push of a task that several people share, also one approved for the rest of the task before that was so", async () => {
+    for (const brain of ["acme:chat:oc_1", "acme:repo:acme/demo", undefined]) {
+      const { stub } = await runningTask(brain);
+      await stub.authorize("r1", "push", repo, move("a", "b"));
+      await stub.answer("allow", "", "q-1", true);
+      expect(await stub.authorize("r1", "push", repo, move("a", "b"))).toMatchObject({ state: "allow" });
+      // The same branch again: asked about again.
+      expect(await stub.authorize("r2", "push", repo, move("b", "c")), String(brain)).toMatchObject({ state: "pending" });
+      expect((await stub.status()).inbox.map((item: any) => item.kind)).not.toContain("standing");
+    }
+  });
+
+  it("lets later pushes of the same branches through once approved for the task, for one person alone with the agent, and nothing else", async () => {
+    const { stub } = await runningTask("acme:user:ou_1");
     await stub.authorize("r1", "push", repo, move("a", "b"));
     expect(await stub.answer("allow", "", "q-1", true)).toMatchObject({ ok: true });
     expect(await stub.authorize("r1", "push", repo, move("a", "b"))).toMatchObject({ state: "allow" });
