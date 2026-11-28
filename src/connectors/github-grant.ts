@@ -257,8 +257,7 @@ export class GithubGrant extends DurableObject<Env> {
     const stored = await this.#load();
     if (!stored || (only !== undefined && stored.bound !== only)) return;
     const owed = this.#owed(stored, `dropped:${stored.generation + 1}`);
-    void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed });
-    await this.#withdraw();
+    await this.#withdraw(() => void this.ctx.storage.put("grant", { ...stored, generation: stored.generation + 1, pending: [], grant: undefined, bound: undefined, owed }));
     void this.ctx.storage.setAlarm(Date.now());
     // That account, and no other they may have come to hold since.
     // (Given up outright, whatever is noted as theirs goes: also what a binding that was interrupted half-way left behind.)
@@ -467,7 +466,8 @@ export class GithubGrant extends DurableObject<Env> {
     } catch {
       return undefined;
     }
-    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return undefined;
+    // Run out, with nothing left to renew it by: it will not come back, and what was lent it is stopped.
+    if (!grant.refresh || (grant.refresh_expires_at ?? 0) <= Date.now()) return await this.#withdraw(), undefined;
     this.#renewing ??= this.#renew(grant.version).finally(() => (this.#renewing = undefined));
     return this.#renewing;
   }
@@ -492,9 +492,10 @@ export class GithubGrant extends DurableObject<Env> {
     const after = await this.#load();
     if (!after?.grant || after.grant.version !== version || after.generation !== stored.generation) return undefined;
     if (!renewed || !sealed) {
-      delete after.grant;
-      void this.ctx.storage.put("grant", after);
-      await this.#withdraw();
+      await this.#withdraw(() => {
+        delete after.grant;
+        void this.ctx.storage.put("grant", after);
+      });
       return undefined;
     }
     after.grant = { ...after.grant, ...sealed, version: next, ...tokensOf(renewed, Date.now()) };
@@ -506,9 +507,10 @@ export class GithubGrant extends DurableObject<Env> {
   async #refused(version: string): Promise<void> {
     const stored = await this.#load();
     if (!stored || stored.grant?.version !== version) return;
-    delete stored.grant;
-    await this.ctx.storage.put("grant", stored);
-    await this.#withdraw();
+    await this.#withdraw(() => {
+      delete stored.grant;
+      void this.ctx.storage.put("grant", stored);
+    });
   }
 
   /**
@@ -552,9 +554,17 @@ export class GithubGrant extends DurableObject<Env> {
     const key = `lent:${of.task}`;
     if ((await this.ctx.storage.get(key)) === undefined) {
       const kept = [...(await this.ctx.storage.list<number>({ prefix: "lent:" })).keys()];
-      // Full: room is made only of work that says itself that it is over. Work still under way is never dropped from the list.
+      // Full: room is made only of work that says itself that it is over, and that has answered
+      // that what it read is discarded (see `revoked`: of work that has ended, only that is done).
+      // Work still under way is never dropped from the list.
       if (kept.length >= MAX_LENT) {
-        const over = await Promise.all(kept.map((each) => this.env.TASKS.getByName(each.slice("lent:".length)).isActive().then((active) => !active, () => false)));
+        const done = async (id: string) => {
+          const work = this.env.TASKS.getByName(id);
+          if (await work.isActive()) return false;
+          await work.revoked();
+          return true;
+        };
+        const over = await Promise.all(kept.map((each) => done(each.slice("lent:".length)).catch(() => false)));
         const gone = kept.filter((_each, at) => over[at]);
         if (gone.length === 0) return undefined;
         for (const each of gone) void this.ctx.storage.delete(each);
@@ -575,12 +585,18 @@ export class GithubGrant extends DurableObject<Env> {
   }
 
   #stands(stored: Stored | undefined, of: { generation: number; mark: string; account: number }): boolean {
-    return stored !== undefined && stored.generation === of.generation && stored.grant !== undefined && stored.grant.mark === of.mark && of.mark !== "" && stored.grant.account === of.account;
+    // (One that has run out with nothing to renew it by does not stand either.)
+    return stored !== undefined && stored.generation === of.generation && stored.grant !== undefined && this.#usable(stored.grant) && stored.grant.mark === of.mark && of.mark !== "" && stored.grant.account === of.account;
   }
 
-  /** The authorisation is gone: every piece of work that was lent it is to be stopped, and is until it has been. */
-  async #withdraw(): Promise<void> {
+  /**
+   * The authorisation is gone: every piece of work that was lent it is to be stopped, and is until
+   * it has been. `write`: what records that it is gone. That, and the list of what is to be
+   * stopped, are written with nothing waited for between them: both are kept, or neither.
+   */
+  async #withdraw(write?: () => void): Promise<void> {
     const lent = await this.ctx.storage.list<number>({ prefix: "lent:" });
+    write?.();
     for (const [key, at] of lent) {
       void this.ctx.storage.put(`stop:${key.slice("lent:".length)}`, at);
       void this.ctx.storage.delete(key);

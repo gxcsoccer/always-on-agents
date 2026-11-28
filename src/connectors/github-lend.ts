@@ -13,7 +13,7 @@
  * be before all of them: nothing is lent there. See docs/design/github-as-the-person.zh-CN.md.
  */
 import type { Env } from "../env";
-import { isPrivateSession, type Scope, scopeName } from "../events";
+import { privateSessionKey, type Scope, scopeName } from "../events";
 import { registry } from "../registry";
 import { covers } from "./github-app";
 import type { Actor, Prepared } from "../workers/types";
@@ -55,7 +55,7 @@ const LATER = "it could not be found out from GitHub just now whether that repos
  * been shown to be able to read it.
  */
 const UNREADABLE =
-  "that repository cannot be read from here; nothing was started. It is not one anyone may read, and nothing shows that the person may read it with a GitHub authorisation given here: there may be no repository of that name, it may not be connected to this organisation here, they may have given no authorisation that stands, or theirs may not reach it. Tell them that, without guessing which. Asking them to authorise from here is not built yet";
+  "that repository cannot be read from here; nothing was started. It is not one anyone may read, and nothing shows that the person may read it with a GitHub authorisation given here: there may be no repository of that name, it may not be connected to this organisation here, they may have given no authorisation that stands, theirs may not reach it, or it could not be checked just now (then asking again later may do). Tell them that, without guessing which. Asking them to authorise from here is not built yet";
 
 /** Whether anyone at all may read a repository with git: asked as a stranger would. "unknown" where GitHub gave no answer about that. */
 async function anyoneReads(repo: string): Promise<boolean | "unknown"> {
@@ -82,9 +82,11 @@ export async function lendForStart(env: Env, about: { scope: Scope; sessionKey: 
   // Work that goes on from earlier work is on what that left, and is lent nothing new.
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || about.continueFrom !== null) return ORDINARY;
   // Their own conversation, and they the one who asked: by what the host established, not by where it looks to be.
-  if (scope.kind !== "user" || !actor || actor.shared || !isPrivateSession(about.sessionKey)) return ORDINARY;
+  if (scope.kind !== "user" || !actor || actor.shared) return ORDINARY;
   if (about.by === null || about.by !== actor.person || scope.id !== actor.person) return ORDINARY;
   if (!setUp(env) || !actor.origin.app_id || !actor.origin.tenant_key) return ORDINARY;
+  // (The conversation is the private one of that very origin, whole: not merely one that is private.)
+  if (about.sessionKey !== privateSessionKey(actor.connector, { app_id: actor.origin.app_id, tenant_key: actor.origin.tenant_key })) return ORDINARY;
   const app = await registry(env).feishuApp(actor.origin.app_id);
   if (!app || app.tenant !== scope.tenant) return ORDINARY;
   // Which repository is the person's to say: named whole in their own words.

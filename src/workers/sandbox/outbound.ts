@@ -136,7 +136,10 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
       return undefined;
     };
 
-    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));
+    // What git reads with goes to the address made here from what the request was taken to be
+    // (which repository, which of git's endpoints, for reading), not to the address as the guest wrote it.
+    const reading = `https://github.com/${git.repo}.git/${git.endpoint}${git.endpoint === "info/refs" ? "?service=git-upload-pack" : ""}`;
+    if (!git.push) return (await credited(() => this.#task.githubFetchToken())) ?? fetch(new Request(reading, new Request(request, { headers, redirect: "manual" })));
     if (!own) return this.#refuse(request, url, "this task may only push to the repository it was started on");
     // Asking what the remote has is harmless; the push itself is the request that carries commits.
     if (git.endpoint === "info/refs") return (await credited(() => this.#task.githubToken())) ?? fetch(new Request(request, { headers, redirect: "manual" }));

@@ -265,6 +265,9 @@ export class Tasks implements Wakes {
       if (kind === "refused") throw new Error(typeof (prepared as { reason?: unknown }).reason === "string" && (prepared as { reason: string }).reason !== "" ? (prepared as { reason: string }).reason : UNSAID);
       if (kind !== "ordinary" && kind !== "bound") throw new Error(UNSAID);
       if (prepared.kind === "bound") {
+        // Nothing is named to follow work that is bound: what would follow is done later, on the
+        // strength of whatever stands then, and what this work was bound to may be gone by then.
+        if (then && then.tools.length > 0) throw new Error("this work would be done with something lent for it alone, and nothing can be named to follow such work; nothing was started. Hand it over with nothing to follow (then: null); what was to follow can be asked for once it has ended");
         // What it is bound to has to be something that can be kept and read again as it was given:
         // settled here, before anything is written, and kept as it is written out now.
         const record = prepared.record as unknown;
@@ -1150,9 +1153,15 @@ export class Tasks implements Wakes {
       const bound = this.#lendOf(taskId).lend;
       const task = bound === undefined ? undefined : this.#s.rows<{ worker: string }>("SELECT worker FROM tasks WHERE id = ?", taskId)[0];
       if (task && this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length === 0) {
-        const worker = this.#b.workerNamed(task.worker);
-        // (A worker that binds work and has no such word to say is not asked.)
-        if (worker?.holds && (await worker.holds(this.#b.env, bound)) !== "holds") {
+        // Its worker as it is known here, also one no longer offered. One that is not known at all
+        // cannot say that what the work was bound to stands. (One that has no such word to say is not asked.)
+        let worker: Worker | undefined;
+        try {
+          worker = this.#b.workerOf(task.worker);
+        } catch {
+          worker = undefined;
+        }
+        if (!worker || (worker.holds && (await worker.holds(this.#b.env, bound)) !== "holds")) {
           kind = "failed";
           report = { error: "what this work was allowed for it no longer stands (the person's authorisation was given up, or is no longer taken); what it came to was not taken in", ...(report.usage !== undefined ? { usage: report.usage } : {}), ...(report.model_calls !== undefined ? { model_calls: report.model_calls } : {}), ...(report.notes_not_read !== undefined ? { notes_not_read: report.notes_not_read } : {}) };
           body = report;

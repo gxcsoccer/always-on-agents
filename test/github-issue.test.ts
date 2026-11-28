@@ -10,7 +10,7 @@ import { challengeOf } from "../src/connectors/feishu-grant";
 import { normalize } from "../src/connectors/feishu";
 import { grantName } from "../src/connectors/github-grant";
 import { lendForStart, lentToken, type PersonLend } from "../src/connectors/github-lend";
-import { scopeName } from "../src/events";
+import { privateSessionKey, scopeName } from "../src/events";
 import type { FeishuApp } from "../src/registry";
 import { call, installFakeModel, model, modelCalls, say, wake } from "./helpers";
 
@@ -1849,7 +1849,7 @@ describe("reminding people where several talk", () => {
 });
 
 describe("lending a person's own GitHub authorisation to sandbox work they asked for", () => {
-  const SESSION = "private:own";
+  const SESSION = privateSessionKey("feishu", { app_id: CHAT_APP, tenant_key: ORG });
   const INSTALLED = "77";
   const SECRET = "elsewhere/secret";
   let key: string;
@@ -1927,6 +1927,9 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     await ordinary({ scope: { tenant: TENANT, kind: "chat", id: "oc_team" } });
     await ordinary({}, { shared: true });
     await ordinary({ sessionKey: "chat:oc_team" });
+    // A private conversation, but not the one of the origin they were verified through.
+    await ordinary({ sessionKey: "private:own" });
+    await ordinary({ sessionKey: privateSessionKey("feishu", { app_id: CHAT_APP, tenant_key: "org_other" }) });
     // In the repository's own conversation.
     await ordinary({ scope: { tenant: TENANT, kind: "repo", id: PRIVATE } });
     // Nobody established to have asked, or someone else, or another person's conversation.
@@ -1958,6 +1961,7 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     // Never authorised: nothing of what the tenant's own credential saw of the repository is said.
     const unreadable = await said(ann);
     expect(unreadable).not.toMatch(/again in a little while/);
+    expect(unreadable).toMatch(/asking again later may do/);
     // The same words for one that is not there at all, and for one that is not this tenant's here.
     expect(await said(ann, "acme/no-such-thing")).toBe(unreadable);
     expect(await said(ann, SECRET)).toBe(unreadable);
@@ -2085,15 +2089,37 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     // Full, and all of them at work: one more is lent nothing, and none of those is forgotten.
     const more = task(ann);
     expect(await lentToken(env as any, record, more)).toBeUndefined();
-    // One of them is over: its place is the newcomer's.
+    // One of them is over: once it has answered that what it read is discarded, its place is the newcomer's.
+    await (env as any).TASKS.getByName(works[3].id).configure({ ended: true, revokedUnheard: true });
+    expect(await lentToken(env as any, record, more)).toBeUndefined();
     await (env as any).TASKS.getByName(works[3].id).configure({ ended: true });
     expect(await lentToken(env as any, record, more)).toBeDefined();
+    expect(await revokedAt(works[3].id)).toBe(2);
     await (await ann.grant()).drop();
     await runDurableObjectAlarm(await ann.grant());
     expect(await revokedAt(works[0].id)).toBe(1);
     expect(await revokedAt(works[49].id)).toBe(1);
     expect(await revokedAt(more.id)).toBe(1);
-    expect(await revokedAt(works[3].id)).toBe(0);
+    expect(await revokedAt(works[3].id)).toBe(2);
+  });
+
+  it("no longer stands once it has run out with nothing to renew it by: what was lent it is stopped, and nothing is taken for standing", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      stored.grant.refresh_expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    expect(await (await ann.grant()).holds(record)).toBe(false);
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+    expect(await (await ann.grant()).standing()).toMatchObject({ authorised: false });
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(mine.id)).toBe(1);
   });
 
   describe("from their own conversation", () => {
@@ -2121,6 +2147,15 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
       await his.says(`看下 ${PRIVATE} 的测试为什么挂了`);
       expect(JSON.stringify(toolOutputs())).toContain("nothing was started");
       expect(await rowsOf(his.stub, "SELECT id FROM tasks")).toEqual([]);
+    });
+
+    it("starts nothing where something is named to follow work that would be lent it", async () => {
+      const ann = someone();
+      const alone = await authorised(ann);
+      model.replies([call("hand_over", { worker: "sandbox", title: "看测试", brief: "看看测试为什么挂了。", continue_from: null, repository: `https://github.com/${PRIVATE}`, then: ["github_create_issue"] })], [say("")]);
+      await alone.says(`看下 ${PRIVATE} 的测试为什么挂了，有问题就提个 issue`);
+      expect(JSON.stringify(toolOutputs())).toContain("nothing can be named to follow such work");
+      expect(await rowsOf(alone.stub, "SELECT id FROM tasks WHERE worker = 'sandbox' AND title = '看测试'")).toEqual([]);
     });
 
     it("does not take in what the work came to once the authorisation it was lent is gone, though the work was not yet told to stop", async () => {
