@@ -56,6 +56,10 @@ describe("event normalisation", () => {
     expect(at("closed", T1)?.source_id).not.toBe(at("closed", T2)?.source_id);
     expect(at("reopened", T1)?.source_id).not.toBe(at("reopened", T2)?.source_id);
     expect(at("closed", T1)?.source_id).toBe(at("closed", T1)?.source_id);
+    // Pushed back to a commit it was at before: another event, not the earlier one delivered again.
+    const A = { head: { ref: "retry", sha: "aaa" } };
+    expect(at("synchronize", T2, A)?.source_id).not.toBe(at("synchronize", T1, A)?.source_id);
+    expect(at("synchronize", T1, A)?.source_id).toBe(at("synchronize", T1, A)?.source_id);
     // Where GitHub does not say when: nothing is superseded by it, and that it was closed is nothing at all.
     expect(at("synchronize")?.supersedes).toBeUndefined();
     expect(at("closed")).toBeUndefined();

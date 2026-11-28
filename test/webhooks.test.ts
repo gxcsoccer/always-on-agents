@@ -105,6 +105,53 @@ describe("the GitHub webhook endpoint", () => {
     }
   });
 
+  it("spends nothing, once pull requests are no longer looked at by themselves, on word of them that already waits or was taken up and put off; with no further word arriving", async () => {
+    const id = await tenant();
+    const repo = `acme/${id}`;
+    const { webhook_secret } = await registry().linkGithubRepo(repo, id);
+    const brain = brainFor(`${id}:repo:${repo}`);
+    const sql = (query: string, ...args: unknown[]) => runInDurableObject(brain, (_i: unknown, state: DurableObjectState) => state.storage.sql.exec(query, ...(args as any[])).toArray());
+    const word = (number: number, sha: string, updated_at: string) => deliver(webhook_secret, "pull_request", { action: "opened", repository: { full_name: repo }, sender: { login: "dana", id: 5, type: "User" }, pull_request: { id: 900 + number, number, title: "Add retry", html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: "retry", sha }, base: { ref: "main" }, user: { login: "dana" }, updated_at } });
+    // Taken in while they were looked at by themselves. One of them from before anything was kept of which it is the state of.
+    await word(7, "a1", "2026-11-28T01:00:00Z");
+    await word(8, "b1", "2026-11-28T01:00:00Z");
+    await sql("UPDATE inbox SET data = json_remove(data, '$.supersedes')");
+    await sql("DELETE FROM latest_states");
+    // And a person asks something in one of them.
+    await deliver(webhook_secret, "issue_comment", { ...comment(repo, 41, "@always-on-agent what does this change?"), issue: { number: 8, pull_request: {} } });
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      model.replies([say("")]);
+      for (let i = 0; i < 5; i++) await wake(brain);
+      // Only what the person asked was brought before the model.
+      expect(modelCalls).toHaveLength(1);
+      expect(JSON.stringify(modelCalls[0].input)).toContain("what does this change?");
+      expect(JSON.stringify(modelCalls[0].input)).not.toContain("was opened by");
+      expect((await sql("SELECT kind, status FROM inbox ORDER BY id")).map((row) => `${row.kind} ${row.status}`)).toEqual(["github.pull_request dropped", "github.pull_request dropped", "message done"]);
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+
+    // A run that took such word up and was put off before doing anything (the allowance was used up): ended with nothing spent.
+    await word(9, "c1", "2026-11-28T02:00:00Z");
+    const [event] = await sql("SELECT id, session_key FROM inbox WHERE status = 'pending'");
+    await sql("INSERT INTO sessions (id, session_key, created_at, updated_at) VALUES ('s-held', ?, 1, 1) ON CONFLICT DO NOTHING", event.session_key);
+    const session = (await sql("SELECT id FROM sessions WHERE session_key = ?", event.session_key))[0].id;
+    await sql("INSERT INTO runs (id, session_id, status, started_at, retry_at) VALUES ('r-held', ?, 'running', 1, 1)", session);
+    await sql("UPDATE inbox SET status = 'claimed', run_id = 'r-held' WHERE id = ?", event.id);
+    await sql("INSERT INTO meta (key, value) VALUES ('active_run', 'r-held') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    (env as any).GITHUB_AUTO_REVIEW = "off";
+    try {
+      const before = modelCalls.length;
+      for (let i = 0; i < 3; i++) await wake(brain);
+      expect(modelCalls).toHaveLength(before);
+      expect((await sql("SELECT status FROM runs WHERE id = 'r-held'"))[0].status).toBe("done");
+      expect((await sql("SELECT status FROM inbox WHERE id = ?", event.id))[0].status).toBe("dropped");
+    } finally {
+      (env as any).GITHUB_AUTO_REVIEW = "on";
+    }
+  });
+
   it("gives the same refusal for a wrong secret, another repository's secret and an unregistered repository", async () => {
     const a = await tenant();
     const b = await tenant();

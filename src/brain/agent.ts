@@ -17,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 
-import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, toolsOf, trusts, unreceived } from "../connectors";
+import { shows, amend, aside, closeInvitation, holds, canRevisit, deliver, direct, offeredFor, pictures, quoted, under, received, standingOf, toolsOf, trusts, unreceived, wanted } from "../connectors";
 import type { Env } from "../env";
 import { type InboundEvent, type Principal, isPrivateSession, type Target, type WorkerEventKind } from "../events";
 import { messageText, respond } from "../model/openai";
@@ -128,6 +128,7 @@ export class BrainAgent extends DurableObject<Env> {
       stillStands: (event) => this.#revisions.stillStands(event),
       reminders: this.#reminders,
       toolsOf,
+      wanted: (source, kind) => wanted(this.env, source, kind),
       guidance,
       shows: (target) => shows(this.#store.scope(), target),
       workers,

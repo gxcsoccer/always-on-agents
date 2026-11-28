@@ -79,6 +79,7 @@ function bench(state: DurableObjectState) {
     outside,
     isDecider: (principal) => principal.kind === "human" && principal.explicit && principal.unlinked !== true,
     toolsOf: (connector) => (connector === "feishu" ? settings.connectorTools : []),
+    wanted: () => true,
     workers: () => settings.workers,
     leftToGoOnFrom: () => [],
     guidance: () => "",

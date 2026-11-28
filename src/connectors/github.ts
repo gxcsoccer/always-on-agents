@@ -17,8 +17,13 @@ import { githubTokenFor } from "./github-app";
 import { authorisationRevoked, githubComment, githubCreateIssue, githubDisconnect, grantCallback, grantConfirm, grantHolds, grantInvitation, grantName, grantOffers } from "./github-grant";
 import { type CodeReview, type Connector, DeliveryDeferred, type OutboundMessage, type Receipt, type Standing } from "./types";
 
+/** Whether a pull request is looked at by itself, when it is opened or pushed to: only where the deployment says so. */
+const reviewsByItself = (env: Env) => env.GITHUB_AUTO_REVIEW === "on";
+
 export const githubConnector: Connector = {
   name: "github",
+  // Word of a pull request that was taken in while they were looked at by themselves, and still waits.
+  wanted: (env, event) => event.kind !== "github.pull_request" || reviewsByItself(env),
   // Also plugged into the chat connector: what a person there can have done on GitHub in their own name.
   serves: ["feishu"],
   tools: [githubCreateIssue, githubComment, githubDisconnect],
@@ -407,7 +412,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // Word that a pull request was opened or pushed to is something to look at by itself only where
   // the deployment says so. Elsewhere it is taken in as one that ends what waits and is not taken
   // up (see InboundEvent.supersedes): someone who asks there is still answered.
-  if (event.kind === "github.pull_request" && env.GITHUB_AUTO_REVIEW !== "on") {
+  if (event.kind === "github.pull_request" && !reviewsByItself(env)) {
     if (!event.supersedes) return json({ ignored: "pull requests are looked at only when someone asks" }, 202);
     event.supersedes = { ...event.supersedes, void: true };
   }
@@ -448,8 +453,9 @@ export function normalize(
     // that still wait. One that says it was closed (or merged) only ends them.
     const at = Date.parse(pr.updated_at ?? "") || 0;
     const closed = payload.action === "closed";
-    // Closed and opened again at the same commit, more than once: each time is another event.
-    const again = closed || payload.action === "reopened" ? `:${at}` : "";
+    // The same thing at the same commit, more than once (closed and opened again; pushed back to an
+    // earlier commit): each time is another event, told apart by when. One delivered again says the same time.
+    const again = at > 0 ? `:${at}` : "";
     // (That it was closed is only for ending the others: where its place in the order cannot be told, it is nothing.)
     if (closed && at === 0) return undefined;
     return {

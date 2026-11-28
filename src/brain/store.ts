@@ -91,15 +91,25 @@ export class BrainStore {
     // Checked explicitly: rowsWritten also counts index writes, so it cannot tell an insert from an ignore.
     if (this.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ?", event.source, event.source_id).length > 0) return false;
     // Only the latest state under a key means anything (see InboundEvent.supersedes). Settled here,
-    // as the event is written and only for one that is new: what it supersedes is still waiting
-    // (what has been taken up is left alone), and is kept, as dropped. One that comes after a
-    // later one under its key was superseded before it arrived.
+    // as the event is written and only for one that is new. Which state was the latest, and when,
+    // is kept by itself, for as long as the key is heard of: not with the events, whose words go.
+    // One from before the latest was superseded before it arrived; at the very same moment, one
+    // that only ends the others stands whichever arrived first, and of two others the later to arrive.
+    // What it supersedes is what still waits under its key (what has been taken up is left alone),
+    // and is kept, as dropped. Under the key is only what was said to be so here: nothing a
+    // connector happens to put in an event's own data counts.
     const latest = event.supersedes;
     const KEY = "json_extract(data, '$.supersedes.key')";
-    const AT = "json_extract(data, '$.supersedes.at')";
-    const late = latest !== undefined && this.rows(`SELECT 1 FROM inbox WHERE source = ? AND ${KEY} = ? AND ${AT} > ?`, event.source, latest.key, latest.at).length > 0;
-    if (latest && !late) this.sql.exec(`UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = ? AND ${KEY} = ? AND ${AT} <= ?`, event.source, latest.key, latest.at);
-    if (latest) event = { ...event, data: { ...event.data, supersedes: { key: latest.key, at: latest.at } } };
+    const before = latest ? this.rows<{ at: number; void: number }>("SELECT at, void FROM latest_states WHERE source = ? AND key = ?", event.source, latest.key)[0] : undefined;
+    const late = latest !== undefined && before !== undefined && (before.at > latest.at || (before.at === latest.at && before.void === 1 && !latest.void));
+    if (latest && !late) {
+      this.sql.exec(`UPDATE inbox SET status = 'dropped' WHERE status = 'pending' AND source = ? AND ${KEY} = ?`, event.source, latest.key);
+      this.sql.exec("INSERT INTO latest_states (source, key, at, void) VALUES (?, ?, ?, ?) ON CONFLICT(source, key) DO UPDATE SET at = excluded.at, void = excluded.void", event.source, latest.key, latest.at, latest.void ? 1 : 0);
+    }
+    if (latest || (event.data && "supersedes" in event.data)) {
+      const { supersedes: _not, ...rest } = event.data ?? {};
+      event = { ...event, data: latest ? { ...rest, supersedes: { key: latest.key, at: latest.at } } : rest };
+    }
     this.sql.exec(
       `INSERT OR IGNORE INTO inbox (source, source_id, kind, session_key, principal, text, data, reply_to, received_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
