@@ -61,6 +61,30 @@ export async function githubTokenFor(env: Env, tenant: string, repo: string, to:
 }
 
 /**
+ * Whether one installation covers a repository now, and the name still means the repository it
+ * meant (by GitHub's number for it): asked of GitHub with the App's own identity, by having it
+ * issue, for that repository alone, a token that is allowed nothing. "unknown" where GitHub gave
+ * no answer about that.
+ */
+export async function covers(env: Env, installation: string, repo: string, repoId: number): Promise<boolean | "unknown"> {
+  if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return false;
+  try {
+    const response = await fetch(`${API}/app/installations/${encodeURIComponent(installation)}/access_tokens`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await appJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY)}`, accept: "application/vnd.github+json", "user-agent": "always-on-agent", "content-type": "application/json" },
+      body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { metadata: "read" } }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (response.status === 422 || response.status === 404) return false;
+    if (!response.ok) return "unknown";
+    const body = (await response.json()) as { repositories?: { id?: unknown; full_name?: string }[] };
+    return body.repositories?.length === 1 && body.repositories[0].full_name?.toLowerCase() === repo.toLowerCase() && body.repositories[0].id === repoId;
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Whether a credential issued for a tenant is still that tenant's to use. One issued through the
  * App is, while the installation it came from is the tenant's; one that does not say which
  * installation that was (an earlier version kept them so) is not known to be, and is asked for

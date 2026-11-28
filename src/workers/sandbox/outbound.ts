@@ -127,9 +127,11 @@ export class Outbound extends WorkerEntrypoint<Env, { taskId: string }> {
     // under: the two are lent apart), and only where the request it is for is about to be sent.
     // Asking takes a moment, and no credential is also what a task that has ended is given: such a
     // one sends nothing, with a credential or without.
-    const credited = async (lent: () => Promise<string | undefined>): Promise<Response | undefined> => {
+    const credited = async (lent: () => Promise<string | false | undefined>): Promise<Response | undefined> => {
       const token = own ? await lent() : undefined;
       if (own && !(await this.#task.isActive())) return new Response("this task has ended\n", { status: 403 });
+      // Lent something that is no longer to be had: not sent as a stranger's request instead.
+      if (token === false) return new Response("what this task read this repository with is no longer lent to it\n", { status: 403 });
       if (token) headers.set("authorization", `Basic ${btoa(`x-access-token:${token}`)}`);
       return undefined;
     };

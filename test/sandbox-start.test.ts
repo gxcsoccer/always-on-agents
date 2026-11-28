@@ -15,6 +15,12 @@ vi.mock("cloudflare:workers", async (original) => ({
     ) {}
   },
 }));
+/** What the connector that lends a person's authorisation answers, and what it was asked. */
+const lending = { asked: [] as { lend: any; task: any }[], answer: (async () => "ghu_person") as () => Promise<string | undefined> };
+vi.mock("../src/connectors/github-lend", async (original) => ({
+  ...(await original<typeof import("../src/connectors/github-lend")>()),
+  lentToken: async (_env: unknown, lend: unknown, task: unknown) => (lending.asked.push({ lend, task }), lending.answer()),
+}));
 vi.mock("@cloudflare/sandbox", () => ({
   Files: class {
     // As the real one: making a directory that is there already fails, unless asked to accept it.
@@ -621,5 +627,107 @@ describe("a sandbox task, started and stopped", () => {
     expect((await pending).phase).toBe("cancelled");
     expect(launched).toEqual([]);
     expect(((await task.status()) as { phase: string }).phase).toBe("cancelled");
+  });
+});
+
+describe("a sandbox task that was lent a person's own authorisation", () => {
+  const LEND = { v: 1, kind: "github-person", grant: "g1", tenant: "t", person: "ou_1", connector: "feishu", origin: { app_id: "cli_1", tenant_key: "org" }, session: "private:own", ref: 7, repo: "acme/core", repo_id: 102, installation: "77", account: 5, generation: 1, mark: "m1" };
+  const lentTask = async () => {
+    const made = fixture();
+    lending.asked.length = 0;
+    lending.answer = async () => "ghu_person";
+    await made.task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", requested_by: "ou_1", repository: "https://github.com/acme/core", lend: LEND });
+    return made;
+  };
+
+  it("reads with what the connector hands it for each request, keeps none of it, and is lent nothing else by that", async () => {
+    const { task, records } = await lentTask();
+    expect(await task.githubFetchToken()).toBe("ghu_person");
+    expect(await task.githubFetchToken()).toBe("ghu_person");
+    // Asked each time, with the record as it was kept and which work this is.
+    expect(lending.asked).toEqual([1, 2].map(() => ({ lend: LEND, task: { id: "fixture", brain: "t:user:ou_1", repo: "acme/core" } })));
+    expect(JSON.stringify([...records.values()])).not.toContain("ghu_person");
+    // How it stands says nothing of what it was lent or by whom.
+    expect(JSON.stringify(await task.status())).not.toMatch(/github-person|"lend"|"mark"|requested_by/);
+    // A push, and GitHub's API, are lent as ever: not from the person.
+    expect(await task.githubToken()).toBeUndefined();
+    expect(await task.githubReadToken()).toBeUndefined();
+    expect(lending.asked).toHaveLength(2);
+    // No longer to be had, or it cannot be asked: the read is not to be made at all (which is not "none, as a stranger").
+    lending.answer = async () => undefined;
+    expect(await task.githubFetchToken()).toBe(false);
+    lending.answer = async () => Promise.reject(new Error("unreachable"));
+    expect(await task.githubFetchToken()).toBe(false);
+    // A task that was lent nothing is as ever: none, and the connector is not asked.
+    const plain = fixture();
+    await plain.task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", repository: "https://github.com/acme/core" });
+    lending.asked.length = 0;
+    expect(await plain.task.githubFetchToken()).toBeUndefined();
+    expect(lending.asked).toEqual([]);
+  });
+
+  it("is not started with a record it cannot read", async () => {
+    for (const lend of [null, {}, { ...LEND, v: 2 }, { ...LEND, mark: "" }, { ...LEND, installation: undefined }, { ...LEND, repo_id: "102" }]) {
+      const { task } = fixture();
+      expect(await task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", repository: "https://github.com/acme/core", lend }), JSON.stringify(lend)).toMatchObject({ phase: "failed" });
+      expect(await task.status()).toEqual({ error: "no such task" });
+      // And never under that id after.
+      expect(await task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", repository: "https://github.com/acme/core" })).toMatchObject({ phase: "failed" });
+    }
+  });
+
+  it("has no copy taken of what it read, while it works or when it ends, and leaves nothing to go on from", async () => {
+    const { task, container, records, background } = await lentTask();
+    // Progress, which is when a copy is taken of other work.
+    const state = records.get("state");
+    await task.callback("progress", state.token, { message: "reading" }).catch(() => undefined);
+    await Promise.all(background);
+    expect(backups.taken).toBe(0);
+    expect(await task.snapshot()).toBe("lent");
+    ended(container, { code: "0", events: DONE });
+    await task.alarm();
+    expect(await task.status()).toMatchObject({ phase: "succeeded" });
+    expect((await task.status() as any).checkpoint).toBeUndefined();
+    expect(backups.taken).toBe(0);
+    expect(await task.snapshot()).toBe("lent");
+  });
+
+  it("ends, saying why, when what it was lent is gone: how it ended is written before its container is discarded, and it reads nothing after", async () => {
+    const { task, container, reported, bodies, background, records } = await lentTask();
+    expect(container.running).toBe(true);
+    let phaseAsDiscarded: string | undefined;
+    const destroy = container.destroy.bind(container);
+    container.destroy = async () => {
+      phaseAsDiscarded = records.get("state").phase;
+      await destroy();
+    };
+    expect(await task.revoked()).toEqual({ ok: true });
+    await Promise.all(background);
+    expect(phaseAsDiscarded).toBe("failed");
+    expect(container.running).toBe(false);
+    expect(await task.status()).toMatchObject({ phase: "failed", error: expect.stringContaining("no longer stands") });
+    expect(reported).toEqual(["failed"]);
+    expect(JSON.stringify(bodies)).toContain("no longer stands");
+    expect(await task.githubFetchToken()).toBe(false);
+    // Told again: nothing more.
+    await task.revoked();
+    await Promise.all(background);
+    expect(reported).toEqual(["failed"]);
+
+    // One that had ended well already keeps its container a while: that is discarded too, and how it ended stands.
+    const done = await lentTask();
+    ended(done.container, { code: "0", events: DONE });
+    await done.task.alarm();
+    done.container.running = true;
+    await done.task.revoked();
+    expect(done.container.running).toBe(false);
+    expect(await done.task.status()).toMatchObject({ phase: "succeeded" });
+
+    // A task that was lent nothing is not touched.
+    const plain = fixture();
+    await plain.task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1" });
+    await plain.task.revoked();
+    expect(plain.container.running).toBe(true);
+    expect(await plain.task.status()).toMatchObject({ phase: expect.not.stringMatching(/failed/) });
   });
 });

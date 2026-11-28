@@ -188,6 +188,19 @@ describe("git over the proxy", () => {
     expect(forwarded[1].headers.get("authorization")).toBeNull();
   });
 
+  it("sends no read at all for a task whose lent authorisation is no longer to be had: not as a stranger either", async () => {
+    const { send } = await proxyFor({ repository: "acme/demo", fetchWithdrawn: true } as never);
+    const refused = await send(advert);
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toContain("no longer lent");
+    expect((await send("https://github.com/acme/demo.git/git-upload-pack", { method: "POST", body: "0000" })).status).toBe(403);
+    expect(forwarded).toEqual([]);
+    // Another repository is read as a stranger would, as ever.
+    await send("https://github.com/acme/other.git/info/refs?service=git-upload-pack");
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0].headers.get("authorization")).toBeNull();
+  });
+
   it("asks for what git reads with apart from what a push goes out under, and passes on only the headers git's own exchange needs", async () => {
     // Lent for reading and not for pushing: reading goes out with it, and nothing is asked for of the other kind.
     const { send, pushAsks } = await proxyFor({ repository: "acme/demo", fetchToken: "test-fetch-token", tokenWithdrawnAfter: 0 });

@@ -1143,6 +1143,22 @@ export class Tasks implements Wakes {
    */
   async event(taskId: string, seq: number, kind: WorkerEventKind, report: Record<string, unknown>): Promise<{ ok: boolean }> {
     let body = report;
+    // The good end of work that was bound to something (see Worker.prepareStart) is taken in only
+    // while that still stands, as its worker says now: asked before anything is written, and only
+    // of a report not taken before. Gone, it is taken as failed, so that nothing follows it.
+    if (kind === "result") {
+      const bound = this.#lendOf(taskId).lend;
+      const task = bound === undefined ? undefined : this.#s.rows<{ worker: string }>("SELECT worker FROM tasks WHERE id = ?", taskId)[0];
+      if (task && this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length === 0) {
+        const worker = this.#b.workerNamed(task.worker);
+        // (A worker that binds work and has no such word to say is not asked.)
+        if (worker?.holds && (await worker.holds(this.#b.env, bound)) !== "holds") {
+          kind = "failed";
+          report = { error: "what this work was allowed for it no longer stands (the person's authorisation was given up, or is no longer taken); what it came to was not taken in", ...(report.usage !== undefined ? { usage: report.usage } : {}), ...(report.model_calls !== undefined ? { model_calls: report.model_calls } : {}), ...(report.notes_not_read !== undefined ? { notes_not_read: report.notes_not_read } : {}) };
+          body = report;
+        }
+      }
+    }
     // Of notes that were not read, only which and when is kept and told: never their words, whatever a worker sends.
     if (Array.isArray(body.notes_not_read)) body = { ...body, notes_not_read: (body.notes_not_read as { id?: unknown; at?: unknown }[]).map((note) => ({ id: String(note?.id ?? ""), ...(typeof note?.at === "number" ? { at: note.at } : {}) })) };
     const outcome: { known: boolean; wake: boolean; terminal: boolean; spent?: number } = this.#s.transaction(() => {

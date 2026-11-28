@@ -22,6 +22,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import type { Env } from "../../env";
 import { fromTheirs, githubTokenFor, lendsTo } from "../../connectors/github-app";
+import { type PersonLend, lentToken, readLend } from "../../connectors/github-lend";
 import type { WorkerEventKind } from "../../events";
 import { registry } from "../../registry";
 import { standingEligible, BRAIN_HOST, type Outbound, type RefUpdate, describePush } from "./outbound";
@@ -110,6 +111,12 @@ export interface TaskState {
   brain?: string;
   /** The one person established to have asked for this task, where there is one: what a connector decides lending by, and nothing else. */
   requested_by?: string;
+  /**
+   * What this task was lent of a person's own when it was handed over (see github-lend.ts): a
+   * record of on what strength, never the credential. Such a task's files are of something only
+   * that person may read: no copy of them is taken, and nothing goes on from it.
+   */
+  lend?: PersonLend;
   model_calls: number;
   finished_at?: number;
   /** Held here, never in the container. Dropped with the task. */
@@ -188,6 +195,8 @@ export interface StartInput {
   brain?: string;
   /** The one person the Brain established asked for this, where there is one. */
   requested_by?: string;
+  /** What the worker bound this work to before it was written, as the Brain kept it. */
+  lend?: unknown;
   id: string;
   prompt?: string;
   repository?: string;
@@ -376,6 +385,11 @@ export class TaskSandbox extends DurableObject<Env> {
         this.ctx.storage.kv.put("closed", true);
         return { phase: "failed", error: "the start arrived too late to be taken" };
       }
+      // Bound to something that cannot be read here: not started as if it were bound to nothing.
+      if (input.lend !== undefined && !readLend(input.lend)) {
+        this.ctx.storage.kv.put("closed", true);
+        return { phase: "failed", error: "what this work was to be lent could not be read" };
+      }
     }
     const state = await this.#start(input);
     return { phase: state.phase, error: state.error };
@@ -422,6 +436,7 @@ export class TaskSandbox extends DurableObject<Env> {
       asks: 0,
       brain: input.brain,
       ...(input.requested_by ? { requested_by: input.requested_by } : {}),
+      ...(input.lend !== undefined && !input.seed ? { lend: readLend(input.lend) } : {}),
       model_calls: 0,
       starting_since: t0,
       out: [],
@@ -509,8 +524,10 @@ export class TaskSandbox extends DurableObject<Env> {
    * finished, where it is kept, and until when. Nothing unless the task succeeded, a checkpoint
    * was taken after it had (see #settle), and it has not yet been removed.
    */
-  async snapshot(): Promise<{ record: DirectoryBackupRecord; cwd: string; repository?: string; until: number } | null> {
+  async snapshot(): Promise<{ record: DirectoryBackupRecord; cwd: string; repository?: string; until: number } | "lent" | null> {
     const state = this.#state();
+    // What it worked on was lent for that work alone: it is said so, and not that it is no longer kept.
+    if (state?.lend) return "lent";
     if (!state || state.phase !== "succeeded" || !state.checkpoint?.final) return null;
     const until = (state.finished_at ?? state.checkpoint.at) + PURGE_AFTER_MS;
     // Not handed out in its last minutes: whoever takes it needs time to read it before it is removed.
@@ -522,7 +539,7 @@ export class TaskSandbox extends DurableObject<Env> {
     const state = this.#state();
     if (!state) return { error: "no such task" };
     // (Who asked for it is for deciding what it is lent, and is not part of how it stands.)
-    const { requested_by: _, ...shown } = state;
+    const { requested_by: _, lend: _lent, ...shown } = state;
     return { ...shown, token: "(hidden)", github_token: state.github_token ? { ...state.github_token, token: "(hidden)" } : undefined, github_read_token: state.github_read_token ? { ...state.github_read_token, token: "(hidden)" } : undefined, github_public_token: state.github_public_token ? { ...state.github_public_token, token: "(hidden)" } : undefined };
   }
 
@@ -758,8 +775,40 @@ export class TaskSandbox extends DurableObject<Env> {
    * from what a push goes out under, so that one can be lent where the other is not. Lent by the
    * same rule today.
    */
-  async githubFetchToken(): Promise<string | undefined> {
-    return this.#lend("write");
+  async githubFetchToken(): Promise<string | false | undefined> {
+    const state = this.#state();
+    if (!state?.lend) return this.#lend("write");
+    // Lent a person's own authorisation: theirs is what it reads with, asked of the connector that
+    // holds it each time and kept nowhere here. Only for this: a push and the API are lent as ever.
+    const working = (now: TaskState | undefined) => now !== undefined && (ACTIVE.has(now.phase) || now.phase === "starting");
+    // Where it is not to be had (any more), the read is not made at all: `false`, which is not
+    // "none, read as a stranger would".
+    if (!state.brain || !working(state)) return false;
+    const token = await lentToken(this.env, state.lend, { id: state.id, brain: state.brain, repo: await this.repository() }).catch(() => undefined);
+    // That took a moment; the task may have ended meanwhile.
+    return (working(this.#state()) && token) || false;
+  }
+
+  /**
+   * The authorisation this task was lent is gone (the person gave it up, or GitHub no longer
+   * takes it): the task ends here, and says why. Nothing for a task that was lent none.
+   */
+  async revoked(): Promise<{ ok: true }> {
+    const state = this.#state();
+    if (!state?.lend) return { ok: true };
+    if (ACTIVE.has(state.phase) || state.phase === "starting" || state.phase === "idle") {
+      // How it ended is written down first; then the container, which still holds what it read, is discarded.
+      state.phase = "failed";
+      state.error = "the person's GitHub authorisation, which this work read their repository with, no longer stands; the work was stopped";
+      state.pending = undefined;
+      this.#emit(state, "failed", { error: state.error });
+      this.#save(state);
+      await this.ctx.storage.setAlarm(Date.now() + CHECK_INTERVAL_MS);
+      this.ctx.waitUntil(this.#flush());
+    }
+    // (Also of one that had ended already: its container is kept a while for looking into, and what it read is in it.)
+    if (this.#container.running) await this.#container.destroy();
+    return { ok: true };
   }
 
   /** The same, for reading GitHub's API: lent by the same rule, and it can only read. None without an App: there is no token of the deployment's that only reads. */
@@ -1138,6 +1187,8 @@ export class TaskSandbox extends DurableObject<Env> {
    */
   async #checkpoint(): Promise<void> {
     const before = this.#state();
+    // (Nothing of what a person's own authorisation was lent to read is copied anywhere.)
+    if (before?.lend) return;
     if (!before || this.#checkpointing || this.#leaving === TaskSandbox.#round(before) || !ACTIVE.has(before.phase) || !this.#container.running) return;
     if (before.checkpoint && Date.now() - before.checkpoint.at < CHECKPOINT_MIN_INTERVAL_MS) return;
     // If old checkpoints cannot be deleted, stop making new ones rather than pile them up: every
@@ -1508,7 +1559,7 @@ export class TaskSandbox extends DurableObject<Env> {
       still.notes_closed = still.run;
       this.#save(still);
     }
-    if (!lost && exitCode === 0 && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
+    if (!lost && exitCode === 0 && !before.lend && (before.stale_checkpoints?.length ?? 0) < MAX_STALE_CHECKPOINTS) {
       const started = Date.now();
       this.#leaving = mine;
       try {

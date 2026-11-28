@@ -39,6 +39,8 @@ export class FakeTask extends DurableObject {
   async snapshot() {
     const first = ((this.ctx.storage.kv.get("calls") as { method: string; args: any }[] | undefined) ?? []).find((each) => each.method === "start")?.args;
     if (!first) return null;
+    // As the real task that was lent a person's authorisation: it says so, and hands nothing out.
+    if (first.lend !== undefined) return "lent";
     return { record: { id: "kept", dir: "/workspace/job" }, cwd: first.repository ? "/workspace/job/repo" : "/workspace/job/scratch", ...(first.repository ? { repository: first.repository } : {}), until: Date.now() + 3_600_000 };
   }
   /** As the real task: whether it was ever started here. (The real one also closes an id it never took; nothing here starts one afterwards.) */
@@ -66,6 +68,12 @@ export class FakeTask extends DurableObject {
   }
   async cancel() {
     this.#record("cancel", {});
+    return { ok: true };
+  }
+  /** As the real task: told that what it was lent is gone. A test can have it not answer. */
+  async revoked() {
+    this.#record("revoked", {});
+    if ((this.#policy() as { revokedUnheard?: boolean }).revokedUnheard) throw new Error("connection lost");
     return { ok: true };
   }
   // --- the side the outbound proxy talks to; answers are whatever the test configured ---
@@ -111,7 +119,9 @@ export class FakeTask extends DurableObject {
   async githubFetchToken() {
     this.ctx.storage.kv.put("fetch_asks", ((this.ctx.storage.kv.get("fetch_asks") as number | undefined) ?? 0) + 1);
     if (this.#endsWhileLending()) return undefined;
-    const policy = this.#policy() as { repository?: string; fetchToken?: string };
+    const policy = this.#policy() as { repository?: string; fetchToken?: string; fetchWithdrawn?: boolean };
+    // (As the real task that was lent a person's authorisation which is no longer to be had: not "none", but "not to be read".)
+    if (policy.fetchWithdrawn) return false;
     return (policy.repository ?? "") ? (policy.fetchToken ?? "test-github-token") : undefined;
   }
   /** As the real task: a credential that can only read, lent where the other is; none where the test says the task is not lent one. A test can have the lending fail, or the task end while it is asked. */
