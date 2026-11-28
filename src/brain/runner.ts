@@ -483,17 +483,22 @@ export class Runner {
     const entered = this.#s.rows<RunRow>("UPDATE runs SET entries = entries + 1, retry_at = NULL WHERE id = ? RETURNING *", runId)[0];
     if (!entered) return;
     // Taken up and then put off before anything was done (the day's allowance was used up, say):
-    // what it took up is looked at again as things are now. What its connector no longer wants,
-    // and what a later word about the same thing has superseded meanwhile, is dropped; a run left
-    // with nothing ends here, with nothing spent, and what it had written of them into the
-    // conversation's record (nothing else, so far) goes with it.
+    // what it took up is looked at again as things are now. Where its connector no longer wants
+    // any of it, or a later word about the same thing has superseded it meanwhile, all of it is
+    // dropped and the run ends here, with nothing spent; what it had written of them into the
+    // conversation's record (nothing else, so far) goes with it. Only where that is so of every
+    // event it took up: what it wrote into the record is one piece for all of them, and a run
+    // that still has something to do goes on with it as it is.
     if (entered.steps === 0 && entered.status === "running") {
       const held = this.#s.rows<{ id: number; source: string; kind: string; data: string | null }>("SELECT id, source, kind, data FROM inbox WHERE run_id = ? AND status = 'claimed'", runId);
       const unwanted = held.filter((each) => !this.#b.wanted(each.source, each.kind) || this.#s.superseded(each.source, each.data));
-      for (const each of unwanted) this.#s.sql.exec("UPDATE inbox SET status = 'dropped', run_id = NULL WHERE id = ?", each.id);
       if (held.length > 0 && unwanted.length === held.length) {
-        this.#s.sql.exec("DELETE FROM items WHERE run_id = ?", runId);
-        return this.#finish(runId, "done");
+        this.#s.transaction(() => {
+          for (const each of unwanted) this.#s.sql.exec("UPDATE inbox SET status = 'dropped', run_id = NULL WHERE id = ?", each.id);
+          this.#s.sql.exec("DELETE FROM items WHERE run_id = ?", runId);
+          this.#finish(runId, "done");
+        });
+        return;
       }
     }
     // Taken up again after an interruption: what it had read of the conversation's record is not

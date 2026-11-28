@@ -86,7 +86,6 @@ export class BrainStore {
     console.log(JSON.stringify({ event, scope: this.#ctx.id.name, ...detail }));
   }
 
-  /** Stores an event unless the same (source, source_id) is already held. Says whether it was stored. */
   /**
    * Whether an event that was taken in says how something stood at a moment that a later word
    * under its key has since superseded (see InboundEvent.supersedes): known from what is kept of
@@ -104,7 +103,15 @@ export class BrainStore {
     return latest !== undefined && (latest.at > under.at || (latest.at === under.at && latest.void === 1));
   }
 
+  /**
+   * Stores an event unless the same (source, source_id) is already held. Says whether it was stored.
+   * What it supersedes, which state is the latest, and the event itself are written together or not at all.
+   */
   insertEvent(event: InboundEvent): boolean {
+    return this.transaction(() => this.#insert(event));
+  }
+
+  #insert(event: InboundEvent): boolean {
     // Checked explicitly: rowsWritten also counts index writes, so it cannot tell an insert from an ignore.
     if (this.rows("SELECT 1 FROM inbox WHERE source = ? AND source_id = ?", event.source, event.source_id).length > 0) return false;
     // Only the latest state under a key means anything (see InboundEvent.supersedes). Settled here,

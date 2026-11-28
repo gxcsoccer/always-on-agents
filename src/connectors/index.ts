@@ -47,12 +47,12 @@ export function trusts(source: string): boolean {
   return trusted.has(source);
 }
 
-/** The tools a connector offers, if any. Whether they are offered in a given run is the Brain's decision. */
 /** Whether an event that waits is still to be taken up, as its connector says now (see Connector.wanted). */
 export function wanted(env: Env, source: string, kind: string): boolean {
   return byName.get(source)?.wanted?.(env, { kind }) ?? true;
 }
 
+/** The tools a connector offers, if any. Whether they are offered in a given run is the Brain's decision. */
 export function toolsOf(name: string): ConnectorTool[] {
   return [...(byName.get(name)?.tools ?? []), ...serving(name).flatMap((each) => each.tools ?? [])];
 }
