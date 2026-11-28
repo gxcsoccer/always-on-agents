@@ -2115,11 +2115,29 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
       stored.grant.refresh_expires_at = Date.now() - 1;
       await state.storage.put("grant", stored);
     });
-    expect(await (await ann.grant()).holds(record)).toBe(false);
+    // Something asked under another giving of it changes nothing for what is lent under this one.
+    expect(await (await ann.grant()).holds({ ...record, mark: `${record.mark}x` })).toBe(false);
+    expect(await runDurableObjectAlarm(await ann.grant())).toBe(false);
+    // Seen by the work's own next asking (nobody else has to ask anything): it is told to stop.
     expect(await lentToken(env as any, record, mine)).toBeUndefined();
-    expect(await (await ann.grant()).standing()).toMatchObject({ authorised: false });
     await runDurableObjectAlarm(await ann.grant());
     expect(await revokedAt(mine.id)).toBe(1);
+
+    // And seen where the good end of the work is about to be taken in: the same.
+    const bea = someone();
+    await authorised(bea);
+    const hers = await lent(bea);
+    const work = task(bea);
+    expect(await lentToken(env as any, hers, work)).toBeDefined();
+    await runInDurableObject(await bea.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      stored.grant.refresh_expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    expect(await (await bea.grant()).holds(hers)).toBe(false);
+    await runDurableObjectAlarm(await bea.grant());
+    expect(await revokedAt(work.id)).toBe(1);
   });
 
   describe("from their own conversation", () => {

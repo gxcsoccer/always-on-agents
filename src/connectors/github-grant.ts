@@ -550,7 +550,7 @@ export class GithubGrant extends DurableObject<Env> {
    * authorisation goes. Never kept by whoever asks: asked for again each time.
    */
   async lendToken(of: { generation: number; mark: string; account: number; task: string }): Promise<string | undefined> {
-    if (!of.task || !this.#stands(await this.#load(), of)) return undefined;
+    if (!of.task || !(await this.#standsNow(of))) return undefined;
     const key = `lent:${of.task}`;
     if ((await this.ctx.storage.get(key)) === undefined) {
       const kept = [...(await this.ctx.storage.list<number>({ prefix: "lent:" })).keys()];
@@ -581,12 +581,30 @@ export class GithubGrant extends DurableObject<Env> {
 
   /** Whether the authorisation something was lent under is the one that stands now. */
   async holds(of: { generation: number; mark: string; account: number }): Promise<boolean> {
-    return this.#stands(await this.#load(), of);
+    return this.#standsNow(of);
+  }
+
+  /**
+   * The same, for whoever asks on behalf of something lent: where it is seen here that this very
+   * giving of the authorisation has run out with nothing to renew it by, what was lent it is
+   * stopped (once: there is nothing left on the list after). An asker under another giving is
+   * only turned away: what is lent under the one that stands now is not touched.
+   */
+  async #standsNow(of: { generation: number; mark: string; account: number }): Promise<boolean> {
+    const stored = await this.#load();
+    if (this.#stands(stored, of)) return true;
+    if (this.#same(stored, of)) await this.#withdraw();
+    return false;
+  }
+
+  /** Whether what is held is the giving of the authorisation that something was lent under, whether or not it is still good. */
+  #same(stored: Stored | undefined, of: { generation: number; mark: string; account: number }): boolean {
+    return stored !== undefined && stored.generation === of.generation && stored.grant !== undefined && stored.grant.mark === of.mark && of.mark !== "" && stored.grant.account === of.account;
   }
 
   #stands(stored: Stored | undefined, of: { generation: number; mark: string; account: number }): boolean {
     // (One that has run out with nothing to renew it by does not stand either.)
-    return stored !== undefined && stored.generation === of.generation && stored.grant !== undefined && this.#usable(stored.grant) && stored.grant.mark === of.mark && of.mark !== "" && stored.grant.account === of.account;
+    return this.#same(stored, of) && this.#usable(stored!.grant!);
   }
 
   /**
