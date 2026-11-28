@@ -734,6 +734,54 @@ describe("whose GitHub account it is", () => {
   });
 });
 
+describe("who a GitHub account is, in a repository's own conversation", () => {
+  it("is the person who authorised as it in the chat, with nothing set up by hand, for as long as it is theirs", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const { webhook_secret } = await registry().linkGithubRepo(PUBLIC, TENANT);
+    const brain = (env as any).BRAIN.getByName(scopeName({ tenant: TENANT, kind: "repo", id: PUBLIC })) as any;
+    let n = 0;
+    const says = async (account: number) => {
+      const id = 7_000 + ++n;
+      const response = await signed("issue_comment", { action: "created", repository: { full_name: PUBLIC }, sender: { id: account, login: loginOf(account), type: "User" }, issue: { number: 3, pull_request: {} }, comment: { id, body: "@always-on-agent please look", user: { id: account, login: loginOf(account) }, author_association: "MEMBER", created_at: "2026-11-28T01:00:00Z", updated_at: "2026-11-28T01:00:00Z" } }, webhook_secret);
+      expect(response.status).toBe(202);
+      return JSON.parse((await rowsOf(brain, "SELECT principal FROM inbox WHERE source_id = ?", `comment:${id}`))[0].principal);
+    };
+    // Hers: she is the person she is in the chat, and her word counts there.
+    expect(await says(ann.account)).toMatchObject({ kind: "human", id: ann.openId, explicit: true });
+    expect((await says(ann.account)).unlinked).toBeUndefined();
+    // An account nobody here authorised as is still not known.
+    expect(await says(987_654)).toMatchObject({ id: "github:987654", unlinked: true });
+    // Nor one that is somebody's in another tenant only.
+    await registry().createTenant("elsewhere", "elsewhere");
+    await registry().setFeishuApp("elsewhere", { app_id: "cli_else", app_secret: "s", bot_open_id: "ou_bot2", transport: "long_connection" });
+    const bob = someone("elsewhere", { ...APP, app_id: "cli_else", tenant: "elsewhere" }, "org_else");
+    await (await bob.grant()).invite(bob.who, "https://agent.test/v1/github/oauth/callback", 1, { brain: "x", call: "c", text: "t", where: "private" });
+    await registry().claimGithubPerson("elsewhere", String(bob.account), await grantName(bob.who));
+    const bound = (person: ReturnType<typeof someone>, account: number | undefined) =>
+      person.grant().then((grant) =>
+        runInDurableObject(grant, async (_i: unknown, state: DurableObjectState) => {
+          const stored = (await state.storage.get<any>("grant"))!;
+          await state.storage.put("grant", { ...stored, bound: account });
+        }),
+      );
+    await bound(bob, bob.account);
+    expect(await (await bob.grant()).personOf(bob.account)).toBe(bob.openId);
+    expect(await says(bob.account)).toMatchObject({ unlinked: true });
+    // Given up: it is nobody's again.
+    await (await ann.grant()).drop();
+    expect(await says(ann.account)).toMatchObject({ id: `github:${ann.account}`, unlinked: true });
+    // And where the note that an account is someone's outlives its being theirs (left behind half-way), the grant itself says it is not.
+    const cal = someone();
+    await authorised(cal);
+    expect(await says(cal.account)).toMatchObject({ id: cal.openId });
+    await bound(cal, undefined);
+    expect(await says(cal.account)).toMatchObject({ unlinked: true });
+    await bound(cal, cal.account + 1);
+    expect(await says(cal.account)).toMatchObject({ unlinked: true });
+  });
+});
+
 describe("commenting on GitHub as the person who asked", () => {
   it("asks them to authorise once, posts it once in their name on the one they named, and says what it is on", async () => {
     const ann = someone();

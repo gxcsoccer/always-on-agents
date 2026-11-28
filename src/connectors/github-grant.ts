@@ -274,6 +274,15 @@ export class GithubGrant extends DurableObject<Env> {
     if (only === undefined || was.bound !== undefined) await registry(this.env).releaseGithubPerson(await grantName(was.who), only === undefined ? undefined : String(was.bound));
   }
 
+  /**
+   * Who, in the chat, a GitHub account is: the person this grant is of, while that account is
+   * theirs here (from when they authorised as it until they give it up). None for any other account.
+   */
+  async personOf(account: number): Promise<string | null> {
+    const stored = await this.#load();
+    return stored && stored.bound === account ? stored.who.open_id : null;
+  }
+
   /** For the operator: whether there is a grant and for which account. Never a token, nor what was asked. */
   async status(): Promise<{ authorised: boolean; account?: number; login?: string; pending: number; issues: Record<string, number> }> {
     const stored = await this.#load();

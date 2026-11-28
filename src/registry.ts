@@ -344,6 +344,11 @@ export class Registry extends DurableObject<Env> {
     else this.ctx.storage.sql.exec("DELETE FROM github_people WHERE grant_name = ? AND account = ?", grant, account);
   }
 
+  /** The grant under which a GitHub account is some person's in one tenant, by name; none where it is nobody's there. */
+  async githubPersonGrant(tenant: string, account: string): Promise<string | null> {
+    return this.ctx.storage.sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE tenant = ? AND account = ?", tenant, account).toArray()[0]?.grant_name ?? null;
+  }
+
   /** Every grant given as one GitHub account, in whichever tenant. */
   async githubGrantsOf(account: string): Promise<string[]> {
     return this.ctx.storage.sql.exec<{ grant_name: string }>("SELECT grant_name FROM github_people WHERE account = ?", account).toArray().map((each) => each.grant_name);

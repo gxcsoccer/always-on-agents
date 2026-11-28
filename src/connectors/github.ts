@@ -332,6 +332,22 @@ export async function commentStanding(env: Env, scope: Scope, subject: string): 
   return { revision: Date.parse(comment.updated_at ?? comment.created_at ?? "") || 0, holder: fingerprint(comment.body ?? ""), deleted: false, edited: comment.updated_at !== comment.created_at };
 }
 
+/**
+ * The person of a tenant who authorised GitHub, in the chat, as this account: GitHub itself said
+ * then that the account is theirs, so on GitHub they are that person, with nothing set up by
+ * hand. While the account is theirs there: given up, it is nobody's again. None where that
+ * cannot be asked just now (they are then taken as not known, which lets nothing through).
+ */
+async function personAs(env: Env, tenant: string, account: string): Promise<string | null> {
+  if (!/^\d+$/.test(account)) return null;
+  try {
+    const grant = await registry(env).githubPersonGrant(tenant, account);
+    return grant ? await env.GITHUB_GRANTS.getByName(grant).personOf(Number(account)) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   // Until the signature has been checked the caller is unknown, so every refusal is the same 401,
   // whatever was wrong: a missing header, a body that is not JSON, an unknown source, a bad signature.
@@ -399,7 +415,7 @@ export async function handleGithubWebhook(request: Request, env: Env): Promise<R
   // renamed and then claimed by someone else.
   if (event.principal.kind === "human") {
     const accountId = event.principal.id.replace(/^github:/, "");
-    const user = await registry(env).resolveIdentity(tenant, "github", accountId);
+    const user = (await registry(env).resolveIdentity(tenant, "github", accountId)) ?? (await personAs(env, tenant, accountId));
     // A user id of the form "github:…", which can no longer be given, was never counted as a
     // member in a repository. It still is not.
     if (user) event.principal = { ...event.principal, id: user, unlinked: user.startsWith("github:") ? true : undefined };
