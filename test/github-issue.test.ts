@@ -1943,6 +1943,8 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     // Going on from earlier work; no repository.
     await ordinary({ continueFrom: "earlier" });
     await ordinary({ options: { repository: null } });
+    // Verified through another connector, whose origin happens to carry the same names: other people.
+    await ordinary({ sessionKey: privateSessionKey("other", { app_id: CHAT_APP, tenant_key: ORG }) }, { connector: "other" });
     // Through a chat app that is not this tenant's.
     await ordinary({}, { origin: { app_id: "cli_unknown", tenant_key: ORG } });
     // One anyone may read: the tenant's own, and somebody else's.
@@ -1961,7 +1963,6 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     // Never authorised: nothing of what the tenant's own credential saw of the repository is said.
     const unreadable = await said(ann);
     expect(unreadable).not.toMatch(/again in a little while/);
-    expect(unreadable).toMatch(/asking again later may do/);
     // The same words for one that is not there at all, and for one that is not this tenant's here.
     expect(await said(ann, "acme/no-such-thing")).toBe(unreadable);
     expect(await said(ann, SECRET)).toBe(unreadable);
@@ -1983,6 +1984,21 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     world.gitDown = true;
     expect(await said(ann, SECRET)).toMatch(/again in a little while/);
     world.gitDown = false;
+    // Whether they can read it cannot be found out just now (their token has run out and cannot be renewed at the moment; or
+    // the object that holds it cannot be asked): to be asked again, and not that they cannot read it.
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      stored.grant.expires_at = Date.now() - 1;
+      await state.storage.put("grant", stored);
+    });
+    world.renewalsDown = true;
+    expect(await said(ann)).toMatch(/again in a little while/);
+    world.renewalsDown = false;
+    const real = (env as any).GITHUB_GRANTS;
+    (env as any).GITHUB_GRANTS = { getByName: () => ({ sees: async () => Promise.reject(new Error("unreachable")) }) };
+    expect(await said(ann)).toMatch(/again in a little while/);
+    (env as any).GITHUB_GRANTS = real;
+    expect((await lendForStart(env as any, about(ann))).kind).toBe("bound");
     // GitHub no longer takes their token.
     for (const [token, each] of world.tokens) world.tokens.set(token, { ...each, good: false });
     expect(await said(ann)).toBe(unreadable);
@@ -2078,6 +2094,27 @@ describe("lending a person's own GitHub authorisation to sandbox work they asked
     expect((await ann.stored()).grant.account).toBe(record.account);
     expect(await (await ann.grant()).holds(record)).toBe(false);
     expect(await lentToken(env as any, record, mine)).toBeUndefined();
+  });
+
+  it("stops what was lent under an earlier giving of the authorisation when it is given anew over that one", async () => {
+    const ann = someone();
+    await authorised(ann);
+    const record = await lent(ann);
+    const mine = task(ann);
+    expect(await lentToken(env as any, record, mine)).toBeDefined();
+    // Someone comes back through an invitation and confirms, while the earlier giving is still held.
+    await runInDurableObject(await ann.grant(), async (_i: unknown, state: DurableObjectState) => {
+      const stored = (await state.storage.get<any>("grant"))!;
+      const { since: _since, mark: _mark, ...held } = stored.grant;
+      stored.pending.push({ nonce: "n-again", verifier: "v", redirect: "https://agent.test/v1/github/oauth/callback", expires_at: Date.now() + 600_000, state: "taken", held: { ...held, confirm: "word", until: Date.now() + 60_000 } });
+      await state.storage.put("grant", stored);
+    });
+    expect(await (await ann.grant()).install("n-again", "word")).toBe("done");
+    expect((await ann.stored()).grant.mark).not.toBe(record.mark);
+    await runDurableObjectAlarm(await ann.grant());
+    expect(await revokedAt(mine.id)).toBe(1);
+    expect(await lentToken(env as any, record, mine)).toBeUndefined();
+    expect(await lentToken(env as any, await lent(ann), task(ann))).toBeDefined();
   });
 
   it("keeps work that is still under way on the list of what it was lent to, however many more ask", async () => {

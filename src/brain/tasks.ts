@@ -1151,8 +1151,9 @@ export class Tasks implements Wakes {
     // of a report not taken before. Gone, it is taken as failed, so that nothing follows it.
     if (kind === "result") {
       const bound = this.#lendOf(taskId).lend;
-      const task = bound === undefined ? undefined : this.#s.rows<{ worker: string }>("SELECT worker FROM tasks WHERE id = ?", taskId)[0];
-      if (task && this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length === 0) {
+      const task = bound === undefined ? undefined : this.#s.rows<{ worker: string; status: string }>("SELECT worker, status FROM tasks WHERE id = ?", taskId)[0];
+      // (Of work that has ended here already nothing is taken in whatever is said: nobody is asked.)
+      if (task && !TERMINAL_TASK.has(task.status) && this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? AND seq = ?", taskId, seq).length === 0) {
         // Its worker as it is known here, also one no longer offered. One that is not known at all
         // cannot say that what the work was bound to stands. (One that has no such word to say is not asked.)
         let worker: Worker | undefined;

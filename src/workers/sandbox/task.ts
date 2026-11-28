@@ -386,7 +386,8 @@ export class TaskSandbox extends DurableObject<Env> {
         return { phase: "failed", error: "the start arrived too late to be taken" };
       }
       // Bound to something that cannot be read here: not started as if it were bound to nothing.
-      if (input.lend !== undefined && !readLend(input.lend)) {
+      // (Nor lent anything while it goes on from other work: the two never go together.)
+      if (input.lend !== undefined && (input.seed !== undefined || !readLend(input.lend))) {
         this.ctx.storage.kv.put("closed", true);
         return { phase: "failed", error: "what this work was to be lent could not be read" };
       }
@@ -436,7 +437,7 @@ export class TaskSandbox extends DurableObject<Env> {
       asks: 0,
       brain: input.brain,
       ...(input.requested_by ? { requested_by: input.requested_by } : {}),
-      ...(input.lend !== undefined && !input.seed ? { lend: readLend(input.lend) } : {}),
+      ...(input.lend !== undefined ? { lend: readLend(input.lend) } : {}),
       model_calls: 0,
       starting_since: t0,
       out: [],
@@ -1243,7 +1244,7 @@ export class TaskSandbox extends DurableObject<Env> {
   /** The container is gone. Puts the last checkpoint into a new one and continues the same session. */
   async #recover(): Promise<void> {
     const before = this.#state();
-    if (!before?.checkpoint) return;
+    if (!before?.checkpoint || before.lend) return;
     const started = Date.now();
     before.recoveries += 1;
     // Whatever was being held died with the container; its question no longer stands.

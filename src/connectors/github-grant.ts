@@ -211,10 +211,14 @@ export class GithubGrant extends DurableObject<Env> {
     delete through.held;
     through.state = "done";
     through.at = now;
-    stored.grant = { ...grant, since: now, mark: random(16) };
-    stored.bound = grant.account;
-    stored.owed = this.#owed(stored, grant.version);
-    void this.ctx.storage.put("grant", stored);
+    // A new giving of the authorisation. Whatever was lent under one before it is not lent under
+    // this one: it is stopped, in the same step as this is written.
+    await this.#withdraw(() => {
+      stored.grant = { ...grant, since: now, mark: random(16) };
+      stored.bound = grant.account;
+      stored.owed = this.#owed(stored, grant.version);
+      void this.ctx.storage.put("grant", stored);
+    });
     void this.ctx.storage.setAlarm(now);
     return "done";
   }
@@ -569,8 +573,9 @@ export class GithubGrant extends DurableObject<Env> {
         if (gone.length === 0) return undefined;
         for (const each of gone) void this.ctx.storage.delete(each);
         // (Asking took time: only under the authorisation as it stands now.)
-        if (!this.#stands(await this.#load(), of)) return undefined;
       }
+      // (Noted only under the authorisation as it stands at this very step.)
+      if (!this.#stands(await this.#load(), of)) return undefined;
       await this.ctx.storage.put(key, Date.now());
     }
     const held = await this.#token();

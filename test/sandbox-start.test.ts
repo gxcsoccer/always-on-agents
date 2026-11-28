@@ -674,6 +674,11 @@ describe("a sandbox task that was lent a person's own authorisation", () => {
       // And never under that id after.
       expect(await task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", repository: "https://github.com/acme/core" })).toMatchObject({ phase: "failed" });
     }
+    // Nor lent anything while going on from other work.
+    const { task } = fixture();
+    expect(await task.start({ id: "fixture", prompt: "look", brain: "t:user:ou_1", lend: LEND, seed: { from: "earlier", record: { id: "kept", dir: "/workspace/job" } as never, cwd: "/workspace/job/repo", repository: "https://github.com/acme/core" } })).toMatchObject({ phase: "failed" });
+    expect(await task.status()).toEqual({ error: "no such task" });
+    expect(backups.restored).toEqual([]);
   });
 
   it("has no copy taken of what it read, while it works or when it ends, and leaves nothing to go on from", async () => {

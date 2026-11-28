@@ -713,6 +713,11 @@ describe("tasks, by themselves", () => {
         expect(statusOf(bound.task_id).status).toBe("failed");
         expect(statusOf(bound.task_id).result).not.toContain("found it");
         expect(checked).toEqual([1, 2].map(() => ({ v: 1, leave: "to read acme/app" })));
+        // Of work that has ended here already nobody is asked, whatever is reported of it after.
+        stands = new Error("cannot be asked just now");
+        await tasks.event(bound.task_id, 2, "result", { text: "found it after all" });
+        expect(statusOf(bound.task_id).status).toBe("failed");
+        expect(checked).toHaveLength(2);
         // Work that was bound to nothing is not asked about.
         await tasks.event(plain.task_id, 1, "result", { text: "plain" });
         expect(statusOf(plain.task_id)).toMatchObject({ status: "succeeded", result: expect.stringContaining("plain") });
