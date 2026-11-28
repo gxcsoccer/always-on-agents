@@ -890,7 +890,38 @@ export class Tasks implements Wakes {
     // read from. From here to the worker call nothing else can interleave.
     // The question whose posted text was confirmed unchanged, if it was posted somewhere editable.
     let confirmedAsk: string | undefined;
-    if (decision === "allow") {
+    // Known before anything is written: an answer nobody can be given is not recorded as given.
+    const asking = this.#b.workerOf(String(task.worker));
+    if (!asking.answer) throw new Error("the worker of this task takes no answers");
+    // An approval of a push on record for the question still shown as open, where several people
+    // talk, whose word never came back from the work: before anything else is looked at, the work
+    // is asked whether it has it. One it took stands as it was given, by whom it was given,
+    // whatever has been said, changed or lost since: this call only finds that out and says so.
+    // One it has not is looked at below as a new one would be. A question the work no longer has
+    // open, with no answer on its record, has ended without one.
+    let taken = false;
+    let waiting = false;
+    {
+      const openAt = task.status === "needs_input" && task.pending ? (JSON.parse(task.pending) as { id: string; source?: string; ask?: string }) : undefined;
+      if (decision === "allow" && intent?.decision === "allow" && openAt && intent.pending_id === openAt.id && this.#s.scope().kind !== "user" && openAt.source === "proxy") {
+        // (A worker that keeps no record of its questions cannot say.)
+        const fate: QuestionFate = asking.decisionOn ? await asking.decisionOn(this.#b.env, taskId, intent.pending_id).catch(() => ({ state: "unknown" as const })) : { state: "unknown" };
+        if (fate.state === "unknown") throw new Error("it could not be found out just now whether the approval given earlier reached the work; nothing more was sent. Call this tool again in a little while");
+        const now = this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", taskId)[0];
+        if (!now || now.status !== task.status || now.pending !== task.pending || now.answering !== task.answering) throw new Error("something here changed while the work was being asked; call this tool again");
+        if (fate.state === "decided") taken = true;
+        else if (fate.state === "pending") waiting = true;
+        else {
+          // The work's record is whole and holds no answer to it, and it waits on it no longer: the question is over.
+          this.#s.transaction(() => {
+            this.#s.sql.exec("UPDATE tasks SET status = 'running', pending = NULL, answering = NULL, updated_at = ? WHERE id = ? AND status = 'needs_input' AND json_extract(pending, '$.id') = ?", Date.now(), taskId, openAt.id);
+            if (openAt.ask) this.#closeQuestion(openAt.ask, { state: "withdrawn" });
+          });
+          throw new Error("that question is over: the work no longer waits on it, and no answer to it took effect. Nothing was sent. If the work needs this again it will ask again, as a new question");
+        }
+      }
+    }
+    if (decision === "allow" && !taken) {
       // Everything in this conversation that could bear on it, handled or still waiting.
       const candidates = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE session_key = ? AND received_at > ?", sessionKey, task.created_at ?? 0);
       await this.#r.refreshStanding(candidates);
@@ -964,24 +995,17 @@ export class Tasks implements Wakes {
         (approver !== undefined && this.#r.saidSinceWhereTyped(approver, task.created_at ?? 0));
       return decision === "deny" || against || !approver || !this.#r.stillStands(approver);
     };
-    // Known before anything is written: an answer nobody can be given is not recorded as given.
-    const asking = this.#b.workerOf(String(task.worker));
-    if (!asking.answer) throw new Error("the worker of this task takes no answers");
-    if (intent?.decision === "allow" && intent.pending_id === open && stale(intent)) {
+    if (!taken && intent?.decision === "allow" && intent.pending_id === open && stale(intent)) {
       before = { decision: intent.decision, decided_by: intent.decided_by };
       setAside = intent.deciding_event;
       intent = undefined;
     }
-    // An approval of a push on record, where several people talk, is not sent again on the strength
-    // of what was found out when it was given. First the worker is asked whether it has it: one
-    // it took stands as it was given, by whom it was given, whatever has changed since. One it
-    // has not is looked at as a new one would be: whoever gave it is asked about again, and who may
-    // no longer write there has not approved (that approval is void, and is on record no more).
-    if (intent?.decision === "allow" && intent.pending_id === open && this.#s.scope().kind !== "user" && (JSON.parse(task.pending) as { source?: string }).source === "proxy") {
+    // One the work still waits on is looked at as a new one would be: whoever gave it is asked
+    // about again, and who may no longer write there has not approved (that approval is void,
+    // and is on record no more).
+    if (waiting && intent?.decision === "allow" && intent.pending_id === open) {
       const held = intent;
-      const fate = asking.decisionOn ? await asking.decisionOn(this.#b.env, taskId, held.pending_id).catch(() => ({ state: "unknown" as const })) : { state: "pending" as const };
-      if (fate.state === "unknown") throw new Error("it could not be found out just now whether the approval given earlier reached the work; nothing more was sent. Call this tool again in a little while");
-      if (fate.state !== "decided") {
+      {
         const approver = this.#s.rows<InboxRow>("SELECT * FROM inbox WHERE id = ?", held.deciding_event)[0];
         const on = this.#repositoryOf(taskId);
         const resource = (JSON.parse(task.pending) as { resource?: unknown }).resource;

@@ -2572,10 +2572,42 @@ describe("tasks, by themselves", () => {
         const { answer, worker, settings } = bench;
         settings.writes = () => "yes";
         await unheard(bench);
-        worker.fate.q1 = { state: "undecided" };
+        worker.fate.q1 = { state: "pending" };
         expect(await answer("t1", "allow", "call_2")).toMatchObject({ decision: "allow", decided_by: "alice" });
         expect(settings.writesAsked).toHaveLength(2);
       });
+      // The work no longer has the question open and holds no answer to it: it is over. Nobody is asked about, and nothing is sent.
+      await pushing(async (bench) => {
+        const { answer, worker, settings, kept, closed } = bench;
+        settings.writes = () => "yes";
+        const { open } = await unheard(bench);
+        worker.fate.q1 = { state: "undecided" };
+        settings.writesAsked.length = 0;
+        await expect(answer("t1", "allow", "call_2")).rejects.toThrow(/that question is over.*Nothing was sent/);
+        expect(settings.writesAsked).toEqual([]);
+        expect(worker.answered).toHaveLength(1);
+        expect(kept("t1")).toMatchObject({ status: "running", pending: null, answering: null });
+        expect(closed(open.ask)).toEqual({ state: "withdrawn" });
+      });
+      // The work did take it; since then the question as posted was edited, or whoever approved said more: what happened is told as it happened, not that it can only be refused.
+      for (const since of ["edited", "took back"]) {
+        await pushing(async (bench) => {
+          const { answer, worker, settings, store, reply } = bench;
+          const RECEIPT = { subject: "q:posted", holder: "as written" };
+          settings.revisable.add("feishu");
+          settings.now[RECEIPT.subject] = { revision: 1, holder: "as written", deleted: false, edited: false };
+          settings.writes = () => "yes";
+          await unheard(bench, { receipt: RECEIPT });
+          worker.fate.q1 = { state: "decided", decision: "allow" };
+          if (since === "edited") {
+            store.sql.exec("INSERT INTO revisions (subject, revision, deleted, holder) VALUES ('q:posted', 2, 0, 'reworded')");
+            settings.now[RECEIPT.subject] = { revision: 2, holder: "reworded", deleted: false, edited: true };
+          } else reply("wait");
+          settings.writesAsked.length = 0;
+          expect(await answer("t1", "allow", "call_2"), since).toMatchObject({ decision: "allow", decided_by: "alice" });
+          expect(settings.writesAsked).toEqual([]);
+        });
+      }
       // While GitHub is asked about them again, someone refuses: set aside, as anything said against it sets it aside.
       await pushing(async (bench) => {
         const { answer, worker, settings, reply } = bench;
