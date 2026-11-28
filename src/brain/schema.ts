@@ -368,6 +368,11 @@ export const MIGRATIONS: string[] = [
   // 41: beside a message that reminds people, the name the one who asked wrote for some of them
   // (by their ids): where the message's own words name the person, a channel puts its mention there.
   `CREATE TABLE IF NOT EXISTS outbox_names (idem TEXT PRIMARY KEY, names TEXT NOT NULL);`,
+  // 42: what a task's worker bound it to when it looked at it before it was written (see
+  // Worker.prepareStart): the worker's own record, kept as it was given and handed back when the
+  // task is started, with the options it was asked with then (one that is bound is started with
+  // those, however its call is made again). Beside the task, by its id, as the other things added to tasks are.
+  `CREATE TABLE IF NOT EXISTS task_lends (task_id TEXT PRIMARY KEY, record TEXT NOT NULL, options TEXT NOT NULL);`,
 ];
 
 export function migrate(storage: DurableObjectStorage): void {

@@ -13,6 +13,32 @@ import type { Env } from "../env";
 import type { Scope } from "../events";
 import type { QuestionFate } from "./result";
 
+/**
+ * What a host knows of the one person a run acts for, for a worker that looks at work before it is
+ * written. A run acts for one person in their own conversation and also where several people talk:
+ * that there is an actor says nothing of where. Where it is, is told by the scope, the conversation
+ * and `shared`.
+ */
+export interface Actor {
+  person: string;
+  connector: string;
+  origin: Record<string, string>;
+  /** Set where they asked in a conversation several people share. */
+  shared?: true;
+  /** What they wrote in the messages this was asked in, and shortly before: each with the message it is of. */
+  said: { ref: number; text: string }[];
+  recent: { ref: number; text: string }[];
+}
+
+/**
+ * What a worker says of a new piece of work before it is written: as ever; not to be started (in
+ * words for the model, which say whether asking again later may do); or bound to a record of the
+ * worker's own, which the Brain keeps with the work and hands back when it is started. The record
+ * is something that can be kept as JSON and read again, with a version of its own that the worker
+ * checks as it reads it: the Brain only keeps it.
+ */
+export type Prepared = { kind: "ordinary" } | { kind: "refused"; reason: string } | { kind: "bound"; record: Record<string, unknown> };
+
 /** One piece of work, as the Brain hands it over. `id` is the Brain's, kept before the worker is asked: the same id is the same piece of work. */
 export interface Work {
   id: string;
@@ -22,6 +48,13 @@ export interface Work {
   options: Record<string, unknown>;
   /** The scope name of the Brain to report to. */
   brain: string;
+  /**
+   * What this worker bound the work to when it looked at it before it was written (see
+   * `Worker.prepareStart`): kept with the work by the Brain as it was given, and handed back here
+   * each time the work is started. The worker's own to read; never the model's, and never part of
+   * the options or the brief.
+   */
+  lend?: unknown;
   /** The one person the Brain established asked for this, where there is one (not whoever is told of its end). A worker that lends a person's own authorisation goes by this. */
   by?: string;
   /**
@@ -65,6 +98,17 @@ export interface Worker {
    * will not take (an option that is not what it should be, work it does not do from that place).
    */
   accepts?(options: Record<string, unknown>, scope: Scope): void;
+  /**
+   * For a worker the Brain starts: a look at a new piece of work before anything is written, taken
+   * or started, by which the worker may bind it to something it is then allowed (a credential
+   * lent for it, say), or turn it away. It may ask others; it takes no place, starts nothing, and
+   * notes nothing as begun. Asked once for a piece of work: the same call made again is the work
+   * it made, with what was kept then.
+   * `by`: the one person the Brain established asked, if one did. `actor`: what the host knows of
+   * them where the run acts for one person (through which connector and verified origin, and what
+   * they wrote, each with a reference to the message): for the worker to check, never to store whole.
+   */
+  prepareStart?(env: Env, about: { scope: Scope; sessionKey: string; by: string | null; options: Record<string, unknown>; continueFrom: string | null; actor?: Actor }): Promise<Prepared>;
   /**
    * For a worker the Brain starts: it can go on from an earlier piece of its own work that ended
    * well (see `Work.continue_from`), for as long as it keeps what that left. Said to the model

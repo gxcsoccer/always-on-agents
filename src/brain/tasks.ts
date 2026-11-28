@@ -14,6 +14,7 @@ import type { registry } from "../registry";
 import { type RefUpdate, standingEligible } from "../workers/questions";
 import { type QuestionFate, clipResult } from "../workers/result";
 import type { Started, Worker } from "../workers";
+import type { Actor, Prepared } from "../workers/types";
 import type { Outbox } from "./outbox";
 import { type WorkEnd, workIs } from "./work";
 import { decidingReply, speaksAgainst, wantsStanding } from "./approval";
@@ -110,6 +111,9 @@ const MAX_FINISHED_LISTED = 5;
 /** What a task's last status is, as a piece of work. */
 export const taskEnd = (status: string): WorkEnd => ({ succeeded: "done", failed: "failed", cancelled: "cancelled" } as Record<string, WorkEnd>)[status] ?? "unknown";
 
+/** Said where no task may be had in a place at all: there is none to wait for. */
+const NONE_HERE = "tasks cannot be handed to a worker here at present: the limit set for this place is none. Tell the person so; waiting or trying again will not change it";
+
 /** Of what a call gave, the options that are this worker's own. */
 const own = (worker: Worker, options: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.entries(options).filter(([key]) => key in (worker.options ?? {})));
 
@@ -170,12 +174,39 @@ export class Tasks implements Wakes {
   }
 
   /**
+   * The earlier piece of work a new one is to go on from, if it may: this conversation's, this
+   * worker's, the one asker's own, and not one that ended badly. Throws, in words for the model,
+   * where it may not. Looked at before a worker is asked anything about the new work (nothing of
+   * an earlier piece that is not the asker's is said to it), and again as the task is written.
+   */
+  #goesOnFrom(run: RunRow, sessionKey: string, offered: Worker | undefined, name: string | null, from: string): Row {
+    const earlier = this.#s.rows<Row>("SELECT worker, session_key, status, requested_by FROM tasks WHERE id = ?", from)[0];
+    // Whose it was: the one person who asked for it, and it is theirs alone to go on from. Being in the same conversation is not enough.
+    const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+    const asker = people.length === 1 ? people[0] : null;
+    if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
+    // (Work nobody in particular asked for, or a run that is not one person's, has nobody whose it is: it is not gone on from.)
+    // Said as what it is where this run is not one person's own (it was started by a worker's report, say, or several people spoke):
+    // the work may well be there, and theirs; it is this run that cannot ask for it.
+    if (asker === null && earlier && earlier.session_key === sessionKey) throw new Error("going on from earlier work can only be asked for in answer to the one person whose work it was, and this step was not started by a message of theirs alone; nothing was started. Tell them how things stand; it is gone on from when they ask again");
+    if (!earlier || asker === null || earlier.session_key !== sessionKey || earlier.worker !== offered.name || earlier.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
+    if (TERMINAL_TASK.has(String(earlier.status)) && earlier.status !== "succeeded") throw new Error("that piece of work did not end well, so there is nothing of it to go on from; hand this over as something new");
+    return earlier;
+  }
+
+  /** What a task's worker bound it to before it was written, as kept with it: handed back each time the task is started. */
+  #lendOf(taskId: string): { lend?: unknown } {
+    const kept = this.#s.rows<{ record: string }>("SELECT record FROM task_lends WHERE task_id = ?", taskId)[0]?.record;
+    return kept === undefined ? {} : { lend: JSON.parse(kept) as unknown };
+  }
+
+  /**
    * Hands a piece of work to a worker the Brain starts, and says how it then stands. `name` is
    * the worker it is for; null where the call does not say (a tool call from before there was
    * more than one): then the worker the deployment names for that tool (`firstWorker`), while it is offered. `options`
    * are that worker's own, and it is the worker that says whether they will do.
    */
-  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }): Promise<unknown> {
+  async dispatch(run: RunRow, sessionKey: string, callId: string, name: string | null, title: string, brief: string, options: Record<string, unknown>, from: string | null = null, then?: { tools: string[]; events: { said: number[]; recent: number[] } }, actor?: Actor): Promise<unknown> {
     const scope = this.#s.scope();
 
     // The row is written before anything is started. A retry of this tool call finds it by op_id
@@ -191,7 +222,8 @@ export class Tasks implements Wakes {
     // And what it goes on from is what was written with it when that was found to be allowed: a call that says otherwise is not this call.
     const wrote = task ? (this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null) : null;
     if (task && from !== wrote) throw new Error("this call was first made for something else; nothing further was started");
-    if (task && wrote !== null) {
+    // (So with one that was bound to something for the one who asked: how it stands is theirs to be told, and nobody else's.)
+    if (task && (wrote !== null || this.#s.rows("SELECT 1 FROM task_lends WHERE task_id = ?", task.id).length > 0)) {
       const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
       if (people.length !== 1 || people[0] !== task.requested_by) throw new Error("this call was first made for someone else; nothing further was started");
     }
@@ -202,23 +234,60 @@ export class Tasks implements Wakes {
     // that names no worker is the tool from before there were several: it goes to the worker the
     // deployment says that tool was for, if it still offers that one, and to no other.
     const offered = task ? undefined : name !== null ? this.#b.workerNamed(name) : this.#b.firstWorker();
+    // The worker's own look at a new piece of work, before anything is written, taken or started
+    // (see Worker.prepareStart). It may ask others, which takes time: so it comes first, and
+    // everything that is looked at here afterwards (what it goes on from, who waits, how many
+    // run) is looked at once it is back, with nothing awaited before the task is written.
+    let bound: { record: string; by: string; options: Record<string, unknown> } | undefined;
+    if (!task && offered?.start && offered.prepareStart) {
+      const mine = own(offered, options);
+      offered.accepts?.(mine, scope);
+      // What can be told at once is told before the worker is asked anything: where no task may be
+      // had here at all, and what this is to go on from, which has to be the asker's own before a
+      // word of it reaches the worker. (Both are looked at again as the task is written.)
+      if (this.#limits().scope_active_tasks === 0) throw new Error(NONE_HERE);
+      if (from !== null) this.#goesOnFrom(run, sessionKey, offered, name, from);
+      const who = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+      const by = who.length === 1 ? who[0] : null;
+      let prepared: Prepared | Error;
+      try {
+        prepared = await offered.prepareStart(this.#b.env, { scope, sessionKey, by, options: mine, continueFrom: from, ...(actor ? { actor } : {}) });
+      } catch (err) {
+        prepared = err instanceof Error ? err : new Error(String(err));
+      }
+      // The same call may have been written meanwhile, by another making of it: then it is that
+      // task, with what was kept for it, whatever this look came to, also where it failed.
+      if (this.#s.rows("SELECT 1 FROM tasks WHERE op_id = ?", callId).length > 0) return this.dispatch(run, sessionKey, callId, name, title, brief, options, from, then);
+      if (prepared instanceof Error) throw prepared;
+      // Anything but one of the three answers is no answer: never taken for work as ever.
+      const UNSAID = "the worker could not say what this work is allowed; nothing was started";
+      const kind = (prepared as { kind?: unknown } | null)?.kind;
+      if (kind === "refused") throw new Error(typeof (prepared as { reason?: unknown }).reason === "string" && (prepared as { reason: string }).reason !== "" ? (prepared as { reason: string }).reason : UNSAID);
+      if (kind !== "ordinary" && kind !== "bound") throw new Error(UNSAID);
+      if (prepared.kind === "bound") {
+        // What it is bound to has to be something that can be kept and read again as it was given:
+        // settled here, before anything is written, and kept as it is written out now.
+        const record = prepared.record as unknown;
+        let kept: string | undefined;
+        try {
+          kept = record !== null && typeof record === "object" && !Array.isArray(record) ? JSON.stringify(record) : undefined;
+        } catch {
+          kept = undefined;
+        }
+        if (typeof kept !== "string" || !kept.startsWith("{")) throw new Error(UNSAID);
+        // And it was bound for the one who asked when it was looked at: whoever that is now has to be the same.
+        const now = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+        if (by === null || now.length !== 1 || now[0] !== by || (actor !== undefined && actor.person !== by)) throw new Error("who asked for this changed while it was being looked at; nothing was started. They can ask again");
+        bound = { record: kept, by, options: mine };
+      }
+    }
     /** Whether this is put after a piece of work that has not ended, to wait for it. */
     let waits = false;
     // Going on from an earlier piece of work: it has to be this conversation's, this worker's, and
     // one that ended well; and the worker has to be one that goes on at all. Whoever asks, and
     // whatever was approved then, are this new piece's own: nothing of the earlier one's is carried.
     if (!task && from !== null) {
-      const earlier = this.#s.rows<Row>("SELECT worker, session_key, status, requested_by FROM tasks WHERE id = ?", from)[0];
-      // Whose it was: the one person who asked for it, and it is theirs alone to go on from. Being in the same conversation is not enough.
-      const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
-      const asker = people.length === 1 ? people[0] : null;
-      if (!offered?.goes_on) throw new Error(`the worker "${offered?.name ?? name}" cannot go on with an earlier piece of work; hand this over as something new, and say in the brief what it follows`);
-      // (Work nobody in particular asked for, or a run that is not one person's, has nobody whose it is: it is not gone on from.)
-      // Said as what it is where this run is not one person's own (it was started by a worker's report, say, or several people spoke):
-      // the work may well be there, and theirs; it is this run that cannot ask for it.
-      if (asker === null && earlier && earlier.session_key === sessionKey) throw new Error("going on from earlier work can only be asked for in answer to the one person whose work it was, and this step was not started by a message of theirs alone; nothing was started. Tell them how things stand; it is gone on from when they ask again");
-      if (!earlier || asker === null || earlier.session_key !== sessionKey || earlier.worker !== offered.name || earlier.requested_by !== asker) throw new Error(`there is no piece of work ${JSON.stringify(from)} of this worker's to go on with here; nothing was started`);
-      if (TERMINAL_TASK.has(String(earlier.status)) && earlier.status !== "succeeded") throw new Error("that piece of work did not end well, so there is nothing of it to go on from; hand this over as something new");
+      const earlier = this.#goesOnFrom(run, sessionKey, offered, name, from);
       // Not ended yet: this is put after it, to be started when it has ended well. One line, with no branches: a piece
       // of work has one waiting behind it, and the next goes behind that one. (Looked at and written with nothing awaited between.)
       if (!TERMINAL_TASK.has(String(earlier.status))) {
@@ -245,7 +314,7 @@ export class Tasks implements Wakes {
       // (One that waits is not one that is at it: it is counted when its turn comes.)
       if (most === 0 || (!waits && this.#active() >= most)) {
         // Said as what it is where no task may be had here at all: there is none to wait for.
-        if (most === 0) throw new Error("tasks cannot be handed to a worker here at present: the limit set for this place is none. Tell the person so; waiting or trying again will not change it");
+        if (most === 0) throw new Error(NONE_HERE);
         throw new Error(`there are already ${most} tasks running here; wait for one to finish or cancel one`);
       }
       const now = Date.now();
@@ -286,6 +355,12 @@ export class Tasks implements Wakes {
         // What it works on: what it was given, or, going on from another, what that one worked on.
         const on = typeof options.repository === "string" && options.repository !== "" ? options.repository : from !== null ? (this.#s.rows<{ repository: string }>("SELECT repository FROM task_on WHERE task_id = ?", from)[0]?.repository ?? null) : null;
         if (on !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_on (task_id, repository) VALUES (?, ?)", id, on);
+        // What its worker bound it to, as the worker gave it: its own to read when the work is started, and nobody else's.
+        // (With what it was asked with then: one that is bound is started with that, however the call is made again.)
+        if (bound !== undefined) {
+          if (bound.by !== requestedBy) throw new Error("who asked for this changed while it was being looked at; nothing was started. They can ask again");
+          this.#s.sql.exec("INSERT INTO task_lends (task_id, record, options) VALUES (?, ?, ?)", id, bound.record, JSON.stringify(bound.options));
+        }
         if (then && then.tools.length > 0 && requestedBy !== null) this.#s.sql.exec("INSERT OR IGNORE INTO task_then (task_id, request, tools, events, repository) VALUES (?, ?, ?, ?, ?)", id, run.id, JSON.stringify(then.tools), JSON.stringify(then.events), on);
       });
       // (One that waits is watched from when it is let through to be started, not while it waits.)
@@ -308,6 +383,15 @@ export class Tasks implements Wakes {
       return this.#told(this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0]);
     }
     options = own(worker, options);
+    // One that was bound is the work it was when it was bound: what it was asked with then, for
+    // the one who asked then, whatever this making of the call says.
+    const lent = this.#s.rows<{ options: string }>("SELECT options FROM task_lends WHERE task_id = ?", task.id)[0];
+    if (lent) {
+      const people = [...new Set(this.#b.deciders(run.id).map((p) => p.id))];
+      if (people.length !== 1 || people[0] !== task.requested_by) throw new Error("this call was first made for someone else; nothing further was started");
+      options = JSON.parse(lent.options) as Record<string, unknown>;
+      brief = String(task.brief);
+    }
     // How far this task may go, as it was fixed when it was written (one written before that was
     // kept: as every task could then). Its worker, its place and its watchdog go by the same figures.
     const bounds = this.#boundsOf(task);
@@ -364,7 +448,7 @@ export class Tasks implements Wakes {
     const follows = this.#s.rows<{ from_id: string }>("SELECT from_id FROM task_follows WHERE task_id = ?", task.id)[0]?.from_id ?? null;
     // The worker may first take it only so long after it was first written, however often this is repeated.
     const until = Date.now() + START_WAIT_MS;
-    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
+    const start = () => within(worker.start!(this.#b.env, { id: task.id, brief, options, brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), ...this.#lendOf(String(task.id)), accept_by: Number(task.created_at) + ACCEPT_WITHIN_MS, bounds, ...(follows !== null ? { continue_from: follows } : {}) }), Math.max(1, until - Date.now())).catch(() => undefined);
     const heard = () => this.#s.rows<Row>("SELECT * FROM tasks WHERE id = ?", task.id)[0].status !== "dispatching" || this.#s.rows("SELECT 1 FROM task_events WHERE task_id = ? LIMIT 1", task.id).length > 0;
     let started: Started | undefined = await start();
     // Asked once more only if nothing was heard meanwhile, and there is time left to wait.
@@ -617,7 +701,7 @@ export class Tasks implements Wakes {
       if (left() === 0) break;
       let answer: Started | undefined;
       try {
-        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
+        answer = await within(worker.start(this.#b.env, { id: row.task_id, brief: String(task.brief), options: own(worker, JSON.parse(row.options) as Record<string, unknown>), brain: this.#s.scopeName(), ...(typeof task.requested_by === "string" ? { by: task.requested_by } : {}), ...this.#lendOf(row.task_id), accept_by: started + ACCEPT_WITHIN_MS, bounds: this.#boundsOf(task), ...(from ? { continue_from: from } : {}) }), Math.min(left(), CONFIRM_CALL_MS));
       } catch {
         answer = undefined;
       }

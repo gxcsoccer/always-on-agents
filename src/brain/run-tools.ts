@@ -523,7 +523,24 @@ export class RunTools {
         const unknown = then.filter((each) => !may.includes(each));
         if (unknown.length > 0) throw new Error(`${unknown.join(", ")} cannot be named to follow this work: ${may.length > 0 ? `only ${may.join(", ")} can here` : "nothing can be done in a person's name from this run"}; nothing was handed over`);
         const following = acting && then.length > 0 ? { tools: then, events: { said: this.#b.requests.basis(run.id).map((each) => each.id), recent: acting.recentIds } } : undefined;
-        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom, following)) as { task_id: string; status: string; note?: string };
+        // What is known here of the one person this run acts for, for a worker that looks at the work
+        // before it is written: who, through which connector and verified origin, and what they
+        // wrote, each with the message it is of. Never whoever a task's end or a timer stands for,
+        // nor anything the model said: only the run's own acting, decided from what is stored.
+        // (Put together only for a worker that looks: no other is told any of it.)
+        const looks = acting !== undefined && worker.prepareStart !== undefined;
+        const basis = looks ? this.#b.requests.basis(run.id) : [];
+        const actor = acting && looks
+          ? {
+              person: acting.person,
+              connector: acting.connector,
+              origin: acting.origin,
+              ...(acting.shared ? { shared: true as const } : {}),
+              said: acting.said.flatMap((each, at) => (basis[at] ? [{ ref: basis[at].id, text: each.text }] : [])),
+              recent: acting.recent.flatMap((each, at) => (acting.recentIds[at] !== undefined ? [{ ref: acting.recentIds[at], text: each.text }] : [])),
+            }
+          : undefined;
+        const started = (await this.#b.tasks.dispatch(run, session.session_key, callId, name, title, brief, own, continueFrom, following, actor)) as { task_id: string; status: string; note?: string };
         return { work_id: started.task_id, status: started.status, ...(started.note ? { note: started.note } : {}) };
       },
       workStatus: async (workId) => {

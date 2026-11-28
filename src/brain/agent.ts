@@ -434,6 +434,7 @@ export class BrainAgent extends DurableObject<Env> {
       this.#store.sql.exec("DELETE FROM task_then WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_on WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM task_asked WHERE task_id NOT IN (SELECT id FROM tasks)");
+      this.#store.sql.exec("DELETE FROM task_lends WHERE task_id NOT IN (SELECT id FROM tasks)");
       this.#store.sql.exec("DELETE FROM outbox_reminds WHERE idem NOT IN (SELECT idem FROM outbox)");
       this.#store.sql.exec("DELETE FROM outbox_names WHERE idem NOT IN (SELECT idem FROM outbox)");
       this.#store.sql.exec("DELETE FROM reminded WHERE at < ?", old);

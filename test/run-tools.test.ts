@@ -58,6 +58,10 @@ function bench(state: DurableObjectState) {
     },
     outside,
     actingFor: () => settings.acting,
+    workers: () => [
+      { name: "probe", description: "", acts_as: "agent" as const, prepareStart: async () => ({ kind: "ordinary" as const }), start: async () => ({ state: "started" as const }) },
+      { name: "plain", description: "", acts_as: "agent" as const, start: async () => ({ state: "started" as const }) },
+    ],
     mayUse: () => settings.mayUse,
     following: () => settings.following,
     reminders: {
@@ -79,6 +83,7 @@ function bench(state: DurableObjectState) {
       cancel: note("cancel"),
       basis: () => (settings.event ? [settings.event] : settings.basis.map((id) => ({ id }))) as never,
       endRequest: note("endRequest"),
+      record: () => undefined,
       noteSource: note("noteSource"),
       putOff: note("putOff"),
       wait: (...args: unknown[]) => (calls.push(["wait", ...args]), { waiting: "kept" }),
@@ -367,12 +372,28 @@ describe("a run's tools", () => {
   });
 
   it("hands tasks to their part, in this conversation", async () => {
-    await within(async ({ tools, of, run }) => {
+    await within(async ({ tools, of, run, calls, settings }) => {
       const t = tools();
       await t.dispatchTask("c2", "title", "brief", null);
       await t.taskStatus("t1");
       await t.answerTask("c3", "t1", "allow", "ok");
       await t.cancelTask("t1");
+      // Handed over for the one person the run acts for: what is known here of them goes along for the worker's own look, each thing they wrote with the message it is of.
+      await t.handOver("c5", "probe", "title", "brief", {}, null, null, []);
+      expect(of("dispatch").at(-1)).toEqual([run, SESSION_KEY, "c5", "probe", "title", "brief", {}, null, undefined, { person: "ou_1", connector: "feishu", origin: { app_id: "cli_1" }, said: [{ ref: 7, text: "read this" }], recent: [{ ref: 41, text: "earlier" }] }]);
+      // Nor is a worker that looks told anything of a person where the run acts for nobody (a timer's firing, the end of a task).
+      settings.acting = undefined;
+      await t.handOver("c7", "probe", "title", "brief", {}, null, null, []);
+      expect(of("dispatch").at(-1)).toEqual([run, SESSION_KEY, "c7", "probe", "title", "brief", {}, null, undefined, undefined]);
+      settings.acting = { ...PERSON, shared: true };
+      await t.handOver("c8", "probe", "title", "brief", {}, null, null, []);
+      expect((of("dispatch").at(-1) as unknown[]).at(-1)).toMatchObject({ person: "ou_1", shared: true });
+      settings.acting = PERSON;
+      for (const id of ["c7", "c8"]) calls.splice(calls.findIndex(([name, , , call]) => name === "dispatch" && call === id), 1);
+      // A worker that does not look is told none of it.
+      await t.handOver("c6", "plain", "title", "brief", {}, null, null, []);
+      expect(of("dispatch").at(-1)).toEqual([run, SESSION_KEY, "c6", "plain", "title", "brief", {}, null, undefined, undefined]);
+      for (const id of ["c5", "c6"]) calls.splice(calls.findIndex(([name, , , call]) => name === "dispatch" && call === id), 1);
       // The tool from before there was more than one worker names none: the tasks part finds the one that is started from here.
       expect(of("dispatch")).toEqual([[run, SESSION_KEY, "c2", null, "title", "brief", { repository: null }]]);
       expect(of("status")).toEqual([["t1", "dm"]]);
